@@ -4221,8 +4221,14 @@ STAGE_BYTES_SIG = "static size_t ggml_sycl_expert_stage_bytes(const ggml_sycl::p
 STAGE_BYTES_BODY = ("if (layout != GGML_LAYOUT_AOS) { return staged; } const size_t slot = "
                     "ggml_sycl::moe_expert_triplet_slot_bytes(plan, layer, expert); return slot >= staged ? slot : "
                     "staged; }")
-PRELOAD_SLOT = ("expert_preload_bytes = ggml_sycl_expert_stage_bytes(*ggml_sycl_cache_plan_owner(cache), "
-                "expert_slot_layer, static_cast<int>(e), expert_preload_layout, expert_preload_bytes);")
+# The preload reads the cache's plan once per tensor, for the bulk decline and each expert's slot sizing, and a DPAS
+# rollback once for its restore: an owner fetch costs an atomic load and a shared_ptr copy.
+PRELOAD_OWNER = ("const auto plan_owner = ggml_sycl_cache_plan_owner(cache); "
+                 "auto try_bulk_stage_moe_tensor = [&]() -> bool {")
+DPAS_OWNER = ("restore_keys.reserve(local_experts.size()); const auto plan_owner = ggml_sycl_cache_plan_owner(cache); "
+              "for (int e : local_experts) {")
+PRELOAD_SLOT = ("expert_preload_bytes = ggml_sycl_expert_stage_bytes(*plan_owner, expert_slot_layer, "
+                "static_cast<int>(e), expert_preload_layout, expert_preload_bytes);")
 PRELOAD_STAGE = ("ggml_sycl::unified_cache_direct_stage_expert(device, key, expert_aos, expert_size, "
                  "expert_preload_bytes, expert_preload_layout,")
 PRELOAD_STAGE_END = PRELOAD_STAGE + " expert_fill_fn, expert_fill_ctx, moe_preload_q, &handle);"
@@ -4232,13 +4238,13 @@ PRELOAD_GUARD = "if (expert_slot_layer >= 0) { " + PRELOAD_SLOT + " }"
 PRELOAD_LAYER = "expert_slot_layer = placement.layer_id;"
 BULK_LAYER = "bulk_layers.push_back(placement.layer_id);"
 BULK_SLOT = ("if (bulk_layout == GGML_LAYOUT_AOS) { for (size_t e = 0; e < bulk_layers.size(); ++e) { "
-             "if (ggml_sycl_expert_stage_bytes(*ggml_sycl_cache_plan_owner(cache), bulk_layers[e], "
-             "static_cast<int>(e), bulk_layout, bulk_expert_bytes) != bulk_expert_bytes) { return false; } } }")
+             "if (ggml_sycl_expert_stage_bytes(*plan_owner, bulk_layers[e], static_cast<int>(e), bulk_layout, "
+             "bulk_expert_bytes) != bulk_expert_bytes) { return false; } } }")
 BULK_STAGE = "auto bulk_result = ggml_sycl::unified_cache_direct_stage_expert_tensor("
 DPAS_AOS_FILL = ("if (base_layout == GGML_LAYOUT_AOS) { restore_fill_fn = nullptr; restore_fill = nullptr; "
                  "if (have_plan) {")
-DPAS_SLOT = ("restore_bytes = ggml_sycl_expert_stage_bytes(*ggml_sycl_cache_plan_owner(cache), placement.layer_id, "
-             "e, base_layout, expert_base_bytes);")
+DPAS_SLOT = ("restore_bytes = ggml_sycl_expert_stage_bytes(*plan_owner, placement.layer_id, e, base_layout, "
+             "expert_base_bytes);")
 DPAS_STAGE = ("auto rollback = ggml_sycl::unified_cache_direct_stage_expert(device, key, expert_aos, tensor->nb[2], "
               "restore_bytes, base_layout, restore_fill_fn, restore_fill, s1_preload_q, &rollback_handle);")
 PLANNER_CHARGES = "placement_entries_charge_expert_slots(plan.entries);"
@@ -4330,6 +4336,8 @@ def claim_every_member_mint_takes_the_triplet_slot(sycl: str, cache: str, plan_h
             and s.count(PRELOAD_STAGE_END) == 1 and ordered(s, PRELOAD_LAYER, PRELOAD_GUARD, PRELOAD_STAGE_END)
             and s.count(BULK_SLOT) == 1 and ordered(s, BULK_LAYER, BULK_SLOT, BULK_STAGE)
             and s.count(DPAS_SLOT) == 1 and ordered(s, DPAS_AOS_FILL, DPAS_SLOT, DPAS_STAGE)
+            and s.count(PRELOAD_OWNER) == 1 and ordered(s, PRELOAD_OWNER, BULK_SLOT, PRELOAD_GUARD)
+            and s.count(DPAS_OWNER) == 1 and ordered(s, DPAS_OWNER, DPAS_SLOT)
             and len(re.findall(r"\bggml_sycl_expert_stage_bytes\(", s)) == 4
             and len(re.findall(r"\bexpert_triplet_slot_bytes\(", s)) == 0
             and len(re.findall(r"\bexpert_triplet_slot_bytes\(", c)) == 0
@@ -4627,6 +4635,18 @@ def test_mutant_repeat_off_its_member_demoted_to_info_fails():
 def test_mutant_repeat_off_its_member_ignores_the_device_fails():
     mutant = _once_in(PLAN_HPP, OFF_SIG, " || e.target_device != member->target_device", "")
     assert not claim_a_repeat_off_its_member_warns(CACHE, mutant)
+
+
+def test_mutant_preload_sizes_from_the_global_plan_fails():
+    """The global snapshot is not the cache's plan: the load would size a slot from another plan than it stages by."""
+    mutant = _once(SYCL, PRELOAD_OWNER,
+                   PRELOAD_OWNER.replace("ggml_sycl_cache_plan_owner(cache)", "preload_plan_owner"))
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_dpas_restore_sizes_from_the_global_plan_fails():
+    mutant = _once(SYCL, DPAS_OWNER, DPAS_OWNER.replace("ggml_sycl_cache_plan_owner(cache)", "preload_plan_owner"))
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
 
 
 def test_mutant_bulk_stages_past_the_slot_fails():

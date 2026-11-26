@@ -48317,6 +48317,10 @@ static void ggml_sycl_preload_model_weights() {
 
                     bool any_cached = false;
 
+                    // The cache's plan, fetched once for the tensor: the bulk decline and each expert's preload size
+                    // an AOS member from its triplet's slot.
+                    const auto plan_owner = ggml_sycl_cache_plan_owner(cache);
+
                     auto try_bulk_stage_moe_tensor = [&]() -> bool {
                         static const bool bulk_stage_enabled = [] {
                             const char * env = std::getenv("GGML_SYCL_MOE_BULK_STAGE");
@@ -48412,9 +48416,8 @@ static void ggml_sycl_preload_model_weights() {
                         // it.
                         if (bulk_layout == GGML_LAYOUT_AOS) {
                             for (size_t e = 0; e < bulk_layers.size(); ++e) {
-                                if (ggml_sycl_expert_stage_bytes(*ggml_sycl_cache_plan_owner(cache), bulk_layers[e],
-                                                                 static_cast<int>(e), bulk_layout,
-                                                                 bulk_expert_bytes) != bulk_expert_bytes) {
+                                if (ggml_sycl_expert_stage_bytes(*plan_owner, bulk_layers[e], static_cast<int>(e),
+                                                                 bulk_layout, bulk_expert_bytes) != bulk_expert_bytes) {
                                     return false;
                                 }
                             }
@@ -48614,9 +48617,9 @@ static void ggml_sycl_preload_model_weights() {
                             configure_expert_preload(expert_requested_layout, expert_preload_bytes, expert_fill_fn,
                                                      expert_fill_ctx, expert_reorder_ctx, expert_tiled_ctx);
                         if (expert_slot_layer >= 0) {
-                            expert_preload_bytes = ggml_sycl_expert_stage_bytes(
-                                *ggml_sycl_cache_plan_owner(cache), expert_slot_layer, static_cast<int>(e),
-                                expert_preload_layout, expert_preload_bytes);
+                            expert_preload_bytes =
+                                ggml_sycl_expert_stage_bytes(*plan_owner, expert_slot_layer, static_cast<int>(e),
+                                                             expert_preload_layout, expert_preload_bytes);
                         }
 
                         const uint8_t *    expert_aos = static_cast<const uint8_t *>(tensor->data) + e * expert_size;
@@ -49402,6 +49405,8 @@ static void ggml_sycl_preload_model_weights() {
                         std::exception_ptr                    restore_async_error;
                         std::vector<ggml_sycl_cache_id>       restore_keys;
                         restore_keys.reserve(local_experts.size());
+                        // The cache's plan, fetched once for the restore: an AOS base is sized from its triplet's slot.
+                        const auto plan_owner = ggml_sycl_cache_plan_owner(cache);
                         for (int e : local_experts) {
                             try {
                                 if (e < 0 || tensor->nb[2] == 0 ||
@@ -49433,12 +49438,10 @@ static void ggml_sycl_preload_model_weights() {
                                     restore_fill_fn = nullptr;
                                     restore_fill    = nullptr;
                                     if (have_plan) {
-                                        const auto placement =
-                                            (*ggml_sycl_cache_plan_owner(cache)).lookup_expert_placement(tname, e);
+                                        const auto placement = plan_owner->lookup_expert_placement(tname, e);
                                         if (placement.found()) {
                                             restore_bytes = ggml_sycl_expert_stage_bytes(
-                                                *ggml_sycl_cache_plan_owner(cache), placement.layer_id, e, base_layout,
-                                                expert_base_bytes);
+                                                *plan_owner, placement.layer_id, e, base_layout, expert_base_bytes);
                                         }
                                     }
                                 }
