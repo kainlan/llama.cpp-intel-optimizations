@@ -88458,8 +88458,8 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     // A fused gate_up weight (MOE_TENSOR_GATE_UP) is one plain matrix per expert to this executor, so the resident
     // claim takes it. The staged claim does not: the ring's windows stage a layer's separate gate, up and down host
     // matrices only (moe_expert_role_is_triplet), so a staged gate_up weight would decline at its first host expert.
-    const moe_tensor_type role = moe_classify_tensor(weight->name ? weight->name : "");
-    const bool triplet_role    = role == MOE_TENSOR_GATE || role == MOE_TENSOR_UP || role == MOE_TENSOR_DOWN;
+    const moe_tensor_type role         = moe_classify_tensor(weight->name ? weight->name : "");
+    const bool            triplet_role = role == MOE_TENSOR_GATE || role == MOE_TENSOR_UP || role == MOE_TENSOR_DOWN;
     if (!triplet_role && !(role == MOE_TENSOR_GATE_UP && !host_staged)) {
         return false;
     }
@@ -100075,9 +100075,11 @@ static void ggml_sycl_mul_mat_id_with_direct_reentry(ggml_backend_sycl_context &
     }
     g_mmid_direct_reentry.requested         = nullptr;
     g_mmid_direct_reentry.suppressed_weight = dst->src[0];
+
     struct suppression_end {
         ~suppression_end() { g_mmid_direct_reentry.suppressed_weight = nullptr; }
     } end;
+
     ggml_sycl_mul_mat_id(ctx, dst);
 }
 
