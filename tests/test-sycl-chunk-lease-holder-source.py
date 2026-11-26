@@ -359,6 +359,17 @@ HINT_GUARD = "} else if (holders.chunk_leases != 0) {"
 HINT = 'ggml_log_internal(level, "[VRAM-ARENA] set GGML_SYCL_LEASE_HOLDERS=1'
 HOLDER_LINE = 'ggml_log_internal(level, "[VRAM-ARENA] chunk lease holder on device %d:'
 HOLDER_SUM = 'ggml_log_internal(level, "[VRAM-ARENA] chunk leases on device %d by holder:'
+# Each line's arguments, the counts it reports included, closing the call its prefix opens.
+HINT_ARGS = "holders.chunk_leases, dev_id);"
+HOLDER_LINE_ARGS = "dev_id, held, site, copy, taken_at);"
+HOLDER_SUM_ARGS = "dev_id, sum, chunk_leases);"
+
+
+def line_args(body: str, line: str, args: str) -> bool:
+    """The first call that opens with `line` passes `args` right after its one format literal."""
+    k = body.find(line)
+    tail = re.compile(r'(?:[^"\\]|\\.)*", ' + re.escape(args))
+    return k != -1 and tail.match(body, k + len(line)) is not None
 
 
 def claim_report_at_the_callers_level(uc: str) -> bool:
@@ -370,8 +381,11 @@ def claim_report_at_the_callers_level(uc: str) -> bool:
         ordered(rep, CENSUS_CALL, SITE_AT_LEVEL, FLAG, HOLDER_CALL, HINT_GUARD, HINT)
         and guarded(rep, FLAG, HOLDER_CALL)
         and guarded(rep, HINT_GUARD, HINT)
+        and line_args(rep, HINT, HINT_ARGS)
         and "GGML_LOG_" not in rep
         and ordered(hold, "arena_chunk_leases_by_holder_[", HOLDER_LINE, HOLDER_SUM)
+        and line_args(hold, HOLDER_LINE, HOLDER_LINE_ARGS)
+        and line_args(hold, HOLDER_SUM, HOLDER_SUM_ARGS)
         and "GGML_LOG_" not in hold
         # A full table is told apart from a take with no address.
         and ordered(hold, "if (slot == CHUNK_LEASE_HOLDER_NO_ADDRESS) {",
@@ -635,6 +649,24 @@ def test_witness_holder_line_at_warn():
     assert not claim_report_at_the_callers_level(
         mutate_in(UC, HOLDER_REPORT_SIG, HOLDER_LINE,
                   HOLDER_LINE.replace("ggml_log_internal(level, ", "GGML_LOG_WARN("))
+    )
+
+
+def test_witness_hint_without_the_lease_count():
+    assert not claim_report_at_the_callers_level(
+        mutate_in(UC, REPORT_SIG, HINT_ARGS, HINT_ARGS.replace("holders.chunk_leases", "0u"))
+    )
+
+
+def test_witness_holder_line_without_its_count():
+    assert not claim_report_at_the_callers_level(
+        mutate_in(UC, HOLDER_REPORT_SIG, HOLDER_LINE_ARGS, HOLDER_LINE_ARGS.replace("held", "0u"))
+    )
+
+
+def test_witness_holder_sum_without_the_sum():
+    assert not claim_report_at_the_callers_level(
+        mutate_in(UC, HOLDER_REPORT_SIG, HOLDER_SUM_ARGS, HOLDER_SUM_ARGS.replace("sum", "0u"))
     )
 
 

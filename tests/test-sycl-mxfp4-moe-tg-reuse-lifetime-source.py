@@ -169,12 +169,17 @@ def claim_end_drops_the_copied_handle(mmvq: str, mmvqh: str) -> bool:
 # ---- the model release says when a graph call is still in flight ----
 
 RELEASE_SIG = "static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner)"
-INFLIGHT_READ = "const int inflight = ggml_sycl_graph_inflight_count();"
+# The reclaim clears the dying model's live bit. Read before it, the liveness still counts that model and never says
+# that no model is live, so the WARN could never fire.
+SLOT_RECLAIM = "ggml_sycl::unified_cache_release_model_slot(slot);"
+INFLIGHT_READ ="const int inflight = ggml_sycl_graph_inflight_count();"
 # Only at the last live model's release: while another model is live the last-release step reports nothing, and a call
 # in flight is that model's decode.
 INFLIGHT_GUARD = "if (inflight != 0 && ggml_sycl_no_model_live()) {"
 NO_LIVE_SIG = "static bool ggml_sycl_no_model_live()"
 NO_LIVE_READ = "return cache->live_model_mask() == 0;"
+# With no cache there is no arena line for the WARN to explain, so the helper's fall-through answer is false.
+NO_LIVE_TAIL = "return false; }"
 # The call at WARN, a stable part of its text, and its arguments; the rest of the wording is free.
 INFLIGHT_WARN_RE = re.compile(r'ggml_sycl_diag_emit_warn\( "\[SYCL\] model slot %u release: %d graph call\(s\) '
                               r'still in flight;(?:[^"\\]|\\.)*", slot, inflight\);')
@@ -194,11 +199,15 @@ def claim_release_warns_on_a_call_in_flight(gs: str) -> bool:
     w = warns[0].start()
     g = body.find(INFLIGHT_GUARD)
     r = body.find(INFLIGHT_READ)
+    s = body.find(SLOT_RECLAIM)
+    no_live = fn_body(c, NO_LIVE_SIG)
     return (
-        r != -1
-        and r < g < w < body.find(LAST_RELEASE)
+        s != -1
+        and r != -1
+        and s < r < g < w < body.find(LAST_RELEASE)
         and body[g + len(INFLIGHT_GUARD) : w].strip() == ""
-        and NO_LIVE_READ in fn_body(c, NO_LIVE_SIG)
+        and NO_LIVE_READ in no_live
+        and no_live.endswith(NO_LIVE_TAIL)
     )
 
 
@@ -308,6 +317,20 @@ def test_witness_liveness_read_inverted():
     assert not claim_release_warns_on_a_call_in_flight(
         mutate_in(code(GS), NO_LIVE_SIG, NO_LIVE_READ, "return cache->live_model_mask() != 0;")
     )
+
+
+def test_witness_liveness_with_no_cache_answers_no_model_live():
+    assert not claim_release_warns_on_a_call_in_flight(
+        mutate_in(code(GS), NO_LIVE_SIG, NO_LIVE_TAIL, "return true; }")
+    )
+
+
+def test_witness_release_warns_before_the_reclaim():
+    # The read, guard and WARN back at the top of the release, where the dying model's bit is still set.
+    block = INFLIGHT_READ + " " + INFLIGHT_GUARD + " " + INFLIGHT_WARN + " }"
+    moved = release_mutant(block, "")
+    first = "const size_t rows = ggml_sycl_release_host_weight_extras_for_owner(owner);"
+    assert not claim_release_warns_on_a_call_in_flight(mutate_in(moved, RELEASE_SIG, first, block + " " + first))
 
 
 def test_witness_release_warns_below_default_verbosity():
