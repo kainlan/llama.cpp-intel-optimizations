@@ -7,7 +7,8 @@ THE COST.  Before every op, ggml_sycl_compute_forward_impl calls
 ggml_sycl_chain_source_ready_events_if_needed(*ctx.stream(), dst, device), which
 resolves each source and its view chain and, for every ready event it finds, asks
 ggml_sycl_should_add_dependency, a get_info(command_execution_status) query.  The
-backend's queues are profiling-enabled, and on driver 26.35 a status query on an
+backend's queues carry profiling only when GGML_SYCL_QUEUE_PROFILING=1 or a profiling
+diagnostic is requested; then, on driver 26.35, a status query on an
 unfinished kernel of a profiling queue busy-waits on the kernel's timestamp packet
 (libze_intel_gpu.so.1.17.39758, 0x389ae0).  During Qwen3.8 hybrid decode the ready
 events come from producers on the same in-order ctx.stream() the consumer is

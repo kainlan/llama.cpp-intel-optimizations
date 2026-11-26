@@ -15013,9 +15013,14 @@ sycl::event unified_cache::copy_to_device_async(void *                          
     return mem_copy_async(dst_handle, src_handle, size, q, deps);
 }
 
-// NOTE for any NEW caller: this BLOCKS rather than polls on a
-// profiling-enabled queue (see unified-cache.hpp's own get_dma_queue()
-// comment). Callers that hold a lock across this call
+// NOTE for any NEW caller: this BLOCKS rather than polls on a queue that
+// carries profiling (see unified-cache.hpp's own get_dma_queue() comment).
+// A backend queue carries profiling only when the queue-profiling resolver
+// answers on (GGML_SYCL_QUEUE_PROFILING=1 or a requested profiling
+// diagnostic, queue-profiling.hpp); by default none does and the query
+// polls. A caller must still be written for the blocking case, because a
+// profiling run is exactly when it is exercised. Callers that hold a lock
+// across this call
 // serialise the allocation/lookup path behind whatever produced `evt` --
 // that was the exact bug in the oneDNN Graph-scratch DIRECT reuse pool
 // (llama.cpp-c6ah). Pool entries must go through
@@ -16206,8 +16211,8 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         // flag_slot this pool entry will be checked against
         // (onednn_graph_scratch_pool_entry_release_complete()), instead of
         // leaving pool lookups to query `event` directly (which BLOCKS
-        // rather than polls on the profiling-enabled queue `event` lives
-        // on -- see event_complete()'s comment). A marker kernel with no
+        // rather than polls when the queue `event` lives on carries
+        // profiling -- see event_complete()'s comment). A marker kernel with no
         // dependency but this one release event costs nothing on the
         // allocation path: it runs on get_event_watch_queue(), a dedicated
         // queue nothing else waits on, and (unlike an earlier, host_task-
@@ -16413,8 +16418,9 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
     // pattern (see get_dma_queue()'s comment above): a dedicated
     // NON-profiling queue whose events CAN be polled via
     // event.get_info<command_execution_status>() without blocking, unlike
-    // every other backend stream (profiling-enabled, where that same query
-    // blocks instead of polling).
+    // every other backend stream when it carries profiling
+    // (GGML_SYCL_QUEUE_PROFILING=1 or a requested profiling diagnostic),
+    // where that same query blocks instead of polling.
     //
     // THE ASSUMPTION IS ALREADY KNOWN TO BREAK UNDER TP: ggml_backend_sycl_context::
     // stream()/ctx.stream() (common.hpp) returns the TP shared-context queue

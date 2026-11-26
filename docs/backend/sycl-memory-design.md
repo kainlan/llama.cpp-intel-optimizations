@@ -619,8 +619,9 @@ it back to three:
    version of this allocator gated every `free()` (and every `alloc()`'s
    opportunistic drain) on `event.get_info<command_execution_status>()`. That
    call **blocks** rather than polls on a profiling-enabled queue (every
-   backend compute queue is one; see `get_dma_queue()`'s comment in
-   `unified-cache.hpp`) — and the event this allocator receives always comes
+   backend compute queue is one when the queues carry profiling:
+   `GGML_SYCL_QUEUE_PROFILING=1` or a requested profiling diagnostic; see
+   `get_dma_queue()`'s comment in `unified-cache.hpp`) — and the event this allocator receives always comes
    from that same compute queue. The result was that every `free()` became a
    synchronous wait for that op's device completion, undoing most of the
    host-time win the allocator existed to deliver (measured: attention host
@@ -1046,9 +1047,11 @@ ticket reproduced on:
   device marker kernel, not a direct SYCL event query, and not a
   host_task either (llama.cpp-c6ah).** `event_complete()`'s bare
   `command_execution_status` query BLOCKS rather than polls on any
-  profiling-enabled queue, and every backend stream — including the one
-  oneDNN's free callback supplies `release_event` on — is
-  profiling-enabled (see that function's own comment). Querying
+  profiling-enabled queue, and, when the queues carry profiling
+  (`GGML_SYCL_QUEUE_PROFILING=1` or a requested profiling diagnostic), every
+  backend stream — including the one oneDNN's free callback supplies
+  `release_event` on — is profiling-enabled (see that function's own
+  comment). Querying
   `release_event` directly from the reuse pool therefore WAITS for an
   in-flight SDPA kernel to finish instead of skipping it, defeating the
   "park and skip in-flight entries" design; this bare-query block remains
@@ -1113,7 +1116,8 @@ ticket reproduced on:
   device-kernel event on a non-profiling queue, both measured a few ms or
   less either way. Every real pool release event in production is
   device-kernel-produced (oneDNN's own free callback), matching the case
-  that actually blocks.
+  that blocks when the queue carries profiling (`GGML_SYCL_QUEUE_PROFILING=1`
+  or a requested profiling diagnostic).
 - **Without TP, a parked entry is reused while its release is still in
   flight (llama.cpp-jwjz).** Every Graph-scratch consumer submits on the
   cache's own in-order queue when TP is inactive. That is the fact the

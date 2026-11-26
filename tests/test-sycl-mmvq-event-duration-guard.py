@@ -4,14 +4,14 @@ only when a profiling diagnostic is actually enabled.
 
 mmvq_sycl_event_duration_us() calls sycl::event::get_profiling_info(), which
 BLOCKS the calling host thread until the event completes (see the comment on
-the helper itself). Every backend queue is created with
-sycl::property::queue::enable_profiling, so the call always succeeds and
-always blocks -- there is no way to observe "profiling info unavailable" as
-an escape hatch on this backend. An unconditional call on the MoE decode hot
-path is therefore an unconditional host wait per submit (ruling 6: no host
-waits in dispatch). This test scans the source text (no GPU, no build)
-rather than measuring the wait, because the wait cannot be observed without
-hardware.
+the helper itself). A backend queue is created with
+sycl::property::queue::enable_profiling only when GGML_SYCL_QUEUE_PROFILING=1
+or a profiling diagnostic is requested; there the call succeeds and blocks,
+and on any other queue it throws. An unconditional call on the MoE decode hot
+path is therefore either an unconditional host wait per submit or an
+unconditional exception per submit (ruling 6: no host waits in dispatch).
+This test scans the source text (no GPU, no build) rather than measuring the
+wait, because the wait cannot be observed without hardware.
 """
 from __future__ import annotations
 

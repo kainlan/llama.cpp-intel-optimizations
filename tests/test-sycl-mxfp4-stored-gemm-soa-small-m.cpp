@@ -35,6 +35,7 @@
 #include "ggml-sycl.h"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/mxfp4-stored-gemm.hpp"
+#include "ggml-sycl/queue-profiling.hpp"
 #include "ggml.h"
 #include "mxfp4-stored-layout-oracle.hpp"
 #include "test-skip.h"
@@ -139,16 +140,22 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
     // ctx->stream() is the same queue production dispatch (and the sibling
     // GPU tests that go through ggml_backend_graph_compute) submits on --
     // the correct USM/context owner for the buffers allocated above, and
-    // (llama.cpp-yke2, S7: unconditional sycl::property::queue::enable_profiling
-    // in dpct's create_queue_impl) now reliably carries
-    // sycl::property::queue::enable_profiling in every process, so it is
+    // (llama.cpp-yke2, S7: enable_profiling is a property of the backend's
+    // own queues, not of a profiling-only queue built here) carries
+    // sycl::property::queue::enable_profiling whenever the queue-profiling
+    // resolver answers on: GGML_SYCL_QUEUE_PROFILING=1, or a requested
+    // profiling diagnostic such as GGML_SYCL_KERNEL_PROFILE below. It is
     // used directly for both the uploads above and every kernel launch
     // below -- no separate profiling-only queue construction, and no extra
-    // wait to order it against the uploads, is needed any more.
+    // wait to order it against the uploads, is needed.
     auto *        sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     sycl::queue & q        = *sycl_ctx->stream();
 
-    const bool profiling_requested = std::getenv("GGML_SYCL_KERNEL_PROFILE") != nullptr;
+    // The same parse the kernel profiler and the queue-profiling resolver use, so "0" is not a request. A request
+    // counts only when the queue carries profiling: with GGML_SYCL_QUEUE_PROFILING=0 the resolver refuses it, and
+    // reading an event's profiling info would throw.
+    const bool profiling_requested = ggml_sycl_profile_env_flag(std::getenv("GGML_SYCL_KERNEL_PROFILE"), false) &&
+                                     ggml_sycl_queue_profiling_enabled();
 
     // Bytes moved per call, for deriving per-launch bandwidth: the whole
     // expert's SOA buffer (17 bytes per 32-element block: 16 nibble-packed +
@@ -174,12 +181,13 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
                                (double) M * (double) (n_k / 32) * 4.0 + (double) M * (double) n_out * 4.0;
 
     if (profiling_requested) {
-        // Confirms llama.cpp-yke2's S7 (unconditional enable_profiling in
+        // Confirms llama.cpp-yke2's S7 (enable_profiling from the resolver in
         // dpct's create_queue_impl) actually reaches this queue: this used
         // to fail under a single-GPU selector before S7 landed (llama.cpp-6f73,
         // round 3), which is why this test built its own profiling-only
         // queue rather than asserting on `q` directly -- that workaround is
-        // gone now that the assert below is expected to hold unconditionally.
+        // gone now that the assert below is expected to hold whenever the
+        // diagnostic is requested.
         const bool has_profiling = q.has_property<sycl::property::queue::enable_profiling>();
         const bool is_in_order   = q.has_property<sycl::property::queue::in_order>();
         std::printf("  queue diag: has_property(enable_profiling)=%d has_property(in_order)=%d addr=%p\n",
