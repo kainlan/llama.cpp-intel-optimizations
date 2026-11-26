@@ -906,10 +906,49 @@ static void ggml_sycl_fattn_seq_ids_free_all(ggml_backend_sycl_context::fattn_se
 // and before the model the context ran.  Memcpy happens on the inference
 // stream, so it is correctly ordered before the FA kernel that reads it
 // (in-order queue) without an explicit barrier.
+//
+// The slots are allocated and dropped one at a time through the helpers
+// below, which keep the count of live slots the device test reads.
+static std::atomic<int> g_fattn_operand_stage_allocs{ 0 };
+
+static void ggml_sycl_fattn_operand_stage_slot_free(void *& ptr, size_t & bytes, ggml_sycl::mem_handle & owner) {
+    if (owner.valid()) {
+        g_fattn_operand_stage_allocs.fetch_sub(1);
+    }
+    ggml_sycl_fattn_release_owner(ptr, bytes, owner);
+}
+
 static void ggml_sycl_fattn_operand_stage_free_all(ggml_backend_sycl_context::fattn_operand_stage & stage) {
-    ggml_sycl_fattn_release_owner(stage.sinks.dev, stage.sinks.capacity, stage.sinks.owner);
-    ggml_sycl_fattn_release_owner(stage.mask.dev, stage.mask.capacity, stage.mask.owner);
+    ggml_sycl_fattn_operand_stage_slot_free(stage.sinks.dev, stage.sinks.capacity, stage.sinks.owner);
+    ggml_sycl_fattn_operand_stage_slot_free(stage.mask.dev, stage.mask.capacity, stage.mask.owner);
     stage.alloc_queue = nullptr;
+}
+
+// Makes `slot` hold at least `bytes` on `stream`. A stream other than the one
+// the stage last allocated on drops both slots first; a slot that is too
+// small is dropped and allocated again. False when the allocation fails,
+// which leaves the slot empty.
+static bool ggml_sycl_fattn_operand_stage_reserve(ggml_backend_sycl_context::fattn_operand_stage &       stage,
+                                                  ggml_backend_sycl_context::fattn_operand_stage::slot & slot,
+                                                  size_t                                                 bytes,
+                                                  sycl::queue *                                          stream) {
+    if (stage.alloc_queue && stage.alloc_queue != stream) {
+        ggml_sycl_fattn_operand_stage_free_all(stage);
+    }
+    stage.alloc_queue = stream;
+
+    if (bytes <= slot.capacity) {
+        return true;
+    }
+    ggml_sycl_fattn_operand_stage_slot_free(slot.dev, slot.capacity, slot.owner);
+    if (!ggml_sycl_fattn_alloc_device_owner(bytes, stream, ggml_sycl::alloc_role::STAGING,
+                                            ggml_sycl::runtime_category::STAGING, "fattn_weight_stage", &slot.dev,
+                                            slot.owner)) {
+        return false;
+    }
+    g_fattn_operand_stage_allocs.fetch_add(1);
+    slot.capacity = bytes;
+    return true;
 }
 
 // Returns a device-addressable pointer for `src` on `stream`.  If the
@@ -950,32 +989,16 @@ static const char * ggml_sycl_fattn_stage_weight_src(ggml_backend_sycl_context::
     }
 
     // Stage: grow the slot if needed, then memcpy on the inference stream.
-    if (stage.alloc_queue && stage.alloc_queue != stream) {
-        // Queue changed (unlikely during steady-state inference): free both
-        // slots and reallocate on the new queue.
-        ggml_sycl_fattn_operand_stage_free_all(stage);
-    }
-    stage.alloc_queue = stream;
-
-    if (bytes > slot.capacity) {
-        if (slot.dev) {
-            ggml_sycl_fattn_release_owner(slot.dev, slot.capacity, slot.owner);
+    if (!ggml_sycl_fattn_operand_stage_reserve(stage, slot, bytes, stream)) {
+        static bool warned = false;
+        if (!warned) {
+            GGML_LOG_WARN(
+                "[SYCL] fattn weight staging: failed to allocate %zu bytes for %s; "
+                "falling back to host-pinned zero-copy (may be slower)\n",
+                bytes, role);
+            warned = true;
         }
-        (void) ggml_sycl_fattn_alloc_device_owner(bytes, stream, ggml_sycl::alloc_role::STAGING,
-                                                  ggml_sycl::runtime_category::STAGING, "fattn_weight_stage", &slot.dev,
-                                                  slot.owner);
-        if (!slot.dev) {
-            static bool warned = false;
-            if (!warned) {
-                GGML_LOG_WARN(
-                    "[SYCL] fattn weight staging: failed to allocate %zu bytes for %s; "
-                    "falling back to host-pinned zero-copy (may be slower)\n",
-                    bytes, role);
-                warned = true;
-            }
-            return static_cast<const char *>(resolved);  // Host-pinned USM, still GPU-readable.
-        }
-        slot.capacity = bytes;
+        return static_cast<const char *>(resolved);  // Host-pinned USM, still GPU-readable.
     }
 
     // In-order queue ensures this memcpy completes before the FA kernel
@@ -1001,12 +1024,30 @@ void ggml_sycl_fattn_release_context_buffers(ggml_backend_sycl_context & ctx) {
     ggml_sycl_fattn_operand_stage_free_all(ctx.fattn_buffers.operand_stage);
 }
 
-// Test hooks: the live sequence-id device buffers, and a way to allocate a context's four without a graph.
+// Test hooks: the counts of live sequence-id device buffers and of live operand-staging slots, and a way to
+// allocate each group on a context without a graph.
 extern "C" int ggml_sycl_test_seq_id_buffer_allocs() {
     return g_seq_id_buffer_allocs.load();
 }
 
+extern "C" int ggml_sycl_test_fattn_operand_stage_allocs() {
+    return g_fattn_operand_stage_allocs.load();
+}
+
 #    if defined(GGML_SYCL_PRIVATE_TESTING)
+// Fills the context's sinks and mask slots through the helper the op stages through, with no tensor behind them.
+extern "C" bool ggml_sycl_test_fattn_operand_stage_touch(ggml_backend_t backend) {
+    if (!backend || !backend->context) {
+        return false;
+    }
+    ggml_backend_sycl_context & ctx    = *static_cast<ggml_backend_sycl_context *>(backend->context);
+    auto &                      stage  = ctx.fattn_buffers.operand_stage;
+    sycl::queue *               stream = ctx.stream();
+    const size_t                bytes  = 64 * sizeof(float);
+    return ggml_sycl_fattn_operand_stage_reserve(stage, stage.sinks, bytes, stream) &&
+           ggml_sycl_fattn_operand_stage_reserve(stage, stage.mask, bytes, stream);
+}
+
 extern "C" bool ggml_sycl_test_seq_id_buffers_touch(ggml_backend_t backend) {
     if (!backend || !backend->context) {
         return false;

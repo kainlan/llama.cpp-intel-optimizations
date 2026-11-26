@@ -119,6 +119,10 @@ RELEASE_OWNER_SIG = ("template <typename T> static void ggml_sycl_fattn_release_
 RELEASE_OWNER_CALL = "ggml_sycl_fattn_release_owner(ptr, bytes, owner);"
 SEQ_ID_FREE_SIG = ("static void ggml_sycl_fattn_seq_ids_free(int32_t *& ptr, size_t & bytes, ggml_sycl::mem_handle & "
                    "owner) {")
+STAGE_SLOT_FREE_SIG = ("static void ggml_sycl_fattn_operand_stage_slot_free(void *& ptr, size_t & bytes, "
+                       "ggml_sycl::mem_handle & owner) {")
+# The releases that also keep a count of live buffers for the device test.
+COUNTED_FREE_SIGS = (SEQ_ID_FREE_SIG, STAGE_SLOT_FREE_SIG)
 V2_AUTO_FREE_SIG = ("static void ggml_sycl_fattn_v2_auto_free_all(ggml_backend_sycl_context::fattn_v2_auto_buffers & "
                     "buffers) {")
 SEQ_IDS_FREE_SIG = ("static void ggml_sycl_fattn_seq_ids_free_all(ggml_backend_sycl_context::fattn_seq_id_buffers & "
@@ -237,11 +241,12 @@ def release_reaches_every_owner(fattn: str) -> bool:
 
 
 def release_is_the_handle_destructor(fattn: str) -> bool:
-    """C5: a buffer is released by resetting its handle; no mem_handle is newed and no owner deleted."""
+    """C5: a buffer is released by resetting its handle, a counted release ends in that reset whatever it counted,
+    and no mem_handle is newed and no owner deleted."""
     b = body(fattn, RELEASE_OWNER_SIG)
-    counted = body(fattn, SEQ_ID_FREE_SIG)
+    counted = [body(fattn, sig) for sig in COUNTED_FREE_SIGS]
     return (bool(b) and "owner = {};" in b and not CONTROL_FLOW.search(b) and
-            counted.endswith(RELEASE_OWNER_CALL + " }") and not re.search(r"\breturn\b", counted) and
+            all(c.endswith(RELEASE_OWNER_CALL + " }") and not re.search(r"\breturn\b", c) for c in counted) and
             not re.search(r"\bnew ggml_sycl::mem_handle\b", fattn) and not re.search(r"\bdelete owner\b", fattn))
 
 
@@ -411,11 +416,13 @@ def test_mutant_owner_deleted_by_hand():
 
 
 def test_mutant_counted_release_keeps_the_handle():
-    counted = body(FATTN, SEQ_ID_FREE_SIG)
-    m = _mutate(FATTN, counted, _mutate(counted, RELEASE_OWNER_CALL, "ptr = nullptr;"))
-    assert not release_is_the_handle_destructor(m)
-    m = _mutate(FATTN, counted, _mutate(counted, RELEASE_OWNER_CALL, "return; " + RELEASE_OWNER_CALL))
-    assert not release_is_the_handle_destructor(m)
+    for sig in COUNTED_FREE_SIGS:
+        # The mutation is made in the function's whole text, so it lands on this counted release and no other.
+        counted = sig + body(FATTN, sig)[1:]
+        m = _mutate(FATTN, counted, _mutate(counted, RELEASE_OWNER_CALL, "ptr = nullptr;"))
+        assert not release_is_the_handle_destructor(m), sig
+        m = _mutate(FATTN, counted, _mutate(counted, RELEASE_OWNER_CALL, "return; " + RELEASE_OWNER_CALL))
+        assert not release_is_the_handle_destructor(m), sig
 
 
 def test_mutant_destructor_never_releases():
