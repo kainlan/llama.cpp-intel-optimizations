@@ -179,6 +179,28 @@ temp 0, `llama-completion`. Zero kernel fault lines in every run.
   source contracts that pinned the structure 1d changed on purpose; each contract is strengthened to name the
   new exits, not loosened.
 
+## The WEIGHT-zone rule on the cards (lead's runs, each once, `f011d5d1f2` against base `b44cb4b5f`, 2026-11-25)
+
+Same long prompts as above. Correctness only: every arm ran while another session built (`ninja` and up to 17
+`icpx` alive at the start or end of each arm), so no throughput figure from this chain counts, in either direction.
+
+- Inkling, B50 alone: one drop line, "its RUNTIME zone was rebuilt at 512.0 MB, 46.6 MB less, and its WEIGHT zone
+  grew from 12579.9 MB to 12626.5 MB"; plans 9715.3, 9668.3, then the load's own 10215.0 MB, base's figure; text
+  byte-equal to base.
+- Qwen3.6-35B NVFP4, B50: the early pass keeps the ring (no drop line; the no-room keep prints at INFO only). The
+  load's late pass drops it: "the plan made with it left 12435 experts of its 120 resident-only expert weights on
+  the host ... its RUNTIME zone was rebuilt at 726.4 MB, 421.0 MB less, and its WEIGHT zone grew from 12164.6 MB to
+  12585.6 MB". Plans 6827.6 (early, ring kept), 6994.7 (late, with the ring), 6572.8 MB (after the drop, base's
+  figure). Text byte-equal to base. So on Qwen the room is real in the late pass, and the drop returns it.
+- Inkling, B70 and both cards: no drop line; text byte-equal to the `69c4ea428` run and to each other.
+- Qwen3.6 NVFP4 perplexity, B70, `-c 2048 --chunks 6`: base 15.7496 +/- 0.6006, new 15.7449 +/- 0.6004.
+- `test-moe-pp-batched-dequant`, `test-moe-q1-nvfp4-dispatch-refusal`, `test-moe-mixed-residency-q1-nvfp4` on the
+  B50: exit 0. Inkling count gates (B70, B50 alone, both cards), Mistral B70 and GPT-OSS B50 gates: pass. Zero kernel
+  fault lines. Peak GPU host backing at most 20 GiB in every arm.
+- My expectation written before the run ("Qwen B50 keeps its ring") was wrong: it read the `69c4ea428` early-pass
+  line as the load's answer. The late pass is the one that counts.
+- Owed before a speed claim on the B50: an interleaved pair with no builder alive.
+
 ## What is not known yet
 
 - How much of the exposed host time is the ids wait and how much the operand build.
