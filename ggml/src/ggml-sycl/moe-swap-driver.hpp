@@ -21,9 +21,10 @@
 //     zone's room epoch (moe_swap_driver_call::room_epoch) is what it was at that answer: the zone has gained no room
 //     since, so the same request would be refused again. A boundary it is held at does not count toward its drop
 //     streak, and the policy stays in flight. An epoch that moved sends it again, and that answer counts toward the
-//     streak like any other. Held at MOE_SWAP_PENDING_HOLD_BOUND settled boundaries in a row, it is given up as a
-//     dropped admit is (a restore, which goes at that boundary, or an open slot), so room that never comes does not
-//     hold the policy in flight for the rest of the generation.
+//     streak like any other. It is given up at the MOE_SWAP_PENDING_HOLD_BOUND-th settled boundary with the epoch
+//     unchanged, as a dropped admit is (a restore, which goes at that boundary, or an open slot), so room that never
+//     comes does not hold the policy in flight for the rest of the generation. An unsettled boundary neither counts
+//     nor resets the hold.
 //   - An evict refused finally latches its block only when the transaction marks the refusal as one every evict of
 //     the block would meet (moe_swap_move::latches_block: the caller sets it for a device copy that shares a bulk
 //     tensor's storage). Any other final refusal drops that proposal alone, counted by its reason.
@@ -69,7 +70,8 @@ constexpr const char MOE_SWAP_ENV[] = "GGML_SYCL_MOE_SWAP";
 // bounds how long an admit that will not land holds the policy in flight. It is a chosen bound, not a measured one.
 constexpr int MOE_SWAP_PENDING_DROP_STREAK = 4;
 
-// Settled boundaries a pending admit is held at, its device zone's room epoch unchanged, before it is given up. An
+// A pending admit held for zone room is given up at the 16th settled boundary with its device zone's room epoch
+// unchanged: it is held at the fifteen before it, and an unsettled boundary neither counts nor resets the hold. An
 // admit refused for zone room is not sent again until the epoch says the zone could have gained room; when no room
 // ever comes, the hold alone would keep the policy in flight for the rest of the generation. Sixteen is above the
 // case the hold exists for, the few boundaries until a deferred-free pass hands an evict's room back, and at 43 ms a
@@ -158,7 +160,7 @@ struct moe_swap_pending {
     const char * busy_reason  = nullptr;
     bool         room_held    = false;  // its last answer was BUSY for device zone room, under room_epoch
     uint64_t     room_epoch   = 0;      // the zone's room epoch that answer was given under
-    int          held_streak  = 0;      // settled boundaries in a row it was held at, not sent
+    int          held_streak  = 0;      // settled boundaries it was held at since that answer; unsettled ones add none
 };
 
 // A move whose transaction threw before it answered: an evict's pair, or a pending admit as it was sent.
