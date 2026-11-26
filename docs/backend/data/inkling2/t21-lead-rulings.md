@@ -201,6 +201,36 @@ Same long prompts as above. Correctness only: every arm ran while another sessio
   line as the load's answer. The late pass is the one that counts.
 - Owed before a speed claim on the B50: an interleaved pair with no builder alive.
 
+## Step 1 merged to master (lead's runs, 2026-11-26, `b67e17fcb6` = fork/master `dd59d8710` + `43ea320243`)
+
+Task 21 step 1 closed after r8 (spec PASS, quality APPROVED, narrow re-review APPROVED). The base arm in every pair
+is `b44cb4b5f`, whose tree is byte-identical to `dd59d8710` (`git diff` empty). `llama-bench -p 512 -n 128`, ABBA,
+one load per arm; a builder alive at either end of an arm makes that arm's figure a lower bound.
+
+| Pair (card) | reps | pp512 base / new (t/s) | tg128 base / new (t/s) | window |
+|---|---|---|---|---|
+| Inkling Q8_K_XL (B70) | 3 | 112.31, 109.51 / 259.39, 259.96 | 29.02, 29.01 / 29.06, 28.97 | clean |
+| Mistral 7B Q4_0 (B70) | 3 | 3343.04 / 3343.09 | 109.49 / 109.72 | first pair clean, second pair built over |
+| GPT-OSS 20B MXFP4 (B50) | 8 | medians 865.36, 858.41 / 864.05, 860.67 | medians 35.82, 35.73 / 35.82, 35.43 | clean |
+| Inkling, B50 alone, tg only | 8 | - | medians 10.37, 10.42 / 10.88, 10.59 | first pair built over, second clean |
+
+- The scoring rule was fixed before the 8-rep runs: both new medians inside the base medians' range is noise, both
+  below both base medians is a regression. GPT-OSS pp is inside; GPT-OSS tg and Inkling B50 tg have one new median
+  outside on each side, neither both below. An earlier 3-rep GPT-OSS B50 pair read new 4% low with one ~760 t/s
+  sample per new arm; its address-masked logs were identical between builds, and the 8-rep pair does not repeat it.
+- Inkling B50 alone, final state in every arm: one 14240.0 MB arena (scratch 512, runtime 512, oneDNN 256, shared
+  KV+WEIGHT 12960 MB) and 4576 of 6144 experts on the device, the same as base. The new build plans once more at
+  load (the ring drop), then rebuilds to that arena.
+- Long real-text prompt (4737 tokens, `-c 8192`, `-n 255`), merged tree: B70 154.66 pp / 26.07 tg (base earlier
+  91.29 / 26.02). B50 alone: base 13.15 pp / 7.26 tg, new 15.32 / 6.22. A 24-job build started at 05:42:44, during
+  the new arm's decode, so the new tg is not a figure; the pp phase ran clean. Output byte-equal to base.
+- Merged-tree gates: Inkling count gate on the B70, the B50 alone and both cards; Mistral B70; GPT-OSS B50 (`grep
+  -cx` = 1); the two contract sweeps red only on master's five (`test-sycl-moe-legacy-ranking-removed-source` timed
+  out at 300 s under the gate chain's load and passes alone in 91 s). Zero kernel fault lines throughout.
+- `MUL_MAT_ID` in `test-backend-ops`, both cards, `9991c401ac` build against base: identical OK, FAIL and
+  not-supported sets (1306 / 114 / 322); no NVFP4 case fails; the failing cases fail on base too.
+- Not measured on this sha: the Qwen3.6-35B NVFP4 speed pair.
+
 ## What is not known yet
 
 - How much of the exposed host time is the ids wait and how much the operand build.
