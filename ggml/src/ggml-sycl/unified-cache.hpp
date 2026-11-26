@@ -4212,7 +4212,9 @@ inline bool expert_retire_succeeded(expert_retire_status status) {
 // expert under, key first; the lease on key's entry is the one returned. owner is the destination storage, minted
 // owner-first by the caller before it took any listed lock, so no allocation for the bytes runs under one: pinned host
 // storage that holds logical_bytes for a move to the host, and WEIGHT zone storage on the device for a move to the
-// device, exactly staged_expert_bytes() of the host copy's layout and this member's type, ncols and logical_bytes.
+// device, exactly expert_triplet_member_bytes() of the three members' staged_expert_bytes() as AOS (from their type,
+// ncols and logical_bytes): the triplet's slot when it has one, so every member of such a triplet takes one WEIGHT-zone
+// size, else the member's own staged bytes.
 // type, ncols and logical_bytes are the weight's type, row width and bytes per expert (nb[2]), which the caller
 // resolves from its tensor. An expert's size is a fact of its tensor, never of a cache entry, whose storage may be
 // padded: each direction copies logical_bytes from offset 0 of its source, so a padded device entry's tail never
@@ -5053,8 +5055,9 @@ class unified_cache {
     // storage, which the direct mirror and the id mapping both name, with no device entry under the member's
     // direct-stage key (a withdrawn one the deferred-free pass has not reclaimed yet refuses as "device entry exists",
     // so a later boundary retries). A missing host copy refuses as "not lent", and one holding fewer than the member's
-    // logical_bytes as "host copy size". Each member's owner must be exactly staged_expert_bytes() of the host copy's
-    // layout and the member's type, ncols and logical_bytes, never less than logical_bytes ("device storage size").
+    // logical_bytes as "host copy size". Each member's owner must be exactly expert_triplet_member_bytes() of the
+    // three members' staged_expert_bytes() as AOS (the triplet's slot when it has one, else the member's own staged
+    // bytes), never less than logical_bytes ("device storage size").
     // One member that fails refuses the triplet with a reason and leaves no state behind. Otherwise the three H2D
     // copies go on the BCS queue behind the host copy's writes, each moving logical_bytes from offset 0 of the host
     // copy and retaining its two owners until it completes, so the pinned storage outlives the read whatever happens to
@@ -5652,6 +5655,12 @@ class unified_cache {
                              size_t &     used,
                              size_t &     available,
                              size_t &     largest_free);
+    // The size of every free block of the allocators `zone` draws on, read under its allocator group's mutex, in no
+    // order: the free space zone_largest_free reports the top of, block by block. WEIGHT in single-chunk mode is the
+    // KV allocator's blocks, so free KV room reads as WEIGHT room, as it is. Diagnostic: it walks every block, so a
+    // caller asks it once, never per allocation. Takes the group mutex, so a caller already inside the group must not
+    // call it. False, with `sizes` empty, when no arena is active.
+    bool             zone_free_block_sizes(vram_zone_id zone, std::vector<size_t> & sizes);
     // A count that moves each time `zone` could have gained room: a block went back to an allocator it draws on, or
     // those allocators were made or reset. It never moves for an allocation or a refusal, so a request the zone
     // refused under one value is refused again while the value stands. It is kept per allocator group, the unit room
@@ -7140,6 +7149,14 @@ class unified_cache {
     void arena_note_allocators_made() noexcept;
 
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
+    // Calls visit(allocator) for each allocator `zone` draws on, the one place that choice is made: WEIGHT in
+    // single-chunk mode the KV allocator, WEIGHT and KV in chunked mode the per-chunk allocators (KV its own tail
+    // allocator first), any other zone its own. True when the zone is served that way, even with no allocator made
+    // yet; false for a zone with no allocator outside those modes, whose room only its counters give. Takes no lock:
+    // the caller holds the group's mutex, or reads the figures bare as zone_largest_free does. Defined in, and used
+    // only by, unified-cache.cpp.
+    template <typename F> bool arena_visit_zone_allocators(vram_zone_id zone, F && visit) const;
+
     // Written by arena_destroy() under arena_destroy_mutex_ on each refusal and cleared when a teardown completes; read
     // without that lock.
     std::atomic<zone_arena_teardown_refusal> arena_teardown_refusal_{ zone_arena_teardown_refusal::NONE };

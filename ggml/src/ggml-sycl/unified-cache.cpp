@@ -12,6 +12,7 @@
 #include "cpu-traits-support.hpp"
 #include "e2e-profile.hpp"
 #include "expert-prefetch.hpp"
+#include "expert-slot.hpp"
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
@@ -33,6 +34,7 @@
 #include "range-index.hpp"
 #include "scratch-test-mutant.hpp"
 #include "sycl-timeline.hpp"
+#include "tlsf-allocator.hpp"
 #include "unified-types.hpp"
 #include "vram-headroom.hpp"
 #include "weight-row-padding.hpp"
@@ -11933,6 +11935,12 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         }
         deps[i].reserve(2);
     }
+    // The storage every member must own: what the WEIGHT zone hands it (expert_triplet_member_bytes, expert-slot.hpp),
+    // from the members' staged bytes as AOS, the one layout this stages (each host copy is checked to be AOS below).
+    size_t staged[3] = { 0, 0, 0 };
+    for (int i = 0; i < 3; ++i) {
+        staged[i] = staged_expert_bytes(GGML_LAYOUT_AOS, members[i].type, members[i].ncols, members[i].logical_bytes);
+    }
 
     // 1. Each member's host copy is one the direction copies from, a loan's for a refill and any whole pinned
     // host-zone copy for an admit, all three members before anything changes.
@@ -11996,11 +12004,12 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                 refusal = "host copy size";
                 break;
             }
-            // The storage is the size direct staging gives the expert, its bytes and the padded tail the copy below
-            // zero-fills, asked of the layout; never less than its bytes. The entry is published at that size, so it
-            // owns its whole allocation, which a loan that later lends it again requires.
-            const size_t staged = staged_expert_bytes(e.layout, members[i].type, members[i].ncols, logical);
-            if (device_size[i] != staged || staged < logical) {
+            // The storage is the size direct staging gives the member, its triplet's slot or else its own staged
+            // bytes: the expert's bytes and a tail the copy below zero-fills (the row padding the kernels may read,
+            // then any slot rounding), never less than its bytes. The entry is published at that size, so it owns its
+            // whole allocation, which a loan that later lends it again requires.
+            const size_t member_bytes = expert_triplet_member_bytes(staged, i);
+            if (device_size[i] != member_bytes || member_bytes < logical) {
                 refusal = "device storage size";
                 break;
             }
@@ -31505,36 +31514,37 @@ void unified_cache::dump_live_zone_allocations(vram_zone_id zone, const char * w
     fflush(stderr);
 }
 
-size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
+template <typename F> bool unified_cache::arena_visit_zone_allocators(vram_zone_id zone, F && visit) const {
     const auto & z = arena_zones_[static_cast<int>(zone)];
-
     if (arena_chunks_.size() == 1 && zone == vram_zone_id::WEIGHT) {
-        const auto & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
-        if (kv.allocator) {
-            return kv.allocator->largest_free_block();
+        if (const tlsf_allocator * kv = arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator.get()) {
+            visit(*kv);
         }
-        return 0;
+        return true;
     }
-
-    // N-chunk shared WEIGHT/KV: max across per-chunk allocators (a single alloc cannot
-    // span chunks, so the largest fittable size is the largest single chunk's
-    // largest free block).  KV includes its dedicated tail allocator too.
+    // N-chunk shared WEIGHT/KV: the per-chunk allocators, and KV's dedicated tail allocator too.
     if ((zone == vram_zone_id::WEIGHT || zone == vram_zone_id::KV) && !weight_chunk_allocators_.empty()) {
-        size_t best = 0;
         if (zone == vram_zone_id::KV && z.allocator) {
-            best = z.allocator->largest_free_block();
+            visit(*z.allocator);
         }
         for (const auto & wca : weight_chunk_allocators_) {
-            best = std::max(best, wca.allocator->largest_free_block());
+            visit(*wca.allocator);
         }
-        return best;
+        return true;
     }
-
     if (z.allocator) {
-        return z.allocator->largest_free_block();
+        visit(*z.allocator);
+        return true;
     }
+    return false;
+}
 
-    return zone_available(zone);
+size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
+    // A single allocation cannot span chunks, so the largest fittable size is the largest of the allocators' own.
+    size_t     best   = 0;
+    const bool served = arena_visit_zone_allocators(
+        zone, [&best](const tlsf_allocator & allocator) { best = std::max(best, allocator.largest_free_block()); });
+    return served ? best : zone_available(zone);
 }
 
 bool unified_cache::zone_free_figures(vram_zone_id zone,
@@ -31550,6 +31560,23 @@ bool unified_cache::zone_free_figures(vram_zone_id zone,
     used         = zone_used(zone);
     available    = zone_available(zone);
     largest_free = zone_largest_free(zone);
+    return true;
+}
+
+bool unified_cache::zone_free_block_sizes(vram_zone_id zone, std::vector<size_t> & sizes) {
+    sizes.clear();
+    if (!arena_active()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+    // The allocators zone_largest_free reads the top of.
+    (void) arena_visit_zone_allocators(zone, [&sizes](const tlsf_allocator & allocator) {
+        for (const tlsf_allocator::extent & e : allocator.block_census()) {
+            if (e.free) {
+                sizes.push_back(e.size);
+            }
+        }
+    });
     return true;
 }
 
@@ -33269,16 +33296,14 @@ static void reorder_plan_entries_for_moe_materialization(placement_plan &       
     }
 
     for (const moe_triplet_group & group : moe_groups) {
+        // A group's indices are in plan order, and this runs after the last slot charge. Entries that share a role
+        // keep that order (a stable sort keyed on the role alone): the first entry of each role is the one the slot
+        // charge (placement_entries_charge_expert_slots) and the index's find_expert_entry both read, so the slot the
+        // load looks up is the slot the plan charged.
         std::vector<size_t> indices = group.indices;
-        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-            const placement_entry & ea     = plan.entries[a];
-            const placement_entry & eb     = plan.entries[b];
-            const int               role_a = moe_materialization_role_order(ea.expert_role);
-            const int               role_b = moe_materialization_role_order(eb.expert_role);
-            if (role_a != role_b) {
-                return role_a < role_b;
-            }
-            return static_cast<uint8_t>(ea.priority) < static_cast<uint8_t>(eb.priority);
+        std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            return moe_materialization_role_order(plan.entries[a].expert_role) <
+                   moe_materialization_role_order(plan.entries[b].expert_role);
         });
 
         for (size_t idx : indices) {
@@ -33444,8 +33469,23 @@ static void log_moe_placement_diagnostics(const char * tag, const placement_plan
     }
 
     const auto summary = plan.summarize_expert_placements(observed_layers, n_experts);
-    GGML_LOG_INFO("[%s] expected=%zu planned=%zu unclassified=%zu duplicates=%zu missing=%zu\n", tag, summary.expected,
-                  summary.planned, summary.unclassified, summary.duplicates, summary.missing);
+    // A duplicated role reaches a default-verbosity log: the load stages a repeat as its member, so a repeat planned
+    // in another layout or on another device is charged what the load does not stage.
+    ggml_log_internal(summary.duplicates != 0 ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
+                      "[%s] expected=%zu planned=%zu unclassified=%zu duplicates=%zu missing=%zu\n", tag,
+                      summary.expected, summary.planned, summary.unclassified, summary.duplicates, summary.missing);
+    for (const placement_repeat_off_member & off : placement_entries_repeats_off_their_member(plan.entries)) {
+        char member_buf[32];
+        char repeat_buf[32];
+        GGML_LOG_WARN(
+            "[%s] layer %d expert %d %s: a repeated entry (%s on %s) differs from its member (%s on %s); the load "
+            "stages it as its member, so the repeat's charge does not follow the slot the load stages it at\n",
+            tag, off.repeat->layer_id, off.repeat->expert_id, expert_tensor_role_name(off.repeat->expert_role),
+            scratch_layout_name(off.repeat->layout),
+            placement_target_name(off.repeat->target_device, repeat_buf, sizeof(repeat_buf)),
+            scratch_layout_name(off.member->layout),
+            placement_target_name(off.member->target_device, member_buf, sizeof(member_buf)));
+    }
     GGML_LOG_INFO("[%s] roles: gate=%zu up=%zu down=%zu gate_up=%zu unknown=%zu\n", tag,
                   summary.role_counts[static_cast<size_t>(expert_tensor_role::GATE)],
                   summary.role_counts[static_cast<size_t>(expert_tensor_role::UP)],
@@ -33997,7 +34037,8 @@ static ggml_layout_mode planner_multi_device_moe_common_layout(const placement_t
 // What a routed expert in `layout` costs the WEIGHT zone when it is on a device: its staged bytes, rounded as the zone
 // rounds them. A host-placed expert carries the same charge, because a later move to a device charges what the entry
 // says. An AOS quantized expert is staged with its row-padding tail, which dst_size leaves out because loans and
-// refills size their copies from the entry.
+// refills size their copies from the entry. This is one member alone: once its triplet's three entries exist,
+// placement_entries_charge_expert_slots() charges each member of a triplet that has a slot the slot's bytes instead.
 static size_t planner_expert_vram_charge_bytes(ggml_type type, int64_t ncols, ggml_layout_mode layout, size_t bytes) {
     return placement_vram_charge_bytes(layout == GGML_LAYOUT_AOS ? aos_staged_weight_bytes(type, ncols, bytes) : bytes);
 }
@@ -34846,6 +34887,48 @@ static void add_multi_moe_decode_secondary_alternates(placement_plan &          
     }
 }
 
+// After a pass that re-laid out expert entries, charging each the size it now stages alone: charge every member of a
+// triplet with a slot the slot again, as the load stages it, give a triplet that lost its slot its members' own
+// charges back, and move the totals of the device each changed entry is on by its change
+// (placement_entries_recharge_expert_slots_on). An entry on a device `devices` does not name moves no total, as the
+// pass that changed it accounts only those devices. A device short of the difference is still charged it, since the
+// load stages the slot whatever the plan says, and the plan warns how far past its budget that put the devices.
+// Returns the bytes charged past every device's remaining room.
+static size_t planner_recharge_expert_slots(placement_plan &                               plan,
+                                            const std::vector<placement_recharge_device> & devices,
+                                            const char *                                   pass) {
+    const size_t over =
+        placement_entries_recharge_expert_slots_on(plan.entries, devices, plan.weight_vram_bytes, plan.vram_bytes);
+    if (over > 0) {
+        GGML_LOG_WARN("[PLACEMENT-MOE] %s: expert slots re-charged %.1f MB past the devices' remaining room\n", pass,
+                      over / (1024.0 * 1024.0));
+    }
+    return over;
+}
+
+// The one device a single-device pass accounts, for planner_recharge_expert_slots: `device_id` with its remaining room
+// and its per-device total, which a single-device plan does not keep (null).
+static std::vector<placement_recharge_device> planner_recharge_device(int      device_id,
+                                                                      size_t & remaining,
+                                                                      size_t * device_vram = nullptr) {
+    std::vector<placement_recharge_device> devices;
+    devices.push_back({ device_id, &remaining, device_vram });
+    return devices;
+}
+
+// The devices a multi-device pass accounts, for planner_recharge_expert_slots: device_budgets[d] with remaining[d] and
+// the plan's per-device total d.
+static std::vector<placement_recharge_device> planner_recharge_devices_of(placement_plan &                   plan,
+                                                                          const std::vector<device_budget> & budgets,
+                                                                          std::vector<size_t> & remaining) {
+    std::vector<placement_recharge_device> devices;
+    for (size_t d = 0; d < budgets.size() && d < remaining.size(); ++d) {
+        size_t * device_vram = d < plan.per_device_vram.size() ? &plan.per_device_vram[d] : nullptr;
+        devices.push_back({ budgets[d].device_id, &remaining[d], device_vram });
+    }
+    return devices;
+}
+
 static void apply_multi_moe_per_target_layouts(placement_plan &                   plan,
                                                std::vector<size_t> &              remaining,
                                                const std::vector<device_budget> & device_budgets,
@@ -34917,26 +35000,14 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
                 entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
             const size_t new_charge =
                 planner_expert_vram_charge_bytes(entry.type, entry.ne[0], target_layout, new_size);
-            if (new_charge > old_charge) {
-                const size_t extra = new_charge - old_charge;
-                if (remaining[dev_index] < extra) {
-                    skipped_capacity++;
-                    continue;
-                }
-                remaining[dev_index] -= extra;
-                plan.weight_vram_bytes += extra;
-                plan.vram_bytes += extra;
-                plan.per_device_vram[dev_index] += extra;
-                charged_delta += static_cast<int64_t>(extra);
-            } else if (old_charge > new_charge) {
-                const size_t freed = old_charge - new_charge;
-                remaining[dev_index] += freed;
-                plan.weight_vram_bytes = plan.weight_vram_bytes > freed ? plan.weight_vram_bytes - freed : 0;
-                plan.vram_bytes        = plan.vram_bytes > freed ? plan.vram_bytes - freed : 0;
-                plan.per_device_vram[dev_index] =
-                    plan.per_device_vram[dev_index] > freed ? plan.per_device_vram[dev_index] - freed : 0;
-                charged_delta -= static_cast<int64_t>(freed);
+            // A layout that needs more room than the device has left is skipped: the move would charge past it.
+            if (new_charge > old_charge && remaining[dev_index] < new_charge - old_charge) {
+                skipped_capacity++;
+                continue;
             }
+            (void) placement_charge_move(old_charge, new_charge, remaining[dev_index], plan.per_device_vram[dev_index],
+                                         plan.weight_vram_bytes, plan.vram_bytes);
+            charged_delta += static_cast<int64_t>(new_charge) - static_cast<int64_t>(old_charge);
             entry.vram_charge_size = new_charge;
             device_changed++;
         } else {
@@ -34975,6 +35046,12 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
                 break;
         }
     }
+
+    // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot. A member moved
+    // out of AOS can leave its triplet with no slot, and the re-charge then gives the slot back: each AOS member of
+    // that triplet goes back to its own staged size.
+    planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
+                                  "per-target layouts");
 
     GGML_LOG_INFO(
         "[PLACEMENT-MOE-MULTI] per-target layouts: device_changed=%zu host_changed=%zu xmx_tiled=%zu "
@@ -35041,24 +35118,17 @@ static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
             entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
         const size_t new_charge = planner_expert_vram_charge_bytes(entry.type, entry.ne[0], target_layout, new_size);
         if (new_charge > old_charge) {
+            // An upgrade that would leave the device less than the guard is skipped: the move would charge into it.
             const size_t extra = new_charge - old_charge;
             if (remaining <= k_layout_upgrade_guard || extra > remaining - k_layout_upgrade_guard) {
                 continue;
             }
-            remaining -= extra;
-            plan.weight_vram_bytes += extra;
-            plan.vram_bytes += extra;
-            plan.per_device_vram[device_index] += extra;
             charged_bytes += extra;
-        } else if (old_charge > new_charge) {
-            const size_t freed = old_charge - new_charge;
-            remaining += freed;
-            plan.weight_vram_bytes = plan.weight_vram_bytes > freed ? plan.weight_vram_bytes - freed : 0;
-            plan.vram_bytes        = plan.vram_bytes > freed ? plan.vram_bytes - freed : 0;
-            plan.per_device_vram[device_index] =
-                plan.per_device_vram[device_index] > freed ? plan.per_device_vram[device_index] - freed : 0;
-            released_bytes += freed;
+        } else {
+            released_bytes += old_charge - new_charge;
         }
+        (void) placement_charge_move(old_charge, new_charge, remaining, plan.per_device_vram[device_index],
+                                     plan.weight_vram_bytes, plan.vram_bytes);
 
         entry.layout           = target_layout;
         entry.dst_size         = new_size;
@@ -35070,6 +35140,12 @@ static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
             soa_entries++;
         }
     }
+    // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot. A member moved
+    // out of AOS can leave its triplet with no slot, and the re-charge then gives the slot back: each AOS member of
+    // that triplet goes back to its own staged size. Only this device's entries changed, so only its totals move.
+    planner_recharge_expert_slots(plan,
+                                  planner_recharge_device(device_id, remaining, &plan.per_device_vram[device_index]),
+                                  "primary executor layout upgrades");
 
     if (upgraded_entries > 0) {
         GGML_LOG_INFO(
@@ -38990,6 +39066,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             placement_host_backing_when_host(plan, kv_info, /*routed_expert=*/false, tensor.get_rows_only);
         plan.entries.push_back(std::move(entry));
     }
+    // Every member of a triplet takes its slot in the WEIGHT zone (expert-slot.hpp), so each is charged the slot's
+    // bytes before anything is packed against the zone.
+    placement_entries_charge_expert_slots(plan.entries);
 
     // Sort by (priority ASC, layer_id ASC, dst_size DESC).
     // This ensures highest-priority weights fill VRAM first, earlier layers
@@ -39230,6 +39309,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         if (!planner_xmx_moe_forced()) {
             prepare_single_moe_pp_gate_up_primary_layouts_for_pack(plan, device_id, kv_info, envelope);
         }
+        // A gate or up moved to SOA above leaves its triplet without a slot, and its AOS members keep the slot's charge
+        // until charged again. No expert is placed yet, so no total moves; the pack reads these charges.
+        placement_entries_charge_expert_slots(plan.entries);
         auto   moe_groups             = build_moe_triplet_groups(plan, moe_indices, &hotness_source);
         size_t pp_alt_groups          = 0;
         size_t pp_alt_entries         = 0;
@@ -39347,6 +39429,10 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 }
             }
         }
+        // A host expert now stages as AOS, so its triplet may have a slot it lacked in another layout, and the charge a
+        // later move to the device reads is the slot's. The pack charged each device triplet as charged above, so a
+        // device entry's charge does not change here; were it to, its change moves the totals.
+        planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining), "triplet pack");
         room.expert_bytes  = stats.device_bytes;
         room.expert_groups = stats.device_groups;
 
@@ -39368,7 +39454,12 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             maybe_upgrade_moe_down_layouts_to_i8(plan, remaining, device_id, n_experts);
             add_single_moe_pp_executable_alternates(plan, remaining, device_id, kv_info, envelope, nullptr);
         }
+        // An I8 member leaves AOS, so its triplet loses its slot and the AOS members give it back before the gate/up
+        // upgrade reads the room. A single-device plan keeps no per-device total.
+        planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining), "I8 down layout upgrades");
         maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);
+        planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining),
+                                      "I8 gate/up layout upgrades");
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
         record_moe_block_device_slots(plan, moe_groups);
         log_moe_spread_placement("PLACEMENT-MOE", plan, kv_info, stats.hotness, "every routed expert fits");
@@ -40565,6 +40656,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 
         plan.entries.push_back(std::move(entry));
     }
+    // Every member of a triplet takes its slot in a WEIGHT zone (expert-slot.hpp), so each is charged the slot's bytes
+    // before anything is packed against a device.
+    placement_entries_charge_expert_slots(plan.entries);
 
     // Step 3: Sort by (priority ASC, layer_id ASC, dst_size DESC, expert_id ASC).
     std::sort(plan.entries.begin(), plan.entries.end(), [](const placement_entry & a, const placement_entry & b) {
@@ -40964,6 +41058,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             if (!plan.per_device_vram.empty()) {
                 plan.per_device_vram[0] += primary_down_charged;
             }
+            planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
+                                          "I8 down layout upgrades");
         }
         if (device_budgets.size() > 1) {
             std::vector<double> moe_device_scores(device_budgets.size(), 1.0);
@@ -41433,6 +41529,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                     add_multi_moe_pp_executable_alternates(plan, remaining, device_budgets, kv_info, envelope);
                 }
                 plan.per_device_vram[0] += primary_down_charged;
+                planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
+                                              "I8 down layout upgrades");
                 GGML_LOG_INFO(
                     "[PLACEMENT-MOE-MULTI] secondary executor layout is selected per planned route; current secondary "
                     "capability remains SOA until grouped secondary XMX dispatch is implemented\n");

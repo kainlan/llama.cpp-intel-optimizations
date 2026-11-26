@@ -70,16 +70,25 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       list and the busy and refused reason lists;
   D18 the hold of an admit refused for device room has its two inputs: the caller hands the step the device WEIGHT
       zone's room epoch (unified_cache::zone_room_epoch), read before the step; and the refusal's cause reaches the
-      move typed, not as text: the preparation leaves the size of a refused device mint on the prepared triplet,
-      right where the mint fails; the transaction marks the named triplet's outcome when that refusal is transient
-      (the "WEIGHT zone full" answer, and no other); and the callback gives the move MOE_SWAP_BUSY_CAUSE_ZONE_ROOM
-      from the outcome. Without either the driver holds nothing, sends a refused admit again at every boundary, and
-      no unit test sees it;
+      move typed, not as text: the preparation leaves the size of a refused device mint (what the member asked: its
+      triplet's slot, else its own staged size) and what the whole triplet asks (expert_triplet_zone_ask_of: its
+      slot and its members' bytes summed) on the prepared triplet, right where the mint fails, and reads no zone
+      figures there; the transaction marks the named triplet's outcome when that refusal is transient (the "WEIGHT
+      zone full" answer, and no other), and reads the WEIGHT zone's largest free block onto it, before the refused
+      triplet's members go back, only for a refusal ggml_sycl_expert_zone_refusal_kept says the boundary's line keeps
+      (the read walks the zone's top free class under its lock); and the callback gives the move
+      MOE_SWAP_BUSY_CAUSE_ZONE_ROOM from the outcome. Without either the driver holds nothing, sends a refused admit
+      again at every boundary, and no unit test sees it;
   D19 a boundary whose transaction refused admits for device room says so in one WARN line: the callback counts the
-      answers that carry a refused size and keeps the largest, and after its loop over the batch, on that count alone
-      (so a batch that moved nothing prints it too, and no admit prints its own), calls
+      answers that carry a refused size and keeps, by ggml_sycl_expert_zone_refusal_kept (the first, then each that
+      asks more in all, the one rule the transaction's read follows too), the refused triplet's ask with its refused
+      member's size and the largest free block at its refusal, all three of that one refusal, and after its loop over
+      the batch, on that count alone (so a batch that moved nothing prints it too, and no admit prints its own), calls
       ggml_sycl_moe_swap_warn_zone_refusal once with the admits it sent; the helper reads the WEIGHT zone's free
-      figures together (unified_cache::zone_free_figures) and logs moe_swap_zone_refusal_line at WARN;
+      figures together (unified_cache::zone_free_figures) and logs moe_swap_zone_refusal_line at WARN,
+      and once per swap instance, at the first such boundary whose zone free blocks it can read (a flag on the
+      instance, set after that read and before it prints), logs them (unified_cache::zone_free_block_sizes) as
+      moe_swap_zone_free_census_line at WARN;
   D20 the hold takes the transaction's own give-backs out of the epoch's move. A transaction that gives back storage
       it took moves the room epoch with no room gained, so an unmeasured give-back sends the refused admit again at
       every boundary. The meter (ggml_sycl_expert_room_meter) reads the WEIGHT zone's epoch right before and right
@@ -242,18 +251,61 @@ NO_GROWTH_ROOM_FIELDS = (f"const size_t bound = {ROOM_BOUND};", "const size_t li
 ROOM_EPOCH_READ = "call.room_epoch = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;"
 BUSY_CAUSE_SET = ("m.busy_cause = o.zone_room_bytes != 0 ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM : "
                   "ggml_sycl::MOE_SWAP_BUSY_CAUSE_TRANSIENT;")
-ZONE_ROOM_MINT = ("storage = ggml_sycl_device_expert_alloc(device, staged); if (!storage.valid()) { "
-                  "out.mint_refused_bytes = staged;")
+ZONE_ROOM_MINT = ("storage = ggml_sycl_device_expert_alloc(device, member_bytes); if (!storage.valid()) { "
+                  "out.mint_refused_bytes = member_bytes; "
+                  "out.mint_refused_ask = ggml_sycl::expert_triplet_zone_ask_of(staged); const bool arena =")
+ZONE_FREE_READ = ("if ((*named_moves)[triplet.named].zone_room_bytes != 0 && ggml_sycl_expert_zone_refusal_kept("
+                  "zone_refusal_read, zone_refusal_read_ask, triplet.mint_refused_ask)) { "
+                  "size_t capacity = 0; size_t used = 0; size_t avail = 0; "
+                  "(void) cache->zone_free_figures(ggml_sycl::vram_zone_id::WEIGHT, capacity, used, avail, "
+                  "(*named_moves)[triplet.named].zone_largest_free_at_refusal); "
+                  "zone_refusal_read = true; zone_refusal_read_ask = triplet.mint_refused_ask; }")
+# The refused triplet's members going back, whatever runs the release.
+ZONE_REFUSED_GIVE_BACK = ("([&triplet] { for (ggml_sycl::expert_move_member & m : triplet.members) { "
+                          "m.owner = ggml_sycl::mem_handle{}; } });")
+KEPT_SIG = "static bool ggml_sycl_expert_zone_refusal_kept("
+# The census and zone_largest_free read the allocators one visitor names, so the census counts the blocks whose top
+# zone_largest_free reports, in the same three cases.
+ZONE_VISIT_SIG = "template <typename F> bool unified_cache::arena_visit_zone_allocators("
+ZONE_CENSUS_SIG = "bool unified_cache::zone_free_block_sizes("
+ZONE_LARGEST_SIG = "size_t unified_cache::zone_largest_free("
+ZONE_VISIT_CASES = ("if (arena_chunks_.size() == 1 && zone == vram_zone_id::WEIGHT) { "
+                    "if (const tlsf_allocator * kv = arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator.get()) "
+                    "{ visit(*kv); } return true; }",
+                    "if ((zone == vram_zone_id::WEIGHT || zone == vram_zone_id::KV) && "
+                    "!weight_chunk_allocators_.empty()) { if (zone == vram_zone_id::KV && z.allocator) { "
+                    "visit(*z.allocator); } for (const auto & wca : weight_chunk_allocators_) { "
+                    "visit(*wca.allocator); } return true; }",
+                    "if (z.allocator) { visit(*z.allocator); return true; } return false;")
+ZONE_CENSUS_VISIT = "(void) arena_visit_zone_allocators(zone, [&sizes](const tlsf_allocator & allocator) {"
+ZONE_LARGEST_VISIT = "const bool served = arena_visit_zone_allocators(zone, [&best](const tlsf_allocator & allocator) {"
+ZONE_OWN_CHOICE = ("arena_zones_", "weight_chunk_allocators_", "arena_chunks_")
+KEPT_BODY = "{ return !any_kept || ask.total > kept.total; }"
 ZONE_ROOM_OUTCOME = "(*named_moves)[triplet.named].zone_room_bytes = transient ? triplet.mint_refused_bytes : 0;"
+ZONE_ASK_OUTCOME = ("(*named_moves)[triplet.named].zone_room_ask = transient ? triplet.mint_refused_ask : "
+                    "ggml_sycl::expert_triplet_zone_ask{};")
 ZONE_REFUSED_COUNT = ("if (o.zone_room_bytes != 0) { ++zone_refused; "
-                      "zone_refused_max = std::max(zone_refused_max, o.zone_room_bytes); }")
+                      "if (ggml_sycl_expert_zone_refusal_kept(zone_refused_member != 0, zone_refused_ask, "
+                      "o.zone_room_ask)) { "
+                      "zone_refused_member = o.zone_room_bytes; zone_refused_ask = o.zone_room_ask; "
+                      "zone_refused_free = o.zone_largest_free_at_refusal; } }")
 # The loop over the batch ends on the refusal WARN's call; the zone-refusal line comes right after it, on the count.
-ZONE_WARN_AFTER_LOOP = (WARN_CALL + " } if (zone_refused != 0) { ggml_sycl_moe_swap_warn_zone_refusal(cache, device, "
-                        "zone_refused, request.admit.size(), zone_refused_max); }")
+ZONE_WARN_AFTER_LOOP = (WARN_CALL + " } if (zone_refused != 0) { ggml_sycl_moe_swap_warn_zone_refusal(inst, cache, "
+                        "device, zone_refused, request.admit.size(), zone_refused_member, zone_refused_ask, "
+                        "zone_refused_free); }")
 ZONE_WARN_FIELDS = ("(void) cache->zone_free_figures(ggml_sycl::vram_zone_id::WEIGHT, capacity, used, available, "
                     "largest_free);",
-                    'GGML_LOG_WARN("%s\\n", ggml_sycl::moe_swap_zone_refusal_line(device, refused, admits, asked, '
-                    "available, largest_free).c_str());")
+                    "const std::string line = ggml_sycl::moe_swap_zone_refusal_line(device, refused, admits, "
+                    "ask.slot, ask.total, largest_at_refusal, available, largest_free); "
+                    'GGML_LOG_WARN("%s\\n", line.c_str());')
+ZONE_CENSUS_ONCE = "if (inst.zone_census_printed || !cache) { return; }"
+ZONE_CENSUS_READ = ("if (!cache->zone_free_block_sizes(ggml_sycl::vram_zone_id::WEIGHT, free_sizes)) { return; } "
+                    "inst.zone_census_printed = true;")
+ZONE_CENSUS_BLOCK = ("const size_t member_block = ggml_sycl::tlsf_allocator::round_request(member, "
+                     "ggml_sycl::tlsf_allocator::block_grain);")
+ZONE_CENSUS_LOG = ("const std::string census = ggml_sycl::moe_swap_zone_free_census_line(device, free_sizes, member, "
+                   "member_block, "
+                   'GGML_SYCL_MOE_SWAP_ZONE_CENSUS_TOP); GGML_LOG_WARN("%s\\n", census.c_str());')
 METER_SIG = "struct ggml_sycl_expert_room_meter {"
 GIVE_BACK_SIG = "struct ggml_sycl_expert_prepared_give_back {"
 ENTRY_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run("
@@ -261,6 +313,16 @@ ROOM_STOOD_SIG = "inline bool moe_swap_room_stood("
 METER_MEASURE = ("const uint64_t before = cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT); release(); "
                  "moved += cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) - before;")
 GIVE_BACK_FIELDS = ("meter.give_back([this] { prepared.clear(); });", "answer->room_self_delta = meter.moved;")
+# The guard writes the batch's three host-time parts into the answer on every exit, the one place the body writes them.
+GIVE_BACK_COST = ("answer->meta_us = meta_us;", "answer->copy_us = copy_us;", "answer->remap_us = remap_us;")
+# The refusal the line keeps is tracked across the whole batch: one flag, declared once before the prepare loop, so
+# the zone's figures are read for the first refusal and then only for each that asks the zone more.
+REFUSAL_READ_DECL = "bool zone_refusal_read = false;"
+PREPARE_LOOP = "for (uint32_t t = 0; t < n_selected && !stop; ++t) {"
+# The test hook that resets a device's swap instance between cases clears the census latch too, so a case after one
+# that printed the census prints it again.
+FORGET_SIG = "void test_swap_forget(int device) {"
+FORGET_CENSUS = "inst.zone_census_printed = false;"
 GIVE_BACK_DECL = ("ggml_sycl_expert_room_meter room_meter{ named ? cache : nullptr }; "
                   "ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, "
                   "meta_us, copy_us, remap_us };")
@@ -753,26 +815,65 @@ def check(raw: dict[str, str]) -> None:
     if norm(callback).count(BUSY_CAUSE_SET) != 1 or sycl.count("busy_cause") != 1:
         fail("D18", "the transaction callback does not give each answered move its busy cause from the outcome's "
                     "zone_room, in one place")
-    if norm(prep).count(ZONE_ROOM_MINT) != 1 or len(word_matches(r"mint_refused_bytes\s*=(?!=)", sycl)) != 2:
+    if (norm(prep).count(ZONE_ROOM_MINT) != 1 or len(word_matches(r"mint_refused_bytes\s*=(?!=)", sycl)) != 2
+            or len(word_matches(r"mint_refused_ask\s*=(?!=)", sycl)) != 2 or "zone_free_figures(" in norm(prep)):
         fail("D18", "the preparation does not leave the size of a refused device mint on the prepared triplet, set "
-                    "where the device mint fails and nowhere else")
+                    "where the device mint fails and nowhere else, without reading the zone's figures there")
+    txn_norm = norm(body(sycl, TXN_SIG))
+    if (txn_norm.count(ZONE_FREE_READ) != 1 or txn_norm.count("zone_free_figures(") != 1
+            or txn_norm.count(ZONE_REFUSED_GIVE_BACK) != 1
+            or not ordered(txn_norm, ZONE_ROOM_OUTCOME, ZONE_FREE_READ, ZONE_REFUSED_GIVE_BACK)
+            or len(word_matches(r"zone_largest_free_at_refusal\s*=(?!=)", sycl)) != 1):
+        fail("D18", "the transaction does not read the largest free block at a refused device mint onto the named "
+                    "triplet's outcome, before its members go back, for the refusal the boundary's line keeps alone")
+    if (txn_norm.count(REFUSAL_READ_DECL) != 1 or txn_norm.count(PREPARE_LOOP) != 1
+            or not ordered(txn_norm, REFUSAL_READ_DECL, PREPARE_LOOP)
+            or len(word_matches(r"zone_refusal_read\s*=(?!=)", sycl)) != 2):
+        fail("D18", "the refusal whose figures were read is not tracked across the batch by one flag declared before "
+                    "the prepare loop, so the zone's figures could be read at every refusal")
     if (norm(body(sycl, TXN_SIG)).count(ZONE_ROOM_OUTCOME) != 1
-            or len(word_matches(r"zone_room_bytes\s*=(?!=)", sycl)) != 2):
+            or len(word_matches(r"zone_room_bytes\s*=(?!=)", sycl)) != 2
+            or norm(body(sycl, TXN_SIG)).count(ZONE_ASK_OUTCOME) != 1
+            or len(word_matches(r"zone_room_ask\s*=(?!=)", sycl)) != 2):
         fail("D18", "the transaction does not mark the named triplet's outcome exactly when a device mint was refused "
                     "transiently")
 
     # D19 --------------------------------------------------------------------------------------------------------------
     zone_warn = norm(body(sycl, ZONE_WARN_SIG))
+    if (norm(body(sycl, KEPT_SIG)).strip() != KEPT_BODY
+            or len(word_matches(r"ggml_sycl_expert_zone_refusal_kept\(", sycl)) != 3):
+        fail("D19", "the refusal a boundary's line keeps is not chosen by one rule, the first and then each that asks "
+                    "the zone more in all, used by both the transaction's read and the callback")
     if norm(callback).count(ZONE_REFUSED_COUNT) != 1 or len(re.findall(r"\bzone_refused\b\s*(?:=(?!=)|\+=)", caller)) != 1:
-        fail("D19", "the transaction callback does not count the answers refused for device room, with the largest "
-                    "size, in one place")
+        fail("D19", "the transaction callback does not count the answers refused for device room, keeping the "
+                    "largest refused triplet's ask and refused member together, in one place")
     if norm(callback).count(ZONE_WARN_AFTER_LOOP) != 1 or sycl.count("ggml_sycl_moe_swap_warn_zone_refusal(") != 2:
         fail("D19", "the zone-refusal line is not printed once per boundary, after the loop over the batch, whenever "
                     "an admit was refused for device room")
     if not zone_warn or not all(f in zone_warn for f in ZONE_WARN_FIELDS) or "GGML_LOG" in zone_warn.replace(
-            ZONE_WARN_FIELDS[1], ""):
+            ZONE_WARN_FIELDS[1], "").replace(ZONE_CENSUS_LOG, ""):
         fail("D19", "ggml_sycl_moe_swap_warn_zone_refusal does not log moe_swap_zone_refusal_line at WARN with the "
                     "WEIGHT zone's free figures read together")
+    if not (zone_warn.count(ZONE_CENSUS_ONCE) == 1 and zone_warn.count(ZONE_CENSUS_READ) == 1
+            and zone_warn.count(ZONE_CENSUS_LOG) == 1 and zone_warn.count(ZONE_CENSUS_BLOCK) == 1
+            and ordered(zone_warn, ZONE_CENSUS_BLOCK, ZONE_CENSUS_LOG)
+            and ordered(zone_warn, ZONE_WARN_FIELDS[1], ZONE_CENSUS_ONCE, ZONE_CENSUS_BLOCK, ZONE_CENSUS_READ,
+                        ZONE_CENSUS_LOG)
+            and len(word_matches(r"zone_census_printed\s*=(?!=)", sycl.replace(body(sycl, FORGET_SIG), ""))) == 2):
+        fail("D19", "the WEIGHT zone's free-block census is not logged at WARN once per swap instance, at the first "
+                    "refusal for room whose free blocks it read, after the refusal line")
+    if norm(body(sycl, FORGET_SIG)).count(FORGET_CENSUS) != 1:
+        fail("D19", "the test hook that resets a device's swap instance leaves the census latch set, so a case after "
+                    "one that printed the census never prints it")
+    visit = norm(body(cache, ZONE_VISIT_SIG))
+    census_body = norm(body(cache, ZONE_CENSUS_SIG))
+    largest_body = norm(body(cache, ZONE_LARGEST_SIG))
+    if (not ordered(visit, *ZONE_VISIT_CASES) or census_body.count(ZONE_CENSUS_VISIT) != 1
+            or largest_body.count(ZONE_LARGEST_VISIT) != 1
+            or any(f in census_body or f in largest_body for f in ZONE_OWN_CHOICE)):
+        fail("D19", "the census and zone_largest_free do not both read the allocators one visitor names (WEIGHT on one "
+                    "chunk the KV allocator, WEIGHT and KV on chunks the chunks', any other zone its own), so the "
+                    "census can count blocks other than those whose top the zone reports")
 
     # D20 --------------------------------------------------------------------------------------------------------------
     txn = norm(body(sycl, TXN_SIG))
@@ -784,6 +885,9 @@ def check(raw: dict[str, str]) -> None:
             or len(word_matches(r"room_self_delta\s*=(?!=)", sycl)) != 4):
         fail("D20", "the prepared list is not given back measured by a guard that then writes the answer's "
                     "room_self_delta, the one place it is written besides the entry's copy")
+    if not all(give_back.count(f) == 1 for f in GIVE_BACK_COST):
+        fail("D20", "the give-back guard does not write the batch's meta, copy and remap host time into the answer on "
+                    "every exit")
     if txn.count(GIVE_BACK_DECL) != 1 or not ordered(txn, "prepared.reserve(n_selected);", GIVE_BACK_DECL, PREPARE_CALL):
         fail("D20", "the named move does not declare its meter and its give-back guard before the first triplet is "
                     "prepared, so an exit could give minted storage back unmeasured")
@@ -1093,7 +1197,29 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", CORE_SIG, "o.zone_room_bytes != 0 ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM",
                   "false ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM")])
     expect_fail("refused-mint-not-recorded", "D18",
-                [("sycl", PREP_SIG, "out.mint_refused_bytes = staged;", "")])
+                [("sycl", PREP_SIG, "out.mint_refused_bytes = member_bytes;", "")])
+    expect_fail("refused-mint-records-its-own-staged-size", "D18",
+                [("sycl", PREP_SIG, "out.mint_refused_bytes = member_bytes;", "out.mint_refused_bytes = 1;")])
+    expect_fail("largest-free-at-refusal-not-read", "D18",
+                [("sycl", TXN_SIG, "(void) cache->zone_free_figures(", "(void) sizeof(")])
+    expect_fail("largest-free-at-refusal-read-at-every-refusal", "D18",
+                [("sycl", TXN_SIG, "zone_room_bytes != 0 &&\n                ggml_sycl_expert_zone_refusal_kept(",
+                  "zone_room_bytes != 0 &&\n                true | ggml_sycl_expert_zone_refusal_kept(")])
+    expect_fail("largest-free-at-refusal-read-in-the-preparation-too", "D18",
+                [("sycl", PREP_SIG, "out.mint_refused_ask   = ggml_sycl::expert_triplet_zone_ask_of(staged);",
+                  "out.mint_refused_ask   = ggml_sycl::expert_triplet_zone_ask_of(staged);\n                "
+                  "{ size_t c = 0, u = 0, a = 0, l = 0; (void) cache.zone_free_figures("
+                  "ggml_sycl::vram_zone_id::WEIGHT, c, u, a, l); }")])
+    expect_fail("largest-free-at-refusal-read-after-the-give-back", "D18",
+                [("sycl", TXN_SIG, "room_meter.give_back([&triplet] {\n                for ("
+                  "ggml_sycl::expert_move_member & m : triplet.members) {\n                    "
+                  "m.owner = ggml_sycl::mem_handle{};\n                }\n            });\n", ""),
+                 ("sycl", TXN_SIG, "if ((*named_moves)[triplet.named].zone_room_bytes != 0 &&",
+                  "room_meter.give_back([&triplet] { for (ggml_sycl::expert_move_member & m : triplet.members) { "
+                  "m.owner = ggml_sycl::mem_handle{}; } });\n            "
+                  "if ((*named_moves)[triplet.named].zone_room_bytes != 0 &&")])
+    expect_fail("largest-free-at-refusal-read-for-a-refusal-of-no-room", "D18",
+                [("sycl", TXN_SIG, "if ((*named_moves)[triplet.named].zone_room_bytes != 0 &&", "if (")])
     expect_fail("host-mint-recorded-as-a-device-one", "D18",
                 [("sycl", PREP_SIG, "*transient = out.kind == ggml_sycl_expert_move_kind::EVICT;",
                   "out.mint_refused_bytes = target.logical_bytes;\n                "
@@ -1108,18 +1234,77 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("zone-refusal-line-per-admit", "D19",
                 [("sycl", CORE_SIG, after_loop,
                   "ggml_sycl_moe_swap_warn_refusal(inst, device, m);\n                if (zone_refused != 0) {\n"
-                  "                    ggml_sycl_moe_swap_warn_zone_refusal(cache, device, zone_refused, "
-                  "request.admit.size(), zone_refused_max);\n                }\n            }\n")])
+                  "                    ggml_sycl_moe_swap_warn_zone_refusal(inst, cache, device, zone_refused, "
+                  "request.admit.size(), zone_refused_member, zone_refused_ask, zone_refused_free);\n"
+                  "                }\n            }\n")])
     expect_fail("zone-refusal-line-only-when-accepted", "D19",
                 [("sycl", CORE_SIG, "if (zone_refused != 0) {", "if (zone_refused != 0 && result.accepted) {")])
     expect_fail("zone-refusal-line-dropped", "D19",
                 [("sycl", CORE_SIG, "if (zone_refused != 0) {", "if (false) {")])
     expect_fail("zone-refusals-not-counted", "D19", [("sycl", CORE_SIG, "++zone_refused;", "")])
-    expect_fail("zone-refusal-line-at-info", "D19", [("sycl", ZONE_WARN_SIG, "GGML_LOG_WARN(", "GGML_LOG_INFO(")])
+    expect_fail("zone-refusal-line-at-info", "D19", [("sycl", ZONE_WARN_SIG, "GGML_LOG_WARN(\"%s\\n\", line.c_str());",
+                                                      "GGML_LOG_INFO(\"%s\\n\", line.c_str());")])
     expect_fail("zone-refusal-figures-of-another-zone", "D19",
-                [("sycl", ZONE_WARN_SIG, "ggml_sycl::vram_zone_id::WEIGHT", "ggml_sycl::vram_zone_id::KV")])
+                [("sycl", ZONE_WARN_SIG, "zone_free_figures(ggml_sycl::vram_zone_id::WEIGHT",
+                  "zone_free_figures(ggml_sycl::vram_zone_id::KV")])
     expect_fail("zone-refusal-figures-not-read", "D19", [("sycl", ZONE_WARN_SIG, "(void) cache->zone_free_figures(",
                                                          "(void) sizeof(")])
+    expect_fail("zone-census-at-every-refusal", "D19",
+                [("sycl", ZONE_WARN_SIG, "    inst.zone_census_printed = true;\n", "")])
+    expect_fail("zone-census-latched-before-its-read", "D19",
+                [("sycl", ZONE_WARN_SIG, "    inst.zone_census_printed = true;\n", ""),
+                 ("sycl", ZONE_WARN_SIG, "    std::vector<size_t> free_sizes;\n",
+                  "    inst.zone_census_printed = true;\n    std::vector<size_t> free_sizes;\n")])
+    expect_fail("zone-visitor-drops-the-single-chunk-kv-case", "D19",
+                [("cache", ZONE_VISIT_SIG, "if (arena_chunks_.size() == 1 && zone == vram_zone_id::WEIGHT) {",
+                  "if (false) {")])
+    expect_fail("zone-visitor-drops-kvs-tail-allocator", "D19",
+                [("cache", ZONE_VISIT_SIG, "if (zone == vram_zone_id::KV && z.allocator) {", "if (false) {")])
+    expect_fail("census-reads-another-zones-allocators", "D19",
+                [("cache", ZONE_CENSUS_SIG, "arena_visit_zone_allocators(zone,",
+                  "arena_visit_zone_allocators(vram_zone_id::KV,")])
+    expect_fail("census-chooses-its-own-allocator", "D19",
+                [("cache", ZONE_CENSUS_SIG, "(void) arena_visit_zone_allocators(zone, [&sizes](",
+                  "(void) arena_zones_; (void) arena_visit_zone_allocators(zone, [&sizes](")])
+    expect_fail("largest-free-chooses-its-own-allocator", "D19",
+                [("cache", ZONE_LARGEST_SIG, "return served ? best : zone_available(zone);",
+                  "return arena_zones_[static_cast<int>(zone)].allocator ? "
+                  "arena_zones_[static_cast<int>(zone)].allocator->largest_free_block() : zone_available(zone);")])
+    expect_fail("refusal-kept-on-an-equal-ask", "D19",
+                [("sycl", KEPT_SIG, "ask.total > kept.total", "ask.total >= kept.total")])
+    expect_fail("refusal-kept-by-another-rule-in-the-callback", "D19",
+                [("sycl", CORE_SIG, "ggml_sycl_expert_zone_refusal_kept(zone_refused_member != 0, zone_refused_ask,\n"
+                  "                                                               o.zone_room_ask)",
+                  "zone_refused_member == 0 || o.zone_room_ask.total >= zone_refused_ask.total")])
+    expect_fail("zone-census-at-info", "D19",
+                [("sycl", ZONE_WARN_SIG, "GGML_LOG_WARN(\"%s\\n\", census.c_str());",
+                  "GGML_LOG_INFO(\"%s\\n\", census.c_str());")])
+    expect_fail("zone-census-of-another-zone", "D19",
+                [("sycl", ZONE_WARN_SIG, "zone_free_block_sizes(ggml_sycl::vram_zone_id::WEIGHT",
+                  "zone_free_block_sizes(ggml_sycl::vram_zone_id::KV")])
+    expect_fail("refused-ask-not-recorded", "D18",
+                [("sycl", PREP_SIG, "out.mint_refused_ask   = ggml_sycl::expert_triplet_zone_ask_of(staged);", "")])
+    expect_fail("zone-ask-not-on-the-outcome", "D18",
+                [("sycl", TXN_SIG, "transient ? triplet.mint_refused_ask : ggml_sycl::expert_triplet_zone_ask{};",
+                  "ggml_sycl::expert_triplet_zone_ask{};")])
+    expect_fail("refused-triplet-ask-not-kept", "D19",
+                [("sycl", CORE_SIG, "zone_refused_ask    = o.zone_room_ask;", "")])
+    expect_fail("refusal-line-prints-three-of-the-member", "D19",
+                [("sycl", ZONE_WARN_SIG, "ask.slot, ask.total,", "ask.slot, 3 * member,")])
+    expect_fail("census-counts-by-slot", "D19",
+                [("sycl", ZONE_WARN_SIG, "free_sizes, member,", "free_sizes, ask.slot,")])
+    expect_fail("census-counts-by-the-unrounded-member", "D19",
+                [("sycl", ZONE_WARN_SIG, "free_sizes, member, member_block,", "free_sizes, member, member,")])
+    expect_fail("census-block-not-the-allocators-rounding", "D19",
+                [("sycl", ZONE_WARN_SIG, "ggml_sycl::tlsf_allocator::round_request(member, "
+                  "ggml_sycl::tlsf_allocator::block_grain);", "member;")])
+    expect_fail("largest-free-at-refusal-not-kept", "D19",
+                [("sycl", CORE_SIG, "zone_refused_free   = o.zone_largest_free_at_refusal;", "")])
+    expect_fail("largest-free-at-refusal-of-another-refusal", "D19",
+                [("sycl", CORE_SIG,
+                  "zone_refused_free   = o.zone_largest_free_at_refusal;\n                        }",
+                  "}\n                        zone_refused_free = std::max(zone_refused_free, "
+                  "o.zone_largest_free_at_refusal);")])
     expect_fail("self-delta-dropped-from-the-comparison", "D20",
                 [("driver", ROOM_STOOD_SIG, "room.epoch_after - before == room.self_delta", "room.epoch_after == before")])
     expect_fail("refused-admit-held-though-room-arrived", "D20", [("driver", STEP_SIG, " && room_stood;", ";")])
@@ -1173,6 +1358,20 @@ def self_test(raw: dict[str, str]) -> int:
                           ("total", "r.total_us        = ggml_sycl::expert_move_us_since(call_start);")):
         expect_fail(f"{field}-cost-not-carried-by-the-entry", "D20", [("sycl", ENTRY_SIG, anchor, "")])
     clock = "    const auto                   call_start = std::chrono::steady_clock::now();\n"
+    for field, anchor in (("meta", "answer->meta_us         = meta_us;\n"),
+                          ("copy", "answer->copy_us         = copy_us;\n"),
+                          ("remap", "answer->remap_us        = remap_us;\n")):
+        expect_fail(f"{field}-cost-not-written-by-the-give-back", "D20",
+                    [("sycl", GIVE_BACK_SIG, "            " + anchor, "")])
+    expect_fail("refusal-read-flag-redeclared-in-the-loop", "D18",
+                [("sycl", TXN_SIG, "        ggml_sycl_expert_prepared_triplet triplet;\n",
+                  "        ggml_sycl_expert_prepared_triplet triplet;\n        bool zone_refusal_read = false;\n")])
+    expect_fail("refusal-read-flag-declared-in-the-loop", "D18",
+                [("sycl", TXN_SIG, "    bool                               zone_refusal_read = false;\n", ""),
+                 ("sycl", TXN_SIG, "        ggml_sycl_expert_prepared_triplet triplet;\n",
+                  "        ggml_sycl_expert_prepared_triplet triplet;\n        bool zone_refusal_read = false;\n")])
+    expect_fail("census-latch-left-set-by-the-test-hook", "D19",
+                [("sycl", FORGET_SIG, "    inst.zone_census_printed = false;\n", "")])
     expect_fail("entry-clock-after-the-run", "D20",
                 [("sycl", ENTRY_SIG, clock, ""),
                  ("sycl", ENTRY_SIG, "    // Each outcome goes back to its own list",

@@ -972,22 +972,86 @@ inline std::string moe_swap_driver_summary_faults(const moe_swap_driver_stats & 
 }
 
 // The line a boundary prints when its transaction refused admits because the device WEIGHT zone had no room: how many
-// of the admits it sent, the largest member the zone was asked for and refused, and what the zone had free after the
-// batch, in bytes. zone_available is every free byte and zone_largest_free the largest free block, so a zone with the
-// bytes and no block large enough for the member reads apart from one with no bytes.
+// of the admits it sent, what the largest refused triplet asks of the zone in all (`triplet_bytes`: three slots when it
+// has a slot, printed as 3 x `slot`; its members' own bytes summed when `slot` is 0), the largest free block the zone
+// had when it refused, and what the zone had free after the batch, in bytes. zone_available is every free byte and
+// zone_largest_free the largest free block, so a zone with the bytes and no block large enough for a member reads
+// apart from one with no bytes.
 inline std::string moe_swap_zone_refusal_line(int      device,
                                               uint64_t refused,
                                               uint64_t admits,
-                                              size_t   asked,
+                                              size_t   slot,
+                                              size_t   triplet_bytes,
+                                              size_t   largest_at_refusal,
                                               size_t   zone_available,
                                               size_t   zone_largest_free) {
     using ull = unsigned long long;
-    char line[256];
+    char need[128];
+    if (slot != 0) {
+        std::snprintf(need, sizeof(need), "3 x %zu = %zu bytes", slot, triplet_bytes);
+    } else {
+        std::snprintf(need, sizeof(need), "%zu bytes, its members at their own sizes (no slot)", triplet_bytes);
+    }
+    char line[512];
     std::snprintf(line, sizeof(line),
-                  "[MOE-SWAP] device %d: WEIGHT zone refused %llu of %llu admits for room: largest member asked %zu "
-                  "bytes, zone_available %zu bytes, zone_largest_free %zu bytes",
-                  device, (ull) refused, (ull) admits, asked, zone_available, zone_largest_free);
+                  "[MOE-SWAP] device %d: WEIGHT zone refused %llu of %llu admits for room: a triplet needs %s, largest "
+                  "free block at refusal %zu bytes; after the batch zone_available %zu bytes, zone_largest_free %zu "
+                  "bytes",
+                  device, (ull) refused, (ull) admits, need, largest_at_refusal, zone_available, zone_largest_free);
     return line;
+}
+
+// The WEIGHT zone's free blocks, printed once per device at the first refusal for room: how many there are and their
+// bytes, how many allocations of `member` bytes (the refused member's size) they hold, and the `top` largest sizes
+// with their counts, largest first, the rest counted. Each block counts whole, as an allocation cannot span two, and
+// each allocation as `member_block` bytes, the block the zone takes for `member` (its size rounded to the zone's
+// grain, which the caller asks of the allocator), so a member off the grain is not counted into the bytes its
+// rounding takes. Free bytes that hold no such allocation are holes, and the sizes say which grain of the zone they
+// come from.
+inline std::string moe_swap_zone_free_census_line(int                         device,
+                                                  const std::vector<size_t> & free_sizes,
+                                                  size_t                      member,
+                                                  size_t                      member_block,
+                                                  size_t                      top) {
+    std::vector<size_t> sizes = free_sizes;
+    std::sort(sizes.begin(), sizes.end(), [](size_t a, size_t b) { return a > b; });
+    size_t bytes  = 0;
+    size_t fitted = 0;
+    for (const size_t s : sizes) {
+        bytes += s;
+        fitted += member_block != 0 ? s / member_block : 0;
+    }
+    char head[256];
+    std::snprintf(head, sizeof(head),
+                  "[MOE-SWAP] device %d: WEIGHT zone free blocks at the first refusal: %zu blocks, %zu bytes, room for "
+                  "%zu allocations of the refused member's %zu bytes; largest:",
+                  device, sizes.size(), bytes, fitted, member);
+    std::string out   = head;
+    size_t      shown = 0;
+    size_t      i     = 0;
+    char        item[64];
+    for (; i < sizes.size() && shown < top; ++shown) {
+        size_t j = i;
+        while (j < sizes.size() && sizes[j] == sizes[i]) {
+            ++j;
+        }
+        std::snprintf(item, sizeof(item), "%s %zu x %zu", shown == 0 ? "" : ",", sizes[i], j - i);
+        out += item;
+        i = j;
+    }
+    if (shown == 0) {
+        out += " none";
+    }
+    if (i < sizes.size()) {
+        size_t rest_sizes = 0;
+        for (size_t j = i; j < sizes.size(); ++j) {
+            rest_sizes += j == i || sizes[j] != sizes[j - 1];
+        }
+        std::snprintf(item, sizeof(item), ", and %zu blocks of %zu smaller size%s", sizes.size() - i, rest_sizes,
+                      rest_sizes == 1 ? "" : "s");
+        out += item;
+    }
+    return out;
 }
 
 }  // namespace ggml_sycl

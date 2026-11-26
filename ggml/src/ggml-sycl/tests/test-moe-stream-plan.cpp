@@ -702,6 +702,272 @@ void test_loan_whose_post_loan_ring_exceeds_the_cap_is_refused() {
     CHECK(!nothing_short.converged && nothing_short.steps == 0);
 }
 
+// One routed-expert member planned on device 0 in `layout`, charged its own staged bytes as the planner first builds
+// it.
+ggml_sycl::placement_entry slot_member(int                layer,
+                                       int                expert,
+                                       expert_tensor_role role,
+                                       ggml_type          type,
+                                       int64_t            ncols,
+                                       size_t             bytes,
+                                       ggml_layout_mode   layout = GGML_LAYOUT_AOS) {
+    ggml_sycl::placement_entry e("blk.0.ffn_exps.weight", bytes, bytes, 0, placement_priority::MOE_UP, layer, expert,
+                                 role, true, 0);
+    e.type              = type;
+    e.ne[0]             = ncols;
+    e.layout            = layout;
+    const size_t staged = ggml_sycl::staged_expert_bytes(layout, type, ncols, bytes);
+    e.vram_charge_size  = ggml_sycl::placement_vram_charge_bytes(staged != 0 ? staged : bytes);
+    return e;
+}
+
+constexpr expert_tensor_role kGate = expert_tensor_role::GATE;
+constexpr expert_tensor_role kUp   = expert_tensor_role::UP;
+constexpr expert_tensor_role kDown = expert_tensor_role::DOWN;
+
+// A 640 x 2560 IQ4_NL expert (gate and up 921600 bytes, down 921816 staged), a Q4_K gate and up beside a Q5_K down, and
+// an IQ4_NL expert whose down is SOA.
+std::vector<ggml_sycl::placement_entry> slot_triplets() {
+    return {
+        slot_member(0, 0, kGate, GGML_TYPE_IQ4_NL, 2560, 921600),
+        slot_member(0, 0, kUp, GGML_TYPE_IQ4_NL, 2560, 921600),
+        slot_member(0, 0, kDown, GGML_TYPE_IQ4_NL, 640, 921600),
+        slot_member(0, 1, kGate, GGML_TYPE_Q4_K, 2048, 589824),
+        slot_member(0, 1, kUp, GGML_TYPE_Q4_K, 2048, 589824),
+        slot_member(0, 1, kDown, GGML_TYPE_Q5_K, 512, 720896),
+        slot_member(0, 2, kGate, GGML_TYPE_IQ4_NL, 2560, 921600),
+        slot_member(0, 2, kUp, GGML_TYPE_IQ4_NL, 2560, 921600),
+        slot_member(0, 2, kDown, GGML_TYPE_IQ4_NL, 640, 921600, GGML_LAYOUT_SOA),
+    };
+}
+
+// The planner charges each member of a triplet with a slot the slot, and leaves a triplet the slot would pad past 1/128
+// (mixed quant types) or whose member does not stage as AOS at each member's own charge.
+void test_charge_expert_slots_takes_the_slot_only_where_nearly_free() {
+    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    std::vector<size_t>                     own;
+    for (const ggml_sycl::placement_entry & e : entries) {
+        own.push_back(e.vram_charge_size);
+    }
+    CHECK(own[0] == 921600 && own[2] == 921856);
+    CHECK(ggml_sycl::placement_entries_charge_expert_slots(entries) == 1);
+    for (size_t i = 0; i < 3; ++i) {
+        CHECK(entries[i].vram_charge_size == 921856);
+    }
+    for (size_t i = 3; i < entries.size(); ++i) {
+        CHECK(entries[i].vram_charge_size == own[i]);
+    }
+}
+
+// After a layout pass reset a member's charge to its own size (or left it 0, read as its dst_size's charge), the
+// re-charge gives the triplet its slot again and reports each changed entry with its charge before and after.
+void test_recharge_reports_each_changed_charge() {
+    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    ggml_sycl::placement_entries_charge_expert_slots(entries);
+    entries[0].vram_charge_size = 921600;
+    entries[1].vram_charge_size = 0;
+    const std::vector<ggml_sycl::placement_charge_change> changes =
+        ggml_sycl::placement_entries_recharge_expert_slots(entries);
+    CHECK(changes.size() == 2);
+    if (changes.size() == 2) {
+        CHECK(changes[0].index == 0 && changes[0].old_charge == 921600 && changes[0].new_charge == 921856);
+        CHECK(changes[1].index == 1 && changes[1].old_charge == 921600 && changes[1].new_charge == 921856);
+    }
+    CHECK(entries[0].vram_charge_size == 921856 && entries[1].vram_charge_size == 921856);
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots(entries).empty());
+}
+
+// One device's totals move by one charge change: a larger charge takes room (and past the budget still charges it,
+// spends what is left and returns the excess), a smaller one gives room back, and no total wraps.
+void test_charge_move() {
+    size_t remaining = 1000;
+    size_t device    = 5000;
+    size_t weight    = 7000;
+    size_t vram      = 9000;
+    CHECK(ggml_sycl::placement_charge_move(100, 300, remaining, device, weight, vram) == 0);
+    CHECK(remaining == 800 && device == 5200 && weight == 7200 && vram == 9200);
+    CHECK(ggml_sycl::placement_charge_move(100, 1300, remaining, device, weight, vram) == 400);
+    CHECK(remaining == 0 && device == 6400 && weight == 8400 && vram == 10400);
+    CHECK(ggml_sycl::placement_charge_move(300, 100, remaining, device, weight, vram) == 0);
+    CHECK(remaining == 200 && device == 6200 && weight == 8200 && vram == 10200);
+    CHECK(ggml_sycl::placement_charge_move(500, 500, remaining, device, weight, vram) == 0);
+    CHECK(remaining == 200 && device == 6200 && weight == 8200 && vram == 10200);
+    size_t small_remaining = 0;
+    size_t small_device    = 50;
+    size_t small_weight    = 60;
+    size_t small_vram      = 70;
+    CHECK(ggml_sycl::placement_charge_move(200, 0, small_remaining, small_device, small_weight, small_vram) == 0);
+    CHECK(small_remaining == 200 && small_device == 0 && small_weight == 0 && small_vram == 0);
+}
+
+// A layout pass moves a slotted triplet's gate out of AOS, charging it its new layout's size: the triplet has no slot
+// now, so its AOS members go back to their own charge. The up member gives its slot back (921856 -> 921600); the down
+// member's own charge rounds to the slot already, so it does not change. A second re-charge changes nothing.
+void test_recharge_gives_back_a_lost_slot() {
+    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    ggml_sycl::placement_entries_charge_expert_slots(entries);
+    CHECK(entries[1].vram_charge_size == 921856);
+    entries[0].layout           = GGML_LAYOUT_SOA;
+    entries[0].vram_charge_size = 950272;
+    const std::vector<ggml_sycl::placement_charge_change> changes =
+        ggml_sycl::placement_entries_recharge_expert_slots(entries);
+    CHECK(changes.size() == 1);
+    if (changes.size() == 1) {
+        CHECK(changes[0].index == 1 && changes[0].old_charge == 921856 && changes[0].new_charge == 921600);
+    }
+    CHECK(entries[0].vram_charge_size == 950272 && entries[1].vram_charge_size == 921600);
+    CHECK(entries[2].vram_charge_size == 921856);
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots(entries).empty());
+}
+
+// The accounted re-charge moves the totals of the device each changed entry is on, found by its target device among
+// the devices given: a device with no per-device total (a single-device plan) still moves its remaining room and the
+// plan's totals, and an entry on the host or on a device not given moves nothing.
+void test_recharge_on_moves_the_target_devices_room() {
+    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    for (size_t i = 3; i < 6; ++i) {
+        entries[i].target_device = 1;
+    }
+    for (size_t i = 6; i < 9; ++i) {
+        entries[i].on_device = false;
+    }
+    std::vector<ggml_sycl::placement_entry> plus = slot_triplets();
+    for (ggml_sycl::placement_entry & e : plus) {
+        e.layer_id      = 1;
+        e.target_device = 7;
+    }
+    entries.insert(entries.end(), plus.begin(), plus.end());
+    entries[3].vram_charge_size = 1000000;  // the mixed triplet on device 1 was charged more than its own size
+    entries[6].vram_charge_size = 1;        // a host member's charge moves no device total
+
+    size_t remaining0 = 10000;
+    size_t vram0      = 50000000;
+    size_t remaining1 = 20000;
+    size_t vram1      = 60000000;
+    size_t weight     = 70000000;
+    size_t vram       = 80000000;
+
+    const std::vector<ggml_sycl::placement_recharge_device> devices = {
+        { 1, &remaining1, &vram1  },
+        { 0, &remaining0, nullptr },
+    };
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(entries, devices, weight, vram) == 0);
+    // Device 0: gate and up take the slot, 256 bytes each.
+    CHECK(remaining0 == 10000 - 512 && vram0 == 50000000);
+    // Device 1: the mixed gate gives back what it was charged past its own size.
+    CHECK(remaining1 == 20000 + (1000000 - 589824) && vram1 == 60000000 - (1000000 - 589824));
+    CHECK(weight == 70000000 + 512 - (1000000 - 589824) && vram == 80000000 + 512 - (1000000 - 589824));
+    // Device 7 is not given: its slotted triplet is charged the slot and moves no total.
+    CHECK(entries[9].vram_charge_size == 921856 && entries[10].vram_charge_size == 921856);
+
+    // Past a device's remaining room the slot is still charged, and the excess is returned.
+    std::vector<ggml_sycl::placement_entry> tight           = slot_triplets();
+    size_t                                  remaining_tight = 300;
+    size_t                                  weight_tight    = 0;
+    size_t                                  vram_tight      = 0;
+
+    const std::vector<ggml_sycl::placement_recharge_device> tight_devices = {
+        { 0, &remaining_tight, nullptr },
+    };
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(tight, tight_devices, weight_tight, vram_tight) == 212);
+    CHECK(remaining_tight == 0 && weight_tight == 512 && vram_tight == 512);
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(tight, tight_devices, weight_tight, vram_tight) == 0);
+
+    // A triplet that loses its slot gives the room back: its gate leaves AOS, and the up member's 256 bytes return.
+    tight[0].layout           = GGML_LAYOUT_SOA;
+    tight[0].vram_charge_size = 921856;
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(tight, tight_devices, weight_tight, vram_tight) == 0);
+    CHECK(remaining_tight == 256 && weight_tight == 256 && vram_tight == 256);
+    CHECK(tight[1].vram_charge_size == 921600);
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots_on(tight, tight_devices, weight_tight, vram_tight) == 0);
+    CHECK(remaining_tight == 256);
+}
+
+// A role met twice in one (layer, expert) is resolved as the plan's index resolves it (find_expert_entry keeps the
+// first): the triplet's slot is the first entries', and each of them is charged it. The load resolves a repeat by name
+// too, so it stages the repeat as its member, with the member's layout and device. A repeat with its member's layout
+// and device is charged what the load stages: here a later, smaller AOS gate is charged the slot. A repeat in another
+// layout or on another device is a known gap: its charge stays on its own layout and device, and the planner warns
+// for it (placement_entries_repeats_off_their_member). Here the first down is AOS with a tail, so the triplet has a
+// slot, and a later SOA down keeps its own SOA charge although the load stages the AOS member at the slot.
+void test_charge_expert_slots_resolves_a_duplicated_role_by_its_first_entry() {
+    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    entries.resize(3);
+    entries.push_back(slot_member(0, 0, kDown, GGML_TYPE_IQ4_NL, 640, 921600, GGML_LAYOUT_SOA));
+    entries.push_back(slot_member(0, 0, kGate, GGML_TYPE_IQ4_NL, 2560, 460800));
+    entries.push_back(slot_member(0, 0, kUp, GGML_TYPE_IQ4_NL, 2560, 921600));
+    entries.back().target_device = 1;
+
+    const size_t soa_charge = entries[3].vram_charge_size;
+    CHECK(entries[4].vram_charge_size == 460800);
+    CHECK(ggml_sycl::placement_entries_charge_expert_slots(entries) == 1);
+    for (size_t i = 0; i < 3; ++i) {
+        CHECK(entries[i].vram_charge_size == 921856);
+    }
+    CHECK(entries[4].vram_charge_size == 921856);
+    // The known gap the planner warns for: the SOA repeat keeps its own charge.
+    CHECK(entries[3].vram_charge_size == soa_charge);
+    // The warning names each repeat off its member, by layout (the SOA down) or by device (the up on device 1), and
+    // not the gate that matches its member.
+    const auto off = ggml_sycl::placement_entries_repeats_off_their_member(entries);
+    CHECK(off.size() == 2);
+    CHECK(off.size() == 2 && off[0].member == &entries[2] && off[0].repeat == &entries[3]);
+    CHECK(off.size() == 2 && off[1].member == &entries[1] && off[1].repeat == &entries[5]);
+    // The load's own lookup agrees: the indexed plan gives the triplet the first entries' slot.
+    placement_plan plan{};
+    plan.entries = entries;
+    plan.build_index();
+    CHECK(ggml_sycl::moe_expert_triplet_slot_bytes(plan, 0, 0) == 921856);
+}
+
+const char * const kBulkNames[3] = { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
+                                     "blk.0.ffn_down_exps.weight" };
+
+// Four IQ4_NL experts of one layer, each a (gate, up, down) triplet named as a model's tensors are, planned AOS on
+// `device`. A down of 640 columns carries a row-padding tail, so each triplet's slot (921856) passes its members'
+// staged bytes; with 2560 columns none does, and the slot is each member's own size (921600). With `alternate`, each
+// entry also carries one alternate of that layout on device 0.
+placement_plan bulk_plan(int64_t          down_cols,
+                         int              device,
+                         bool             alternate        = false,
+                         ggml_layout_mode alternate_layout = GGML_LAYOUT_AOS) {
+    placement_plan           plan{};
+    const expert_tensor_role roles[3] = { kGate, kUp, kDown };
+    for (int e = 0; e < 4; ++e) {
+        for (int r = 0; r < 3; ++r) {
+            ggml_sycl::placement_entry m =
+                slot_member(0, e, roles[r], GGML_TYPE_IQ4_NL, r == 2 ? down_cols : 2560, 921600);
+            m.name          = kBulkNames[r];
+            m.target_device = device;
+            if (alternate) {
+                ggml_sycl::placement_alternate_layout alt;
+                alt.layout        = alternate_layout;
+                alt.target_device = 0;
+                m.alternate_layouts.push_back(alt);
+            }
+            plan.entries.push_back(m);
+        }
+    }
+    plan.build_index();
+    return plan;
+}
+
+// The load's bulk copy stages every expert of a tensor at one stride, its staged bytes, so it declines an AOS tensor
+// whose triplets have a slot past that stride and stages it expert by expert, each at its slot: each such expert can
+// be lent. The answer follows the layout the load stages, the alternate's for a tensor staged through its alternates.
+void test_bulk_staged_mirrors_the_slot_stride_decline() {
+    const placement_plan padded  = bulk_plan(640, 0);
+    const placement_plan aligned = bulk_plan(2560, 0);
+    const placement_plan alt_aos = bulk_plan(640, 1, true);
+    const placement_plan alt_soa = bulk_plan(640, 1, true, GGML_LAYOUT_SOA);
+    for (const char * name : kBulkNames) {
+        CHECK(!ggml_sycl::detail::moe_loan_tensor_bulk_staged(padded, name, 0));
+        CHECK(ggml_sycl::detail::moe_loan_tensor_bulk_staged(aligned, name, 0));
+        CHECK(!ggml_sycl::detail::moe_loan_tensor_bulk_staged(alt_aos, name, 0));
+        CHECK(ggml_sycl::detail::moe_loan_tensor_bulk_staged(alt_soa, name, 0));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -793,6 +1059,13 @@ int main() {
     test_loan_into_a_smaller_ring_is_covered();
     test_loan_into_a_larger_slot_credits_no_held_slot();
     test_loan_into_another_slot_size_that_does_not_grow_is_refused();
+    test_charge_expert_slots_takes_the_slot_only_where_nearly_free();
+    test_recharge_reports_each_changed_charge();
+    test_charge_move();
+    test_recharge_gives_back_a_lost_slot();
+    test_recharge_on_moves_the_target_devices_room();
+    test_charge_expert_slots_resolves_a_duplicated_role_by_its_first_entry();
+    test_bulk_staged_mirrors_the_slot_stride_decline();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);

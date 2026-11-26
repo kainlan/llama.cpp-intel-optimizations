@@ -9,16 +9,19 @@
 // for VRAM; the allocator never touches that memory.
 // Validates O(1) alloc/free semantics, coalescing, reset, and stress.
 
+#include "../ggml/src/ggml-sycl/expert-slot.hpp"
 #include "../ggml/src/ggml-sycl/shared-zone-tags.hpp"
 #include "../ggml/src/ggml-sycl/tlsf-allocator.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <random>
 #include <vector>
 
 // Every check goes through REQUIRE below, which aborts whether or not NDEBUG
@@ -1783,6 +1786,197 @@ static void test_allocate_refuses_only_without_a_fitting_block() {
 }
 
 // ---------------------------------------------------------------------------
+// A WEIGHT zone through a MoE expert swap.  The load stages each expert
+// tensor's device experts one after another, so the zone holds a run of one
+// member size per tensor (down, gate and up of each layer, in the order the
+// loader creates them).  The swap evicts whole triplets, then admits as many
+// others, each minting its gate, then its up, then its down, and giving back
+// what it took when a member finds no room.  `staged` is what each member asks
+// of the zone at the load and at the admit, by role (gate, up, down).
+// ---------------------------------------------------------------------------
+struct expert_swap_result {
+    size_t admitted  = 0;
+    size_t refused   = 0;
+    size_t available = 0;  // free bytes after the admits
+    size_t largest   = 0;  // largest free block after the admits
+};
+
+static expert_swap_result expert_swap_run(const size_t (&staged)[3], size_t layers, size_t per_layer, size_t evicted) {
+    const int    load_order[3] = { 2, 0, 1 };  // down, gate, up: the loader's tensor order within a layer
+    const size_t triplets      = layers * per_layer;
+    size_t       triplet_bytes = 0;
+    for (const size_t s : staged) {
+        triplet_bytes += tlsf_allocator::round_request(s, 256);
+    }
+    // Room for every triplet and a little more: the zone the plan filled, and a remainder it left.
+    tlsf_allocator t(triplets * triplet_bytes + 16 * triplet_bytes);
+
+    std::vector<std::array<size_t, 3>> offset(triplets);
+    for (size_t l = 0; l < layers; ++l) {
+        for (const int r : load_order) {
+            for (size_t x = 0; x < per_layer; ++x) {
+                offset[l * per_layer + x][r] = t.allocate(staged[r]);
+                REQUIRE(offset[l * per_layer + x][r] != SIZE_MAX && "the load stages every planned expert");
+            }
+        }
+    }
+    std::vector<size_t> order(triplets);
+    for (size_t i = 0; i < triplets; ++i) {
+        order[i] = i;
+    }
+    std::mt19937 rng(12345);
+    std::shuffle(order.begin(), order.end(), rng);
+    for (size_t k = 0; k < evicted; ++k) {
+        for (int r = 0; r < 3; ++r) {
+            t.free(offset[order[k]][r]);
+        }
+    }
+
+    expert_swap_result res;
+    for (size_t k = 0; k < evicted; ++k) {
+        size_t got[3] = { SIZE_MAX, SIZE_MAX, SIZE_MAX };
+        bool   fits   = true;
+        for (int r = 0; r < 3 && fits; ++r) {
+            got[r] = t.allocate(staged[r]);
+            fits   = got[r] != SIZE_MAX;
+        }
+        if (fits) {
+            res.admitted++;
+            continue;
+        }
+        res.refused++;
+        for (const size_t o : got) {
+            t.free(o);
+        }
+    }
+    REQUIRE(t.check_invariants());
+    res.available = t.available();
+    res.largest   = t.largest_free_block();
+    return res;
+}
+
+// The 640 x 2560 IQ4_NL expert of the swap the WEIGHT zone refused: gate and
+// up stage 921600 bytes, down 921816 (its row-padding tail).
+static constexpr size_t SWAP_GATE_UP = 921600;
+static constexpr size_t SWAP_DOWN    = 921816;
+
+// Each member at its own size: the zone refuses admits while it holds room for
+// many triplets, in blocks a few grains short of a member.  No allocator
+// policy fixes this (a search of the request's own class first refuses as
+// many); the members' sizes do.  Characterization, kept so the slot test below
+// reads against it.
+static void test_expert_swap_mixed_member_sizes_fragment() {
+    const size_t             staged[3] = { SWAP_GATE_UP, SWAP_GATE_UP, SWAP_DOWN };
+    const size_t             triplet   = 2 * SWAP_GATE_UP + tlsf_allocator::round_request(SWAP_DOWN, 256);
+    const expert_swap_result res       = expert_swap_run(staged, 24, 64, 1152);
+    REQUIRE(res.refused > 0 && "admits are refused");
+    REQUIRE(res.available >= 10 * triplet && "while the zone holds room for ten triplets and more");
+    REQUIRE(res.largest < 3 * SWAP_GATE_UP && "in blocks too small for one triplet");
+    std::cout << "test_expert_swap_mixed_member_sizes_fragment: PASSED (refused " << res.refused << " of 1152, "
+              << res.available << " bytes free, largest block " << res.largest << ")\n";
+}
+
+// The slot rule: the largest staged member, rounded up to the grain.
+static void test_expert_triplet_slot_bytes() {
+    const size_t mixed[3] = { SWAP_GATE_UP, SWAP_GATE_UP, SWAP_DOWN };
+    REQUIRE(expert_triplet_slot_bytes(mixed) == 921856 && "the padded down member, rounded to the grain");
+    const size_t down_first[3] = { SWAP_DOWN, SWAP_GATE_UP, SWAP_GATE_UP };
+    REQUIRE(expert_triplet_slot_bytes(down_first) == 921856 && "the largest member, wherever it is");
+    const size_t uniform[3] = { 4096, 4096, 4096 };
+    REQUIRE(expert_triplet_slot_bytes(uniform) == 4096 && "members already on the grain keep their size");
+    // The device loan fixtures' Q4_0 expert of 640 columns: 1 MiB and 216 bytes of row padding round up one grain, to
+    // 1 MiB and 256 bytes; the 1 MiB expert itself, already on the grain, is not bumped a grain.
+    const size_t q4_0_640[3] = { 1048576 + 216, 1048576 + 216, 1048576 + 216 };
+    REQUIRE(expert_triplet_slot_bytes(q4_0_640) == 1048576 + 256 && "216 bytes past the grain round up to one grain");
+    const size_t aligned[3] = { 1048576, 1048576, 1048576 };
+    REQUIRE(expert_triplet_slot_bytes(aligned) == 1048576 && "an aligned size stays as it is");
+    const size_t sub_grain[3] = { 1, 100, 200 };
+    REQUIRE(expert_triplet_slot_bytes(sub_grain) == 256 && "a slot is at least one grain");
+    const size_t unstaged[3] = { SWAP_GATE_UP, 0, SWAP_DOWN };
+    REQUIRE(expert_triplet_slot_bytes(unstaged) == 0 && "a member with no staged size: no slot");
+    const size_t wraps[3] = { SWAP_GATE_UP, SIZE_MAX - 1, SWAP_DOWN };
+    REQUIRE(expert_triplet_slot_bytes(wraps) == 0 && "a size the rounding would wrap: no slot");
+    std::cout << "test_expert_triplet_slot_bytes: PASSED\n";
+}
+
+// A Q4_K gate and up beside a Q5_K down, 2048 x 512 and 512 x 2048: rows on
+// the padding multiple, so each member's staged bytes are its own.
+static constexpr size_t MIXED_GATE_UP = 512 * (2048 / 256) * 144;
+static constexpr size_t MIXED_DOWN    = 2048 * (512 / 256) * 176;
+
+// The slot only where it is nearly free: the padding it adds to a triplet,
+// three slots less the members' grain-rounded bytes, is at most 1/128 of
+// those bytes.  A triplet past that keeps each member's own size.
+static void test_expert_triplet_slot_padding_bound() {
+    const size_t iq4[3] = { SWAP_GATE_UP, SWAP_GATE_UP, SWAP_DOWN };
+    REQUIRE(expert_triplet_slot_bytes(iq4) == 921856 && "a padded down member: 512 bytes of padding, under 1/128");
+    const size_t mixed[3] = { MIXED_GATE_UP, MIXED_GATE_UP, MIXED_DOWN };
+    REQUIRE(expert_triplet_slot_bytes(mixed) == 0 && "a Q4_K/Q4_K/Q5_K triplet would pad 14%: no slot");
+    // 65280 x 2 + 66048 = 196608 bytes; padding 2 x 768 = 1536 = 196608 / 128.
+    const size_t at_bound[3] = { 65280, 65280, 66048 };
+    REQUIRE(expert_triplet_slot_bytes(at_bound) == 66048 && "padding exactly 1/128 of the triplet takes the slot");
+    // One grain more on the down member: padding 2048 against 196864 / 128 = 1538.
+    const size_t past_bound[3] = { 65280, 65280, 66304 };
+    REQUIRE(expert_triplet_slot_bytes(past_bound) == 0 && "one grain past 1/128: no slot");
+    std::cout << "test_expert_triplet_slot_padding_bound: PASSED\n";
+}
+
+// What the zone hands each member: the slot when the triplet has one, the
+// member's own staged bytes when it has none.
+static void test_expert_triplet_member_bytes() {
+    const size_t iq4[3] = { SWAP_GATE_UP, SWAP_GATE_UP, SWAP_DOWN };
+    for (int r = 0; r < 3; ++r) {
+        REQUIRE(expert_triplet_member_bytes(iq4, r) == 921856 && "every member of a slotted triplet takes the slot");
+    }
+    const size_t mixed[3] = { MIXED_GATE_UP, MIXED_GATE_UP, MIXED_DOWN };
+    for (int r = 0; r < 3; ++r) {
+        REQUIRE(expert_triplet_member_bytes(mixed, r) == mixed[r] && "a triplet with no slot: each its own bytes");
+    }
+    std::cout << "test_expert_triplet_member_bytes: PASSED\n";
+}
+
+// What a triplet asks of the zone together: three slots when it has one, else
+// its members' own sizes summed, and the slot it has (0 for none).
+static void test_expert_triplet_zone_ask() {
+    const size_t                  iq4[3]  = { SWAP_GATE_UP, SWAP_GATE_UP, SWAP_DOWN };
+    const expert_triplet_zone_ask slotted = expert_triplet_zone_ask_of(iq4);
+    REQUIRE(slotted.slot == 921856 && "a slotted triplet asks its slot");
+    REQUIRE(slotted.total == 3 * 921856 && "and three of them");
+    const size_t                  mixed[3] = { MIXED_GATE_UP, MIXED_GATE_UP, MIXED_DOWN };
+    const expert_triplet_zone_ask own      = expert_triplet_zone_ask_of(mixed);
+    REQUIRE(own.slot == 0 && "a triplet with no slot says so");
+    REQUIRE(own.total == 2 * MIXED_GATE_UP + MIXED_DOWN && "and asks its members' own bytes");
+    REQUIRE(own.total != 3 * MIXED_DOWN && "not three of its largest member");
+    std::cout << "test_expert_triplet_zone_ask: PASSED\n";
+}
+
+// A triplet with no slot fragments the zone another way: a gate or up admit
+// splits a freed down-sized block and leaves a remainder no member fits.
+// Characterization of a known gap the slot rule leaves open on purpose.
+static void test_expert_swap_unslotted_mixed_quant_fragments() {
+    const size_t             staged[3] = { MIXED_GATE_UP, MIXED_GATE_UP, MIXED_DOWN };
+    const size_t             triplet   = 2 * MIXED_GATE_UP + MIXED_DOWN;
+    const expert_swap_result res       = expert_swap_run(staged, 24, 64, 1152);
+    REQUIRE(res.refused > 0 && "admits are refused");
+    REQUIRE(res.available >= 10 * triplet && "while the zone holds room for ten triplets and more");
+    REQUIRE(res.largest < triplet && "in blocks too small for one triplet");
+    std::cout << "test_expert_swap_unslotted_mixed_quant_fragments: PASSED (refused " << res.refused << " of 1152, "
+              << res.available << " bytes free, largest block " << res.largest << ")\n";
+}
+
+// Every member at its triplet's slot: the same load and the same swap admit
+// every triplet the swap evicted room for.
+static void test_expert_swap_at_triplet_slot_admits_all() {
+    const size_t members[3] = { SWAP_GATE_UP, SWAP_GATE_UP, SWAP_DOWN };
+    const size_t slot       = expert_triplet_slot_bytes(members);
+    REQUIRE(slot >= tlsf_allocator::round_request(SWAP_DOWN, 256) && "the slot holds every member");
+    const size_t             staged[3] = { slot, slot, slot };
+    const expert_swap_result res       = expert_swap_run(staged, 24, 64, 1152);
+    REQUIRE(res.refused == 0 && res.admitted == 1152 && "every admit fits the room an evict freed");
+    std::cout << "test_expert_swap_at_triplet_slot_admits_all: PASSED\n";
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 int main() {
@@ -1831,6 +2025,13 @@ int main() {
     test_allocate_unbounded_last_class();
     test_allocate_class_walk_triplet_replay();
     test_allocate_refuses_only_without_a_fitting_block();
+    test_expert_swap_mixed_member_sizes_fragment();
+    test_expert_triplet_slot_bytes();
+    test_expert_triplet_slot_padding_bound();
+    test_expert_triplet_member_bytes();
+    test_expert_triplet_zone_ask();
+    test_expert_swap_unslotted_mixed_quant_fragments();
+    test_expert_swap_at_triplet_slot_admits_all();
 
     std::cout << "\nAll tlsf_allocator tests PASSED!\n";
     return 0;

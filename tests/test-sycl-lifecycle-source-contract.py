@@ -736,7 +736,9 @@ INTERNAL_WRAPPER_SITES = {
         "const auto plan = ggml_sycl_cache_plan_owner(cache);": 2,
         "const auto plan_hybrid_owner = ggml_sycl_cache_plan_owner(plan_cache_hybrid);": 1,
         "const auto plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;": 1,
-        "const auto plan_owner = ggml_sycl_cache_plan_owner(cache);": 12,
+        # Two of these are the preload's: one per tensor for the bulk decline and each expert's slot sizing, and one
+        # for a DPAS rollback's restore, each fetched once for the tensor's experts rather than once per expert.
+        "const auto plan_owner = ggml_sycl_cache_plan_owner(cache);": 14,
         "const auto plan_owner = ggml_sycl_cache_plan_owner(plan_cache);": 4,
         "const auto plan_owner = ggml_sycl_cache_plan_owner(route_cache);": 1,
         "const auto plan_ref_owner = ggml_sycl_cache_plan_owner(plan_cache);": 1,
