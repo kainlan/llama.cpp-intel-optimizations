@@ -129,17 +129,20 @@ SEQ_IDS_RESERVE_SIG = ("static bool ggml_sycl_fattn_seq_ids_reserve(ggml_backend
 STAGE_RESERVE_SIG = ("static bool ggml_sycl_fattn_operand_stage_reserve(ggml_backend_sycl_context::fattn_operand_stage & "
                      "stage, ggml_backend_sycl_context::fattn_operand_stage::slot & slot, size_t bytes, "
                      "sycl::queue * stream) {")
-# A counted group's reserve: its signature, the statement it must open with, the text that marks an allocation of the
-# group, and how often that text may stand outside the reserve (the allocating helper's own definition, if any).
+# A counted group's reserve: its signature, the statement it must open with, and the texts that mark an allocation of
+# the group, each with how often it stands outside the reserve and whether the reserve must contain it.
+# The cohort string is the marker that a direct call of the allocator cannot avoid. The staging slots pass it in the
+# reserve itself. The sequence ids pass it in one helper, so the string stands once outside the reserve, and the
+# helper's name is a second marker: it stands outside only in its own definition and is called only in the reserve.
 RESERVES = (
     (SEQ_IDS_RESERVE_SIG,
      "if (buffers.alloc_queue && buffers.alloc_queue != stream) { ggml_sycl_fattn_seq_ids_free_all(buffers); } "
      "buffers.alloc_queue = stream;",
-     "ggml_sycl_fattn_seq_ids_alloc(", 1),
+     (('"fattn_seq_ids"', 1, False), ("ggml_sycl_fattn_seq_ids_alloc(", 1, True))),
     (STAGE_RESERVE_SIG,
      "if (stage.alloc_queue && stage.alloc_queue != stream) { ggml_sycl_fattn_operand_stage_free_all(stage); } "
      "stage.alloc_queue = stream;",
-     '"fattn_weight_stage"', 0),
+     (('"fattn_weight_stage"', 0, True),)),
 )
 STAGE_SRC_SIG = ("static const char * ggml_sycl_fattn_operand_stage_src(ggml_backend_sycl_context::fattn_operand_stage "
                  "& stage, ggml_backend_sycl_context::fattn_operand_stage::slot & slot, const ggml_tensor * src, "
@@ -297,12 +300,13 @@ def no_exit_switch(fattn: str) -> bool:
 def reserve_owns_the_allocation(fattn: str) -> bool:
     """C8: a counted group is allocated only in its reserve, which opens by dropping the group on a new stream, and
     its production caller reaches the group through that reserve."""
-    for sig, opening, alloc_marker, outside in RESERVES:
+    for sig, opening, markers in RESERVES:
         b = body(fattn, sig)
-        if not b.startswith("{ " + opening) or fattn.count(alloc_marker) - b.count(alloc_marker) != outside:
+        if not b.startswith("{ " + opening):
             return False
-        if b.count(alloc_marker) == 0:
-            return False
+        for marker, outside, in_reserve in markers:
+            if fattn.count(marker) - b.count(marker) != outside or (in_reserve and marker not in b):
+                return False
     return all(call in body(fattn, caller) for caller, call in RESERVE_CALLERS)
 
 
@@ -489,7 +493,7 @@ def test_mutant_counted_release_keeps_the_handle():
 
 
 def test_mutant_reserve_keeps_buffers_from_another_stream():
-    for sig, opening, _, _ in RESERVES:
+    for sig, opening, _ in RESERVES:
         reserve = body(FATTN, sig)
         # The drop is gone: the group grows on size alone.
         m = _mutate(FATTN, reserve, _mutate(reserve, opening, opening.split("} ", 1)[1]))
@@ -501,6 +505,11 @@ def test_mutant_reserve_keeps_buffers_from_another_stream():
 
 def test_mutant_group_allocated_outside_its_reserve():
     m = FATTN + " static void f(ggml_sycl::mem_handle & o) { (void) ggml_sycl_fattn_seq_ids_alloc(1, nullptr, o); }"
+    assert not reserve_owns_the_allocation(m)
+    # The helper bypassed: a direct call of the allocator under the group's cohort.
+    m = FATTN + (' static void f(int32_t *& p, ggml_sycl::mem_handle & o) { (void) '
+                 'ggml_sycl_fattn_alloc_device_owner_t(1, nullptr, ggml_sycl::alloc_role::GRAPH_TMP, '
+                 'ggml_sycl::runtime_category::GRAPH, "fattn_seq_ids", p, o); }')
     assert not reserve_owns_the_allocation(m)
     m = FATTN + (' static void f(void ** p, ggml_sycl::mem_handle & o) { (void) ggml_sycl_fattn_alloc_device_owner('
                  '8, nullptr, ggml_sycl::alloc_role::STAGING, ggml_sycl::runtime_category::STAGING, '

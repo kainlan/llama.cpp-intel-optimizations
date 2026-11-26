@@ -1111,7 +1111,7 @@ extern "C" int ggml_sycl_test_fattn_operand_stage_allocs() {
 }
 
 // Reserves `bytes` in each of the context's four sequence-id buffers the way the op does: the ids, then the
-// offsets. A null `stream` is the context's own.
+// offsets. A null `stream` is the context's own. False when `bytes` holds no element or a reserve fails.
 extern "C" bool ggml_sycl_test_seq_id_buffers_touch(ggml_backend_t backend, size_t bytes, sycl::queue * stream) {
     ggml_backend_sycl_context * ctx = ggml_sycl_test_fattn_context(backend);
     if (!ctx) {
@@ -1120,7 +1120,7 @@ extern "C" bool ggml_sycl_test_seq_id_buffers_touch(ggml_backend_t backend, size
     auto &        buffers = ctx->fattn_buffers.seq_ids;
     sycl::queue * target  = stream ? stream : ctx->stream();
     const size_t  count   = bytes / sizeof(int32_t);
-    return ggml_sycl_fattn_seq_ids_reserve(buffers, target, count, count, 0) &&
+    return count > 0 && ggml_sycl_fattn_seq_ids_reserve(buffers, target, count, count, 0) &&
            ggml_sycl_fattn_seq_ids_reserve(buffers, target, 0, 0, count);
 }
 
