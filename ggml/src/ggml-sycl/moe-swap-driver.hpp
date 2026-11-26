@@ -78,9 +78,10 @@ constexpr int MOE_SWAP_PENDING_DROP_STREAK = 4;
 // hold. It is held at the fifteen before it. An admit refused for zone room is not sent again until the epoch says
 // the zone could have gained room; when no room ever comes, the hold alone would keep the policy in flight for the
 // rest of the generation. Sixteen is above the case the hold exists for, the few boundaries until a deferred-free
-// pass hands an evict's room back, and at 43 ms a decode token it is about 0.7 s. A held boundary costs the admit
-// nothing and a sent one a lookup in the zone's allocator, so the bound trades only how long the policy waits. It is
-// a chosen bound, not a measured one.
+// pass hands an evict's room back. At 43 ms a decode token one hold is about 0.7 s, and a pair that never fits is
+// held twice, as the admit and then as the restore it becomes: about 32 settled boundaries, about 1.4 s, with the
+// policy in flight before the slot is left open. A held boundary costs the admit nothing and a sent one a lookup in
+// the zone's allocator, so the bound trades only how long the policy waits. It is a chosen bound, not a measured one.
 constexpr int MOE_SWAP_PENDING_HOLD_BOUND = 16;
 
 // The BUSY reason under which an evict of a batch whose transaction threw, still resident by the next view, is counted.

@@ -22328,8 +22328,13 @@ struct ggml_sycl_expert_room_meter {
 // call moved the epoch by into the answer. What is left in a prepared triplet by then is storage the cache did not
 // take: all of it on an exit that moved nothing, and a triplet the cache refused otherwise. It is the one writer of
 // room_self_delta, and it writes after the body's return has copied the rest of the answer, since the last give-back
-// is its own. Declared right after the list and before the first triplet is prepared, so every exit that can hold
-// minted storage passes through it, and the list empties where it always did: after the lock, the latch and the leases.
+// is its own. Declared right after the list and before the first triplet is prepared, so every return and every throw
+// after that gives the list back through it, and the list empties where it always did: after the lock, the latch and
+// the leases. Two releases are not measured. A throw out of the preparation releases the triplet it was preparing as
+// it unwinds, outside the meter. A copy submission that fails part way (the cache's "copy submit failed") leaves the
+// triplet's storage retained by the copies already submitted, which give it back when they complete, after the call.
+// Either moves the epoch outside every measured window, so it reads as room from outside: the admit is sent again,
+// never held when it should not be.
 struct ggml_sycl_expert_prepared_give_back {
     std::vector<ggml_sycl_expert_prepared_triplet> & prepared;
     ggml_sycl_expert_room_meter &                    meter;
@@ -23916,8 +23921,9 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
             ggml_sycl_expert_move_result result;
             const ggml_sycl_txn_result code = ggml_sycl_expert_move_transaction_run(device, request, nullptr, &result);
 
-            // Read as soon as the transaction has returned, with nothing of this thread's freed in between: with how
-            // far the transaction's own give-backs moved it, it tells the step whether the zone gained room meanwhile.
+            // Read as soon as the transaction has returned, with nothing of the transaction's own storage given back
+            // in between: with how far the transaction's own give-backs moved it, it tells the step whether the zone
+            // gained room meanwhile.
             const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;
 
             // Each move's answer comes back in its own list, in list order. The call answers every triplet it was
