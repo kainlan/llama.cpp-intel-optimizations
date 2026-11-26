@@ -35,6 +35,7 @@ WHAT THIS DOES NOT PROVE. It reads text. That the placement and the tokens are u
 
 from __future__ import annotations
 
+import functools
 import re
 import sys
 from pathlib import Path
@@ -131,9 +132,30 @@ class MutantNotApplied(Exception):
     pass
 
 
+# The self-test runs the gate on a mutant of one source at a time, so the pure text functions below are cached by
+# content: the unmutated sources, and what is cut from them, stay cached because every mutant reads them, and a mutated
+# text is used for its one check and evicted. A whole source is a megabytes-long key, so those get a small cache
+# of their own; a hit returns what the same text gave before, so every mutant is still judged on its own text.
+_WHOLE_SOURCE = 1 << 20  # a text this long is a whole source or a whole copy of one, not a body cut from it
+
+
+def content_cache(fn):
+    """Cache `fn` by its leading text argument in two tiers: the few whole-source texts stay hot, and the many short
+    texts cut from them are held in a larger cache whose keys are each under a megabyte."""
+    short = functools.lru_cache(maxsize=256)(fn)
+    whole = functools.lru_cache(maxsize=8)(fn)
+
+    @functools.wraps(fn)
+    def cached(text, *args):
+        return (whole if len(text) >= _WHOLE_SOURCE else short)(text, *args)
+
+    return cached
+
+
 _COMMENT_OR_LITERAL = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.DOTALL)
 
 
+@content_cache
 def blank_comments(text: str) -> str:
     """Comments become spaces (newlines kept); string and character literals stay as they are."""
 
@@ -146,6 +168,7 @@ def blank_comments(text: str) -> str:
     return _COMMENT_OR_LITERAL.sub(repl, text)
 
 
+@content_cache
 def squash(text: str) -> str:
     t = re.sub(r"\s+", " ", text)
     t = re.sub(r"\( ", "(", t)
@@ -177,7 +200,8 @@ def body(code: str, marker: str, pin: str) -> str:
     raise ContractError(f"FAIL [pin {pin}]: the body after `{marker}` is unbalanced")
 
 
-def calls(code: str, name: str) -> list[str]:
+@content_cache
+def calls(code: str, name: str) -> tuple[str, ...]:
     """Each call of `name` in squashed code, as its argument text up to the matching parenthesis."""
     sq = squash(code)
     out = []
@@ -192,7 +216,36 @@ def calls(code: str, name: str) -> list[str]:
             if depth == 0:
                 out.append(sq[m.end() : k])
                 break
-    return out
+    return tuple(out)
+
+
+@content_cache
+def layer_id_variables(code: str) -> tuple[str, ...]:
+    """The names a `moe_cache_layer_id(...)` result is assigned to in `code`. The assignment is found from its literal
+    tail and the name read back from the text before it, so the scan needs no leading word-boundary regex."""
+    sq = squash(code)
+    out = []
+    for m in re.finditer(r"=\s*moe_cache_layer_id\(", sq):
+        var = re.search(r"(\w+)\s*$", sq[max(0, m.start() - 200) : m.start()])
+        if var:
+            out.append(var.group(1))
+    return tuple(out)
+
+
+@content_cache
+def removed_name(text: str) -> tuple[str, int] | None:
+    """The first removed word, then the first removed log tag, in `text`, with its byte offset; None if it has none. A
+    word is scanned without a leading \\b, so the regex engine can search for the literal and the boundary before it
+    is read off the match."""
+    for word in REMOVED_WORDS:
+        for m in re.finditer(re.escape(word) + r"\b", text):
+            if m.start() == 0 or not (text[m.start() - 1].isalnum() or text[m.start() - 1] == "_"):
+                return word, m.start()
+    for tag in REMOVED_TAGS:
+        at = text.find(tag)
+        if at >= 0:
+            return tag, at
+    return None
 
 
 def check(raws: dict[str, str]) -> None:
@@ -200,16 +253,12 @@ def check(raws: dict[str, str]) -> None:
 
     # L1: nothing of the removed mechanisms survives, in code or in comments.
     for name, text in raws.items():
-        for word in REMOVED_WORDS:
-            m = re.search(r"\b" + re.escape(word) + r"\b", text)
-            if m:
-                line = text.count("\n", 0, m.start()) + 1
-                raise ContractError(f"FAIL [pin L1]: removed name `{word}` is still in {name}:{line}")
-        for tag in REMOVED_TAGS:
-            at = text.find(tag)
-            if at >= 0:
-                line = text.count("\n", 0, at) + 1
-                raise ContractError(f"FAIL [pin L1]: removed log tag `{tag}` is still in {name}:{line}")
+        found = removed_name(text)
+        if found:
+            what, at = found
+            kind = "log tag" if what in REMOVED_TAGS else "name"
+            line = text.count("\n", 0, at) + 1
+            raise ContractError(f"FAIL [pin L1]: removed {kind} `{what}` is still in {name}:{line}")
 
     # L2: the rank API the planner reads is declared, defined and read.
     hpp = squash(code[CACHE_HPP])
@@ -242,9 +291,7 @@ def check(raws: dict[str, str]) -> None:
         for args in calls(code[name], "get_expert_popularity_rank"):
             if "moe_cache_layer_id" in args or "hash" in args:
                 raise ContractError(f"FAIL [pin L4]: {name} looks a rank up under a hash layer id: `({args})`")
-        sq = squash(code[name])
-        for m in re.finditer(r"\b(\w+)\s*=\s*moe_cache_layer_id\(", sq):
-            var = m.group(1)
+        for var in layer_id_variables(code[name]):
             for args in calls(code[name], "get_expert_popularity_rank"):
                 if re.search(r"\b" + re.escape(var) + r"\b", args):
                     raise ContractError(f"FAIL [pin L4]: {name} looks a rank up under `{var}`, a moe_cache_layer_id")

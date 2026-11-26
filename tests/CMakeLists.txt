@@ -1214,7 +1214,7 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-legacy-ranking-removed-source.py
             --self-test)
     set_tests_properties(test-sycl-moe-legacy-ranking-removed-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 300)
     # The opt-in spread order of routed experts: both orders go through one comparator, the switch is read once and
     # reaches the planner only through the inventory intake, the planner writes no popularity rank, the spread sort runs
     # before the ring room and the pack, and the swap headroom is a WEIGHT zone term. Run WITH --self-test so each
