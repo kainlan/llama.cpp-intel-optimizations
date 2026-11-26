@@ -116,9 +116,9 @@ struct rig {
     uint64_t                                room_epoch        = 0;
     uint64_t                                txn_self_moves    = 0;
     uint64_t                                txn_outside_moves = 0;
-    moe_swap_txn_cost                       txn_cost;                     // what the next transaction reports it cost
-    const uint64_t *                        counts_decode_at  = nullptr;  // the arrays the counts callback was handed
-    const uint64_t *                        counts_prompt_at  = nullptr;
+    moe_swap_txn_cost                       txn_cost;                    // what the next transaction reports it cost
+    const uint64_t *                        counts_decode_at = nullptr;  // the arrays the counts callback was handed
+    const uint64_t *                        counts_prompt_at = nullptr;
     moe_swap_driver_state                   d;
 
     rig(int n_blocks, int n_experts, int resident_per_block, const moe_swap_params & p = moe_swap_params{}) :
@@ -1274,7 +1274,6 @@ static void test_a_throw_leaves_a_held_admit_pending() {
     CHECK(reasons(r.d.stats.busy, ggml_sycl::MOE_SWAP_UNSETTLED_REASON) == 1);
 }
 
-// The zone-refusal line names its five figures, the sizes in bytes, under the driver's prefix.
 // What a transaction moved is recorded without allocating: the step reserves the lists it records into before it sends
 // the batch, since a moved triplet cannot be taken back and an allocation that failed after the move would leave the
 // driver not knowing it moved. Every allocation fails from the moment the transaction has answered. The batch holds a
@@ -1336,6 +1335,7 @@ static void test_the_admit_batch_is_recorded_without_allocating() {
     }
 }
 
+// The zone-refusal line names its five figures, the sizes in bytes, under the driver's prefix.
 static void test_the_zone_refusal_line_names_its_figures() {
     const std::string line = ggml_sycl::moe_swap_zone_refusal_line(1, 276, 300, 3145728, 1048576, 524288);
     CHECK(line ==

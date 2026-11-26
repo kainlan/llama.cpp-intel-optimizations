@@ -9646,8 +9646,8 @@ static unified_cache_key make_direct_stage_key(cache_entry_type           type,
 }
 
 // The two keys an expert's id is resolved by as it moves between the card and the host: its device entry's (the AOS
-// layout, which every named move and loan stages) and a host copy's. The loan, its rollback and the restore name them
-// alike, so they are named here once.
+// layout, which every named move and loan stages) and a host copy's. The loan's checks, its rollback and the restore
+// name them through these.
 static unified_cache_key expert_device_key(const ggml_sycl_cache_id & id) {
     return make_direct_stage_key(cache_entry_type::MOE_EXPERT, id, GGML_LAYOUT_AOS);
 }
@@ -11607,8 +11607,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
         std::lock(direct_lock, cache_lock);
         for (int i = 0; i < 3 && !refusal; ++i) {
-            const auto it =
-                entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS));
+            const auto it = entries_.find(expert_device_key(members[i].key));
             if (it == entries_.end() || it->second.retired || !it->second.device_ptr ||
                 it->second.state == cache_entry_state::EVICTING || it->second.state == cache_entry_state::FAILED) {
                 refusal = "not resident";
@@ -11659,8 +11658,8 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             // owner's and stays until that owner withdraws it, so "host entry exists" comes back at every retry. The
             // registration below refuses the same, so an entry that appears after this check fails the loan whole
             // instead of being replaced.
-            for (const ggml_sycl_cache_id & host_key : members[i].host_keys) {
-                const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 });
+            for (const ggml_sycl_cache_id & host_id : members[i].host_keys) {
+                const auto host = entries_.find(expert_host_key(host_id));
                 if (host != entries_.end()) {
                     refusal = host->second.retired ? "host entry retiring" : "host entry exists";
                     break;

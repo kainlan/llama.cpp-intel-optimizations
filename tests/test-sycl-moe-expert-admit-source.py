@@ -80,7 +80,9 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
       host-resident entry out, so retired_by_expert_move is set only on the device entries an evict retires, and the
       copy to the device never names it;
   M1  a named move's one result line is a DEBUG line with no timings; what the move cost the boundary thread is the
-      answer's instead, written on every exit, a throw included, by the guard that also writes the room figure: the
+      answer's instead, written to the body's answer on every exit by the guard that also writes the room figure (a
+      transaction that threw is neither reported, since the entry rethrows before it copies the answer, nor counted
+      by the swap driver): the
       microseconds the cache spent in each move's copy step and in its id handover and retire, the transaction in the
       members' metadata lookups, and the call's whole time from its first statement. Each cache body, the loan's and
       the copy to the device, records its two times in the move record, the preparation times its resolver call, and
@@ -757,8 +759,9 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("cost-not-written", "M1", [("sycl", "", "answer->remap_us        = remap_us;", "")])
     PAD = " " * 27
     expect_fail("cost-guard-before-its-counters", "M1",
-                [("sycl", TXN_SIG, "    uint64_t%s meta_us  = 0;\n    uint64_t%s copy_us  = 0;\n    uint64_t%s remap_us = 0;\n"
-                   % (PAD, PAD, PAD), ""),
+                [("sycl", TXN_SIG,
+                  "    uint64_t%s meta_us  = 0;\n    uint64_t%s copy_us  = 0;\n    uint64_t%s remap_us = 0;\n"
+                  % (PAD, PAD, PAD), ""),
                  ("sycl", TXN_SIG, "    const char * stop      = nullptr;\n",
                   "    const char * stop      = nullptr;\n    uint64_t meta_us = 0;\n    uint64_t copy_us = 0;\n"
                   "    uint64_t remap_us = 0;\n")])

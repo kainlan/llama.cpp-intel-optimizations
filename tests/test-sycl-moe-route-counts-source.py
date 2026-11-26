@@ -214,24 +214,34 @@ def squash(text: str) -> str:
 
 
 def without_private_testing(text: str) -> str:
-    """`text` with each `#if defined(GGML_SYCL_PRIVATE_TESTING)` region blanked, newlines kept, so the pins read what
-    production runs: the private device tests count into a table and take it from the registry on purpose."""
+    """`text` with the PRIVATE_TESTING arm of each `#if defined(GGML_SYCL_PRIVATE_TESTING)` blanked, newlines kept, so
+    the pins read what production runs: the private device tests count into a table and take it from the registry on
+    purpose. The arm after a depth-1 `#else` or `#elif` is production code and is kept."""
     out: list[str] = []
-    depth = 0  # nesting of conditionals inside the private region; 0 outside it
+    depth = 0  # nesting of conditionals inside the conditional being read; 0 outside any private conditional
+    keep = False  # inside the `#else`/`#elif` arm of a private conditional
     for line in text.split("\n"):
         stripped = line.strip()
         if depth == 0:
             if re.match(r"#\s*if\s+defined\(GGML_SYCL_PRIVATE_TESTING\)\s*$", stripped):
-                depth = 1
+                depth, keep = 1, False
                 out.append("")
             else:
                 out.append(line)
             continue
         if re.match(r"#\s*if", stripped):
             depth += 1
+        elif re.match(r"#\s*(else|elif)\b", stripped) and depth == 1:
+            keep = True
+            out.append("")
+            continue
         elif re.match(r"#\s*endif", stripped):
             depth -= 1
-        out.append("")
+            if depth == 0:
+                keep = False
+                out.append("")
+                continue
+        out.append(line if keep else "")
     return "\n".join(out)
 
 
@@ -625,6 +635,13 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    record->route_counts = ggml_sycl::moe_route_counts_current(device);",
                   "    record->route_counts = ggml_sycl::moe_route_counts_current(device);\n"
                   "        (void) ggml_sycl::moe_route_counts_current(device);")])
+    anchor = "    record->route_counts = ggml_sycl::moe_route_counts_current(device);"
+    expect_fail("table-taken-in-the-else-arm-of-a-private-block", "P10", B,
+                [(anchor, anchor + "\n#if defined(GGML_SYCL_PRIVATE_TESTING)\n        (void) 0;\n#else\n"
+                  "        (void) ggml_sycl::moe_route_counts_current(device);\n#endif")])
+    expect_fail("table-taken-in-a-nested-block-of-the-else-arm", "P10", B,
+                [(anchor, anchor + "\n#if defined(GGML_SYCL_PRIVATE_TESTING)\n        (void) 0;\n#else\n#ifdef X\n"
+                  "#endif\n        (void) ggml_sycl::moe_route_counts_current(device);\n#endif")])
     expect_fail("header-reaches-sycl", "P11", "header",
                 [("namespace ggml_sycl {\n\nclass moe_route_counts {",
                   "namespace ggml_sycl {\n\ninline void* dev_alloc(sycl::queue& q) { return sycl::malloc_host(8, q); }\n"

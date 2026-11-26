@@ -254,8 +254,8 @@ METER_MEASURE = ("const uint64_t before = cache->zone_room_epoch(ggml_sycl::vram
 GIVE_BACK_FIELDS = ("meter.give_back([this] { prepared.clear(); });", "answer->room_self_delta = meter.moved;",
                     "answer->total_us = ggml_sycl::expert_move_us_since(start);")
 GIVE_BACK_DECL = ("ggml_sycl_expert_room_meter room_meter{ named ? cache : nullptr }; "
-                  "ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, meta_us, "
-                  "copy_us, remap_us, txn_start };")
+                  "ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, "
+                  "meta_us, copy_us, remap_us, txn_start };")
 PREPARE_CALL = "stop = ggml_sycl_expert_prepare_triplet("
 REFUSED_GIVE_BACK = ("room_meter.give_back([&triplet] { for (ggml_sycl::expert_move_member & m : triplet.members) { "
                      "m.owner = ggml_sycl::mem_handle{}; } });")
@@ -268,7 +268,8 @@ COUNT_COST = ("moe_swap_detail::moe_swap_count_cost(st, room.cost);",
 EPOCH_AFTER_READ = ("ggml_sycl_expert_move_transaction_run(device, request, resolver, &result); "
                     "const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;")
 TXN_ROOM_RETURN = ("const ggml_sycl::moe_swap_txn_cost cost{ result.copy_us, result.remap_us, result.meta_us, "
-                   "result.total_us }; return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };")
+                   "result.total_us }; "
+                   "return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };")
 ROOM_STOOD_BODY = "return room.epoch_after - before == room.self_delta;"
 ADMIT_TXN = "const moe_swap_txn_room room = txn(d.batch);"
 ROOM_STOOD_USE = "const bool room_stood = moe_swap_detail::moe_swap_room_stood(c.room_epoch, room);"
@@ -747,9 +748,10 @@ def check(raw: dict[str, str]) -> None:
             or sycl.count("moe_swap_txn_room{") != 1):
         fail("D20", "the transaction callback does not read the room epoch right after the transaction returns and "
                     "return it with the transaction's own sum")
-    if any(norm(driver).count(c) != 1 for c in COUNT_COST) or norm(driver).count("inline void moe_swap_count_cost(") != 1:
-        fail("D20", "the step does not sum each transaction's cost into the stats once, at the admit transaction and at "
-                    "the evict one")
+    if (any(norm(driver).count(c) != 1 for c in COUNT_COST)
+            or norm(driver).count("inline void moe_swap_count_cost(") != 1):
+        fail("D20", "the step does not sum each transaction's cost into the stats once, at the admit transaction "
+                    "and at the evict one")
     if norm(body(driver, ROOM_STOOD_SIG)).count(ROOM_STOOD_BODY) != 1:
         fail("D20", "moe_swap_room_stood does not compare the epoch's move since the boundary's read with the "
                     "transaction's own sum")
@@ -855,7 +857,8 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", CALLER_SIG, "if (!ggml_sycl_moe_swap_enabled()) {",
                   "std::lock_guard held(g_tensor_inventory_mutex);\n    if (!ggml_sycl_moe_swap_enabled()) {")])
     expect_fail("lock-across-the-step-in-the-claimed-body", "D4",
-                [("sycl", CORE_SIG, "ggml_sycl_moe_swap_instance &                      inst  = g_sycl_moe_swap[device];",
+                [("sycl", CORE_SIG,
+                  "ggml_sycl_moe_swap_instance &                      inst  = g_sycl_moe_swap[device];",
                   "std::lock_guard held(g_tensor_inventory_mutex);\n    "
                   "ggml_sycl_moe_swap_instance &                      inst  = g_sycl_moe_swap[device];")])
     expect_fail("bare-lock", "D4",
@@ -982,7 +985,8 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", WARN_SIG, "if (m.outcome != ggml_sycl::MOE_SWAP_MOVE_REFUSED) {", "if (false) {")])
     expect_fail("refusal-at-info", "D12",
                 [("sycl", WARN_SIG, "GGML_LOG_WARN(", "GGML_LOG_INFO(")])
-    expect_fail("refusal-not-logged", "D12", [("sycl", CORE_SIG, "ggml_sycl_moe_swap_warn_refusal(inst, device, m);", "")])
+    expect_fail("refusal-not-logged", "D12",
+                [("sycl", CORE_SIG, "ggml_sycl_moe_swap_warn_refusal(inst, device, m);", "")])
     expect_fail("warned-set-cleared-elsewhere", "D12",
                 [("sycl", REPORT_SIG, "ggml_sycl_moe_swap_fold(inst);",
                   "inst.refusals_warned_evict.clear();\n    ggml_sycl_moe_swap_fold(inst);")])
@@ -1063,12 +1067,13 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", TXN_SIG, "room_meter.give_back([&triplet] {", "std::invoke([&triplet] {")])
     expect_fail("prepared-list-given-back-unmeasured", "D20",
                 [("sycl", GIVE_BACK_SIG, "meter.give_back([this] { prepared.clear(); });", "prepared.clear();")])
-    guard_decl = ("    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, meta_us, "
-                  "copy_us,\n"
+    guard_decl = ("    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, "
+                  "meta_us, copy_us,\n"
                   "                                                   remap_us, txn_start };\n")
     after_preparation = "    if (named && prepared.empty()) {\n"
     expect_fail("give-back-guard-declared-after-the-preparation", "D20",
-                [("sycl", TXN_SIG, guard_decl, ""), ("sycl", TXN_SIG, after_preparation, guard_decl + after_preparation)])
+                [("sycl", TXN_SIG, guard_decl, ""),
+                 ("sycl", TXN_SIG, after_preparation, guard_decl + after_preparation)])
     expect_fail("self-delta-not-written-to-the-answer", "D20",
                 [("sycl", GIVE_BACK_SIG, "answer->room_self_delta = meter.moved;", "(void) answer;")])
     expect_fail("self-delta-not-carried-by-the-entry", "D20",
@@ -1080,8 +1085,9 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("self-delta-not-returned", "D20",
                 [("sycl", CORE_SIG, "{ epoch_after, result.room_self_delta, cost }", "{ epoch_after, 0, cost }")])
     expect_fail("admit-cost-not-counted", "D20", [("driver", "", "        " + COUNT_COST[0] + "\n", "")])
-    expect_fail("evict-cost-not-counted", "D20", [("driver", "", "    " + COUNT_COST[1] + "\n    for (size_t i = 0; i < keep",
-                                                    "    for (size_t i = 0; i < keep")])
+    expect_fail("evict-cost-not-counted", "D20",
+                [("driver", "", "    " + COUNT_COST[1] + "\n    for (size_t i = 0; i < keep",
+                  "    for (size_t i = 0; i < keep")])
     expect_fail("cost-not-returned", "D20",
                 [("sycl", CORE_SIG, "{ epoch_after, result.room_self_delta, cost }",
                   "{ epoch_after, result.room_self_delta, {} }")])

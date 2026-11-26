@@ -22344,9 +22344,10 @@ struct ggml_sycl_expert_prepared_give_back {
     std::vector<ggml_sycl_expert_prepared_triplet> & prepared;
     ggml_sycl_expert_room_meter &                    meter;
     ggml_sycl_expert_loan_result *                   answer;
-    // A named move's cost to the boundary thread, written with the room figure on every exit: the batch's host time
-    // the transaction counts (the members' metadata lookups, the cache's copy submissions and id handovers) and the
-    // time since `start`, which includes this release of the leases.
+    // A named move's cost to the boundary thread, written to the body's answer with the room figure on every exit: the
+    // batch's host time the transaction counts (the members' metadata lookups, the cache's copy submissions and id
+    // handovers) and the time since `start`, which includes this release of the leases. On a throw the entry never
+    // copies that answer on, so a transaction that threw is neither reported nor counted.
     const uint64_t &                                 meta_us;
     const uint64_t &                                 copy_us;
     const uint64_t &                                 remap_us;
@@ -23141,7 +23142,9 @@ struct ggml_sycl_expert_move_result {
     size_t                                     bytes_admitted  = 0;  // device storage the admitted triplets took
     // How far the call's own give-backs moved the device WEIGHT zone's room epoch (ggml_sycl_expert_room_meter).
     uint64_t                                   room_self_delta = 0;
-    // The call's cost to the boundary thread, in microseconds, as a call that was refused or threw reports it too.
+    // The call's cost to the boundary thread, in microseconds, as a refused call reports it too. A call that threw
+    // reports none of it: the entry rethrows before it copies the answer, and the swap driver counts a transaction
+    // only once it has returned.
     uint64_t                                   meta_us         = 0;
     uint64_t                                   copy_us         = 0;
     uint64_t                                   remap_us        = 0;

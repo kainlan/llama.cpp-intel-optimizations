@@ -384,7 +384,7 @@ def claim_registration_catches_everything(cache: str) -> bool:
 LOAD_EFFECT = 'if (acquire_bound_load_effect().failed()) { out.reason = "load effect unavailable"; return false; }'
 COHERENCE = ("if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) "
              '{ out.reason = "plan not coherent"; return false; }')
-HOST_EXISTS = ("const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }); "
+HOST_EXISTS = ("const auto host = entries_.find(expert_host_key(host_id)); "
                "if (host != entries_.end()) { "
                'refusal = host->second.retired ? "host entry retiring" : "host entry exists"; break; }')
 REFUSE_EARLY = "if (refusal) { out.reason = refusal; return false; }"
@@ -1710,6 +1710,30 @@ def test_mutant_rollback_takes_the_id_from_another_registrant_fails():
         _once_in(CACHE, HAND_BACK_SIG, " && !held_by_another", ""))
 
 
+def claim_the_loan_names_its_keys_through_the_helpers(cache: str) -> bool:
+    """The loan's checks, hand-over, rollback and restore build no key by hand: a second spelling of the device entry's
+    layout or of the host key's sentinels is one a helper edit would leave behind."""
+    loan = body(norm(cache), LOAN_SIG)
+    return (bool(loan) and "make_direct_stage_key(" not in loan and "cache_entry_type::MOE_EXPERT" not in loan
+            and loan.count("expert_device_key(") >= 4 and loan.count("expert_host_key(") >= 3)
+
+
+def test_the_loan_names_its_keys_through_the_helpers():
+    assert claim_the_loan_names_its_keys_through_the_helpers(CACHE)
+
+
+def test_mutant_loan_spells_the_device_key_by_hand_fails():
+    assert not claim_the_loan_names_its_keys_through_the_helpers(
+        _once_in(CACHE, LOAN_SIG, "entries_.find(expert_device_key(members[i].key))",
+                 "entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS))"))
+
+
+def test_mutant_loan_spells_the_host_key_by_hand_fails():
+    assert not claim_the_loan_names_its_keys_through_the_helpers(
+        _once_in(CACHE, LOAN_SIG, "entries_.find(expert_host_key(host_id))",
+                 "entries_.find({ cache_entry_type::MOE_EXPERT, host_id, -1, -1 })"))
+
+
 def test_mutant_hand_over_moves_whatever_the_id_names_fails():
     """The id handed over from an entry it no longer names would point a reader at the host key of a stale copy."""
     assert not claim_the_evict_hands_the_id_over_before_it_retires(
@@ -2130,7 +2154,7 @@ def test_mutant_existing_host_entry_unchecked_fails():
 def test_mutant_idle_host_entry_let_through_fails():
     """Refusing only a retired or leased host entry lets an idle one through to be replaced, storage and all, by a
     registration the loan could not undo."""
-    busy_only = ("const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }); "
+    busy_only = ("const auto host = entries_.find(expert_host_key(host_id)); "
                  "if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) { "
                  'refusal = host->second.retired ? "host entry retiring" : "host entry exists"; break; }')
     assert not claim_existing_host_entry_never_replaced(_once(CACHE, HOST_EXISTS, busy_only), SYCL)
@@ -3842,7 +3866,8 @@ def test_mutant_loan_retire_left_unmarked_fails():
 def test_mutant_admit_marks_its_host_retire_fails():
     """A host copy is host-resident, so the latch never counted it: the mark there is dead code that reads as a rule."""
     assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(
-        _once_in(CACHE, REFILL_BODY_SIG, HOST_RETIRE_CALL, "host->second.retired_by_expert_move = true; " + HOST_RETIRE_CALL),
+        _once_in(CACHE, REFILL_BODY_SIG, HOST_RETIRE_CALL,
+                 "host->second.retired_by_expert_move = true; " + HOST_RETIRE_CALL),
         CACHE_HPP)
 
 

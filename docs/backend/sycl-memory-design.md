@@ -370,10 +370,15 @@ of an entry the cache evicts, and it turns off graph replay and persistent TG un
 pointers that nothing then replays. Two retires are left out of it. A named evict's device entries carry
 `retired_by_expert_move`, which the loan body sets on each as it retires them and a restore clears; their reap leaves
 the latch alone. A host copy never needed the mark: the latch is set only for a device entry that is not host
-resident. The exemption is sound for three reasons, and it holds only while all three do:
-- Every exec graph that may bake a moved expert's pointer is dropped before it replays. The move publishes its plan
-  through the swap, and that publication bumps the exec-graph epoch, which every coexisting context compares before
-  its next replay.
+resident. The exemption is sound for four reasons, and it holds only while all four do:
+- Every recording that may bake a moved expert's pointer is dropped before it replays. The move publishes its plan
+  through the swap, and that publication bumps the exec-graph epoch. Each context compares the epoch at its next graph
+  compute (`optional_layout_epoch`) and, when it differs, drops its whole-graph recording (`exec_graph`), its valid
+  MoE segments and its block graphs. Those are the recordings that can name an expert's address.
+- The keyed decode slots survive that bump, and they hold no expert's address. A keyed split records every
+  `MUL_MAT_ID` as a direct boundary, outside its recorded segments, and that node resolves its experts at each call.
+  "Every recording that may bake a pointer is dropped" is true only because of this: the slots the check leaves
+  alone cannot bake one.
 - Persistent TG never holds an expert's pointer. It refuses every graph with a `MUL_MAT_ID`, so it re-resolves nothing
   of an expert's between tokens.
 - The reap does not run before the bump. The retired entries' leases go to the transaction, which drops them only

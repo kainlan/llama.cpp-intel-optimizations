@@ -2,8 +2,9 @@
 // policy's answer, as a pure function of a plan view, the route counters and the policy state. No SYCL, no ggml, no
 // cache, no logging, no environment and no state outside moe_swap_driver_state, which the caller owns, one per route
 // table. The caller (ggml_sycl_run_expert_swap_at_boundary in ggml-sycl.cpp gates the boundary; its claimed body
-// ggml_sycl_run_expert_swap_claimed) builds the view from the published plan (moe_swap_plan_view_build, moe-stream-plan.hpp), and passes three callables: one that copies
-// the route counters, one that reads the host room, one that runs the named move.
+// ggml_sycl_run_expert_swap_claimed) builds the view from the published plan (moe_swap_plan_view_build,
+// moe-stream-plan.hpp), and passes three callables: one that copies the route counters, one that reads the host room,
+// one that runs the named move.
 //
 // One boundary sends one transaction at most, never both directions:
 //   - Pending admits first. Each evict that moved leaves its admit pending, and the next boundary sends every pending
@@ -279,8 +280,9 @@ struct moe_swap_driver_stats {
     uint64_t                           settled_moved            = 0;  // their moves the next view showed had moved
     uint64_t                           unsettled_moves          = 0;  // moves of a thrown batch not settled yet
     uint32_t                           pending_high_water       = 0;
-    uint64_t                           txn_sent                 = 0;  // transactions sent, accepted or not
-    uint64_t                           txn_copy_us              = 0;  // their cost to the boundary thread
+    // Transactions sent, accepted or refused (one that threw is not counted), and their cost to the boundary thread.
+    uint64_t                           txn_sent                 = 0;
+    uint64_t                           txn_copy_us              = 0;
     uint64_t                           txn_remap_us             = 0;
     uint64_t                           txn_meta_us              = 0;
     uint64_t                           txn_total_us             = 0;
@@ -368,7 +370,8 @@ inline void moe_swap_driver_note_off(moe_swap_driver_state & d, const char * rea
 
 namespace moe_swap_detail {
 
-// One transaction's cost, summed into the stats whatever its answer was: a refused one still took the time.
+// One transaction's cost, summed into the stats whatever its answer was: a refused one still took the time. A
+// transaction that threw returns nothing to sum, so it is neither reported nor counted.
 inline void moe_swap_count_cost(moe_swap_driver_stats & st, const moe_swap_txn_cost & c) {
     ++st.txn_sent;
     st.txn_copy_us += c.copy_us;
