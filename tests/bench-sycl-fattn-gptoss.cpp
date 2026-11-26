@@ -232,6 +232,8 @@ static const char * onednn_reason_name(ggml_sycl_onednn_fa_layout_reason reason)
             return "SINKS_UNSUPPORTED";
         case ggml_sycl_onednn_fa_layout_reason::SOFTCAP_UNSUPPORTED:
             return "SOFTCAP_UNSUPPORTED";
+        case ggml_sycl_onednn_fa_layout_reason::MAX_BIAS_UNSUPPORTED:
+            return "MAX_BIAS_UNSUPPORTED";
         case ggml_sycl_onednn_fa_layout_reason::FP8_KV_UNSUPPORTED:
             return "FP8_KV_UNSUPPORTED";
         case ggml_sycl_onednn_fa_layout_reason::MULTI_SEQ_UNSUPPORTED:
@@ -256,6 +258,10 @@ static const char * onednn_reason_name(ggml_sycl_onednn_fa_layout_reason reason)
             return "V_TYPE_UNSUPPORTED";
         case ggml_sycl_onednn_fa_layout_reason::MASK_TYPE_UNSUPPORTED:
             return "MASK_TYPE_UNSUPPORTED";
+        case ggml_sycl_onednn_fa_layout_reason::MASK_PER_HEAD_UNSUPPORTED:
+            return "MASK_PER_HEAD_UNSUPPORTED";
+        case ggml_sycl_onednn_fa_layout_reason::SCALE_UNSUPPORTED:
+            return "SCALE_UNSUPPORTED";
     }
     return "UNKNOWN";
 }

@@ -230,6 +230,25 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
     if (params.mask && params.mask_type != GGML_TYPE_F16 && params.mask_type != GGML_TYPE_F32) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::MASK_TYPE_UNSUPPORTED);
     }
+    // A mask with a head axis (ne32 > 1) holds a different bias per Q head,
+    // which ggml applies as head % ne32. The SDPA graph below describes the
+    // mask with extent 1 on every head axis, so such a mask would get head 0's
+    // rows on every head: silently wrong attention (llama.cpp-44d0).
+    // Inkling 2 Mini builds this shape (a per-head relative-position bias
+    // folded into the mask, src/llama-graph.cpp), but its node also carries
+    // sinks and is declined earlier, by SINKS_UNSUPPORTED; this check is what
+    // stops a sinks-free per-head mask.
+    // Declining is the chosen simple form, not the only possible one: the
+    // descriptor could take a real head extent and stride for some shapes
+    // (ne32 == H_q, or ne32 == N_rep in the 5-D GQA view), each of which would
+    // need its own device verification. The fallback kernels index the mask
+    // by head % ne32 (xmx_v2 and tile_f16; tile_d512 since llama.cpp-44d0's
+    // fattn-tile.hpp fix). ne32 is 0 when there is no mask, hence the pointer
+    // test. The mask's sequence axis (ne33) needs no check here: anything but
+    // 1 is BATCH_UNSUPPORTED above.
+    if (params.mask && params.ne32 != 1) {
+        return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::MASK_PER_HEAD_UNSUPPORTED);
+    }
 
     // oneDNN Graph SDPA can represent MHA as 4-D (batch,H,S,D) and GQA/MQA as
     // 5-D (batch,H_kv,N_rep,S,D). The direct GQA/MQA path still requires a
@@ -771,9 +790,12 @@ static build_result build_and_compile_sdpa(const sdpa_shape_key & key, const dnn
     //
     // We only derive m_s1 (element stride along the ncols axis). A per-head
     // stride m_s2 was intentionally dropped: the oneDNN logical_tensor dims
-    // we emit have extent 1 on every head axis (ggml carries a non-per-head
-    // mask with ne32=1, which is the only shape this dispatch path serves),
-    // and the canonical oneDNN expression for a broadcast/extent-1 dim is
+    // we emit have extent 1 on every head axis. That is correct only because
+    // the planner admits nothing but a head-broadcast mask (ne32 == 1) and a
+    // single sequence (ne33 == 1); a per-head mask is declined there as
+    // MASK_PER_HEAD_UNSUPPORTED (llama.cpp-44d0). Lifting that decline needs
+    // a real head extent and stride here first.
+    // The canonical oneDNN expression for a broadcast/extent-1 dim is
     // stride = 0 (see /opt/intel/oneapi/dnnl/2025.3/share/doc/dnnl/examples/
     // {gqa,sdpa}.cpp which use layout_type::strided + the natural dense
     // extent-1 stride). oneDNN never multiplies an extent-1 dim by its
