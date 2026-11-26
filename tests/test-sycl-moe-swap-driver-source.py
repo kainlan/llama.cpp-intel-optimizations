@@ -72,7 +72,17 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       answers that carry a refused size and keeps the largest, and after its loop over the batch, on that count alone
       (so a batch that moved nothing prints it too, and no admit prints its own), calls
       ggml_sycl_moe_swap_warn_zone_refusal once with the admits it sent; the helper reads the WEIGHT zone's free
-      figures together (unified_cache::zone_free_figures) and logs moe_swap_zone_refusal_line at WARN.
+      figures together (unified_cache::zone_free_figures) and logs moe_swap_zone_refusal_line at WARN;
+  D20 the hold takes the transaction's own give-backs out of the epoch's move. A transaction that gives back storage
+      it took moves the room epoch with no room gained, so an unmeasured give-back sends the refused admit again at
+      every boundary. The meter (ggml_sycl_expert_room_meter) reads the WEIGHT zone's epoch right before and right
+      after a give-back and sums the moves; the named move measures both of its give-backs with it: a refused
+      triplet's minted members, in the named-refusal branch, and the prepared list, in a guard declared before the
+      first triplet is prepared, which is the one writer of the answer's room_self_delta; the entry carries the sum;
+      the callback reads the epoch right after the transaction returns and returns it with the sum; and the step
+      holds a refused admit, and lets a held one follow the epoch, only when moe_swap_room_stood says the epoch's
+      move since the boundary's read is that sum, under the epoch the transaction left. No host test runs the
+      transaction's side of this, so the text is its only gate here.
 
 Checks run on comment-stripped text, string literals kept. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
@@ -195,6 +205,30 @@ ZONE_WARN_FIELDS = ("(void) cache->zone_free_figures(ggml_sycl::vram_zone_id::WE
                     "largest_free);",
                     'GGML_LOG_WARN("%s\\n", ggml_sycl::moe_swap_zone_refusal_line(device, refused, admits, asked, '
                     "available, largest_free).c_str());")
+METER_SIG = "struct ggml_sycl_expert_room_meter {"
+GIVE_BACK_SIG = "struct ggml_sycl_expert_prepared_give_back {"
+ENTRY_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run("
+ROOM_STOOD_SIG = "inline bool moe_swap_room_stood("
+METER_MEASURE = ("const uint64_t before = cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT); release(); "
+                 "moved += cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) - before;")
+GIVE_BACK_FIELDS = ("meter.give_back([this] { prepared.clear(); });", "answer->room_self_delta = meter.moved;")
+GIVE_BACK_DECL = ("ggml_sycl_expert_room_meter room_meter{ named ? cache : nullptr }; "
+                  "ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr };")
+PREPARE_CALL = "stop = ggml_sycl_expert_prepare_triplet("
+REFUSED_GIVE_BACK = ("room_meter.give_back([&triplet] { for (ggml_sycl::expert_move_member & m : triplet.members) { "
+                     "m.owner = ggml_sycl::mem_handle{}; } });")
+REFILL_BRANCH = "} else if (refill && !transient) {"
+ENTRY_SELF_DELTA = "r.room_self_delta = answer.room_self_delta;"
+# The read comes right after the transaction's call, with nothing between them.
+EPOCH_AFTER_READ = ("ggml_sycl_expert_move_transaction_run(device, request, nullptr, &result); "
+                    "const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;")
+TXN_ROOM_RETURN = "return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta };"
+ROOM_STOOD_BODY = "return room.epoch_after - before == room.self_delta;"
+ADMIT_TXN = "const moe_swap_txn_room room = txn(d.batch);"
+ROOM_STOOD_USE = "const bool room_stood = moe_swap_detail::moe_swap_room_stood(c.room_epoch, room);"
+HELD_FOLLOWS = "p.room_epoch = room_stood ? room.epoch_after : p.room_epoch;"
+HOLD_SET = ("p.room_held = m.busy_cause == MOE_SWAP_BUSY_CAUSE_ZONE_ROOM && room_stood; "
+            "p.room_epoch = room.epoch_after;")
 
 WAITS = re.compile(
     r"(?:\.|->)\s*wait\s*\(|\bwait_and_throw\b|\bdrain_retained_handles\b|\bwait_all\b|\bcommand_execution_status\b|"
@@ -572,8 +606,9 @@ def check(raw: dict[str, str]) -> None:
         prev = at + len(TXN_CALL)
 
     # D18 --------------------------------------------------------------------------------------------------------------
-    if norm(caller[:step_at]).count(ROOM_EPOCH_READ) != 1 or "room_epoch" in callback:
-        fail("D18", "the caller does not hand the step the WEIGHT zone's room epoch, read once before the step")
+    if norm(caller[:step_at]).count(ROOM_EPOCH_READ) != 1 or "call.room_epoch" in callback:
+        fail("D18", "the caller does not hand the step the WEIGHT zone's room epoch, read once before the step and "
+                    "left as read by the callback")
     if norm(callback).count(BUSY_CAUSE_SET) != 1 or sycl.count("busy_cause") != 1:
         fail("D18", "the transaction callback does not give each answered move its busy cause from the outcome's "
                     "zone_room, in one place")
@@ -597,6 +632,37 @@ def check(raw: dict[str, str]) -> None:
             ZONE_WARN_FIELDS[1], ""):
         fail("D19", "ggml_sycl_moe_swap_warn_zone_refusal does not log moe_swap_zone_refusal_line at WARN with the "
                     "WEIGHT zone's free figures read together")
+
+    # D20 --------------------------------------------------------------------------------------------------------------
+    txn = norm(body(sycl, TXN_SIG))
+    give_back = norm(body(sycl, GIVE_BACK_SIG))
+    if norm(body(sycl, METER_SIG)).count(METER_MEASURE) != 1:
+        fail("D20", "the room meter does not read the WEIGHT zone's room epoch right before and right after a "
+                    "give-back and sum the move")
+    if (not all(give_back.count(f) == 1 for f in GIVE_BACK_FIELDS)
+            or len(re.findall(r"\broom_self_delta\s*=(?!=)", sycl)) != 4):
+        fail("D20", "the prepared list is not given back measured by a guard that then writes the answer's "
+                    "room_self_delta, the one place it is written besides the entry's copy")
+    if txn.count(GIVE_BACK_DECL) != 1 or not ordered(txn, "prepared.reserve(n_selected);", GIVE_BACK_DECL, PREPARE_CALL):
+        fail("D20", "the named move does not declare its meter and its give-back guard before the first triplet is "
+                    "prepared, so an exit could give minted storage back unmeasured")
+    if (txn.count(REFUSED_GIVE_BACK) != 1 or not ordered(txn, ZONE_ROOM_OUTCOME, REFUSED_GIVE_BACK, REFILL_BRANCH)
+            or sycl.count(".give_back(") != 2):
+        fail("D20", "a refused named triplet's minted members are not given back measured, in the named-refusal "
+                    "branch")
+    if norm(body(sycl, ENTRY_SIG)).count(ENTRY_SELF_DELTA) != 1:
+        fail("D20", "the named move's entry does not carry the measured sum to its caller")
+    if (norm(callback).count(EPOCH_AFTER_READ) != 1 or norm(callback).count(TXN_ROOM_RETURN) != 1
+            or sycl.count("moe_swap_txn_room{") != 1):
+        fail("D20", "the transaction callback does not read the room epoch right after the transaction returns and "
+                    "return it with the transaction's own sum")
+    if norm(body(driver, ROOM_STOOD_SIG)).count(ROOM_STOOD_BODY) != 1:
+        fail("D20", "moe_swap_room_stood does not compare the epoch's move since the boundary's read with the "
+                    "transaction's own sum")
+    if (not ordered(step, ADMIT_TXN, ROOM_STOOD_USE, HELD_FOLLOWS, HOLD_SET) or step.count(HOLD_SET) != 1
+            or step.count(HELD_FOLLOWS) != 1 or re.search(r"\broom_epoch\s*=\s*c\.room_epoch\b", step)):
+        fail("D20", "the step does not hold a refused admit, and let a held one follow the epoch, only when the room "
+                    "stood, under the epoch the transaction left")
 
 
 def _helper_body(sycl: str, name: str) -> str:
@@ -806,7 +872,9 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("no-growth-room-unbounded-zone-is-zero", "D15",
                 [("cache", NO_GROWTH_ROOM_SIG, "bound > 0 ? bound : capacity", "bound")])
     expect_fail("room-epoch-not-read", "D18",
-                [("sycl", CALLER_SIG, "cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;", "0;")])
+                [("sycl", CALLER_SIG,
+                  "call.room_epoch        = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;",
+                  "call.room_epoch        = 0;")])
     expect_fail("room-epoch-read-in-the-callback", "D18",
                 [("sycl", CALLER_SIG, "ggml_sycl_expert_move_request request;",
                   "call.room_epoch = 0;\n            ggml_sycl_expert_move_request request;")])
@@ -841,6 +909,35 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", ZONE_WARN_SIG, "ggml_sycl::vram_zone_id::WEIGHT", "ggml_sycl::vram_zone_id::KV")])
     expect_fail("zone-refusal-figures-not-read", "D19", [("sycl", ZONE_WARN_SIG, "(void) cache->zone_free_figures(",
                                                          "(void) sizeof(")])
+    expect_fail("self-delta-dropped-from-the-comparison", "D20",
+                [("driver", ROOM_STOOD_SIG, "room.epoch_after - before == room.self_delta", "room.epoch_after == before")])
+    expect_fail("refused-admit-held-though-room-arrived", "D20", [("driver", STEP_SIG, " && room_stood;", ";")])
+    expect_fail("refused-admit-held-under-the-epoch-read-before", "D20",
+                [("driver", STEP_SIG, "p.room_epoch  = room.epoch_after;", "p.room_epoch  = c.room_epoch;")])
+    expect_fail("held-admit-does-not-follow-the-epoch", "D20",
+                [("driver", STEP_SIG, "room_stood ? room.epoch_after : p.room_epoch;", "p.room_epoch;")])
+    expect_fail("meter-does-not-sum-the-move", "D20",
+                [("sycl", METER_SIG, "moved += cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) - before;", "")])
+    expect_fail("meter-off-for-the-named-move", "D20",
+                [("sycl", TXN_SIG, "room_meter{ named ? cache : nullptr };", "room_meter{ nullptr };")])
+    expect_fail("refused-members-given-back-unmeasured", "D20",
+                [("sycl", TXN_SIG, "room_meter.give_back([&triplet] {", "std::invoke([&triplet] {")])
+    expect_fail("prepared-list-given-back-unmeasured", "D20",
+                [("sycl", GIVE_BACK_SIG, "meter.give_back([this] { prepared.clear(); });", "prepared.clear();")])
+    guard_decl = "    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr };\n"
+    after_preparation = "    if (named && prepared.empty()) {\n"
+    expect_fail("give-back-guard-declared-after-the-preparation", "D20",
+                [("sycl", TXN_SIG, guard_decl, ""), ("sycl", TXN_SIG, after_preparation, guard_decl + after_preparation)])
+    expect_fail("self-delta-not-written-to-the-answer", "D20",
+                [("sycl", GIVE_BACK_SIG, "answer->room_self_delta = meter.moved;", "(void) answer;")])
+    expect_fail("self-delta-not-carried-by-the-entry", "D20",
+                [("sycl", ENTRY_SIG, "r.room_self_delta = answer.room_self_delta;", "")])
+    expect_fail("epoch-after-not-read", "D20",
+                [("sycl", CALLER_SIG,
+                  "epoch_after        = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;",
+                  "epoch_after        = 0;")])
+    expect_fail("self-delta-not-returned", "D20",
+                [("sycl", CALLER_SIG, "{ epoch_after, result.room_self_delta }", "{ epoch_after, 0 }")])
 
     try:
         mutate(raw, [("sycl", "", "this anchor is in no source", "x")])
@@ -878,7 +975,8 @@ def main(argv: list[str]) -> int:
         return 1
     print("PASS: the swap driver runs once per synchronize boundary after the refill, gated, without a wait or a lock "
           "across its policy, its evict copies never grow the host zone, its refusals, latch and room are named, and "
-          "its hold reads the zone's room epoch and a typed refusal")
+          "its hold reads the zone's room epoch and a typed refusal, less what the transaction's own give-backs moved "
+          "the epoch by")
     return 0
 
 

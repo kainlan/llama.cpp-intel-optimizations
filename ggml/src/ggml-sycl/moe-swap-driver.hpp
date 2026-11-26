@@ -18,13 +18,15 @@
 //     dropped (and becomes a restore, or an open slot if it was one). A boundary is settled when nothing is lent and
 //     no deferred free is pending: an unsettled boundary may yet give the room back, so it starts the streak over.
 //   - A pending admit that was BUSY for device zone room (moe_swap_move::busy_cause) is held, not sent, while the
-//     zone's room epoch (moe_swap_driver_call::room_epoch) is what it was at that answer: the zone has gained no room
-//     since, so the same request would be refused again. A boundary it is held at does not count toward its drop
-//     streak, and the policy stays in flight. An epoch that moved sends it again, and that answer counts toward the
-//     streak like any other. It is given up at the MOE_SWAP_PENDING_HOLD_BOUND-th settled boundary with the epoch
-//     unchanged, as a dropped admit is (a restore, which goes at that boundary, or an open slot), so room that never
-//     comes does not hold the policy in flight for the rest of the generation. An unsettled boundary neither counts
-//     nor resets the hold.
+//     zone's room epoch (moe_swap_driver_call::room_epoch) is the one that answer's transaction left: the zone has
+//     gained no room since, so the same request would be refused again. A transaction moves the epoch itself when it
+//     gives back storage it took, which is no room gained, so the step takes those moves out of the epoch's change
+//     (moe_swap_txn_room): they neither keep the refused admit from being held nor send a held one again. A boundary
+//     it is held at does not count toward its drop streak, and the policy stays in flight. An epoch that moved for
+//     any other reason sends it again, and that answer counts toward the streak like any other. It is given up at the
+//     MOE_SWAP_PENDING_HOLD_BOUND-th settled boundary with the epoch unchanged, as a dropped admit is (a restore,
+//     which goes at that boundary, or an open slot), so room that never comes does not hold the policy in flight for
+//     the rest of the generation. An unsettled boundary neither counts nor resets the hold.
 //   - An evict refused finally latches its block only when the transaction marks the refusal as one every evict of
 //     the block would meet (moe_swap_move::latches_block: the caller sets it for a device copy that shares a bulk
 //     tensor's storage). Any other final refusal drops that proposal alone, counted by its reason.
@@ -149,6 +151,21 @@ struct moe_swap_move {
     moe_swap_busy_cause   busy_cause    = MOE_SWAP_BUSY_CAUSE_TRANSIENT;
 };
 
+// What a transaction says of the device zone's room epoch once it has returned. A transaction moves the epoch itself
+// when it gives back blocks it took: the members a triplet minted before the zone refused a later one, and whatever a
+// prepared triplet held when the move did not take it. That is room the zone had before the transaction, not room it
+// gained, so the caller measures it: epoch_after is the epoch read after the transaction, and self_delta the sum of
+// the epoch's moves across each of the transaction's own give-backs, read right before and right after each. The step
+// holds an admit refused for room only when the two account for every move since the boundary's own read
+// (moe_swap_driver_call::room_epoch): epoch_after - room_epoch == self_delta. It is measured, not counted, so it
+// does not depend on how many moves one give-back makes. A block another thread gives back inside one of those reads
+// is taken for the transaction's own, and the admit it would have sent is then held, at most to
+// MOE_SWAP_PENDING_HOLD_BOUND.
+struct moe_swap_txn_room {
+    uint64_t epoch_after = 0;
+    uint64_t self_delta  = 0;
+};
+
 // An admit waiting for the boundary after its evict. A restore admits evict_expert back.
 struct moe_swap_pending {
     int          block        = 0;
@@ -158,8 +175,8 @@ struct moe_swap_pending {
     bool         prompt       = false;  // its evict came from a prompt boundary
     int          busy_streak  = 0;      // settled boundaries in a row it was BUSY with busy_reason
     const char * busy_reason  = nullptr;
-    bool         room_held    = false;  // its last answer was BUSY for device zone room, under room_epoch
-    uint64_t     room_epoch   = 0;      // the zone's room epoch that answer was given under
+    bool         room_held    = false;  // its last answer was BUSY for device zone room, and the zone gained none since
+    uint64_t     room_epoch   = 0;      // the zone's room epoch it is held under: the one the last transaction left
     int          held_streak  = 0;      // settled boundaries it was held at since that answer; unsettled ones add none
 };
 
@@ -300,8 +317,8 @@ struct moe_swap_driver_call {
     bool   cache_settled     = true;   // nothing lent and no deferred free pending
     double prompt_gate       = 0.0;    // K for the policy: 0 when the host-to-device rate is not probed
     // The device WEIGHT zone's room epoch, read before the transaction runs: a count that moves each time the zone
-    // could have gained room, and never for an allocation or a refusal. Read before, so room that comes back while
-    // the transaction runs shows as a change at the next boundary.
+    // could have gained room, and never for an allocation or a refusal. Read before, so the step can tell, with what
+    // the transaction returns (moe_swap_txn_room), whether the zone gained room while it ran.
     uint64_t room_epoch        = 0;
 };
 
@@ -363,6 +380,12 @@ inline bool moe_swap_pending_give_up(moe_swap_driver_state & d, moe_swap_pending
 // room, and the zone has not gained room since.
 inline bool moe_swap_pending_held(const moe_swap_pending & p, uint64_t epoch) {
     return p.room_held && p.room_epoch == epoch;
+}
+
+// Whether the zone gained no room while a transaction ran: every move its room epoch made since `before`, the
+// boundary's own read, is one the transaction measured across its own give-backs.
+inline bool moe_swap_room_stood(uint64_t before, const moe_swap_txn_room & room) {
+    return room.epoch_after - before == room.self_delta;
 }
 
 // A BUSY answer for pending admit `p`: its streak counts settled boundaries in a row with one reason, and an unsettled
@@ -508,8 +531,9 @@ inline uint64_t moe_swap_driver_drop_in_flight(moe_swap_driver_state & d) {
 // One synchronize boundary. `counts(decode, prompt)` copies the route counters into two arrays of n_blocks x
 // n_experts; it is called only for a policy call that absorbs. `room()` returns the pinned host bytes the evicts may
 // take; it is called once, and only at a boundary with proposals to send. `txn(batch)` runs the named move on the
-// batch and fills each move's outcome, reason, bytes and block latch. An exception out of `txn` leaves the batch
-// unsettled in `d` and propagates.
+// batch, fills each move's outcome, reason, bytes, block latch and busy cause, and returns what the device zone's room
+// epoch is once it has returned and how far its own give-backs moved it (moe_swap_txn_room). An exception out of `txn`
+// leaves the batch unsettled in `d` and propagates.
 template <typename Counts, typename Room, typename Txn>
 moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
                                             const moe_swap_plan_view &   view,
@@ -645,8 +669,12 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
             d.pending.resize(kept);
             st.unsettled_moves = d.unsettled.size();
         });
-        txn(d.batch);
+        const moe_swap_txn_room                room = txn(d.batch);
         admit_throw.dismiss();
+        // The transaction leaves the epoch somewhere else whenever it gave storage back. Only when that is all that
+        // moved it has the zone gained no room, and only then is an admit held under the epoch the transaction left:
+        // one it just refused for room, and one this boundary held and did not send.
+        const bool room_stood = moe_swap_detail::moe_swap_room_stood(c.room_epoch, room);
         // The answers are in the order the batch was built in: one per pending admit that was not held, which is asked
         // of each entry before the answer changes it.
         size_t kept = 0;
@@ -654,6 +682,9 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
         for (size_t i = 0; i < d.pending.size(); ++i) {
             moe_swap_pending & p = d.pending[i];
             if (moe_swap_detail::moe_swap_pending_held(p, c.room_epoch)) {
+                // Not sent. It follows the epoch past the transaction's own give-backs; when the zone gained room it
+                // keeps the epoch it had, which the next boundary no longer reads, so that boundary sends it.
+                p.room_epoch      = room_stood ? room.epoch_after : p.room_epoch;
                 d.pending[kept++] = p;
                 continue;
             }
@@ -674,9 +705,10 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
             } else if (m.outcome == MOE_SWAP_MOVE_BUSY) {
                 moe_swap_detail::moe_swap_count_reason(st.busy, m.reason);
                 moe_swap_detail::moe_swap_pending_note_busy(p, m.reason, c.cache_settled);
-                // Refused for zone room: held from the next boundary on, under the epoch this one was handed.
-                p.room_held   = m.busy_cause == MOE_SWAP_BUSY_CAUSE_ZONE_ROOM;
-                p.room_epoch  = c.room_epoch;
+                // Refused for zone room with none gained while the transaction ran: held from the next boundary on, under
+                // the epoch the transaction left. Room gained meanwhile may be room for it, so it is sent again.
+                p.room_held   = m.busy_cause == MOE_SWAP_BUSY_CAUSE_ZONE_ROOM && room_stood;
+                p.room_epoch  = room.epoch_after;
                 p.held_streak = 0;
                 stay          = true;
                 if (p.busy_streak >= MOE_SWAP_PENDING_DROP_STREAK) {
@@ -762,7 +794,8 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
         }
         st.unsettled_moves = d.unsettled.size();
     });
-    txn(d.batch);
+    // No admit is pending at a boundary that sends evicts, so what the transaction says of the room has no reader.
+    (void) txn(d.batch);
     evict_throw.dismiss();
     for (size_t i = 0; i < keep; ++i) {
         const moe_swap_move &     m = d.batch[i];

@@ -77,6 +77,9 @@ static bool contains(const std::string & text, const char * part) {
 // many moves, publish what they moved, and throw, as the named move does when a submit throws part way. `room_epoch`
 // is the device zone's room epoch every boundary is handed: a test moves it to say the zone could have gained room.
 // answer_zone_full() scripts the BUSY answer of an admit the zone had no room for, with the cause the move gives it.
+// Each transaction that returns moves the epoch by `txn_self_moves`, which it reports as its own give-backs, and by
+// `txn_outside_moves`, room from elsewhere while it ran, which it does not report and which is spent by one
+// transaction.
 struct rig {
     struct rule {
         moe_swap_move_kind    kind;
@@ -102,6 +105,8 @@ struct rig {
     int                                     throw_after      = -1;
     int                                     throws           = 0;
     uint64_t                                room_epoch       = 0;
+    uint64_t                                txn_self_moves    = 0;
+    uint64_t                                txn_outside_moves = 0;
     const uint64_t *                        counts_decode_at = nullptr;  // the arrays the counts callback was handed
     const uint64_t *                        counts_prompt_at = nullptr;
     moe_swap_driver_state                   d;
@@ -231,6 +236,9 @@ struct rig {
                         throw_after = -1;
                         throw std::runtime_error("submit failed");
                     }
+                    room_epoch += txn_self_moves + txn_outside_moves;
+                    txn_outside_moves = 0;
+                    return ggml_sycl::moe_swap_txn_room{ room_epoch, txn_self_moves };
                 });
         } catch (const std::runtime_error &) {
             ++throws;  // the step rethrew; what the moves answered before it is published below, as the move does
@@ -1132,6 +1140,76 @@ static void test_a_zone_full_admit_sent_at_every_boundary_follows_the_drop_strea
     }
 }
 
+// A transaction moves the room epoch itself when it gives back the members it minted before the zone refused a later
+// one: room the zone had before, not room it gained. An admit refused in such a transaction is still held, under the
+// epoch the transaction left. Room from outside while a transaction runs moves the epoch past what the transaction
+// gave back, so that answer holds nothing and the admit is sent again.
+static void test_a_transaction_that_moves_the_epoch_itself_still_holds_the_admit() {
+    rig r(1, 8, 4);
+    r.decode[r.index(0, 5)] = 10;
+    r.to_period();                                // token 4: evicts 0
+    r.answer_zone_full(0, 5);
+    r.txn_self_moves = 2;                         // each transaction gives back two members it minted
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // token 5: refused for room, the epoch moved by its own give-backs
+    CHECK(r.room_epoch == 2);
+    for (int i = 0; i < 3; ++i) {
+        CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);  // held: nothing but the transaction moved the epoch
+    }
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 1);
+    CHECK(r.d.stats.admits_room_held == 3);
+    CHECK(reasons(r.d.stats.busy, "WEIGHT zone full") == 1);
+    CHECK(r.d.pending.size() == 1);
+    if (r.d.pending.size() == 1) {
+        CHECK(r.d.pending[0].room_held && r.d.pending[0].room_epoch == 2 && r.d.pending[0].held_streak == 3);
+    }
+
+    r.room_epoch += 1;                            // a block went back between boundaries: the admit is sent
+    r.txn_outside_moves = 1;                      // and another goes back while that transaction runs
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // refused again, but the epoch moved by more than its own give-backs
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 2);
+    CHECK(r.d.pending.size() == 1);
+    if (r.d.pending.size() == 1) {
+        CHECK(!r.d.pending[0].room_held);
+    }
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // so it is sent at the next boundary: its own give-backs alone
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);  // and held again
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 3);
+    CHECK(r.d.stats.dropped.empty());
+    CHECK(r.d.stats.admits_room_held == 4);
+}
+
+// A held admit is not in the batch another pending admit is sent in. When that transaction moves the epoch by its own
+// give-backs alone, the held admit stays held under the epoch it left; when room from outside arrives while it runs,
+// the held admit is sent at the next boundary.
+static void test_a_held_admit_follows_the_epoch_past_another_admits_transaction() {
+    rig r(1, 16, 8);
+    r.decode[r.index(0, 8)] = 40;
+    r.decode[r.index(0, 9)] = 30;
+    r.to_period();  // two evicts
+    CHECK(r.d.pending.size() == 2);
+    r.answer_zone_full(0, 8);
+    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 9, MOE_SWAP_MOVE_BUSY, "graph active", 2);
+    r.txn_self_moves = 3;
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // both admits: 8 meets a full zone, 9 a transient
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // 9 alone, and its transaction moves the epoch by its give-backs
+    CHECK(r.last().size() == 1);
+    if (!r.last().empty()) {
+        CHECK(r.last()[0].kind == MOE_SWAP_MOVE_ADMIT && r.last()[0].expert == 9);
+    }
+    r.txn_outside_moves = 1;
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // 9 alone again, 8 still held; room from outside while it runs
+    CHECK(r.last().size() == 1);
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 8) == 1);
+    CHECK(r.d.stats.admits == 1);                 // 9 landed
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // the outside room sends 8 again
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 8) == 2);
+    CHECK(r.last().size() == 1);
+    if (!r.last().empty()) {
+        CHECK(r.last()[0].expert == 8);
+    }
+    CHECK(r.d.stats.dropped.empty());
+}
+
 // A transaction that throws takes only the admits it was sent: a held admit was not in the batch, so it stays pending
 // and held, and the sent one waits unsettled.
 static void test_a_throw_leaves_a_held_admit_pending() {
@@ -1199,6 +1277,8 @@ int main() {
     test_a_zone_full_admit_is_held_while_the_room_epoch_is_unchanged();
     test_a_held_admit_is_given_up_at_the_hold_bound();
     test_a_room_epoch_change_before_the_bound_sends_the_held_admit_again();
+    test_a_transaction_that_moves_the_epoch_itself_still_holds_the_admit();
+    test_a_held_admit_follows_the_epoch_past_another_admits_transaction();
     test_a_zone_full_admit_sent_at_every_boundary_follows_the_drop_streak();
     test_a_throw_leaves_a_held_admit_pending();
     test_the_zone_refusal_line_names_its_figures();
