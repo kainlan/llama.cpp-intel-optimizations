@@ -22027,7 +22027,9 @@ static bool ggml_sycl_expert_move_to_device(ggml_sycl_expert_move_kind kind) {
 // reason, BUSY when a later boundary may move it. reason is null until the transaction decides; the entry gives a
 // triplet the body never decided the call's own answer, since a refusal of the whole call refuses each. to_device
 // says which list named it, the admits' or the evicts'. device_bytes is the device storage a moved triplet took (an
-// admit) or gives back once the cache reaps the entries it retired (an evict).
+// admit) or gives back once the cache reaps the entries it retired (an evict). zone_room says a BUSY admit was refused
+// because the device WEIGHT zone had no room for a member (the "WEIGHT zone full" answer, typed): the one refusal that
+// passes only once the zone gains room, so its caller can wait for that instead of asking again.
 struct ggml_sycl_expert_move_outcome {
     ggml_sycl::moe_expert_triplet_ref triplet;
     bool                              to_device    = true;
@@ -22035,6 +22037,7 @@ struct ggml_sycl_expert_move_outcome {
     ggml_sycl_txn_result              code         = ggml_sycl_txn_result::REFUSED;
     const char *                      reason       = nullptr;
     size_t                            device_bytes = 0;
+    bool                              zone_room    = false;
 };
 
 // Per device, the triplets lent and not yet re-admitted, in the order they were lent, under the identity of the
@@ -22281,13 +22284,16 @@ static const char * ggml_sycl_expert_named_stop(const std::vector<ggml_sycl_expe
 
 // One triplet prepared outside the locks: its members with the storage minted for them, the extra that remembers each
 // member's storage, what its move is, for a named move its place in the caller's list, and the microseconds its
-// preparation spent in the resolver, which looks each member up in the expert metadata.
+// preparation spent in the resolver, which looks each member up in the expert metadata. mint_refused_bytes is the size
+// of the member whose device mint was refused, 0 when none was: with a transient refusal that is the WEIGHT zone
+// answering that it has no room for those bytes.
 struct ggml_sycl_expert_prepared_triplet {
     ggml_sycl::expert_move_member members[3];
-    ggml_tensor_extra_gpu *       extras[3]  = { nullptr, nullptr, nullptr };
-    ggml_sycl_expert_move_kind    kind       = ggml_sycl_expert_move_kind::LOAN;
-    size_t                        named      = 0;
-    uint64_t                      resolve_us = 0;
+    ggml_tensor_extra_gpu *       extras[3]          = { nullptr, nullptr, nullptr };
+    ggml_sycl_expert_move_kind    kind               = ggml_sycl_expert_move_kind::LOAN;
+    size_t                        named              = 0;
+    uint64_t                      resolve_us         = 0;
+    size_t                        mint_refused_bytes = 0;
 };
 
 // Prepare `out` (its kind already set) for the triplet `keys` names, with no lock held: map each member to the cache
@@ -22297,8 +22303,8 @@ struct ggml_sycl_expert_prepared_triplet {
 // tail the cache zero-fills behind the copy. So an expert that goes to the host and back does not grow, and its record
 // keeps resolving. A member with no cache entry to copy from stops with the refusal the cache would give. Returns null
 // when every member is prepared, else the refusal, with *transient true when a later boundary may prepare it: a full
-// WEIGHT zone, which the ring gives back, or an evict's exhausted pinned pool. The storage minted before a refusal goes
-// back with `out`.
+// WEIGHT zone, which the ring gives back, or an evict's exhausted pinned pool. A refused device mint leaves its size in
+// out.mint_refused_bytes. The storage minted before a refusal goes back with `out`.
 static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache &             cache,
                                                      int                                    device,
                                                      const ggml_sycl::placement_plan &      plan,
@@ -22334,6 +22340,7 @@ static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache & 
             }
             storage = ggml_sycl_device_expert_alloc(device, staged);
             if (!storage.valid()) {
+                out.mint_refused_bytes = staged;
                 // A full zone is transient: the ring gives its room back, so the next boundary tries again. No
                 // WEIGHT arena is not, since only a model load makes one, and a load replaces the ledger too.
                 const bool arena = cache.arena_active() && cache.zone_capacity(ggml_sycl::vram_zone_id::WEIGHT) != 0;
@@ -22659,6 +22666,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
         } else if (named) {
             // The storage minted for its other members goes back with `triplet`, so a refusal leaves nothing behind.
             refuse_named(triplet.named, transient ? ggml_sycl_txn_result::BUSY : ggml_sycl_txn_result::REFUSED, stop);
+            // A device mint refused transiently is the "WEIGHT zone full" answer: the zone had no room for a member.
+            (*named_moves)[triplet.named].zone_room = transient && triplet.mint_refused_bytes != 0;
             stop      = nullptr;
             transient = false;
         } else if (refill && !transient) {
@@ -23800,6 +23809,8 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
     call.loans_outstanding = g_sycl_expert_lent_count[device].load(std::memory_order_acquire) != 0;
     call.cache_settled     = !call.loans_outstanding && !(cache && cache->has_pending_deferred_frees());
     call.prompt_gate       = inst.prompt_gate;
+    // Read before the transaction, so room that comes back while it runs moves the epoch the next boundary is handed.
+    call.room_epoch        = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;
     const int nb           = d.policy.n_blocks;
     const int ne           = d.policy.n_experts;
     (void) ggml_sycl::moe_swap_driver_step(
@@ -23836,6 +23847,8 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
                     m.outcome                               = ggml_sycl_moe_swap_outcome_of(o.moved, o.code);
                     m.reason                                = o.reason;
                     m.bytes                                 = o.device_bytes;
+                    m.busy_cause                            = o.zone_room ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM :
+                                                                            ggml_sycl::MOE_SWAP_BUSY_CAUSE_TRANSIENT;
                 } else {
                     m.outcome = ggml_sycl_moe_swap_outcome_of(false, code);
                     m.reason  = result.reason;

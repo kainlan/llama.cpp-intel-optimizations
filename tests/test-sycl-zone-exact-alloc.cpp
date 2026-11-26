@@ -5,6 +5,9 @@
 //               registry), without a raw device allocation, and with the error a caller reads as "no room":
 //               PHYSICAL_ALLOCATION_FAILED, never the control failure direct staging treats as fatal
 //   room        the request is served from the zone as an exact, zone-managed block, and no raw gate is read either
+//   room epoch  the zone's room epoch (unified_cache::zone_room_epoch) moves when a block goes back to the zone and
+//               stands still for a refusal and for an allocation; KV reads the same count as WEIGHT, whose allocator
+//               it shares, and RUNTIME's does not move for a WEIGHT block
 //
 // The cache is a real unified_cache on the OpenCL CPU device, registered through unified_cache_register_for_queue(),
 // so no GPU is touched (the registration pins the selector to the CPU device). Its arena is one chunk, where the
@@ -114,11 +117,13 @@ void test_full_zone_refuses_at_the_zone(unified_cache * cache) {
     std::printf("a zone-exact request on a full zone is refused at the zone:\n");
     const uint64_t reads_before = unified_cache_test_raw_gate_reads(MOCK_DEVICE);
     const uint64_t raw_before   = unified_cache_ext_alloc_count_for_testing(MOCK_DEVICE);
+    const uint64_t epoch_before = cache->zone_room_epoch(vram_zone_id::WEIGHT);
 
     allocation_result miss = unified_cache_zone_allocate_owner(MOCK_DEVICE, vram_zone_id::WEIGHT, REQUEST);
 
     const uint64_t reads = unified_cache_test_raw_gate_reads(MOCK_DEVICE) - reads_before;
     const uint64_t raw   = unified_cache_ext_alloc_count_for_testing(MOCK_DEVICE) - raw_before;
+    CHECK_EQ(cache->zone_room_epoch(vram_zone_id::WEIGHT), epoch_before, "full zone: a refusal moved the room epoch");
     std::printf("  request=%zu zone_available=%zu: served=%d error=%d raw_gate_reads=%llu raw_allocations=%llu\n",
                 REQUEST, cache->zone_available(vram_zone_id::WEIGHT), miss ? 1 : 0, static_cast<int>(miss.error),
                 static_cast<unsigned long long>(reads), static_cast<unsigned long long>(raw));
@@ -132,9 +137,19 @@ void test_full_zone_refuses_at_the_zone(unified_cache * cache) {
 
 void test_room_is_served_from_the_zone(unified_cache * cache, alloc_owner * hole) {
     std::printf("a zone-exact request with room is served from the zone:\n");
+    const uint64_t epoch_full  = cache->zone_room_epoch(vram_zone_id::WEIGHT);
+    const uint64_t epoch_other = cache->zone_room_epoch(vram_zone_id::RUNTIME);
     (void) hole->reset();
     settle();
     CHECK_EQ(cache->zone_available(vram_zone_id::WEIGHT), REQUEST, "room: the hole's bytes did not come back");
+    const uint64_t epoch_room = cache->zone_room_epoch(vram_zone_id::WEIGHT);
+    std::printf("  room epoch: %llu with the zone full, %llu after one block went back\n",
+                static_cast<unsigned long long>(epoch_full), static_cast<unsigned long long>(epoch_room));
+    CHECK(epoch_room != epoch_full, "room epoch: a block that went back to the zone did not move it");
+    CHECK_EQ(cache->zone_room_epoch(vram_zone_id::KV), epoch_room,
+             "room epoch: KV, which shares WEIGHT's allocator, reads another count");
+    CHECK_EQ(cache->zone_room_epoch(vram_zone_id::RUNTIME), epoch_other,
+             "room epoch: a WEIGHT block moved the RUNTIME zone's count");
 
     const uint64_t reads_before = unified_cache_test_raw_gate_reads(MOCK_DEVICE);
     const uint64_t raw_before   = unified_cache_ext_alloc_count_for_testing(MOCK_DEVICE);
@@ -143,6 +158,7 @@ void test_room_is_served_from_the_zone(unified_cache * cache, alloc_owner * hole
 
     const uint64_t reads = unified_cache_test_raw_gate_reads(MOCK_DEVICE) - reads_before;
     const uint64_t raw   = unified_cache_ext_alloc_count_for_testing(MOCK_DEVICE) - raw_before;
+    CHECK_EQ(cache->zone_room_epoch(vram_zone_id::WEIGHT), epoch_room, "room epoch: an allocation moved it");
     std::printf("  request=%zu: served=%d error=%d raw_gate_reads=%llu raw_allocations=%llu zone_available=%zu\n",
                 REQUEST, hit ? 1 : 0, static_cast<int>(hit.error), static_cast<unsigned long long>(reads),
                 static_cast<unsigned long long>(raw), cache->zone_available(vram_zone_id::WEIGHT));

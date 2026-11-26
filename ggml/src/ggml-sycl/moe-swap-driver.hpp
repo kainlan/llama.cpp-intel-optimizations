@@ -7,7 +7,8 @@
 //
 // One boundary sends one transaction at most, never both directions:
 //   - Pending admits first. Each evict that moved leaves its admit pending, and the next boundary sends every pending
-//     admit and nothing else, before the policy may propose. While any is pending the policy is in flight.
+//     admit it does not hold (below) and nothing else, before the policy may propose. While any is pending the policy
+//     is in flight.
 //   - Otherwise the policy's proposals, as evicts only. An evict's device room comes back only when a deferred-free
 //     pass reaps the entries it retired, never to an admit in the same call, so the admit waits a boundary.
 //   - A pending admit refused finally becomes a restore: an admit of the triplet its pair evicted, under the same
@@ -16,6 +17,13 @@
 //   - A pending admit that is BUSY at MOE_SWAP_PENDING_DROP_STREAK settled boundaries in a row with one reason is
 //     dropped (and becomes a restore, or an open slot if it was one). A boundary is settled when nothing is lent and
 //     no deferred free is pending: an unsettled boundary may yet give the room back, so it starts the streak over.
+//   - A pending admit that was BUSY for device zone room (moe_swap_move::busy_cause) is held, not sent, while the
+//     zone's room epoch (moe_swap_driver_call::room_epoch) is what it was at that answer: the zone has gained no room
+//     since, so the same request would be refused again. A boundary it is held at does not count toward its drop
+//     streak, and the policy stays in flight. An epoch that moved sends it again, and that answer counts toward the
+//     streak like any other. Held at MOE_SWAP_PENDING_HOLD_BOUND settled boundaries in a row, it is given up as a
+//     dropped admit is (a restore, which goes at that boundary, or an open slot), so room that never comes does not
+//     hold the policy in flight for the rest of the generation.
 //   - An evict refused finally latches its block only when the transaction marks the refusal as one every evict of
 //     the block would meet (moe_swap_move::latches_block: the caller sets it for a device copy that shares a bulk
 //     tensor's storage). Any other final refusal drops that proposal alone, counted by its reason.
@@ -35,7 +43,7 @@
 //
 // Cost: a boundary that reaches no boundary of the policy and has nothing pending reads, per block, the view's
 // eligible flag and admissible count and the state's latch and open slot, reads no route counter and no cell, and
-// allocates nothing.
+// allocates nothing. A boundary whose pending admits are all held sends nothing and allocates nothing either.
 #pragma once
 
 #include "moe-swap-policy.hpp"
@@ -55,11 +63,19 @@ constexpr const char MOE_SWAP_ENV[] = "GGML_SYCL_MOE_SWAP";
 // Settled boundaries in a row with one BUSY reason after which a pending admit is dropped. A settled boundary has no
 // deferred free pending and nothing lent, so the two waits that hand an admit its room back by themselves are over
 // there. What can still answer BUSY is a transient the move cannot see ending (a load or a publication in flight, an
-// entry changed under it, a submit that threw) or a full WEIGHT zone that only another move frees. One such answer
-// can be the first kind met by chance; the same answer at four settled boundaries in a row says it is not passing,
-// and four bounds how long an admit that will not land holds the policy in flight. It is a chosen bound, not a
-// measured one.
+// entry changed under it, a submit that threw) or a full device zone, whose answer counts here only when it is sent:
+// while the zone's room epoch stands the admit is held instead (MOE_SWAP_PENDING_HOLD_BOUND). One such answer can be
+// a transient met by chance; the same answer at four settled boundaries in a row says it is not passing, and four
+// bounds how long an admit that will not land holds the policy in flight. It is a chosen bound, not a measured one.
 constexpr int MOE_SWAP_PENDING_DROP_STREAK = 4;
+
+// Settled boundaries a pending admit is held at, its device zone's room epoch unchanged, before it is given up. An
+// admit refused for zone room is not sent again until the epoch says the zone could have gained room; when no room
+// ever comes, the hold alone would keep the policy in flight for the rest of the generation. Sixteen is above the
+// case the hold exists for, the few boundaries until a deferred-free pass hands an evict's room back, and at 43 ms a
+// decode token it is about 0.7 s. A held boundary costs the admit nothing and a sent one a lookup in the zone's
+// allocator, so the bound trades only how long the policy waits. It is a chosen bound, not a measured one.
+constexpr int MOE_SWAP_PENDING_HOLD_BOUND = 16;
 
 // The BUSY reason under which an evict of a batch whose transaction threw, still resident by the next view, is counted.
 constexpr const char MOE_SWAP_UNSETTLED_REASON[] = "transaction threw before it answered";
@@ -109,6 +125,13 @@ enum moe_swap_move_outcome {
     MOE_SWAP_MOVE_REFUSED,  // a final refusal: the same move would be refused again
 };
 
+// Why a move was BUSY, where the driver acts on it: a refusal for device zone room is passing only once the zone
+// gains room, which the room epoch (moe_swap_driver_call::room_epoch) says; every other one may pass by itself.
+enum moe_swap_busy_cause {
+    MOE_SWAP_BUSY_CAUSE_TRANSIENT,
+    MOE_SWAP_BUSY_CAUSE_ZONE_ROOM,  // the device zone had no room for the triplet
+};
+
 // One triplet of a transaction: the driver fills kind, block and expert; the transaction fills the rest.
 struct moe_swap_move {
     moe_swap_move_kind    kind    = MOE_SWAP_MOVE_EVICT;
@@ -120,6 +143,8 @@ struct moe_swap_move {
     // A final evict refusal every evict of this block would meet, so the block takes no evict again. The driver does
     // not read refusal texts for this; the transaction knows which of its refusals hold for the whole block.
     bool                  latches_block = false;
+    // For a BUSY admit: what it waits for. The driver does not read refusal texts for this either.
+    moe_swap_busy_cause   busy_cause    = MOE_SWAP_BUSY_CAUSE_TRANSIENT;
 };
 
 // An admit waiting for the boundary after its evict. A restore admits evict_expert back.
@@ -131,6 +156,9 @@ struct moe_swap_pending {
     bool         prompt       = false;  // its evict came from a prompt boundary
     int          busy_streak  = 0;      // settled boundaries in a row it was BUSY with busy_reason
     const char * busy_reason  = nullptr;
+    bool         room_held    = false;  // its last answer was BUSY for device zone room, under room_epoch
+    uint64_t     room_epoch   = 0;      // the zone's room epoch that answer was given under
+    int          held_streak  = 0;      // settled boundaries in a row it was held at, not sent
 };
 
 // A move whose transaction threw before it answered: an evict's pair, or a pending admit as it was sent.
@@ -207,6 +235,7 @@ struct moe_swap_driver_stats {
     uint64_t                           prompt_admit_bytes       = 0;
     uint64_t                           open_slots               = 0;
     uint64_t                           deferred_room            = 0;  // pairs deferred for host room
+    uint64_t                           admits_room_held         = 0;  // pending admits a boundary held, not sent
     uint64_t                           room_reads               = 0;
     size_t                             last_room                = 0;
     uint64_t                           boundaries_no_admissible = 0;
@@ -268,6 +297,10 @@ struct moe_swap_driver_call {
     bool   loans_outstanding = false;  // triplets are lent to a prompt ring
     bool   cache_settled     = true;   // nothing lent and no deferred free pending
     double prompt_gate       = 0.0;    // K for the policy: 0 when the host-to-device rate is not probed
+    // The device WEIGHT zone's room epoch, read before the transaction runs: a count that moves each time the zone
+    // could have gained room, and never for an allocation or a refusal. Read before, so room that comes back while
+    // the transaction runs shows as a change at the next boundary.
+    uint64_t room_epoch        = 0;
 };
 
 enum moe_swap_driver_status {
@@ -319,7 +352,15 @@ inline bool moe_swap_pending_give_up(moe_swap_driver_state & d, moe_swap_pending
     p.restore     = true;
     p.busy_streak = 0;
     p.busy_reason = nullptr;
+    p.room_held   = false;
+    p.held_streak = 0;
     return true;
+}
+
+// Whether pending admit `p` is held at a boundary handed room epoch `epoch`: its last answer was BUSY for device zone
+// room, and the zone has not gained room since.
+inline bool moe_swap_pending_held(const moe_swap_pending & p, uint64_t epoch) {
+    return p.room_held && p.room_epoch == epoch;
 }
 
 // A BUSY answer for pending admit `p`: its streak counts settled boundaries in a row with one reason, and an unsettled
@@ -545,36 +586,76 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
     }
 
     if (!d.pending.empty()) {
+        // The held admits first: each settled boundary one is held at counts toward the hold bound, and at the bound it
+        // is given up. An admit given up becomes a restore, no longer held, so it goes in this boundary's batch; a
+        // restore given up leaves the list. Each entry is finished before the next is read, so a count that throws
+        // leaves the list as it stands.
+        for (size_t i = 0; i < d.pending.size();) {
+            moe_swap_pending & p = d.pending[i];
+            if (moe_swap_detail::moe_swap_pending_held(p, c.room_epoch)) {
+                p.held_streak += c.cache_settled ? 1 : 0;
+                if (p.held_streak < MOE_SWAP_PENDING_HOLD_BOUND) {
+                    ++st.admits_room_held;
+                } else {
+                    moe_swap_detail::moe_swap_count_reason(st.dropped, p.busy_reason);
+                    if (!moe_swap_detail::moe_swap_pending_give_up(d, p)) {
+                        d.pending.erase(d.pending.begin() + static_cast<std::ptrdiff_t>(i));
+                        continue;
+                    }
+                }
+            }
+            ++i;
+        }
         d.batch.clear();
         for (const moe_swap_pending & p : d.pending) {
+            if (moe_swap_detail::moe_swap_pending_held(p, c.room_epoch)) {
+                continue;
+            }
             moe_swap_move m;
             m.kind   = MOE_SWAP_MOVE_ADMIT;
             m.block  = p.block;
             m.expert = p.restore ? p.evict_expert : p.admit_expert;
             d.batch.push_back(m);
         }
+        if (d.batch.empty()) {
+            return MOE_SWAP_DRIVER_IDLE;  // every pending admit is held: nothing to send, and nothing allocated
+        }
         // The guard below runs while a throw unwinds, where a throw of its own ends the process. These reserves are what
         // make its pushes safe: room for one unsettled move per admit sent, and for the throw's BUSY reason should it
         // be new.
-        d.unsettled.reserve(d.unsettled.size() + d.pending.size());
+        d.unsettled.reserve(d.unsettled.size() + d.batch.size());
         st.busy.reserve(st.busy.size() + 1);
         // If the transaction throws, each admit sent is BUSY for the throw, and its streak advances, so admits whose
-        // every transaction throws are dropped under the streak rule (at the settle that finds them not moved).
+        // every transaction throws are dropped under the streak rule (at the settle that finds them not moved). A held
+        // admit was not sent, so it stays pending as it is.
         moe_swap_detail::moe_swap_unwind_guard admit_throw([&]() {
+            size_t kept = 0;
             for (moe_swap_pending & p : d.pending) {
+                if (moe_swap_detail::moe_swap_pending_held(p, c.room_epoch)) {
+                    d.pending[kept++] = p;
+                    continue;
+                }
                 moe_swap_detail::moe_swap_count_reason(st.busy, MOE_SWAP_UNSETTLED_REASON);
                 moe_swap_detail::moe_swap_pending_note_busy(p, MOE_SWAP_UNSETTLED_REASON, c.cache_settled);
+                p.room_held = false;
                 d.unsettled.push_back({ MOE_SWAP_MOVE_ADMIT, p });
             }
-            d.pending.clear();
+            d.pending.resize(kept);
             st.unsettled_moves = d.unsettled.size();
         });
         txn(d.batch);
         admit_throw.dismiss();
+        // The answers are in the order the batch was built in: one per pending admit that was not held, which is asked
+        // of each entry before the answer changes it.
         size_t kept = 0;
+        size_t sent = 0;
         for (size_t i = 0; i < d.pending.size(); ++i) {
-            moe_swap_pending &    p    = d.pending[i];
-            const moe_swap_move & m    = d.batch[i];
+            moe_swap_pending & p = d.pending[i];
+            if (moe_swap_detail::moe_swap_pending_held(p, c.room_epoch)) {
+                d.pending[kept++] = p;
+                continue;
+            }
+            const moe_swap_move & m    = d.batch[sent++];
             bool                  stay = false;
             if (m.outcome == MOE_SWAP_MOVE_MOVED) {
                 d.last_boundary_moved = true;
@@ -591,7 +672,11 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
             } else if (m.outcome == MOE_SWAP_MOVE_BUSY) {
                 moe_swap_detail::moe_swap_count_reason(st.busy, m.reason);
                 moe_swap_detail::moe_swap_pending_note_busy(p, m.reason, c.cache_settled);
-                stay = true;
+                // Refused for zone room: held from the next boundary on, under the epoch this one was handed.
+                p.room_held   = m.busy_cause == MOE_SWAP_BUSY_CAUSE_ZONE_ROOM;
+                p.room_epoch  = c.room_epoch;
+                p.held_streak = 0;
+                stay          = true;
                 if (p.busy_streak >= MOE_SWAP_PENDING_DROP_STREAK) {
                     moe_swap_detail::moe_swap_count_reason(st.dropped, m.reason);
                     stay = moe_swap_detail::moe_swap_pending_give_up(d, p);
@@ -753,7 +838,8 @@ inline std::string moe_swap_driver_summary_moves(const moe_swap_driver_stats & s
 }
 
 // The second summary line: the accepted transactions beside the decode graphs they ran among (a round is two, and
-// each can make a context drop what it recorded), then what the driver could not do, and why.
+// each can make a context drop what it recorded), then what the driver could not do, and why. "held for device room"
+// counts each boundary a pending admit was held at, so one admit held at ten boundaries counts ten.
 inline std::string moe_swap_driver_summary_faults(const moe_swap_driver_stats & st, int device) {
     using ull = unsigned long long;
     char room[64];
@@ -768,14 +854,14 @@ inline std::string moe_swap_driver_summary_faults(const moe_swap_driver_stats & 
     } else {
         std::snprintf(off, sizeof(off), "none");
     }
-    char head[640];
+    char head[704];
     std::snprintf(head, sizeof(head),
                   "[MOE-SWAP] device %d: accepted transactions %llu (evict %llu, admit %llu) over %llu decode graphs; "
-                  "open slots %llu; deferred for host room %llu (%s); no admissible host expert at %llu boundaries "
-                  "(%llu file-mapped triplets passed over); off: %s",
+                  "open slots %llu; deferred for host room %llu (%s); held for device room %llu; no admissible host "
+                  "expert at %llu boundaries (%llu file-mapped triplets passed over); off: %s",
                   device, (ull) (st.transactions_evict + st.transactions_admit), (ull) st.transactions_evict,
                   (ull) st.transactions_admit, (ull) st.decode_graphs, (ull) st.open_slots, (ull) st.deferred_room,
-                  room, (ull) st.boundaries_no_admissible, (ull) st.file_mapped_passed, off);
+                  room, (ull) st.admits_room_held, (ull) st.boundaries_no_admissible, (ull) st.file_mapped_passed, off);
     char tail[256];
     std::snprintf(tail, sizeof(tail),
                   "; settled from the plan after a throw: %llu batches (%llu moves moved); unsettled at report: %llu "

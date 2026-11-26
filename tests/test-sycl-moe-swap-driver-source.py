@@ -60,7 +60,14 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       transaction twice (admits, evicts), and before each call it reserves the unsettled list, and the busy reasons
       when the guard counts one, each past its size (size() + n, never a bare count), then declares a guard whose
       body sets the unsettled count; the line right after the call dismisses that guard. The guard's body runs while
-      a throw unwinds, where a throw ends the process, so the reserves are what make its pushes safe.
+      a throw unwinds, where a throw ends the process, so the reserves are what make its pushes safe;
+  D18 the hold of an admit refused for device room has its two inputs: the caller hands the step the device WEIGHT
+      zone's room epoch (unified_cache::zone_room_epoch), read before the step; and the refusal's cause reaches the
+      move typed, not as text: the preparation leaves the size of a refused device mint on the prepared triplet,
+      right where the mint fails; the transaction marks the named triplet's outcome when that refusal is transient
+      (the "WEIGHT zone full" answer, and no other); and the callback gives the move MOE_SWAP_BUSY_CAUSE_ZONE_ROOM
+      from the outcome. Without either the driver holds nothing, sends a refused admit again at every boundary, and
+      no unit test sees it.
 
 Checks run on comment-stripped text, string literals kept. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
@@ -102,6 +109,7 @@ STEP_SIG = "moe_swap_driver_status moe_swap_driver_step("
 WARN_SIG = "static void ggml_sycl_moe_swap_warn_refusal("
 LATCH_SIG = "static bool ggml_sycl_moe_swap_refusal_latches_block("
 REPORT_SIG = "static void ggml_sycl_moe_swap_report("
+TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_txn_run("
 ROOM_SIG = "static size_t ggml_sycl_moe_swap_host_room("
 LOAN_SIG = "bool unified_cache::loan_expert_triplet("
 NO_GROWTH_ROOM_SIG = "size_t unified_cache::host_zone_no_growth_room("
@@ -166,6 +174,12 @@ MINT_CAP = "if (bound > 0 && ucache->host_zone_used(zone) + alloc_size > bound) 
 ROOM_BOUND = "host_zone_no_growth_bound(zone, host_zone_reserved_capacity(zone), capacity)"
 NO_GROWTH_ROOM_FIELDS = (f"const size_t bound = {ROOM_BOUND};", "const size_t limit = bound > 0 ? bound : capacity;",
                          "return limit > used ? limit - used : 0;")
+ROOM_EPOCH_READ = "call.room_epoch = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;"
+BUSY_CAUSE_SET = ("m.busy_cause = o.zone_room ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM : "
+                  "ggml_sycl::MOE_SWAP_BUSY_CAUSE_TRANSIENT;")
+ZONE_ROOM_MINT = ("storage = ggml_sycl_device_expert_alloc(device, staged); if (!storage.valid()) { "
+                  "out.mint_refused_bytes = staged;")
+ZONE_ROOM_OUTCOME = "(*named_moves)[triplet.named].zone_room = transient && triplet.mint_refused_bytes != 0;"
 
 WAITS = re.compile(
     r"(?:\.|->)\s*wait\s*\(|\bwait_and_throw\b|\bdrain_retained_handles\b|\bwait_all\b|\bcommand_execution_status\b|"
@@ -542,6 +556,19 @@ def check(raw: dict[str, str]) -> None:
             fail("D17", f"guard `{guard.group(1)}` is not dismissed on the line right after the transaction returns")
         prev = at + len(TXN_CALL)
 
+    # D18 --------------------------------------------------------------------------------------------------------------
+    if norm(caller[:step_at]).count(ROOM_EPOCH_READ) != 1 or "room_epoch" in callback:
+        fail("D18", "the caller does not hand the step the WEIGHT zone's room epoch, read once before the step")
+    if norm(callback).count(BUSY_CAUSE_SET) != 1 or sycl.count("busy_cause") != 1:
+        fail("D18", "the transaction callback does not give each answered move its busy cause from the outcome's "
+                    "zone_room, in one place")
+    if norm(prep).count(ZONE_ROOM_MINT) != 1 or len(re.findall(r"\bmint_refused_bytes\s*=(?!=)", sycl)) != 2:
+        fail("D18", "the preparation does not leave the size of a refused device mint on the prepared triplet, set "
+                    "where the device mint fails and nowhere else")
+    if norm(body(sycl, TXN_SIG)).count(ZONE_ROOM_OUTCOME) != 1 or len(re.findall(r"\bzone_room\s*=(?!=)", sycl)) != 2:
+        fail("D18", "the transaction does not mark the named triplet's outcome exactly when a device mint was refused "
+                    "transiently")
+
 
 def _helper_body(sycl: str, name: str) -> str:
     for m in HELPER_DEF.finditer(sycl):
@@ -653,8 +680,8 @@ def self_test(raw: dict[str, str]) -> int:
                 [("driver", FAULTS_SIG, "(ull) st.settled_moved, (ull) st.unsettled_moves)",
                   "(ull) st.settled_moved, 0ull)")])
     expect_fail("admit-throw-leaves-the-count", "D7",
-                [("driver", STEP_SIG, "d.pending.clear();\n            st.unsettled_moves = d.unsettled.size();",
-                  "d.pending.clear();")])
+                [("driver", STEP_SIG, "d.pending.resize(kept);\n            st.unsettled_moves = d.unsettled.size();",
+                  "d.pending.resize(kept);")])
     expect_fail("evict-throw-leaves-the-count", "D7",
                 [("driver", STEP_SIG, "d.unsettled.push_back(u);\n        }\n        st.unsettled_moves = "
                   "d.unsettled.size();", "d.unsettled.push_back(u);\n        }")])
@@ -749,6 +776,25 @@ def self_test(raw: dict[str, str]) -> int:
                 [("cache", NO_GROWTH_ROOM_SIG, ROOM_BOUND, "host_zone_reserved_capacity(zone)")])
     expect_fail("no-growth-room-unbounded-zone-is-zero", "D15",
                 [("cache", NO_GROWTH_ROOM_SIG, "bound > 0 ? bound : capacity", "bound")])
+    expect_fail("room-epoch-not-read", "D18",
+                [("sycl", CALLER_SIG, "cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;", "0;")])
+    expect_fail("room-epoch-read-in-the-callback", "D18",
+                [("sycl", CALLER_SIG, "ggml_sycl_expert_move_request request;",
+                  "call.room_epoch = 0;\n            ggml_sycl_expert_move_request request;")])
+    expect_fail("busy-cause-not-mapped", "D18",
+                [("sycl", CALLER_SIG, "o.zone_room ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM",
+                  "false ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM")])
+    expect_fail("refused-mint-not-recorded", "D18",
+                [("sycl", PREP_SIG, "out.mint_refused_bytes = staged;", "")])
+    expect_fail("host-mint-recorded-as-a-device-one", "D18",
+                [("sycl", PREP_SIG, "*transient = out.kind == ggml_sycl_expert_move_kind::EVICT;",
+                  "out.mint_refused_bytes = target.logical_bytes;\n                "
+                  "*transient = out.kind == ggml_sycl_expert_move_kind::EVICT;")])
+    expect_fail("zone-room-for-any-transient-refusal", "D18",
+                [("sycl", TXN_SIG, "zone_room = transient && triplet.mint_refused_bytes != 0;", "zone_room = transient;")])
+    expect_fail("zone-room-not-on-the-outcome", "D18",
+                [("sycl", TXN_SIG, "(*named_moves)[triplet.named].zone_room = transient && "
+                  "triplet.mint_refused_bytes != 0;", "")])
 
     try:
         mutate(raw, [("sycl", "", "this anchor is in no source", "x")])
@@ -785,7 +831,8 @@ def main(argv: list[str]) -> int:
         print(e)
         return 1
     print("PASS: the swap driver runs once per synchronize boundary after the refill, gated, without a wait or a lock "
-          "across its policy, its evict copies never grow the host zone, and its refusals, latch and room are named")
+          "across its policy, its evict copies never grow the host zone, its refusals, latch and room are named, and "
+          "its hold reads the zone's room epoch and a typed refusal")
     return 0
 
 

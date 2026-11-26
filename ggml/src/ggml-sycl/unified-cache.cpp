@@ -30320,6 +30320,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                     z.allocator = std::make_unique<tlsf_allocator>(z.size);
                 }
             }
+            arena_note_allocators_made();
 
             arena_publish_authorities();
             return true;
@@ -30528,6 +30529,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             z.allocator = std::make_unique<tlsf_allocator>(z.size);
         }
     }
+    arena_note_allocators_made();
 
     arena_publish_authorities();
     return true;
@@ -31153,6 +31155,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
                 }
                 arena_forget_allocation_locked(zone, ptr);
                 zone_used_free(*z.allocator, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
+                arena_note_room_grew(arena_allocator_group_index(zone));
                 if (profile_active) {
                     const size_t idx = static_cast<size_t>(zone);
                     t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31184,6 +31187,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         const auto   p          = reinterpret_cast<uintptr_t>(ptr);
         const size_t chunk_off  = static_cast<size_t>(p - chunk_base);
         zone_used_free(*target->allocator, chunk_off, arena_zones_[static_cast<int>(record_zone)].used);
+        arena_note_room_grew(arena_allocator_group_index(zone));
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31213,6 +31217,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         }
         arena_forget_allocation_locked(zone, ptr);
         zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
+        arena_note_room_grew(arena_allocator_group_index(zone));
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31237,6 +31242,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     }
     arena_forget_allocation_locked(zone, ptr);
     zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
+    arena_note_room_grew(arena_allocator_group_index(zone));
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
         t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31503,6 +31509,20 @@ bool unified_cache::zone_free_figures(vram_zone_id zone,
     available    = zone_available(zone);
     largest_free = zone_largest_free(zone);
     return true;
+}
+
+uint64_t unified_cache::zone_room_epoch(vram_zone_id zone) const noexcept {
+    return arena_allocator_groups_[arena_allocator_group_index(zone)].room_epoch.load(std::memory_order_acquire);
+}
+
+void unified_cache::arena_note_room_grew(size_t group) noexcept {
+    arena_allocator_groups_[group].room_epoch.fetch_add(1, std::memory_order_release);
+}
+
+void unified_cache::arena_note_allocators_made() noexcept {
+    for (size_t group = 0; group < ARENA_ALLOCATOR_GROUP_COUNT; ++group) {
+        arena_note_room_grew(group);
+    }
 }
 
 // The role half of a zone census tag. A role added to the enum after this list reads as its number, never as another
@@ -32221,6 +32241,7 @@ std::shared_ptr<arena_authority> unified_cache::arena_close_authority(vram_zone_
 }
 
 void unified_cache::arena_group_reset_allocators_locked(size_t group) noexcept {
+    arena_note_room_grew(group);  // every block the group's allocators held is room again
     if (group == arena_allocator_group_index(vram_zone_id::KV)) {
         // KV and WEIGHT share the KV allocator and every per-chunk allocator.
         vram_zone & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
