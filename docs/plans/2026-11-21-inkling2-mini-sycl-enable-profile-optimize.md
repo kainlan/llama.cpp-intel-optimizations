@@ -6710,13 +6710,13 @@ What step 1d wrote (implementer record, 2026-11-24; device behaviour is the lead
   inside the summary and reading right. Prompt / decode t/s, new against base: Inkling both cards 160.92 / 25.80
   against 91.29 / 26.02, B70 160.89 / 26.13; Inkling B50 15.17 / 7.38 against 17.76 / 4.74 (not a speed verdict:
   builders alive); Qwen B70 74.37 / 14.31 against 68.07 / 14.31; Qwen B50 25.02 / 7.81 against 23.94 / 7.52. The rows
-  are in `sycl-memory-design.md` and the lead's record, `docs/backend/data/inkling2/t21-lead-rulings.md`. Not yet on
-  a card: any path of (d) as it now reads (the drop on the WEIGHT zone, the keep where SCRATCH would grow, the keep
-  after a give-back rebuild, the held arena, and the no-room keep Qwen on the B50 should take), the multi-device
-  drop (opt-in `GGML_SYCL_MOE_MULTI_GPU`), the dry run's lines, and an Inkling B50 pp/tg pair with no builders
-  alive. Not known: why the B70 prompt gains 9% on Qwen and 75% on Inkling. The dry run gives no zone back, so
-  where a load's give-back rebuilds RUNTIME smaller, the load's last plan can place more experts on the device than
-  the dry run reports.
+  are in the lead's record, `docs/backend/data/inkling2/t21-lead-rulings.md`, and in `sycl-memory-design.md` except
+  Qwen on the B50, a drop that (d) no longer makes (r7 (8) and r8 (2), below). Not yet on a card: any path of (d) as it
+  now reads (the drop on the WEIGHT zone, the keep where SCRATCH would grow, the keep after a give-back rebuild, the
+  held arena, and the no-room keep Qwen on the B50 should take), the multi-device drop (opt-in
+  `GGML_SYCL_MOE_MULTI_GPU`), the dry run's lines, and an Inkling B50 pp/tg pair with no builders alive. Not known: why
+  the B70 prompt gains 9% on Qwen and 75% on Inkling. The dry run gives no zone back, so where a load's give-back
+  rebuilds RUNTIME smaller, the load's last plan can place more experts on the device than the dry run reports.
 - On a card, the lead's chain on `f011d5d1f2` (clause (d) on the WEIGHT zone, before the third review's fixes;
   correctness only, since another session built through every arm; `docs/backend/data/inkling2/t21-lead-rulings.md`,
   "The WEIGHT-zone rule on the cards", on this branch): Inkling on the B50 drops the ring (RUNTIME rebuilt at 512.0
@@ -6752,9 +6752,9 @@ What step 1d wrote (implementer record, 2026-11-24; device behaviour is the lead
   with one WARN naming `cause=row-map-staging`; the second, unarmed, takes the executor, so the refusal does not
   persist), armed again (the same device and cause print no second WARN), and unarmed. Each run checks both nodes'
   dst against the CPU at NMSE <= 5e-4, the failpoint's consumption, the executor's lines, the direct route's
-  candidate, admit, submit and terminal counts, and that no refusal line printed. Exit 77 (skipped: the fixture's
-  weights were not evictable) measures nothing. The other re-entry cause, an executor decline before its first
-  submission, has no failpoint, so no device test reaches it.
+  candidate, admit, submit and terminal counts, and that no refusal line printed. Exit 77 (skipped: no SYCL GPU,
+  more than one card visible, or the fixture's weights not evictable) measures nothing. The other re-entry cause, an
+  executor decline before its first submission, has no failpoint, so no device test reaches it.
   (3) (d)'s first question is one predicate, `moe_pp_ring_drop_can_return_room` (WEIGHT room and RUNTIME room both
   above 0), asked by the stage before it asks the arena and by the dry run before its own answer. The dry run now
   reads the WEIGHT room as the stage does, so on a device with no active arena it keeps the ring, as a load's stage
@@ -6787,6 +6787,28 @@ What step 1d wrote (implementer record, 2026-11-24; device behaviour is the lead
   was added. The lead runs it by hand: `ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-onednn-woq-nvfp4`.
   (2) and the nits are formatting: two alignments in `ggml-sycl.cpp`, `kinds[]` as `static const char * const`
   (its gate-up pin follows), and `k_snake` constants in the device test.
+- The fifth review's fixes (r8, 2026-11-26; quality re-review of `54acaaa5e1..77e1bb5701`, which approved r7).
+  (1) Where the plan read no WEIGHT room with the ring, the load stage's no-room keep INFO printed "its WEIGHT zone
+  holds 0.0 MB with the ring and 0.0 MB without it", which misled in GLOBAL mode, where the arena and its WEIGHT zone
+  exist. One helper, `ggml_sycl_ring_no_weight_room_reason`, now names why for the stage and the dry run: no reason
+  where the WEIGHT room is the planner's own figure; a multi-device plan in GLOBAL cache mode, which reads no WEIGHT
+  zone (a load reads none either); otherwise no active arena or no budget in the plan. The stage prints it instead of
+  zeros and otherwise prints the figures as the WEIGHT room its plan packs against; the dry run's keep line drops its
+  own three-way branch and adds the load's answer (none either, or may differ on the arena its entry ensure builds).
+  Both stay INFO. RED first: the ring-drop contract failed at D1 against the old backend; it now pins the helper whole
+  and its two callers, and has 95 mutants.
+  (2) `sycl-memory-design.md` drops the 69c4ea428 Qwen B50 throughput row, whose correctness row r7 removed.
+  (3) `test-moe-pp-batched-dequant` and `test-moe-pp-staging-refusal --direct-reentry` load their planned model through
+  one header, `ggml/src/ggml-sycl/tests/moe-planned-model-fixture.hpp` (shape, experts, inventory, lifecycle), with no
+  behaviour change; the dequant test keeps `lifecycle_fixture` as a subclass for its variants, so its gate-up pins read
+  as before. The lead reruns the device tests that use it, once each:
+  `ctest --test-dir build -R '^test-moe-pp-batched-dequant$' --output-on-failure` and
+  `ctest --test-dir build -R '^test-moe-pp-staging-refusal-direct-reentry$' --output-on-failure` (the default mode of
+  `test-moe-pp-staging-refusal` is rebuilt but loads its own unplanned model, not the fixture).
+  (4) `moe_pp_ring_drop_marks::mark` and the slots it writes are private, so `record` alone marks a device;
+  `test-sycl-moe-ring-consumer` asserts at compile time that `record` is callable and `mark` is not (RED first: it did
+  not compile while `mark` was public).
+  (5) r7 (1)'s exit 77 names all three skips: no SYCL GPU, more than one card visible, weights not evictable.
 
 ---
 

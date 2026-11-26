@@ -3286,8 +3286,12 @@ ring's micro-batch where it differs from the planning shape, then the ring's own
 terms), and the plan made with it stands, with no second plan, unless the
 give-back rebuilt the arena (below). Where no room returns, one INFO line,
 "device N keeps its PP MoE oneDNN scratch ring ... a drop would give the weights
-no room", gives the RUNTIME room and the WEIGHT zone with the ring and without
-it. Where the arena has live allocations and cannot be
+no room", gives the RUNTIME room and the WEIGHT room the plan packs against,
+with the ring and without it. Where the plan read no WEIGHT room with the ring,
+the line names why instead, through the reason the dry run's keep line names
+too (`ggml_sycl_ring_no_weight_room_reason`): a multi-device plan in GLOBAL
+cache mode reads no WEIGHT zone, or the device has no active arena or no budget
+in the plan. Where the arena has live allocations and cannot be
 rebuilt, one WARN says that the RUNTIME zone would need that much less without
 the ring, that something points into the arena, and how many experts' worth of
 room the ring displaces in this load (`moe_pp_ring_experts_worth`: the room over
@@ -3371,10 +3375,12 @@ an arena whose layout it keeps, whose WEIGHT zone takes the whole room
 (`moe_pp_ring_dry_run_answer`), and plans once more without the ring, against
 the budget it planned the first with. A ring it keeps is put back and its plan
 stands, with an INFO line that says why: a multi-device plan in GLOBAL cache
-mode reads no WEIGHT zone, the device has no active arena or no budget in the
-plan, or the ring takes no RUNTIME room. A device with no active arena is where
-the dry run can differ from a load: a load's entry ensure builds the arena
-before its stage asks, and that line says so. It cannot see a plan without the
+mode reads no WEIGHT zone, and a load reads none either; the device has no
+active arena or no budget in the plan; or the ring takes no RUNTIME room. The
+first two are the load stage's reason (`ggml_sycl_ring_no_weight_room_reason`).
+A device with no active arena is where the dry run can differ from a load: a
+load's entry ensure builds the arena before its stage asks, and that line says
+so. It cannot see a plan without the
 ring that would grow another zone, a rebuild that changes the arena's layout, or
 a held arena, for which a load keeps the ring, and its drop line says so. Where
 a load's give-back rebuilds RUNTIME smaller, the load's last plan can therefore
@@ -3465,7 +3471,6 @@ The same runs' throughput, prompt / decode in t/s:
 | Inkling 2 Mini, both cards | 160.92 / 25.80 | 91.29 / 26.02 |
 | Inkling 2 Mini, B50 alone (not a speed verdict: builders alive) | 15.17 / 7.38 | 17.76 / 4.74 |
 | Qwen3.6-35B NVFP4, B70 | 74.37 / 14.31 | 68.07 / 14.31 |
-| Qwen3.6-35B NVFP4, B50 | 25.02 / 7.81 | 23.94 / 7.52 |
 
 Why the B70 prompt gains 9% on Qwen3.6-35B NVFP4 and 75% on Inkling is not yet
 known.
