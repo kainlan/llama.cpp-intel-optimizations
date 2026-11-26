@@ -9940,7 +9940,7 @@ struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     }
 };
 
-// a KQ scale other than 1/sqrt(hsk): gemma-style models pre-scale Q and pass 1.0
+// KQ scale 1.0 instead of 1/sqrt(hsk), as passed by models that pre-scale Q
 struct test_flash_attn_ext_kq_scale : public test_flash_attn_ext {
     static constexpr float kq_scale = 1.0f;
 
@@ -14333,12 +14333,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {4, 1}, 512, 3, true, true, 8, 10, GGML_PREC_F32,
         GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 4));
 
-    // FLASH_ATTN_EXT: per-head mask (mask->ne[2] > 1) WITHOUT sinks, D=128, F16 K/V,
-    // ne03 = ne33 = 1 and >= 8 queries: the shape a backend's prompt-processing path
-    // (e.g. SYCL's oneDNN SDPA) takes. The sinks cases above never reach such a path.
-    // A per-head bias (Inkling 2 Mini folds one into its mask) must be applied per head
-    // (head % ne32), not head 0's to every head (llama.cpp-44d0). mask_heads=1 is the
-    // head-broadcast control of the same shape. GQA (8 Q heads over 2 KV heads) and MHA.
+    // Fork note (llama.cpp-44d0): per-head masks without sinks at prompt batch sizes, the shapes that
+    // reach the SYCL backend's oneDNN SDPA and tile_d512 routes; mask_heads=1 is each arm's control.
+
+    // FLASH_ATTN_EXT: per-head mask (mask->ne[2] > 1) without sinks
     for (int nq : {32, 35}) {
         for (int mh : {1, 2, 8}) {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {4, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
@@ -14349,10 +14347,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
         }
     }
-    // The same at D=512, where a backend may have a dedicated D=512 prompt kernel (SYCL: oneDNN, else tile).
-    // The GQA arm (gqa_ratio 4, kv a multiple of 256) is the shape a tile kernel groups Q heads for: with a
-    // per-head mask the heads of one group must not share a mask plane. The kq_scale=1 arm is the gemma-style
-    // pre-scaled-Q variant, which a backend may route away from its 1/sqrt(D) kernel.
+    // FLASH_ATTN_EXT: per-head mask (mask->ne[2] > 1) without sinks, D=512, default and pre-scaled-Q KQ scale
     for (int nq : {32, 35}) {
         for (int mh : {1, 2, 8}) {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
