@@ -1158,6 +1158,15 @@ static void test_a_throw_leaves_a_held_admit_pending() {
     CHECK(reasons(r.d.stats.busy, ggml_sycl::MOE_SWAP_UNSETTLED_REASON) == 1);
 }
 
+// The zone-refusal line names its five figures, the sizes in bytes, under the driver's prefix.
+static void test_the_zone_refusal_line_names_its_figures() {
+    const std::string line = ggml_sycl::moe_swap_zone_refusal_line(1, 276, 300, 3145728, 1048576, 524288);
+    CHECK(line ==
+          "[MOE-SWAP] device 1: WEIGHT zone refused 276 of 300 admits for room: largest member asked 3145728 "
+          "bytes, zone_available 1048576 bytes, zone_largest_free 524288 bytes");
+    std::printf("  zone-refusal line: %s\n", line.c_str());
+}
+
 int main() {
     test_a_period_boundary_sends_its_evicts_alone();
     test_pending_admits_go_first_and_hold_the_policy_in_flight();
@@ -1192,6 +1201,7 @@ int main() {
     test_a_room_epoch_change_before_the_bound_sends_the_held_admit_again();
     test_a_zone_full_admit_sent_at_every_boundary_follows_the_drop_streak();
     test_a_throw_leaves_a_held_admit_pending();
+    test_the_zone_refusal_line_names_its_figures();
 
     if (g_failed != 0) {
         std::printf("test-sycl-moe-swap-driver: %d check(s) failed\n", g_failed);

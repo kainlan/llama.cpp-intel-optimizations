@@ -22027,17 +22027,18 @@ static bool ggml_sycl_expert_move_to_device(ggml_sycl_expert_move_kind kind) {
 // reason, BUSY when a later boundary may move it. reason is null until the transaction decides; the entry gives a
 // triplet the body never decided the call's own answer, since a refusal of the whole call refuses each. to_device
 // says which list named it, the admits' or the evicts'. device_bytes is the device storage a moved triplet took (an
-// admit) or gives back once the cache reaps the entries it retired (an evict). zone_room says a BUSY admit was refused
-// because the device WEIGHT zone had no room for a member (the "WEIGHT zone full" answer, typed): the one refusal that
-// passes only once the zone gains room, so its caller can wait for that instead of asking again.
+// admit) or gives back once the cache reaps the entries it retired (an evict). zone_room_bytes is nonzero when a BUSY
+// admit was refused because the device WEIGHT zone had no room for a member (the "WEIGHT zone full" answer, typed),
+// and is that member's size: the one refusal that passes only once the zone gains room, so its caller can wait for
+// that instead of asking again, and can say what the zone was asked for.
 struct ggml_sycl_expert_move_outcome {
     ggml_sycl::moe_expert_triplet_ref triplet;
     bool                              to_device    = true;
     bool                              moved        = false;
     ggml_sycl_txn_result              code         = ggml_sycl_txn_result::REFUSED;
     const char *                      reason       = nullptr;
-    size_t                            device_bytes = 0;
-    bool                              zone_room    = false;
+    size_t                            device_bytes    = 0;
+    size_t                            zone_room_bytes = 0;
 };
 
 // Per device, the triplets lent and not yet re-admitted, in the order they were lent, under the identity of the
@@ -22667,7 +22668,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
             // The storage minted for its other members goes back with `triplet`, so a refusal leaves nothing behind.
             refuse_named(triplet.named, transient ? ggml_sycl_txn_result::BUSY : ggml_sycl_txn_result::REFUSED, stop);
             // A device mint refused transiently is the "WEIGHT zone full" answer: the zone had no room for a member.
-            (*named_moves)[triplet.named].zone_room = transient && triplet.mint_refused_bytes != 0;
+            (*named_moves)[triplet.named].zone_room_bytes = transient ? triplet.mint_refused_bytes : 0;
             stop      = nullptr;
             transient = false;
         } else if (refill && !transient) {
@@ -23705,6 +23706,26 @@ static void ggml_sycl_moe_swap_warn_refusal(ggml_sycl_moe_swap_instance &    ins
                   reason);
 }
 
+// A boundary whose transaction refused admits because the device WEIGHT zone had no room: one WARN line for the
+// boundary, with what the zone has free now that the batch's other mints are taken. The two free figures are read
+// together under the zone's allocator lock, held for the read alone: all the free bytes, and the largest free block,
+// so bytes that are free and still too small for the member asked show as that. With no arena the figures print 0.
+static void ggml_sycl_moe_swap_warn_zone_refusal(ggml_sycl::unified_cache * cache,
+                                                 int                        device,
+                                                 size_t                     refused,
+                                                 size_t                     admits,
+                                                 size_t                     asked) {
+    size_t capacity     = 0;
+    size_t used         = 0;
+    size_t available    = 0;
+    size_t largest_free = 0;
+    if (cache) {
+        (void) cache->zone_free_figures(ggml_sycl::vram_zone_id::WEIGHT, capacity, used, available, largest_free);
+    }
+    GGML_LOG_WARN(
+        "%s\n", ggml_sycl::moe_swap_zone_refusal_line(device, refused, admits, asked, available, largest_free).c_str());
+}
+
 // The host room an evict batch may take: what the pinned host WEIGHT zone can still hand out without growing, the
 // same figure the evict's mint is refused past (ggml_sycl_host_expert_alloc_no_growth). The host arena answers from
 // its own counters, without a wait.
@@ -23835,9 +23856,12 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
             const ggml_sycl_txn_result code = ggml_sycl_expert_move_transaction_run(device, request, nullptr, &result);
 
             // Each move's answer comes back in its own list, in list order. The call answers every triplet it was
-            // given; a move it did not answer takes the call's own answer.
-            size_t next_evict = 0;
-            size_t next_admit = 0;
+            // given; a move it did not answer takes the call's own answer. The admits refused for device room are
+            // counted, with the largest member the zone refused, for the boundary's one line below.
+            size_t next_evict       = 0;
+            size_t next_admit       = 0;
+            size_t zone_refused     = 0;
+            size_t zone_refused_max = 0;
             for (ggml_sycl::moe_swap_move & m : batch) {
                 const bool                                         evict   = m.kind == ggml_sycl::MOE_SWAP_MOVE_EVICT;
                 const std::vector<ggml_sycl_expert_move_outcome> & answers = evict ? result.evicted : result.admitted;
@@ -23847,14 +23871,22 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
                     m.outcome                               = ggml_sycl_moe_swap_outcome_of(o.moved, o.code);
                     m.reason                                = o.reason;
                     m.bytes                                 = o.device_bytes;
-                    m.busy_cause                            = o.zone_room ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM :
-                                                                            ggml_sycl::MOE_SWAP_BUSY_CAUSE_TRANSIENT;
+                    m.busy_cause = o.zone_room_bytes != 0 ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM :
+                                                            ggml_sycl::MOE_SWAP_BUSY_CAUSE_TRANSIENT;
+                    if (o.zone_room_bytes != 0) {
+                        ++zone_refused;
+                        zone_refused_max = std::max(zone_refused_max, o.zone_room_bytes);
+                    }
                 } else {
                     m.outcome = ggml_sycl_moe_swap_outcome_of(false, code);
                     m.reason  = result.reason;
                 }
                 m.latches_block = ggml_sycl_moe_swap_refusal_latches_block(m);
                 ggml_sycl_moe_swap_warn_refusal(inst, device, m);
+            }
+            if (zone_refused != 0) {
+                ggml_sycl_moe_swap_warn_zone_refusal(cache, device, zone_refused, request.admit.size(),
+                                                     zone_refused_max);
             }
         });
 }

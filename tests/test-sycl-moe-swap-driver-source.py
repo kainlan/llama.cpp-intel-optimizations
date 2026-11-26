@@ -67,7 +67,12 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       right where the mint fails; the transaction marks the named triplet's outcome when that refusal is transient
       (the "WEIGHT zone full" answer, and no other); and the callback gives the move MOE_SWAP_BUSY_CAUSE_ZONE_ROOM
       from the outcome. Without either the driver holds nothing, sends a refused admit again at every boundary, and
-      no unit test sees it.
+      no unit test sees it;
+  D19 a boundary whose transaction refused admits for device room says so in one WARN line: the callback counts the
+      answers that carry a refused size and keeps the largest, and after its loop over the batch, on that count alone
+      (so a batch that moved nothing prints it too, and no admit prints its own), calls
+      ggml_sycl_moe_swap_warn_zone_refusal once with the admits it sent; the helper reads the WEIGHT zone's free
+      figures together (unified_cache::zone_free_figures) and logs moe_swap_zone_refusal_line at WARN.
 
 Checks run on comment-stripped text, string literals kept. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
@@ -110,6 +115,7 @@ WARN_SIG = "static void ggml_sycl_moe_swap_warn_refusal("
 LATCH_SIG = "static bool ggml_sycl_moe_swap_refusal_latches_block("
 REPORT_SIG = "static void ggml_sycl_moe_swap_report("
 TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_txn_run("
+ZONE_WARN_SIG = "static void ggml_sycl_moe_swap_warn_zone_refusal("
 ROOM_SIG = "static size_t ggml_sycl_moe_swap_host_room("
 LOAN_SIG = "bool unified_cache::loan_expert_triplet("
 NO_GROWTH_ROOM_SIG = "size_t unified_cache::host_zone_no_growth_room("
@@ -175,11 +181,20 @@ ROOM_BOUND = "host_zone_no_growth_bound(zone, host_zone_reserved_capacity(zone),
 NO_GROWTH_ROOM_FIELDS = (f"const size_t bound = {ROOM_BOUND};", "const size_t limit = bound > 0 ? bound : capacity;",
                          "return limit > used ? limit - used : 0;")
 ROOM_EPOCH_READ = "call.room_epoch = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;"
-BUSY_CAUSE_SET = ("m.busy_cause = o.zone_room ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM : "
+BUSY_CAUSE_SET = ("m.busy_cause = o.zone_room_bytes != 0 ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM : "
                   "ggml_sycl::MOE_SWAP_BUSY_CAUSE_TRANSIENT;")
 ZONE_ROOM_MINT = ("storage = ggml_sycl_device_expert_alloc(device, staged); if (!storage.valid()) { "
                   "out.mint_refused_bytes = staged;")
-ZONE_ROOM_OUTCOME = "(*named_moves)[triplet.named].zone_room = transient && triplet.mint_refused_bytes != 0;"
+ZONE_ROOM_OUTCOME = "(*named_moves)[triplet.named].zone_room_bytes = transient ? triplet.mint_refused_bytes : 0;"
+ZONE_REFUSED_COUNT = ("if (o.zone_room_bytes != 0) { ++zone_refused; "
+                      "zone_refused_max = std::max(zone_refused_max, o.zone_room_bytes); }")
+# The loop over the batch ends on the refusal WARN's call; the zone-refusal line comes right after it, on the count.
+ZONE_WARN_AFTER_LOOP = (WARN_CALL + " } if (zone_refused != 0) { ggml_sycl_moe_swap_warn_zone_refusal(cache, device, "
+                        "zone_refused, request.admit.size(), zone_refused_max); }")
+ZONE_WARN_FIELDS = ("(void) cache->zone_free_figures(ggml_sycl::vram_zone_id::WEIGHT, capacity, used, available, "
+                    "largest_free);",
+                    'GGML_LOG_WARN("%s\\n", ggml_sycl::moe_swap_zone_refusal_line(device, refused, admits, asked, '
+                    "available, largest_free).c_str());")
 
 WAITS = re.compile(
     r"(?:\.|->)\s*wait\s*\(|\bwait_and_throw\b|\bdrain_retained_handles\b|\bwait_all\b|\bcommand_execution_status\b|"
@@ -565,9 +580,23 @@ def check(raw: dict[str, str]) -> None:
     if norm(prep).count(ZONE_ROOM_MINT) != 1 or len(re.findall(r"\bmint_refused_bytes\s*=(?!=)", sycl)) != 2:
         fail("D18", "the preparation does not leave the size of a refused device mint on the prepared triplet, set "
                     "where the device mint fails and nowhere else")
-    if norm(body(sycl, TXN_SIG)).count(ZONE_ROOM_OUTCOME) != 1 or len(re.findall(r"\bzone_room\s*=(?!=)", sycl)) != 2:
+    if (norm(body(sycl, TXN_SIG)).count(ZONE_ROOM_OUTCOME) != 1
+            or len(re.findall(r"\bzone_room_bytes\s*=(?!=)", sycl)) != 2):
         fail("D18", "the transaction does not mark the named triplet's outcome exactly when a device mint was refused "
                     "transiently")
+
+    # D19 --------------------------------------------------------------------------------------------------------------
+    zone_warn = norm(body(sycl, ZONE_WARN_SIG))
+    if norm(callback).count(ZONE_REFUSED_COUNT) != 1 or len(re.findall(r"\bzone_refused\b\s*(?:=(?!=)|\+=)", caller)) != 1:
+        fail("D19", "the transaction callback does not count the answers refused for device room, with the largest "
+                    "size, in one place")
+    if norm(callback).count(ZONE_WARN_AFTER_LOOP) != 1 or sycl.count("ggml_sycl_moe_swap_warn_zone_refusal(") != 2:
+        fail("D19", "the zone-refusal line is not printed once per boundary, after the loop over the batch, whenever "
+                    "an admit was refused for device room")
+    if not zone_warn or not all(f in zone_warn for f in ZONE_WARN_FIELDS) or "GGML_LOG" in zone_warn.replace(
+            ZONE_WARN_FIELDS[1], ""):
+        fail("D19", "ggml_sycl_moe_swap_warn_zone_refusal does not log moe_swap_zone_refusal_line at WARN with the "
+                    "WEIGHT zone's free figures read together")
 
 
 def _helper_body(sycl: str, name: str) -> str:
@@ -782,7 +811,7 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", CALLER_SIG, "ggml_sycl_expert_move_request request;",
                   "call.room_epoch = 0;\n            ggml_sycl_expert_move_request request;")])
     expect_fail("busy-cause-not-mapped", "D18",
-                [("sycl", CALLER_SIG, "o.zone_room ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM",
+                [("sycl", CALLER_SIG, "o.zone_room_bytes != 0 ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM",
                   "false ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM")])
     expect_fail("refused-mint-not-recorded", "D18",
                 [("sycl", PREP_SIG, "out.mint_refused_bytes = staged;", "")])
@@ -791,10 +820,27 @@ def self_test(raw: dict[str, str]) -> int:
                   "out.mint_refused_bytes = target.logical_bytes;\n                "
                   "*transient = out.kind == ggml_sycl_expert_move_kind::EVICT;")])
     expect_fail("zone-room-for-any-transient-refusal", "D18",
-                [("sycl", TXN_SIG, "zone_room = transient && triplet.mint_refused_bytes != 0;", "zone_room = transient;")])
+                [("sycl", TXN_SIG, "zone_room_bytes = transient ? triplet.mint_refused_bytes : 0;",
+                  "zone_room_bytes = triplet.mint_refused_bytes;")])
     expect_fail("zone-room-not-on-the-outcome", "D18",
-                [("sycl", TXN_SIG, "(*named_moves)[triplet.named].zone_room = transient && "
-                  "triplet.mint_refused_bytes != 0;", "")])
+                [("sycl", TXN_SIG, "(*named_moves)[triplet.named].zone_room_bytes = transient ? "
+                  "triplet.mint_refused_bytes : 0;", "")])
+    after_loop = ("ggml_sycl_moe_swap_warn_refusal(inst, device, m);\n            }\n")
+    expect_fail("zone-refusal-line-per-admit", "D19",
+                [("sycl", CALLER_SIG, after_loop,
+                  "ggml_sycl_moe_swap_warn_refusal(inst, device, m);\n                if (zone_refused != 0) {\n"
+                  "                    ggml_sycl_moe_swap_warn_zone_refusal(cache, device, zone_refused, "
+                  "request.admit.size(), zone_refused_max);\n                }\n            }\n")])
+    expect_fail("zone-refusal-line-only-when-accepted", "D19",
+                [("sycl", CALLER_SIG, "if (zone_refused != 0) {", "if (zone_refused != 0 && result.accepted) {")])
+    expect_fail("zone-refusal-line-dropped", "D19",
+                [("sycl", CALLER_SIG, "if (zone_refused != 0) {", "if (false) {")])
+    expect_fail("zone-refusals-not-counted", "D19", [("sycl", CALLER_SIG, "++zone_refused;", "")])
+    expect_fail("zone-refusal-line-at-info", "D19", [("sycl", ZONE_WARN_SIG, "GGML_LOG_WARN(", "GGML_LOG_INFO(")])
+    expect_fail("zone-refusal-figures-of-another-zone", "D19",
+                [("sycl", ZONE_WARN_SIG, "ggml_sycl::vram_zone_id::WEIGHT", "ggml_sycl::vram_zone_id::KV")])
+    expect_fail("zone-refusal-figures-not-read", "D19", [("sycl", ZONE_WARN_SIG, "(void) cache->zone_free_figures(",
+                                                         "(void) sizeof(")])
 
     try:
         mutate(raw, [("sycl", "", "this anchor is in no source", "x")])

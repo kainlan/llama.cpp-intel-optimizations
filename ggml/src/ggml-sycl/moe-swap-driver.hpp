@@ -881,4 +881,23 @@ inline std::string moe_swap_driver_summary_faults(const moe_swap_driver_stats & 
     return out;
 }
 
+// The line a boundary prints when its transaction refused admits because the device WEIGHT zone had no room: how many
+// of the admits it sent, the largest member the zone was asked for and refused, and what the zone had free after the
+// batch, in bytes. zone_available is every free byte and zone_largest_free the largest free block, so a zone with the
+// bytes and no block large enough for the member reads apart from one with no bytes.
+inline std::string moe_swap_zone_refusal_line(int      device,
+                                              uint64_t refused,
+                                              uint64_t admits,
+                                              size_t   asked,
+                                              size_t   zone_available,
+                                              size_t   zone_largest_free) {
+    using ull = unsigned long long;
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "[MOE-SWAP] device %d: WEIGHT zone refused %llu of %llu admits for room: largest member asked %zu "
+                  "bytes, zone_available %zu bytes, zone_largest_free %zu bytes",
+                  device, (ull) refused, (ull) admits, asked, zone_available, zone_largest_free);
+    return line;
+}
+
 }  // namespace ggml_sycl

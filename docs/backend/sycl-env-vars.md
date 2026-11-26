@@ -628,6 +628,14 @@ counted the moves it had in flight as open slots)
 - WARN `[MOE-SWAP] device %d: %s refused: %s (logged once per reason)`: `%s` is `evict` or `admit`, then the named
   move's final refusal reason. Logged as it happens, the first time each reason appears in each direction on the
   device's instance, so a run killed before backend free still says what the driver could not move.
+- WARN `[MOE-SWAP] device %d: WEIGHT zone refused %llu of %llu admits for room: largest member asked %zu bytes,
+  zone_available %zu bytes, zone_largest_free %zu bytes`: one line for each boundary whose transaction refused at
+  least one admit because the device WEIGHT zone had no room, whether or not anything else in the batch moved: the
+  admits refused of the admits sent, the largest member the zone was asked for and refused, and what the zone had
+  free after the batch, read together (`unified_cache::zone_free_figures`). `zone_available` at or above the size
+  asked with `zone_largest_free` below it is fragmentation; both below it is a zone with no room. A boundary whose
+  transaction throws prints none. A refused admit is held, not sent, until the zone's room epoch moves, so the
+  line does not repeat for it at the boundaries in between.
 - WARN `[MOE-SWAP] device %d: no driver ran: %llu boundaries off (multithreaded graphs), %llu skipped (a graph in
   flight, or the instance claimed)`: at backend free, for a device whose boundaries were all turned off or skipped
   before a driver existed (the multithreaded latch set from the first graph, say).
