@@ -150,10 +150,27 @@ _LEXEME_RE = re.compile(
 )
 
 
-# The mutant tests below each rebuild the claims on a copy of one source with one edit; the other sources, and a
-# claim's repeated reads of the same text, are served from a cache keyed by content, so a mutant is still judged on its
-# own text.
-@functools.lru_cache(maxsize=64)
+# The mutant tests below each rebuild the claims on a copy of one source with one edit. The unmutated sources stay
+# cached because every mutant reads them; a mutated text is used for its one claim and evicted. The caches are small on
+# purpose: a key holds a whole source, so a large cache would keep hundreds of dead mutants in memory. A hit returns
+# what the same text gave before, so each mutant is still judged on its own text.
+_WHOLE_SOURCE = 1 << 20  # a text this long is a whole source or a whole stripped copy of one, not a body cut from it
+
+
+def content_cache(fn):
+    """Cache `fn` by its text argument in two tiers: the few whole-source texts stay hot, and the many short texts cut
+    from them are held in a larger cache whose keys are each under a megabyte."""
+    short = functools.lru_cache(maxsize=256)(fn)
+    whole = functools.lru_cache(maxsize=8)(fn)
+
+    @functools.wraps(fn)
+    def cached(text):
+        return (whole if len(text) >= _WHOLE_SOURCE else short)(text)
+
+    return cached
+
+
+@functools.lru_cache(maxsize=8)
 def strip_comments(src: str) -> str:
     def repl(m: re.Match) -> str:
         tok = m.group(0)
@@ -174,7 +191,7 @@ def strip_cmake_comments(src: str) -> str:
 _INVENTORY_GUARD_RE = re.compile(r"std::(lock_guard|unique_lock) ?<[^<>;]*> ?(\w+)\(g_tensor_inventory_mutex\)")
 
 
-@functools.lru_cache(maxsize=256)
+@content_cache
 def norm(text: str) -> str:
     """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so neither a clang-format
     re-wrap nor a re-split format string can turn a claim red, and every guard on g_tensor_inventory_mutex in its

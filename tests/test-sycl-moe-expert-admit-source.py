@@ -128,10 +128,27 @@ class MutantNotApplied(Exception):
     pass
 
 
-# The self-test runs the gate on a mutant of each source in turn; a mutant changes one file, so the pure text functions
-# below are cached by content and the other files are read once. A hit returns what the same text gave before, so each
-# mutant is still judged on its own text.
-@functools.lru_cache(maxsize=64)
+# The self-test runs the gate on a mutant of each source in turn. The unmutated sources, and what is cut from them,
+# stay cached because every mutant reads them; a mutated text is used for its one check and evicted. The caches are
+# small on purpose: a key holds a whole 7 MB source, so a large cache would keep hundreds of dead mutants in memory. A
+# cache hit returns what the same text gave before, so each mutant is still judged on its own text.
+_WHOLE_SOURCE = 1 << 20  # a text this long is a whole source or a whole stripped copy of one, not a body cut from it
+
+
+def content_cache(fn):
+    """Cache `fn` by its text argument in two tiers: the few whole-source texts stay hot, and the many short texts cut
+    from them are held in a larger cache whose keys are each under a megabyte."""
+    short = functools.lru_cache(maxsize=256)(fn)
+    whole = functools.lru_cache(maxsize=8)(fn)
+
+    @functools.wraps(fn)
+    def cached(text):
+        return (whole if len(text) >= _WHOLE_SOURCE else short)(text)
+
+    return cached
+
+
+@functools.lru_cache(maxsize=8)
 def strip_comments(src: str) -> str:
     """Comments blanked to their newlines, literals kept."""
 
@@ -144,7 +161,7 @@ def strip_comments(src: str) -> str:
     return _LEXEME_RE.sub(repl, src)
 
 
-@functools.lru_cache(maxsize=64)
+@content_cache
 def norm(text: str) -> str:
     """Comment-stripped, whitespace-canonical text with adjacent string literals joined, and every guard on
     g_tensor_inventory_mutex in its deduced spelling, so a clang-format re-wrap cannot turn a pin red."""

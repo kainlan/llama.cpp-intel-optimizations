@@ -339,14 +339,15 @@ def fail(pin: str, what: str) -> None:
     raise ContractError(f"FAIL [pin {pin}]: {what}")
 
 
-# The self-test runs the gate on a hundred mutants of the same four sources, each a copy of the real text with one edit,
-# so the pure text functions below are cached by content: the files a mutant leaves alone, and the bodies cut from
-# them, are read once. A cache hit returns what the same text gave before, so every mutant is still judged on its own
-# text and the pins are shown to catch it.
-_CACHE = 64
+# The self-test runs the gate on a mutant of each source in turn. The unmutated sources, and what is cut from them,
+# stay cached because every mutant reads them; a mutated text is used for its one check and evicted. The caches are
+# small on purpose: a key holds a whole 7 MB source, so a large cache would keep hundreds of dead mutants in memory. A
+# cache hit returns what the same text gave before, so each mutant is still judged on its own text.
+_BIG = 8  # entries holding a whole source or its stripped copy
+_SMALL = 256  # entries cut from one
 
 
-@functools.lru_cache(maxsize=_CACHE)
+@functools.lru_cache(maxsize=_BIG)
 def strip_comments(src: str) -> str:
     """Comments blanked to spaces with their newlines kept, literals kept. The length is kept too, so an offset in the
     stripped text is the same offset in the source: a mutant finds its body in the stripped text, where an apostrophe in
@@ -362,7 +363,7 @@ def strip_comments(src: str) -> str:
     return _LEXEME_RE.sub(repl, src)
 
 
-@functools.lru_cache(maxsize=4096)
+@functools.lru_cache(maxsize=_SMALL)
 def norm(text: str) -> str:
     """Whitespace runs collapsed to one space, and none just inside parentheses, so a re-wrap cannot turn a pin red."""
     words = text.split()  # the same whitespace as \s, and far faster on the 7 MB backend source
@@ -409,7 +410,7 @@ def block_span(text: str, open_at: int) -> tuple[int, int]:
     return -1, -1
 
 
-@functools.lru_cache(maxsize=4096)
+@functools.lru_cache(maxsize=_SMALL)
 def body_span(text: str, signature: str) -> tuple[int, int]:
     """[start, end) of the body of the first definition starting with `signature`; a declaration (its parameter list
     closes on a semicolon) is passed over. (-1, -1) when there is none."""
@@ -430,7 +431,7 @@ def body_span(text: str, signature: str) -> tuple[int, int]:
     return -1, -1
 
 
-@functools.lru_cache(maxsize=4096)
+@functools.lru_cache(maxsize=_SMALL)
 def body(text: str, signature: str) -> str:
     start, end = body_span(text, signature)
     return text[start:end] if start >= 0 else ""
@@ -560,7 +561,8 @@ def check(raw: dict[str, str]) -> None:
     # D22 --------------------------------------------------------------------------------------------------------------
     outer_n, core_n = norm(outer), norm(core)
     hook_n = norm(body(sycl, HOOK_SIG))
-    if CORE_DECL not in norm(sycl[sycl.find(CORE_SIG):][:400]):
+    core_at = sycl.find(CORE_SIG)
+    if core_at < 0 or CORE_DECL not in norm(sycl[core_at:sycl.find("{", core_at) + 1]):
         fail("D22", "the claimed body does not take (device, decodes, graphs, resolver)")
     if re.search(r"\bctx\b", core):
         fail("D22", "the claimed body reads the backend context, so a test cannot run it without one")
@@ -828,7 +830,7 @@ def check(raw: dict[str, str]) -> None:
         fail("D21", "arena_note_room_grew does not add one to the group's room epoch")
 
 
-@functools.lru_cache(maxsize=4096)
+@functools.lru_cache(maxsize=_SMALL)
 def _helper_body(sycl: str, name: str) -> str:
     for m in HELPER_DEF.finditer(sycl):
         if m.group(1) == name:
@@ -1195,6 +1197,23 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("room-grew-moves-nothing", "D21",
                 [("cache", ROOM_GREW_SIG, "room_epoch.fetch_add(1, std::memory_order_release);",
                   "room_epoch.load(std::memory_order_acquire);")])
+
+    # The signature is compared up to its opening brace, wherever that falls: a comment inside the parameter list is
+    # blanked, not removed, so it lengthens the text between the name and the brace and must not fail the pin.
+    graphs_param = "uint64_t                               graphs,\n"
+    expect_fail("claimed-body-drops-a-parameter", "D22",
+                [("sycl", "", "                                              " + graphs_param, "")])
+    expect_fail("claimed-body-renames-the-resolver", "D22",
+                [("sycl", "", "* resolver) {\n    ggml_sycl_moe_swap_instance &",
+                  "* res) {\n    ggml_sycl_moe_swap_instance &")])
+    try:
+        check(mutate(raw, [("sycl", "", graphs_param, graphs_param + "// a long note on the boundary's decode count, "
+                            "so that the parameter list is longer than any fixed window of the signature\n"
+                            + " " * 46)]))
+        print("  self-test: a comment inside the parameter list passes")
+    except ContractError as e:
+        print(f"  self-test: a comment inside the parameter list FAILS: {e}")
+        failures.append("comment-in-parameter-list")
 
     try:
         mutate(raw, [("sycl", "", "this anchor is in no source", "x")])
