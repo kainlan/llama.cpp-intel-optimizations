@@ -82,7 +82,15 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       the callback reads the epoch right after the transaction returns and returns it with the sum; and the step
       holds a refused admit, and lets a held one follow the epoch, only when moe_swap_room_stood says the epoch's
       move since the boundary's read is that sum, under the epoch the transaction left. No host test runs the
-      transaction's side of this, so the text is its only gate here.
+      transaction's side of this, so the text is its only gate here;
+  D21 the room epoch moves wherever the zone's allocators gain room. The hold waits for that move, so a site that
+      stops making it holds admits silently to the bound, and no error says so. unified_cache::zone_free gives a block
+      back in four arms (in the N-chunk mode the KV zone's own allocator and a chunk's, then the allocator WEIGHT
+      shares with KV, then a zone's own), and each calls arena_note_room_grew for the zone's group right after its
+      zone_used_free; arena_group_reset_allocators_locked calls it first; arena_note_allocators_made calls it for
+      every group, and arena_reserve calls that at both places it makes the allocators; and arena_note_room_grew adds
+      one to the group's epoch. zone_alloc's own zone_used_free calls undo an allocation that could not be recorded:
+      no room is gained there, and none is pinned.
 
 Checks run on comment-stripped text, string literals kept. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
@@ -229,6 +237,17 @@ ROOM_STOOD_USE = "const bool room_stood = moe_swap_detail::moe_swap_room_stood(c
 HELD_FOLLOWS = "p.room_epoch = room_stood ? room.epoch_after : p.room_epoch;"
 HOLD_SET = ("p.room_held = m.busy_cause == MOE_SWAP_BUSY_CAUSE_ZONE_ROOM && room_stood; "
             "p.room_epoch = room.epoch_after;")
+ZONE_FREE_SIG = "bool unified_cache::zone_free("
+RESET_SIG = "void unified_cache::arena_group_reset_allocators_locked("
+ROOM_GREW_SIG = "void unified_cache::arena_note_room_grew("
+ALLOCATORS_MADE_SIG = "void unified_cache::arena_note_allocators_made("
+ZONE_FREE_GIVES_BACK = re.compile(r"\bzone_used_free\([^;]*;")
+ZONE_FREE_BUMP = "arena_note_room_grew(arena_allocator_group_index(zone));"
+RESET_BUMP = "{ arena_note_room_grew(group);"
+ROOM_GREW_BODY = "arena_allocator_groups_[group].room_epoch.fetch_add(1, std::memory_order_release);"
+ALLOCATORS_MADE_BODY = ("for (size_t group = 0; group < ARENA_ALLOCATOR_GROUP_COUNT; ++group) { "
+                        "arena_note_room_grew(group); }")
+ALLOCATORS_MADE_CALL = "arena_note_allocators_made();"
 
 WAITS = re.compile(
     r"(?:\.|->)\s*wait\s*\(|\bwait_and_throw\b|\bdrain_retained_handles\b|\bwait_all\b|\bcommand_execution_status\b|"
@@ -664,6 +683,23 @@ def check(raw: dict[str, str]) -> None:
         fail("D20", "the step does not hold a refused admit, and let a held one follow the epoch, only when the room "
                     "stood, under the epoch the transaction left")
 
+    # D21 --------------------------------------------------------------------------------------------------------------
+    zone_free = norm(body(cache, ZONE_FREE_SIG))
+    given_back = [m.end() for m in ZONE_FREE_GIVES_BACK.finditer(zone_free)]
+    if (len(given_back) != 4 or zone_free.count(ZONE_FREE_BUMP) != 4
+            or not all(zone_free[at:].startswith(" " + ZONE_FREE_BUMP) for at in given_back)):
+        fail("D21", "unified_cache::zone_free does not move the group's room epoch right after each of its four "
+                    "zone_used_free calls, so a block can go back to the zone with the epoch standing")
+    if not norm(body(cache, RESET_SIG)).startswith(RESET_BUMP):
+        fail("D21", "arena_group_reset_allocators_locked does not move the group's room epoch before it resets the "
+                    "allocators")
+    if (norm(body(cache, ALLOCATORS_MADE_SIG)).count(ALLOCATORS_MADE_BODY) != 1
+            or cache.count(ALLOCATORS_MADE_CALL) != 2):
+        fail("D21", "arena_note_allocators_made does not move every group's room epoch, or is not called at both "
+                    "places the arena's allocators are made")
+    if norm(body(cache, ROOM_GREW_SIG)).count(ROOM_GREW_BODY) != 1:
+        fail("D21", "arena_note_room_grew does not add one to the group's room epoch")
+
 
 def _helper_body(sycl: str, name: str) -> str:
     for m in HELPER_DEF.finditer(sycl):
@@ -938,6 +974,23 @@ def self_test(raw: dict[str, str]) -> int:
                   "const uint64_t epoch_after = 0;")])
     expect_fail("self-delta-not-returned", "D20",
                 [("sycl", CALLER_SIG, "{ epoch_after, result.room_self_delta }", "{ epoch_after, 0 }")])
+    used = "arena_zones_[static_cast<int>(record_zone)].used);\n"
+    bump = "arena_note_room_grew(arena_allocator_group_index(zone));\n"
+    for name, call, indent in (("kv-zone-arm", "zone_used_free(*z.allocator, zone_offset, ", " " * 16),
+                               ("chunk-arm", "zone_used_free(*target->allocator, chunk_off, ", " " * 8),
+                               ("shared-allocator-arm", "zone_used_free(*alloc, zone_offset, ", " " * 8),
+                               ("own-allocator-arm", "zone_used_free(*alloc, zone_offset, ", " " * 4)):
+        expect_fail(f"zone-free-{name}-does-not-move-the-epoch", "D21",
+                    [("cache", ZONE_FREE_SIG, call + used + indent + bump, call + used)])
+    expect_fail("allocator-reset-does-not-move-the-epoch", "D21",
+                [("cache", RESET_SIG, "arena_note_room_grew(group);", "")])
+    expect_fail("allocators-made-moves-no-epoch", "D21",
+                [("cache", ALLOCATORS_MADE_SIG, "arena_note_room_grew(group);", "")])
+    expect_fail("allocators-made-not-noted", "D21",
+                [("cache", "", "\n    arena_note_allocators_made();\n", "\n")])
+    expect_fail("room-grew-moves-nothing", "D21",
+                [("cache", ROOM_GREW_SIG, "room_epoch.fetch_add(1, std::memory_order_release);",
+                  "room_epoch.load(std::memory_order_acquire);")])
 
     try:
         mutate(raw, [("sycl", "", "this anchor is in no source", "x")])
@@ -976,7 +1029,7 @@ def main(argv: list[str]) -> int:
     print("PASS: the swap driver runs once per synchronize boundary after the refill, gated, without a wait or a lock "
           "across its policy, its evict copies never grow the host zone, its refusals, latch and room are named, and "
           "its hold reads the zone's room epoch and a typed refusal, less what the transaction's own give-backs moved "
-          "the epoch by")
+          "the epoch by, and every site that gives the zone room moves that epoch")
     return 0
 
 

@@ -7,6 +7,9 @@
 //               counted once as a cascade miss (zone_cascade_miss), since every caller has a next path, never as a
 //               plan refusal (zone_plan_refusal), which says the plan was wrong
 //   room        the request is served from the zone as an exact, zone-managed block, and no raw gate is read either
+//   arena made  every zone's room epoch has moved by the time the arena's allocators exist: making them is room
+//               gained, so 0 stays the count of a cache with no arena, and an admit refused before the arena
+//               existed is not held under the count the new arena starts from
 //   room epoch  the zone's room epoch (unified_cache::zone_room_epoch) moves when a block goes back to the zone and
 //               stands still for a refusal and for an allocation; KV reads the same count as WEIGHT, whose allocator
 //               it shares, and RUNTIME's does not move for a WEIGHT block
@@ -116,6 +119,18 @@ bool fill_around_hole(unified_cache * cache, alloc_owner * hole, std::vector<all
         fill->push_back(std::move(filler.owner));
     }
     return cache->zone_available(vram_zone_id::WEIGHT) == 0;
+}
+
+// Run before any block has gone back to a zone, so only the making of the allocators can have moved an epoch.
+void test_the_arena_is_made_with_every_room_epoch_moved(unified_cache * cache) {
+    std::printf("the arena's allocators are made with every zone's room epoch moved:\n");
+    const vram_zone_id zones[] = { vram_zone_id::KV, vram_zone_id::WEIGHT, vram_zone_id::ONEDNN, vram_zone_id::RUNTIME,
+                                   vram_zone_id::SCRATCH };
+    for (vram_zone_id zone : zones) {
+        const uint64_t epoch = cache->zone_room_epoch(zone);
+        std::printf("  zone %d: room epoch %llu\n", static_cast<int>(zone), (unsigned long long) epoch);
+        CHECK(epoch != 0, "arena made: a zone's room epoch is still 0, the count a cache with no arena reads");
+    }
 }
 
 void test_full_zone_refuses_at_the_zone(unified_cache * cache) {
@@ -240,6 +255,7 @@ int main(int, char ** argv) {
     unified_cache * cache = make_mock(q);
     std::printf("mock: arena %zu bytes, WEIGHT capacity %zu, available %zu\n", cache->arena_total_size(),
                 cache->zone_capacity(vram_zone_id::WEIGHT), cache->zone_available(vram_zone_id::WEIGHT));
+    test_the_arena_is_made_with_every_room_epoch_moved(cache);
 
     alloc_owner              hole;
     std::vector<alloc_owner> fill;
