@@ -7,10 +7,13 @@ copy of a tensor extra's handle takes a chunk lease of its own, so the copy the 
 arena chunk leased past the model's release, and the last release found the arena held by one tensor_extra(copy)
 lease (GGML_SYCL_LEASE_HOLDERS=1 named mxfp4_moe_tg_reuse_store, GPT-OSS 20B on the B70, 2026-11-26).
 
-The owner of that half is the graph compute that stored it, on the thread that stored it: the graph compute drops it
-when it ends, on every exit after its start invalidated it, through a scope object, so no graph leaves it set and a
-model release, which never overlaps a graph compute on its contexts, finds it empty. The model release cannot clear it
-itself: the store is thread_local on the computing thread, and the release runs on whichever thread frees the model.
+The owner of that half is the graph compute that stored it, on the thread that stored it. The backend's graph compute
+entry (ggml_backend_sycl_graph_compute_unchecked) drops it when the call ends, on every exit, through a scope object
+declared right after the in-flight guard, so the store is empty before the in-flight count falls. The drop sits at the
+entry and not in ggml_backend_sycl_graph_compute_impl, where the start's invalidation is, because the segmented record
+and replay paths run MoE nodes straight from the entry without passing through compute_impl. A model release, which
+never overlaps a graph compute on its contexts, finds the store empty. The model release cannot clear it itself: the
+store is thread_local on the computing thread, and the release runs on whichever thread frees the model.
 
 Host-only text assertions, no SYCL device. llama_test_pytest hands this file to pytest.main(), so the checks live
 inside test_*() functions. Checks read COMMENT-STRIPPED, whitespace-normalised text. Each check has a mutation witness
@@ -90,8 +93,12 @@ def mutate_in(src: str, sig: str, old: str, new: str) -> str:
 
 # ---- the graph compute drops the store's graph-local half on every exit ----
 
+ENTRY_SIG = "static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t backend, ggml_cgraph * cgraph)"
 COMPUTE_SIG = ("static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, "
                "ggml_cgraph * cgraph)")
+INFLIGHT = "graph_inflight_guard inflight_guard(g_sycl_graph_inflight);"
+# The entry's phase-timing lambda returns its milliseconds before the in-flight guard; it is not an exit of the entry.
+PHASE_RETURN = "return ms;"
 NEW_GRAPH = "ggml_sycl_mxfp4_moe_tg_reuse_new_graph();"
 END_GRAPH = "ggml_sycl_mxfp4_moe_tg_reuse_end_graph();"
 SCOPE = ("struct mxfp4_moe_tg_reuse_graph_scope { ~mxfp4_moe_tg_reuse_graph_scope() { " + END_GRAPH +
@@ -99,19 +106,22 @@ SCOPE = ("struct mxfp4_moe_tg_reuse_graph_scope { ~mxfp4_moe_tg_reuse_graph_scop
 
 
 def claim_graph_compute_drops_the_store(gs: str) -> bool:
-    body = fn_body(code(gs), COMPUTE_SIG)
-    i = body.find(NEW_GRAPH)
-    j = body.find(SCOPE)
-    # The scope is armed right after the start's invalidation, at the function's own level (not inside a branch, where
-    # it would end with the branch), and no return sits between the two, so every exit after the start drops the store.
+    c = code(gs)
+    entry = fn_body(c, ENTRY_SIG)
+    i = entry.find(INFLIGHT)
+    j = entry.find(SCOPE)
+    # The scope is armed right after the in-flight guard, so it ends before the guard lowers the count, at the entry's
+    # own level (not inside a branch, where it would end with the branch), and no exit of the entry comes before it,
+    # so every exit of every route drops the store. compute_impl keeps the start's invalidation and arms nothing: a
+    # scope there would miss the segmented paths. The end is called from this scope and nowhere else.
     return (
         i != -1
-        and body.count(NEW_GRAPH) == 1
-        and body.count(SCOPE) == 1
+        and entry.count(SCOPE) == 1
         and i < j
-        and "return" not in body[i:j]
-        and body[i + len(NEW_GRAPH) : j].strip() == ""
-        and body.count(END_GRAPH) == 1
+        and entry[i + len(INFLIGHT) : j].strip() == ""
+        and entry[:j].count("return") == entry[:j].count(PHASE_RETURN)
+        and fn_body(c, COMPUTE_SIG).count(NEW_GRAPH) == 1
+        and c.count(END_GRAPH) == 1
     )
 
 
@@ -149,9 +159,9 @@ def claim_end_drops_the_copied_handle(mmvq: str, mmvqh: str) -> bool:
 
 def test_graph_compute_drops_the_store():
     assert claim_graph_compute_drops_the_store(GS), (
-        "ggml_backend_sycl_graph_compute_impl does not arm, right after the start's invalidation of the MXFP4 MoE "
-        "decode reuse store and at its own level, the scope that drops the store's graph-local handles when it ends, "
-        "so the last graph's copy of a tensor handle outlives the model and holds an arena chunk lease"
+        "ggml_backend_sycl_graph_compute_unchecked does not arm, right after its in-flight guard, at its own level and "
+        "before any exit, the one scope that drops the MXFP4 MoE decode reuse store's graph-local handles when the "
+        "call ends, so the last graph's copy of a tensor handle outlives the model and holds an arena chunk lease"
     )
 
 
@@ -163,25 +173,38 @@ def test_end_drops_the_copied_handle():
 
 
 def test_witness_no_scope():
-    assert not claim_graph_compute_drops_the_store(mutate_in(GS, COMPUTE_SIG, SCOPE, ""))
+    assert not claim_graph_compute_drops_the_store(mutate_in(GS, ENTRY_SIG, SCOPE, ""))
 
 
 def test_witness_scope_in_a_branch():
     assert not claim_graph_compute_drops_the_store(
-        mutate_in(GS, COMPUTE_SIG, SCOPE, "if (cgraph->n_nodes > 0) { " + SCOPE + " }")
+        mutate_in(GS, ENTRY_SIG, SCOPE, "if (cgraph->n_nodes > 0) { " + SCOPE + " }")
     )
 
 
 def test_witness_scope_after_an_early_return():
     assert not claim_graph_compute_drops_the_store(
-        mutate_in(GS, COMPUTE_SIG, NEW_GRAPH + " " + SCOPE,
-                  NEW_GRAPH + " if (cgraph->n_nodes == 0) { return; } " + SCOPE)
+        mutate_in(GS, ENTRY_SIG, INFLIGHT + " " + SCOPE,
+                  INFLIGHT + " if (cgraph->n_nodes == 0) { return GGML_STATUS_SUCCESS; } " + SCOPE)
     )
+
+
+def test_witness_scope_before_the_inflight_guard():
+    # Declared before the guard, the scope would end after the in-flight count fell.
+    assert not claim_graph_compute_drops_the_store(
+        mutate_in(GS, ENTRY_SIG, INFLIGHT + " " + SCOPE, SCOPE + " " + INFLIGHT)
+    )
+
+
+def test_witness_scope_only_in_compute_impl():
+    # The first placement: the segmented record and replay paths never reach it.
+    moved = mutate_in(GS, ENTRY_SIG, SCOPE, "")
+    assert not claim_graph_compute_drops_the_store(mutate_in(moved, COMPUTE_SIG, NEW_GRAPH, NEW_GRAPH + " " + SCOPE))
 
 
 def test_witness_scope_does_nothing():
     assert not claim_graph_compute_drops_the_store(
-        mutate_in(GS, COMPUTE_SIG, SCOPE, SCOPE.replace(END_GRAPH, ""))
+        mutate_in(GS, ENTRY_SIG, SCOPE, SCOPE.replace(END_GRAPH, ""))
     )
 
 
