@@ -1559,7 +1559,8 @@ def claim_copies_are_sized_from_the_tensor(cache: str, sycl: str) -> bool:
     or the plan's dst_size: a loan's host copy at those bytes, a refill's and an admit's device storage at the
     triplet's slot, the largest of the staged sizes the layout gives the three members. The cache is asked only
     whether the source entry is there, under its two locks, and the cache's size checks stay as the guards: a loan's
-    against the device entry and the host copy, a refill's against the host copy and the device storage. So an expert that goes to the host and back does not grow."""
+    against the device entry and the host copy, a refill's against the host copy and the device storage. So an
+    expert that goes to the host and back does not grow."""
     s = norm(sycl)
     txn = body(s, TXN_SIG)
     prep = body(s, PREP_SIG)
