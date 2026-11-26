@@ -1,112 +1,51 @@
 #!/usr/bin/env python3
-"""Source contract: a load drops a resident-only PP MoE oneDNN scratch ring that displaced experts and returns room.
+"""Source contract: where the backend applies the decision on a PP MoE oneDNN scratch ring, and in what order.
 
-Host-only: reads ggml-sycl.cpp, moe-mmvq-tables.hpp, moe-ring-consumer.hpp, unified-cache.cpp and zone-sizing.cpp/.hpp.
-It builds nothing, loads no model and touches no device.
+Host-only: reads ggml-sycl.cpp and unified-cache.cpp. It builds nothing, loads no model and touches no device.
 
-The loader sizes the ring for a model with an expert weight of a type a ring consumer runs, and the ring's room comes
-out of the device's weight capacity. The rule is by use: a ring is dropped only when every weight that uses it reaches
-the batched executor's resident claim alone, every one has another device route for a resident prompt node (the MMID
-direct route), the plan made with the ring leaves at least one expert of those weights on the host, and the drop
-returns room to the weights: the arena's WEIGHT zone, the one both planners pack the weights against, grows once the
-zones are asked for without the ring, with the RUNTIME zone's surplus given back in an arena nothing points into. Today
-the drop set is NVFP4 alone. Such a ring serves a layer only when every expert of it is on the device, and stages no
-host expert. On the B50 with Inkling 2 Mini the ring moved one more layer's experts to the host, and decode and prompt
-both ran slower than with no ring. So the load then publishes no ring, has the arena rebuilt with a smaller RUNTIME zone
-and a larger WEIGHT zone, and plans once more, and that plan is final. The WEIGHT room is read as the planner that made
-the plan reads it. Where the ring takes no RUNTIME room (another consumer sizes the zone), where that planner reads no
-WEIGHT zone (no active arena, or a multi-device plan in GLOBAL cache mode, which packs every device to its budget), where
-the plan without the ring would grow another zone (the give-back then keeps the arena as built), where the WEIGHT room
-does not grow (a rebuild that falls back from one chunk to several carves a KV share out of it), or where the arena is
-held, a drop would give the weights nothing: the ring is published again as it was and the plan made with it stands,
-with no second plan, unless the give-back rebuilt the arena: the zones are then asked for again with the ring, and where
-that leaves less WEIGHT room than the plan was packed against, the device is planned once more with the ring. Each pass
-of a load decides afresh: a keep leaves no record, so a later pass may drop a ring an earlier one kept (Qwen3.6 NVFP4 on
-the B50 does), while a drop holds for the rest of the load. A ring with any STAGED or SOA_EXPERT use, or with a
-weight whose only device prompt route is the ring (IQ1_S, IQ1_M and IQ4_XS today), is sized, published and kept exactly
-as before. These checks pin it:
+The rule is the header comment of ggml/src/ggml-sycl/moe-ring-consumer.hpp; what it measured is in
+docs/backend/sycl-memory-design.md. The pure functions that answer it (the ring uses of a type, the direct route's
+types, the resident check, the decision, the zone rules, the drop marks) are checked on values by
+test-sycl-moe-ring-consumer, test-sycl-moe-mmvq-tables and test-zone-sizing. This contract pins what those tests cannot
+see: which backend functions call them, in what order, through which getter, and where the stage writes, puts a ring
+back, refuses and records a drop. These checks pin it:
 
-  U1  moe_pp_ring_uses_of_type names the uses from the executors' own type tables: RESIDENT from
-      moe_pp_onednn_ring_serves_type, STAGED from moe_pp_batched_takes_staged_type, SOA_EXPERT for MXFP4 at SOA;
-  U2  one definition of the types the MMID direct route runs, in moe-mmvq-tables.hpp: the backend defines none of its
-      own and asks it at the route's two admissions, the hybrid decode record build and the ring weight list;
-  R1  moe_pp_ring_check_resident_only skips a weight with no use, is resident-only only when every weight's use is
-      RESIDENT alone, has the other route only when every weight has it, counts host experts only then, by the plan's
-      own convention on any device (every expert it does not place on a device, a missing one included), and
-      displaces_experts() is all three with at least one host expert;
-  R2  moe_pp_ring_decide answers (a) to (d) in order, each keep by name: no ring weight, a staged or SOA use, a weight
-      with no other device route, no host expert, held (the arena kept as built because something points into it),
-      no room returns (the WEIGHT zone does not grow without the ring), and DROP only past all of them; the answer is
-      the WEIGHT zone with the ring and without it and the held flag; the RUNTIME zone with the ring is no more than
-      the arena's, an unanswerable one with no arena the floor; the RUNTIME room is 0 where the zone needs no less;
-      the dry run's answer is an unheld give-back whose WEIGHT zone takes the room; moe_pp_ring_experts_worth is the
-      room over the ring weights' mean expert size; moe_pp_ring_kept_plan_again plans again only where the WEIGHT room
-      after the second ensure is less than the plan was packed against;
-  W1  the backend builds the weight list with the filter the ring's sizing reads: a gate, up, down or gate_up expert
-      with a shape, of a type with a use, with ne[2] experts and its bytes, and the other route from the direct route's
+  U2  the backend defines no direct-route type set of its own, and the route's admission asks the tables' set;
+  W1  the backend's ring weight list takes the ring sizing's filter, ne[2] experts, their bytes and the direct route's
       type set;
-  D1  one decision: ggml_sycl_plan_ring_resident_check answers nothing for a device with no ring published, is the
-      backend's only caller of moe_pp_ring_check_resident_only, and is called by the load stage's helper and the dry
-      run's helper alone; both decide once through moe_pp_ring_decide, the backend's only callers of it, read the
-      RUNTIME zone with the ring through one capped helper (no more than the arena's RUNTIME zone, and the floor where
-      it is unanswerable with no arena, so neither reads an unanswerable figure as room) and the zone without it through
-      the reserve's own rounding over the floor and the planned requirement, and take the room through the consumer's
-      rule; only the dry run answers from the room alone; whether the plan's planner reads a WEIGHT zone is one rule
-      (kv_reads_device_arena on the plan's mode), asked by the WEIGHT-room helper and the dry run, and the WEIGHT room
-      is the planner's own figure (unified_cache_kv_weight_capacity at the budget the plan packed the device to), 0
-      where it reads no zone or the device has no active arena;
-  S1  the stage helper returns KEPT when (a) to (c) keep the ring, before it writes anything; then it snapshots what it
-      will write, reads the RUNTIME zone with the ring, publishes the device as a model with no ring consumer (the
-      dense scratch at the planning shape, no ring, the planner terms from before the plan), reads the room, reads the
-      WEIGHT room through the planner's figure alone, asks the zones with the give-back only where that room is read
-      and the ring takes RUNTIME room, refusing on a failed ensure, and reads the WEIGHT room after it and the held
-      flag; then it decides once;
-  K1  a ring the decision keeps is put back: the stage has exactly two KEPT exits, the one before any write and the
-      one after the put-back, and the put-back comes first on every kept outcome; where the give-back rebuilt the
-      arena, the zones are asked for again with the ring (refusing on a failed ensure), the WEIGHT room is read again,
-      the stage answers KEPT_PLAN_AGAIN where it is less than the plan was packed against, and a WARN says which;
-      otherwise a
-      WARN with the experts' worth of room that names no holder where held, else an INFO that a drop would give the
-      weights no room; the stage refuses at those two ensures alone; the put-back plans the dense scratch at the
-      ring's micro-batch where the drop moved it, restores the ring's group and the planners' groups from the
-      snapshot, and restores the inventory's copy of the ring, and the ring terms' put-back has the stage's put-back
-      and the dry run's keep as its only callers; only DROP marks the load, WARNs that the RUNTIME zone was rebuilt
-      smaller and the WEIGHT zone grew, and returns DROPPED;
-  S2  only that helper asks for a give-back: one writer of options.give_back in the backend;
-  S3  compute_and_store_plan_for_inventory calls the helper once per branch: the multi-device one on a plan made with
-      budgets read at each plan, after a snapshot of the planner terms, and the single-device one after the micro-batch
-      grow leg and before have_plan; KEPT changes nothing, DROPPED plans once more (single-device without the
-      micro-batch room), KEPT_PLAN_AGAIN plans once more with the ring (single-device with the room the candidate was
-      made with: without it after the micro-batch's fallback), REFUSED refuses the load;
-  S4  the drop holds for the load: the helper marks the device with the load transaction, a mark is written and seen
-      only for a staged load (txn != 0, so a direct planner entry never erases one), the reader asks the marks, and
-      the planner publishes no ring before its entry ensure where an earlier pass dropped it;
-  S5  each pass decides afresh: the early and the late pass each plan once through the same planner, which calls the
-      stage on every pass, the stage reads no mark, and the reader's one caller is the publish of no ring before the
-      entry ensure, so an earlier pass's keep cannot stop a later pass's drop;
-  Y1  the dry run calls the same decision after each device's plan, on the RUNTIME room read with the ring and without
-      it (the planner terms put back from a snapshot taken before that plan), as a give-back on an arena nothing points
-      into, and says it cannot see a plan that would grow another zone; where the plan's planner reads no WEIGHT zone
-      it answers no room and says why; it sizes no zone and records no load; a ring
-      it keeps is put back through the stage's put-back of the ring terms, and only a dropped one makes the caller
-      replace that device's plan with one made without the ring;
+  D1  one decision: the backend's resident check answers nothing for a device with no ring published and is the only
+      caller of the rule; the stage and the dry run are the only callers of the resident check and of the decision,
+      each deciding once, and with the capped helper the only readers of the RUNTIME zone figures; only the dry run
+      answers from the RUNTIME room alone; the planner rule is asked by the WEIGHT-room helper and the dry run, the
+      WEIGHT room by the stage; the zone figure, the cap, the planner rule and the WEIGHT room are pinned whole;
+  S1  the stage keeps before it writes where (a) to (c) keep the ring, then snapshots, reads the RUNTIME zone with the
+      ring, unpublishes the ring, reads the room and the WEIGHT room, asks the zones with the give-back only where
+      both are read, refusing on a failed ensure, reads the WEIGHT room and the held flag again, and decides; it writes
+      through the unpublish alone, plans nothing and reads the WEIGHT room through the planner's figure alone;
+  K1  every kept exit after the write is inside the keep block, which puts the ring back first and holds no drop
+      exit; the kept rebuild asks the zones again and plans again where the WEIGHT room shrank, and each keep logs
+      which it is; every ensure in the stage is a refusal's condition, and the stage refuses nowhere else; the
+      put-back restores the dense scratch, the ring and planner terms and the inventory's ring, and the ring terms'
+      put-back is called by the stage's put-back and the dry run alone; the held WARN names no guessed holder;
+  S2  the stage is the backend's one writer of the give-back option;
+  S3  the planner is the stage's one caller, once per branch, with the replan each answer asks for;
+  S4  the drop's record is read by the reader and written by the stage alone, and the planner publishes no ring before
+      its entry ensure where an earlier pass of the load dropped it;
+  S5  the early and the late pass each plan through the planner, the stage reads no mark, and the planner asks the
+      reader once, before its entry ensure;
+  Y1  the dry run decides once per device plan, publishes no ring and puts the planner terms back before it reads the
+      room, keeps with the ring terms put back and a line that says why, drops with a line that says what it cannot
+      see, sizes no zone, records no load, and is called by the dry run's plans alone, which plan again on a drop;
   Z1  the cache's ensure gives back only when asked: the record is filled before the arena is read, a surplus is asked
-      only with a record, an arena with none to give is kept as built when a give-back is asked, even where another
-      zone would grow (a give-back never takes the ordinary rebuild), an arena something holds is kept as built and
-      marked held, the rebuild takes zone_arena_give_back_sizes, and its tail keeps the snapshot as a kept arena does
-      and marks rebuilt; nothing else in the cache touches the record;
-  Z2  the zone rules: a surplus is every zone held and RUNTIME larger, and the give-back keeps SCRATCH and ONEDNN at
-      least as built and sizes RUNTIME at the plan's.
+      only with a record, an arena with none to give is kept as built, a held arena is kept and marked held, the
+      rebuild takes the give-back's sizes and marks rebuilt; nothing else in the cache touches the record.
 
 Checks run on comment-blanked text. NOT VACUOUS: --self-test runs the gate on in-memory mutants of the real sources.
 Each mutant names the pin that must catch it, and is reported if it survives, if a different pin catches it, or if its
 anchor no longer matches exactly once (NOT APPLIED). ctest registers it with --self-test.
 
-WHAT THIS DOES NOT PROVE. It reads text. The decision's answers on plans and zone figures are
-test-sycl-moe-ring-consumer's, the zone rules' are test-zone-sizing Case 51's, and that the B50 gets its base plan back,
-the B70 keeps its ring, Qwen3.6 NVFP4 on the B50 keeps its ring in the early pass and drops it in the late one, and an
-arena whose SCRATCH zone would grow keeps it, is the lead's run on the cards. No run has taken the second plan after a
-kept give-back rebuild.
+WHAT THIS DOES NOT PROVE. It reads text. The decision's answers are the C++ tests' above, and what a card does with
+them is the lead's runs.
 """
 
 from __future__ import annotations
@@ -118,59 +57,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FILES = {
     "backend": ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp",
-    "tables": ROOT / "ggml/src/ggml-sycl/moe-mmvq-tables.hpp",
-    "consumer": ROOT / "ggml/src/ggml-sycl/moe-ring-consumer.hpp",
     "cache": ROOT / "ggml/src/ggml-sycl/unified-cache.cpp",
-    "zs_hpp": ROOT / "ggml/src/ggml-sycl/zone-sizing.hpp",
-    "zs_cpp": ROOT / "ggml/src/ggml-sycl/zone-sizing.cpp",
 }
 
-USES_FN = "inline uint32_t moe_pp_ring_uses_of_type(enum ggml_type type) {"
-USES_BODY = ("{ uint32_t uses = MOE_PP_RING_USE_NONE; if (moe_pp_onednn_ring_serves_type(type)) { uses |= "
-             "MOE_PP_RING_USE_RESIDENT; } if (moe_pp_batched_takes_staged_type(type)) { uses |= "
-             "MOE_PP_RING_USE_STAGED; } if (type == GGML_TYPE_MXFP4 && moe_pp_batched_f16_supports_layout(type, "
-             "GGML_LAYOUT_SOA)) { uses |= MOE_PP_RING_USE_SOA_EXPERT; } return uses; }")
-RULE_FN = ("inline moe_pp_ring_resident_check moe_pp_ring_check_resident_only(const placement_plan & plan, "
-           "const moe_pp_ring_weight * weights, size_t n_weights) {")
-RULE_SKIP = "if (weights[i].uses == MOE_PP_RING_USE_NONE) { continue; } ++check.n_weights;"
-RULE_MIXED = "if (weights[i].uses != MOE_PP_RING_USE_RESIDENT) { resident_only = false; }"
-RULE_ROUTE = "if (!weights[i].other_device_prompt_route) { other_route = false; }"
-RULE_ONLY = "check.resident_only = resident_only && check.n_weights > 0;"
-RULE_BOTH = "check.other_device_prompt_route = check.resident_only && other_route;"
-RULE_RETURN = "if (!check.other_device_prompt_route) { return check; }"
-RULE_COUNT = ("check.host_experts += weights[i].n_experts - plan.count_experts_on_device(weights[i].name, "
-              "weights[i].n_experts, -1);")
-DISPLACES = ("bool displaces_experts() const { return resident_only && other_device_prompt_route && host_experts > 0; "
-             "}")
-DECIDE_RULE_FN = ("inline moe_pp_ring_decision moe_pp_ring_decide(const moe_pp_ring_resident_check & check, "
-                  "const moe_pp_ring_zone_answer & zone) {")
-DECIDE_RULE_BODY = ("{ if (check.n_weights == 0) { return moe_pp_ring_decision::KEEP_NO_RING_WEIGHT; } if "
-                    "(!check.resident_only) { return moe_pp_ring_decision::KEEP_STAGED_OR_SOA_USE; } if "
-                    "(!check.other_device_prompt_route) { return moe_pp_ring_decision::KEEP_NO_OTHER_DEVICE_ROUTE; } "
-                    "if (check.host_experts <= 0) { return moe_pp_ring_decision::KEEP_NO_HOST_EXPERT; } if "
-                    "(zone.held) { return moe_pp_ring_decision::KEEP_HELD; } if (zone.weight_without_ring <= "
-                    "zone.weight_with_ring) { return moe_pp_ring_decision::KEEP_NO_ROOM_RETURNS; } return "
-                    "moe_pp_ring_decision::DROP; }")
-ZONE_ANSWER = ("struct moe_pp_ring_zone_answer { size_t weight_with_ring = 0; size_t weight_without_ring = 0; "
-               "bool held = false; };")
-WITH_RING_RULE_FN = ("inline size_t moe_pp_ring_runtime_with_ring(size_t planned, bool arena_active, size_t held, "
-                     "size_t floor) {")
-WITH_RING_RULE_BODY = ("{ if (arena_active) { return planned < held ? planned : held; } return planned == SIZE_MAX ? "
-                       "floor : planned; }")
-ROOM_FN = "inline size_t moe_pp_ring_runtime_room(size_t with_ring, size_t without_ring) {"
-ROOM_BODY = "{ return without_ring < with_ring ? with_ring - without_ring : 0; }"
-KEPT_AGAIN_FN = "inline bool moe_pp_ring_kept_plan_again(size_t packed_against, size_t weight_after) {"
-KEPT_AGAIN_BODY = "{ return weight_after < packed_against; }"
-DRY_ANSWER_FN = "inline moe_pp_ring_zone_answer moe_pp_ring_dry_run_answer(size_t runtime_room) {"
-DRY_ANSWER_BODY = "{ moe_pp_ring_zone_answer zone; zone.weight_without_ring = runtime_room; return zone; }"
-WORTH_FN = ("inline int64_t moe_pp_ring_experts_worth(const moe_pp_ring_weight * weights, size_t n_weights, "
-            "size_t room) {")
-WORTH_ORDER = (
-    "if (weights[i].uses == MOE_PP_RING_USE_NONE || weights[i].n_experts <= 0) { continue; }",
-    "bytes += weights[i].bytes; experts += static_cast<uint64_t>(weights[i].n_experts);",
-    "const uint64_t expert_bytes = experts == 0 ? 0 : bytes / experts;",
-    "return expert_bytes == 0 ? 0 : static_cast<int64_t>(room / expert_bytes);",
-)
 RING_DECIDE_CALL = "moe_pp_ring_decide("
 ZONE_FN = "static size_t ggml_sycl_planned_runtime_zone_bytes(int device) {"
 ZONE_BODY = ("{ size_t requirement = 0; size_t reserved = 0; if "
@@ -179,9 +68,11 @@ ZONE_BODY = ("{ size_t requirement = 0; size_t reserved = 0; if "
              "requirement, &reserved)) { return SIZE_MAX; } return reserved; }")
 ZONE_CALL = "ggml_sycl_planned_runtime_zone_bytes("
 WITH_RING_FN = "static size_t ggml_sycl_ring_runtime_with_ring_bytes(int device) {"
-WITH_RING_BODY = ("{ ggml_sycl::unified_cache * const cache = ggml_sycl::get_existing_unified_cache_for_device(device); "
+WITH_RING_BODY = ("{ ggml_sycl::unified_cache * const cache = "
+                  "ggml_sycl::get_existing_unified_cache_for_device(device); "
                   "const bool arena = cache != nullptr && cache->arena_active(); return "
-                  "ggml_sycl::moe_pp_ring_runtime_with_ring(ggml_sycl_planned_runtime_zone_bytes(device), arena, arena ? "
+                  "ggml_sycl::moe_pp_ring_runtime_with_ring(ggml_sycl_planned_runtime_zone_bytes(device), arena, arena "
+                  "? "
                   "cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME) : 0, "
                   "ggml_sycl::unified_cache_runtime_zone_floor_bytes()); }")
 WITH_RING_CALL = "ggml_sycl_ring_runtime_with_ring_bytes("
@@ -192,19 +83,17 @@ PLANNER_ZONE_BODY = ("{ return ggml_sycl::kv_reads_device_arena(plan.multi_devic
                      "ggml_sycl::unified_cache_mode_is_global()); }")
 PLANNER_ZONE_CALL = "ggml_sycl_ring_planner_reads_zone("
 WEIGHT_ROOM_FN = "static size_t ggml_sycl_ring_plan_weight_room(int device, const ggml_sycl::placement_plan & plan) {"
-WEIGHT_ROOM_BODY = ("{ ggml_sycl::unified_cache * const cache = ggml_sycl::get_existing_unified_cache_for_device(device); "
+WEIGHT_ROOM_BODY = ("{ ggml_sycl::unified_cache * const cache = "
+                    "ggml_sycl::get_existing_unified_cache_for_device(device); "
                     "if (!ggml_sycl_ring_planner_reads_zone(plan) || cache == nullptr || !cache->arena_active()) { "
-                    "return 0; } size_t budget = plan.vram_budget; if (plan.multi_device) { budget = 0; for (size_t i = "
+                    "return 0; } size_t budget = plan.vram_budget; if (plan.multi_device) { budget = 0; for (size_t i "
+                    "= "
                     "0; i < plan.devices.size() && i < plan.per_device_vram_budgets.size(); ++i) { if (plan.devices[i] "
                     "== device) { budget = plan.per_device_vram_budgets[i]; } } } return "
                     "ggml_sycl::unified_cache_kv_weight_capacity(device, budget, plan.multi_device); }")
 WEIGHT_ROOM_CALL = "ggml_sycl_ring_plan_weight_room("
-WEIGHT_ROOM_READ = "ggml_sycl_ring_plan_weight_room(device, plan)"
 DRY_ANSWER_CALL = "moe_pp_ring_dry_run_answer("
-DIRECT_FN = "inline bool moe_mmid_direct_route_runs_type(enum ggml_type type) {"
-DIRECT_BODY = "{ return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4; }"
-DIRECT_CALL = "moe_mmid_direct_route_runs_type("
-DIRECT_CALLS = 4
+DIRECT_ADMISSION = "moe_mmid_direct_route_runs_type(src0->type) && direct_layout == GGML_LAYOUT_AOS"
 WEIGHTS_FN = ("static std::vector<ggml_sycl::moe_pp_ring_weight> ggml_sycl_inventory_ring_weights( "
               "const std::vector<ggml_sycl::placement_tensor_info> & detail) {")
 WEIGHTS_BODY = ("{ std::vector<ggml_sycl::moe_pp_ring_weight> weights; for (const ggml_sycl::placement_tensor_info & "
@@ -249,12 +138,12 @@ UNPUBLISH_FN = ("static void ggml_sycl_stage_unpublish_ring(int device, uint32_t
 UNPUBLISH_BODY = ("{ if (ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device) != planning_n_ubatch) { "
                   "(void) ggml_sycl_publish_load_ubatch_scratch(device, planning_n_ubatch); } "
                   "ggml_sycl_stage_publish_no_ring(device); published_before.restore(device); }")
-KEEP_EXIT = ("if (decision != ggml_sycl::moe_pp_ring_decision::DROP) { with_ring.put_back(device, planning_n_ubatch); "
-             "bool plan_again = false; if (give_back.rebuilt) {")
+KEEP_BLOCK = "if (decision != ggml_sycl::moe_pp_ring_decision::DROP) {"
+PUT_BACK_FIRST = "with_ring.put_back(device, planning_n_ubatch);"
 RE_ENSURE = ("ggml_sycl::zone_arena_refusal refusal; if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(device, "
              "&refusal, ggml_sycl_load_arena_options())) {")
 KEEP_ORDER = (
-    KEEP_EXIT,
+    KEEP_BLOCK + " " + PUT_BACK_FIRST + " bool plan_again = false; if (give_back.rebuilt) {",
     RE_ENSURE,
     "return ggml_sycl_stage_ring_drop::REFUSED; }",
     "const size_t weight_kept = ggml_sycl_ring_plan_weight_room(device, plan);",
@@ -286,6 +175,10 @@ KEEP_ORDER = (
 )
 KEPT_EXIT = "return ggml_sycl_stage_ring_drop::KEPT;"
 KEPT_AGAIN_EXIT = "return ggml_sycl_stage_ring_drop::KEPT_PLAN_AGAIN;"
+DROPPED_EXIT = "return ggml_sycl_stage_ring_drop::DROPPED;"
+REFUSED_EXIT = "return ggml_sycl_stage_ring_drop::REFUSED;"
+ENSURE_CALL = "unified_cache_ensure_planned_arena_zones("
+ENSURE_IF = "if (!ggml_sycl::unified_cache_ensure_planned_arena_zones("
 PUBLISHED_STRUCT = "struct ggml_sycl_stage_ring_published {"
 PUBLISHED_SNAPSHOT = ("{ ggml_sycl_stage_ring_published published; published.terms = "
                       "ggml_sycl::load_published_terms::snapshot(device); published.inventory_weight_slot_bytes = "
@@ -342,11 +235,8 @@ ENTRY_ENSURE = "!ggml_sycl_ensure_load_arena_zones(ctx->device, refusal)) {"
 READER_FN = "static bool ggml_sycl_stage_ring_dropped_by_this_load(int device) {"
 READER_BODY = "{ return g_sycl_ring_drop_marks.dropped(device, g_sycl_plan_load_effect_txn); }"
 TXN = "g_sycl_ring_drop_marks"
+TXN_DECL = "static ggml_sycl::moe_pp_ring_drop_marks g_sycl_ring_drop_marks;"
 TXN_WRITE = "g_sycl_ring_drop_marks.mark(device, g_sycl_plan_load_effect_txn);"
-MARK_BODY = ("void mark(int device, uint64_t txn) { if (txn != 0 && device_in_range(device)) { load_txn[device] = "
-             "txn; } }")
-DROPPED_BODY = ("bool dropped(int device, uint64_t txn) const { return txn != 0 && device_in_range(device) && "
-                "load_txn[device] == txn; }")
 HELD_GUESSES = ("a live model", "freed context")
 DRY_FN = ("static bool ggml_sycl_plan_dry_run_drop_displacing_ring(int device, "
           "const std::vector<ggml_sycl::placement_tensor_info> & detail, const ggml_sycl::placement_plan & plan, "
@@ -378,7 +268,7 @@ DRY_ORDER = (
     "return true; }",
 )
 DRY_FORBIDDEN = ("ensure_planned_arena_zones", TXN, "give_back", "ggml_sycl_stage_")
-DRY_PLANS_FN = "static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans("
+DRY_PLANS_SIG = "static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans("
 DRY_SITES = (
     "const ggml_sycl::planner_published_terms terms_before_plan = ggml_sycl::planner_published_terms::snapshot(i); "
     "plans.push_back(plan_multi()); if (ggml_sycl_plan_dry_run_drop_displacing_ring(i, detail, plans.back(), "
@@ -410,13 +300,6 @@ ENSURE_ORDER = (
     "options.give_back->rebuilt = true; return true; }",
     "onednn_graph_scratch_direct_cap_plan_snapshot_bytes_.store(available_budget(), std::memory_order_release);",
 )
-ENSURE_GIVE_BACK_USES = 9
-SURPLUS = ("bool zone_arena_runtime_surplus(const zone_arena_sizes & have, const zone_arena_sizes & need) { return "
-           "have.scratch >= need.scratch && have.onednn >= need.onednn && have.runtime > need.runtime; }")
-GIVE_BACK_SIZES = ("zone_arena_sizes zone_arena_give_back_sizes(const zone_arena_sizes & have, const "
-                   "zone_arena_sizes & need) { return { std::max(have.scratch, need.scratch), "
-                   "std::max(have.onednn, need.onednn), need.runtime }; }")
-OPTION_MEMBER = "zone_arena_give_back * give_back = nullptr;"
 
 
 class ContractError(AssertionError):
@@ -474,10 +357,9 @@ def need_once(hay: str, needle: str, pin: str, what: str) -> int:
     return hay.find(n)
 
 
-def need_count(hay: str, needle: str, count: int, pin: str, what: str) -> None:
-    n = squash(needle)
-    if hay.count(n) != count:
-        raise ContractError(f"FAIL [pin {pin}]: {what}: `{needle}` appears {hay.count(n)} times, not {count}")
+def need_in(hay: str, needle: str, pin: str, what: str) -> None:
+    if squash(needle) not in hay:
+        raise ContractError(f"FAIL [pin {pin}]: {what}: `{needle}` is missing")
 
 
 def need_ordered(hay: str, parts: tuple, pin: str, what: str) -> None:
@@ -489,10 +371,52 @@ def need_ordered(hay: str, parts: tuple, pin: str, what: str) -> None:
         pos = k + len(squash(p))
 
 
-def fn(hay: str, sig: str, pin: str, what: str) -> str:
-    """The body of the one function whose signature, ending at its opening brace, is `sig`."""
-    at = need_once(hay, sig, pin, what) + len(squash(sig)) - 1
-    return brace_text(hay, at, pin)
+def span(hay: str, head: str, pin: str, what: str) -> tuple[int, int, int]:
+    """Where the one function or struct whose head is `head` starts, opens its body and ends. A head that stops before
+    its opening brace (a long parameter list) runs to the first ") {" after it."""
+    start = need_once(hay, head, pin, what)
+    h = squash(head)
+    open_at = start + len(h) - 1 if h.endswith("{") else hay.find(") {", start) + 2
+    return start, open_at, open_at + len(brace_text(hay, open_at, pin))
+
+
+def fn(hay: str, head: str, pin: str, what: str) -> str:
+    """The body of the one function or struct whose head is `head`, from its opening brace."""
+    _, open_at, end = span(hay, head, pin, what)
+    return hay[open_at:end]
+
+
+def only_in(hay: str, needle: str, holders: dict, pin: str, what: str) -> None:
+    """`needle` appears in each holder (a name for the message -> the head of a function or struct, which counts as
+    part of it) and nowhere else in `hay`."""
+    n = squash(needle)
+    spans = []
+    for name, head in holders.items():
+        start, _, end = span(hay, head, pin, what)
+        if n not in hay[start:end]:
+            raise ContractError(f"FAIL [pin {pin}]: {what}: `{needle}` is missing from {name}")
+        spans.append((start, end))
+    pos = 0
+    for start, end in sorted(spans):
+        if n in hay[pos:start]:
+            break
+        pos = max(pos, end)
+    else:
+        if n not in hay[pos:]:
+            return
+    raise ContractError(f"FAIL [pin {pin}]: {what}: `{needle}` appears outside {', '.join(holders)}")
+
+
+def blocks(hay: str, head: str, pin: str) -> list[tuple[int, int]]:
+    """Each block whose `if` condition starts with `head`: where the head starts and where its block ends."""
+    out = []
+    h = squash(head)
+    at = hay.find(h)
+    while at != -1:
+        open_at = hay.find(") {", at) + 2
+        out.append((at, open_at + len(brace_text(hay, open_at, pin))))
+        at = hay.find(h, at + len(h))
+    return out
 
 
 class Sources:
@@ -501,100 +425,62 @@ class Sources:
 
 
 def check_decision(s: Sources) -> None:
-    be, tb, rc = s.sq["backend"], s.sq["tables"], s.sq["consumer"]
-    # U1
-    if fn(tb, USES_FN, "U1", "the ring uses of a type") != squash(USES_BODY):
-        raise ContractError("FAIL [pin U1]: moe_pp_ring_uses_of_type must name each use from its executor's table")
-    # R1
-    rule = fn(rc, RULE_FN, "R1", "the resident-only check")
-    need_ordered(rule, (RULE_SKIP, RULE_MIXED, RULE_ROUTE, RULE_ONLY, RULE_BOTH, RULE_RETURN, RULE_COUNT), "R1",
-                 "the check skips no-use weights, is resident-only only for RESIDENT alone, has the other route only "
-                 "when every weight has it, then counts every expert the plan does not place on a device")
-    need_once(rc, DISPLACES, "R1", "a ring displaces experts only when resident-only, routed and with a host expert")
-    # R2
-    if fn(rc, DECIDE_RULE_FN, "R2", "the decision") != squash(DECIDE_RULE_BODY):
-        raise ContractError("FAIL [pin R2]: the decision must ask (a) to (d) in order, the held arena before the WEIGHT "
-                            "zone's growth, and keep by name")
-    need_once(rc, ZONE_ANSWER, "R2", "the arena's answer is the WEIGHT zone with the ring and without it, and held")
-    if fn(rc, WITH_RING_RULE_FN, "R2", "the RUNTIME zone with the ring") != squash(WITH_RING_RULE_BODY):
-        raise ContractError("FAIL [pin R2]: the RUNTIME zone with the ring is no more than the arena's, and an "
-                            "unanswerable one with no arena is the floor")
-    if fn(rc, ROOM_FN, "R2", "the RUNTIME room") != squash(ROOM_BODY):
-        raise ContractError("FAIL [pin R2]: the RUNTIME room is the zone with the ring less the zone without it, 0 "
-                            "where it needs no less")
-    if fn(rc, KEPT_AGAIN_FN, "R2", "the second plan after a kept rebuild") != squash(KEPT_AGAIN_BODY):
-        raise ContractError("FAIL [pin R2]: a kept plan is made once more only where the WEIGHT room after the second "
-                            "ensure is less than the plan was packed against")
-    if fn(rc, DRY_ANSWER_FN, "R2", "the dry run's answer") != squash(DRY_ANSWER_BODY):
-        raise ContractError("FAIL [pin R2]: the dry run answers as an unheld give-back whose WEIGHT zone takes the room")
-    need_ordered(fn(rc, WORTH_FN, "R2", "the experts' worth"), WORTH_ORDER, "R2",
-                 "the experts' worth is the room over the ring weights' mean expert size")
+    be = s.sq["backend"]
     # U2
-    if fn(tb, DIRECT_FN, "U2", "the direct route's types") != squash(DIRECT_BODY):
-        raise ContractError("FAIL [pin U2]: the MMID direct route's type set must be Q1_0 and NVFP4, defined once")
     if "mmid_direct_route_runs_type(ggml_type" in be or "mmid_direct_route_runs_type(enum ggml_type" in be:
         raise ContractError("FAIL [pin U2]: the backend must not define its own direct-route type set")
-    need_count(be, DIRECT_CALL, DIRECT_CALLS, "U2",
-               "the backend asks the tables' direct-route set at its route admissions, the decode record build and "
-               "the ring weight list")
+    need_in(be, DIRECT_ADMISSION, "U2", "the direct route admits by the tables' type set")
     # W1
     if fn(be, WEIGHTS_FN, "W1", "the backend's ring weight list") != squash(WEIGHTS_BODY):
-        raise ContractError("FAIL [pin W1]: the ring weight list must take the ring sizing's filter and ne[2] experts")
+        raise ContractError("FAIL [pin W1]: the ring weight list must take the ring sizing's filter, ne[2] experts, "
+                            "their bytes and the direct route's type set")
     # D1
-    if fn(be, DECIDE_FN, "D1", "the one decision") != squash(DECIDE_BODY):
-        raise ContractError("FAIL [pin D1]: the decision must answer nothing without a ring and ask the rule once")
-    need_count(be, RULE_CALL, 1, "D1", "the backend asks the rule only through the decision")
-    need_count(be, DECIDE_CALL, 3, "D1", "the decision is defined once and called by the stage and the dry run")
-    for sig in (STAGE_FN, DRY_FN):
-        need_count(fn(be, sig, "D1", "a caller of the decision"), DECIDE_CALL, 1, "D1",
-                   "each of the stage's and the dry run's helpers asks the decision once")
-    need_count(be, RING_DECIDE_CALL, 2, "D1", "the stage and the dry run each ask the decision, and nothing else does")
+    stage_and_dry = {"the stage": STAGE_FN, "the dry run": DRY_FN}
+    if fn(be, DECIDE_FN, "D1", "the resident check") != squash(DECIDE_BODY):
+        raise ContractError("FAIL [pin D1]: the resident check must answer nothing without a ring and ask the rule "
+                            "once")
+    only_in(be, RULE_CALL, {"the resident check": DECIDE_FN}, "D1", "the backend asks the rule through its check")
+    only_in(be, DECIDE_CALL, {"the resident check": DECIDE_FN, **stage_and_dry}, "D1",
+            "the stage and the dry run are the resident check's callers")
+    only_in(be, RING_DECIDE_CALL, stage_and_dry, "D1", "the stage and the dry run are the decision's callers")
+    for name, head in stage_and_dry.items():
+        need_once(fn(be, head, "D1", name), RING_DECIDE_CALL, "D1", f"{name} decides once")
     if fn(be, ZONE_FN, "D1", "the zone figure") != squash(ZONE_BODY):
         raise ContractError("FAIL [pin D1]: the zone figure must be the reserve's rounding over the floor and the "
                             "planned requirement, SIZE_MAX when unanswerable")
     if fn(be, WITH_RING_FN, "D1", "the RUNTIME zone with the ring") != squash(WITH_RING_BODY):
         raise ContractError("FAIL [pin D1]: the RUNTIME zone with the ring must be capped by the arena's RUNTIME zone, "
                             "and read as the floor when unanswerable with no arena, through the consumer's rule")
-    need_count(be, WITH_RING_CALL, 3, "D1", "the RUNTIME zone with the ring is defined once and read by the stage and "
-               "the dry run")
-    need_count(be, ZONE_CALL, 4, "D1", "the zone figure is defined once and read by the capped helper, the stage and "
-               "the dry run")
-    need_count(be, DRY_ANSWER_CALL, 1, "D1", "only the dry run answers from the RUNTIME room alone")
+    only_in(be, WITH_RING_CALL, {"its definition": WITH_RING_FN, **stage_and_dry}, "D1",
+            "the stage and the dry run read the RUNTIME zone with the ring through the one cap")
+    only_in(be, ZONE_CALL, {"its definition": ZONE_FN, "the cap": WITH_RING_FN, **stage_and_dry}, "D1",
+            "the zone figure is read by the cap, the stage and the dry run")
+    only_in(be, DRY_ANSWER_CALL, {"the dry run": DRY_FN}, "D1", "only the dry run answers from the RUNTIME room alone")
     if fn(be, PLANNER_ZONE_FN, "D1", "whether the plan's planner reads a WEIGHT zone") != squash(PLANNER_ZONE_BODY):
-        raise ContractError("FAIL [pin D1]: whether the plan's planner reads a WEIGHT zone is the KV rule on the plan's "
+        raise ContractError("FAIL [pin D1]: whether the plan's planner reads a WEIGHT zone is the KV rule on the "
+                            "plan's "
                             "mode, so a multi-device plan in GLOBAL cache mode reads none")
-    need_count(be, PLANNER_ZONE_CALL, 3, "D1", "the planner rule is defined once and asked by the WEIGHT-room helper "
-               "and the dry run")
-    need_count(fn(be, DRY_FN, "D1", "the dry run"), PLANNER_ZONE_CALL, 1, "D1", "the dry run asks the planner rule")
+    only_in(be, PLANNER_ZONE_CALL,
+            {"its definition": PLANNER_ZONE_FN, "the WEIGHT room": WEIGHT_ROOM_FN, "the dry run": DRY_FN}, "D1",
+            "the planner rule is asked by the WEIGHT-room helper and the dry run")
     if fn(be, WEIGHT_ROOM_FN, "D1", "the WEIGHT room") != squash(WEIGHT_ROOM_BODY):
         raise ContractError("FAIL [pin D1]: the WEIGHT room is the planner's own figure at the budget the plan packed "
                             "the device to, 0 where it reads no zone or the device has no active arena")
-    for sig in (STAGE_FN, DRY_FN):
-        body = fn(be, sig, "D1", "a reader of the RUNTIME zones")
-        need_count(body, RING_DECIDE_CALL, 1, "D1", "each of the stage and the dry run decides once")
-        need_count(body, WITH_RING_CALL, 1, "D1", "each reads the RUNTIME zone with the ring through the one cap")
-        need_count(body, ZONE_CALL, 1, "D1", "each reads the RUNTIME zone without the ring once")
-        need_once(body, ROOM_CALL, "D1", "each reads the RUNTIME room through the consumer's rule")
+    only_in(be, WEIGHT_ROOM_CALL, {"its definition": WEIGHT_ROOM_FN, "the stage": STAGE_FN}, "D1",
+            "the WEIGHT room is read by the stage")
 
 
 def check_stage(s: Sources) -> None:
     be = s.sq["backend"]
-    # S5
     stage = fn(be, STAGE_FN, "S5", "the stage helper")
     plan = fn(be, PLAN_FN, "S5", "the planner")
-    for sig, which in ((EARLY_SIG, "the early pass"), (LATE_SIG, "the late pass")):
-        at = need_once(be, sig, "S5", which)
-        need_count(brace_text(be, be.find(") {", at) + 2, "S5"), PLAN_CALL, 1, "S5",
-                   f"{which} plans once through the planner that calls the stage")
+    # S5
+    for head, which in ((EARLY_SIG, "the early pass"), (LATE_SIG, "the late pass")):
+        need_in(fn(be, head, "S5", which), PLAN_CALL, "S5", f"{which} plans through the planner that calls the stage")
     for word in (READER_CALL, ".dropped("):
         if word in stage:
             raise ContractError(f"FAIL [pin S5]: the stage decides afresh on every pass, but reads a mark: `{word}`")
-    # At most: the reader's one use, before the entry ensure, is S4's to pin.
-    if be.count(squash(READER_CALL)) > 2 or plan.count(squash(READER_CALL)) > 1:
-        raise ContractError("FAIL [pin S5]: the mark's reader is asked only to publish no ring before the planner's "
-                            "entry ensure, never to skip a pass's decision")
     # S1
-    stage = fn(be, STAGE_FN, "S1", "the stage helper")
     need_ordered(stage, STAGE_ORDER, "S1", "the stage helper's order")
     need_once(stage, PLANNING, "S1", "the planning shape the dense scratch goes back to")
     if fn(be, UNPUBLISH_FN, "S1", "the unpublish") != squash(UNPUBLISH_BODY):
@@ -611,26 +497,38 @@ def check_stage(s: Sources) -> None:
         if word in stage:
             raise ContractError(f"FAIL [pin S1]: the stage reads the WEIGHT room through the planner's figure alone, "
                                 f"but names `{word}`")
-    need_count(be, WEIGHT_ROOM_CALL, 4, "S1", "the WEIGHT room is defined once and read three times by the stage")
-    need_count(stage, WEIGHT_ROOM_READ, 3, "S1", "the stage reads the WEIGHT room with the ring, after the give-back "
-               "and after a kept rebuild's second ensure")
     # K1
-    need_ordered(stage, KEEP_ORDER, "K1", "a kept ring is put back before either kept line, and only a drop marks")
-    need_count(stage, KEPT_EXIT, 2, "K1", "the stage keeps at the (a)-(c) exit and after the put-back, nowhere else")
-    need_count(stage, KEPT_AGAIN_EXIT, 1, "K1", "the stage asks for a second plan with the ring at one exit")
-    need_count(stage, "return ggml_sycl_stage_ring_drop::REFUSED;", 2, "K1",
-               "the stage refuses where the give-back's ensure or the put-back's ensure fails, nowhere else")
-    need_count(stage, "unified_cache_ensure_planned_arena_zones(", 2, "K1",
-               "the stage asks the zones for the give-back and, after a give-back rebuild it keeps, with the ring")
-    first_kept = stage.find(squash(KEPT_EXIT))
-    if stage.find("ggml_sycl_stage_unpublish_ring(") < first_kept:
+    need_ordered(stage, KEEP_ORDER, "K1", "a kept ring is put back before either kept line")
+    unpublish = stage.find("ggml_sycl_stage_unpublish_ring(")
+    if stage.find(squash(KEPT_EXIT)) > unpublish:
         raise ContractError("FAIL [pin K1]: the stage's first KEPT exit must come before anything is written")
-    need_count(stage, "put_back(", 1, "K1", "one put-back, on the one kept exit after the write")
+    keep_at = need_once(stage, KEEP_BLOCK, "K1", "the keep block")
+    keep_open = keep_at + len(squash(KEEP_BLOCK)) - 1
+    keep = brace_text(stage, keep_open, "K1")
+    if not keep.startswith("{ " + squash(PUT_BACK_FIRST)):
+        raise ContractError("FAIL [pin K1]: the keep block puts the ring back before anything else")
+    if squash(DROPPED_EXIT) in keep:
+        raise ContractError("FAIL [pin K1]: the keep block holds no drop exit")
+    outside_keep = stage[:keep_at] + "\0" + stage[keep_open + len(keep):]
+    if "put_back(" in outside_keep:
+        raise ContractError("FAIL [pin K1]: the stage puts a ring back only in the keep block")
+    for word in (KEPT_EXIT, KEPT_AGAIN_EXIT):
+        if squash(word) in stage[unpublish:keep_at] + "\0" + stage[keep_open + len(keep):]:
+            raise ContractError(f"FAIL [pin K1]: after the write, `{word}` is an exit of the keep block alone")
+    refusing = blocks(stage, ENSURE_IF, "K1")
+    if stage.count(ENSURE_CALL) != len(refusing):
+        raise ContractError("FAIL [pin K1]: every ensure of the zones in the stage is a refusal's condition")
+    rest = stage
+    for start, end in reversed(refusing):
+        if squash(REFUSED_EXIT) not in stage[start:end]:
+            raise ContractError("FAIL [pin K1]: a failed ensure of the zones refuses the load")
+        rest = rest[:start] + rest[end:]
+    if squash(REFUSED_EXIT) in rest:
+        raise ContractError("FAIL [pin K1]: the stage refuses only where an ensure of the zones fails")
     for guess in HELD_GUESSES:
         if guess in stage:
             raise ContractError(f"FAIL [pin K1]: the held WARN names what is known, not a guessed holder: `{guess}`")
-    at = need_once(be, PUBLISHED_STRUCT, "K1", "the snapshot of what a drop writes")
-    published = brace_text(be, at + len(squash(PUBLISHED_STRUCT)) - 1, "K1")
+    published = fn(be, PUBLISHED_STRUCT, "K1", "the snapshot of what a drop writes")
     need_once(published, PUBLISHED_SNAPSHOT, "K1", "the snapshot takes the load's terms and the inventory's ring")
     if fn(published, PUT_BACK_FN, "K1", "the put-back") != squash(PUT_BACK_BODY):
         raise ContractError("FAIL [pin K1]: the put-back must plan the dense scratch at the ring's micro-batch "
@@ -638,32 +536,33 @@ def check_stage(s: Sources) -> None:
     if fn(be, TERMS_FN, "K1", "the put-back of the ring terms") != squash(TERMS_BODY):
         raise ContractError("FAIL [pin K1]: the put-back of the ring terms must restore the ring's group and every "
                             "planner group the unpublish writes")
-    need_count(be, TERMS_CALL, 3, "K1", "the ring terms' put-back is defined once, called by the stage's put-back "
-               "and the dry run's keep")
+    only_in(be, TERMS_CALL,
+            {"its definition": TERMS_FN, "the stage's put-back": PUBLISHED_STRUCT, "the dry run": DRY_FN}, "K1",
+            "the ring terms' put-back is called by the stage's put-back and the dry run's keep")
     # S2
-    need_count(be, GIVE_BACK_WRITE, 1, "S2", "one writer of the give-back option in the backend")
-    need_once(stage, "options.give_back = &give_back;", "S2", "the stage helper is the give-back's writer")
+    only_in(be, GIVE_BACK_WRITE, {"the stage": STAGE_FN}, "S2", "the stage is the one writer of the give-back option")
+    need_once(stage, "options.give_back = &give_back;", "S2", "the stage asks for the give-back with its own record")
     # S3
-    plan = fn(be, PLAN_FN, "S3", "the planner")
-    need_count(be, STAGE_CALL, 3, "S3", "the stage helper is defined once and called once per branch")
+    only_in(be, STAGE_CALL, {"its definition": STAGE_FN, "the planner": PLAN_FN}, "S3",
+            "the planner is the stage's one caller")
     need_once(plan, MULTI_LAMBDA, "S3", "the multi-device plan reads its budgets at each plan")
     need_once(plan, MULTI_SITE, "S3", "the multi-device branch drops, plans once more, or refuses")
     need_once(plan, SINGLE_SITE, "S3", "the single-device branch drops, plans once more without the room, or refuses")
-    need_ordered(plan, (GROW, SINGLE_SITE), "S3", "the single-device drop follows the micro-batch grow leg")
     need_ordered(plan, (WITH_ROOM_FIRST, GROW, WITH_ROOM_FALLBACK, SINGLE_SITE), "S3",
-                 "a kept ring planned once more takes the room the candidate was made with")
-    need_count(plan, "candidate_with_room", 3, "S3", "the candidate's room is set with the first plan and cleared with "
-               "the fallback's, and read by the second plan alone")
+                 "the single-device drop follows the micro-batch grow leg, and a kept ring planned once more takes the "
+                 "room the candidate was made with")
     # S4
-    need_once(be, READER_FN, "S4", "the drop's reader")
     if fn(be, READER_FN, "S4", "the drop's reader") != squash(READER_BODY):
         raise ContractError("FAIL [pin S4]: the reader must answer only for this thread's staged load")
-    need_count(be, TXN, 3, "S4", "the drop's record is declared, read and written once each")
-    need_once(stage, TXN_WRITE, "S4", "the stage helper records the load that dropped the ring")
-    rc = s.sq["consumer"]
-    need_once(rc, MARK_BODY, "S4", "a mark is written only for a staged load on a device in range")
-    need_once(rc, DROPPED_BODY, "S4", "a mark is seen only by the staged load that wrote it")
+    need_once(be, TXN_DECL, "S4", "the drop's record")
+    only_in(be.replace(squash(TXN_DECL), "", 1), TXN, {"the reader": READER_FN, "the stage": STAGE_FN}, "S4",
+            "the drop's record is read by the reader and written by the stage alone")
+    need_once(stage, TXN_WRITE, "S4", "the stage records the load that dropped the ring")
     need_ordered(plan, (STICKY, ENTRY_ENSURE), "S4", "a dropped ring is published as none before the entry ensure")
+    # S5, after S4 has pinned the reader's one use
+    only_in(be, READER_CALL, {"its definition": READER_FN, "the planner": PLAN_FN}, "S5",
+            "the drop's reader is asked by the planner alone")
+    need_once(plan, READER_CALL, "S5", "the planner asks the reader only to publish no ring before its entry ensure")
 
 
 def check_dry_run(s: Sources) -> None:
@@ -674,25 +573,20 @@ def check_dry_run(s: Sources) -> None:
     for word in DRY_FORBIDDEN:
         if word in dry:
             raise ContractError(f"FAIL [pin Y1]: the dry run sizes no zone and records no load, but names `{word}`")
-    at = need_once(be, DRY_PLANS_FN, "Y1", "the dry run's plans")
-    plans = brace_text(be, be.find(") {", at) + 2, "Y1")
+    plans = fn(be, DRY_PLANS_SIG, "Y1", "the dry run's plans")
     for site in DRY_SITES:
         need_once(plans, site, "Y1", "each dry-run plan is made again without a dropped ring")
-    need_count(be, DRY_CALL, 3, "Y1", "the dry run's helper is defined once and called once per branch")
+    only_in(be, DRY_CALL, {"its definition": DRY_FN, "the dry run's plans": DRY_PLANS_SIG}, "Y1",
+            "the dry run's plans are its helper's one caller")
 
 
 def check_zones(s: Sources) -> None:
-    uc, zc, zh = s.sq["cache"], s.sq["zs_cpp"], s.sq["zs_hpp"]
+    uc = s.sq["cache"]
     # Z1
     ensure = fn(uc, ENSURE_FN, "Z1", "the zone ensure")
     need_ordered(ensure, ENSURE_ORDER, "Z1", "the ensure's give-back")
-    need_count(ensure, "give_back", ENSURE_GIVE_BACK_USES, "Z1", "the ensure's give-back record and its reads")
-    if uc.count("give_back") != ensure.count("give_back"):
-        raise ContractError("FAIL [pin Z1]: nothing in the cache but the ensure touches the give-back record")
-    # Z2
-    need_once(zc, SURPLUS, "Z2", "a surplus is every zone held and RUNTIME larger")
-    need_once(zc, GIVE_BACK_SIZES, "Z2", "the give-back keeps SCRATCH and ONEDNN and sizes RUNTIME at the plan's")
-    need_once(zh, OPTION_MEMBER, "Z2", "the ensure option that asks for the give-back")
+    only_in(uc, "give_back", {"the ensure": ENSURE_FN}, "Z1", "the cache touches the give-back record in its ensure "
+            "alone")
 
 
 def check(s: Sources) -> None:
@@ -737,36 +631,8 @@ def self_test(raws: dict[str, str]) -> int:
         failures.append(f"{name}: SURVIVED")
         print(f"  mutant {name}: SURVIVED (pin {pin})")
 
-    B, T, C, U, ZC, ZH = "backend", "tables", "consumer", "cache", "zs_cpp", "zs_hpp"
-    # U1, R1: the uses and the rule.
-    expect_fail("staged-use-dropped", "U1", T,
-                [("    if (moe_pp_batched_takes_staged_type(type)) {\n        uses |= MOE_PP_RING_USE_STAGED;",
-                  "    if (false) {\n        uses |= MOE_PP_RING_USE_STAGED;")])
-    expect_fail("soa-use-any-type", "U1", T,
-                [("if (type == GGML_TYPE_MXFP4 && moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_SOA)) {",
-                  "if (moe_pp_batched_f16_supports_layout(type, GGML_LAYOUT_SOA)) {")])
-    expect_fail("mixed-ring-resident-only", "R1", C, [("            resident_only = false;\n", "")])
-    expect_fail("host-count-device-zero", "R1", C,
-                [("plan.count_experts_on_device(weights[i].name, weights[i].n_experts, -1);",
-                  "plan.count_experts_on_device(weights[i].name, weights[i].n_experts, 0);")])
-    expect_fail("host-count-semantic-only", "R1", C,
-                [("weights[i].n_experts - plan.count_experts_on_device(weights[i].name, weights[i].n_experts, -1);",
-                  "plan.count_planned_experts(weights[i].name, weights[i].n_experts, -1).host;")])
-    expect_fail("displaces-any-host", "R1", C,
-                [("return resident_only && other_device_prompt_route && host_experts > 0;",
-                  "return host_experts > 0;")])
-    expect_fail("displaces-without-route", "R1", C,
-                [("return resident_only && other_device_prompt_route && host_experts > 0;",
-                  "return resident_only && host_experts > 0;")])
-    expect_fail("route-ignored", "R1", C, [("            other_route = false;\n", "")])
-    expect_fail("route-without-resident-only", "R1", C,
-                [("check.other_device_prompt_route = check.resident_only && other_route;",
-                  "check.other_device_prompt_route = other_route;")])
-    expect_fail("direct-set-widened", "U2", T,
-                [("inline bool moe_mmid_direct_route_runs_type(enum ggml_type type) {\n"
-                  "    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;",
-                  "inline bool moe_mmid_direct_route_runs_type(enum ggml_type type) {\n"
-                  "    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4 || type == GGML_TYPE_IQ4_XS;")])
+    B, U = "backend", "cache"
+    # U2, W1, D1: the direct route's types, the weight list and the one decision.
     expect_fail("route-admission-own-type-test", "U2", B,
                 [("moe_mmid_direct_route_runs_type(src0->type) && direct_layout == GGML_LAYOUT_AOS",
                   "(src0->type == GGML_TYPE_NVFP4) && direct_layout == GGML_LAYOUT_AOS")])
@@ -775,7 +641,6 @@ def self_test(raws: dict[str, str]) -> int:
                   "static bool ggml_sycl_moe_mmid_direct_route_runs_type(ggml_type type) {\n"
                   "    return type == GGML_TYPE_NVFP4;\n}\n\n"
                   "static std::vector<ggml_sycl::moe_pp_ring_weight> ggml_sycl_inventory_ring_weights(")])
-    # W1, D1: the weight list and the one decision.
     expect_fail("weights-without-shape", "W1", B,
                 [("MOE_TENSOR_UNKNOWN || !info.has_shape()) {", "MOE_TENSOR_UNKNOWN) {")])
     expect_fail("weights-one-expert", "W1", B,
@@ -792,37 +657,9 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("dry-run-own-rule", "D1", B,
                 [("check = ggml_sycl_plan_ring_resident_check(device, detail, plan);",
                   "check = ggml_sycl::moe_pp_ring_check_resident_only(plan, nullptr, 0);")])
-    expect_fail("decide-drops-without-room", "R2", C,
-                [("    if (zone.weight_without_ring <= zone.weight_with_ring) {\n"
-                  "        return moe_pp_ring_decision::KEEP_NO_ROOM_RETURNS;\n    }\n", "")])
-    expect_fail("decide-drops-held", "R2", C,
-                [("    if (zone.held) {\n        return moe_pp_ring_decision::KEEP_HELD;\n    }\n", "")])
-    expect_fail("decide-room-at-equal", "R2", C,
-                [("if (zone.weight_without_ring <= zone.weight_with_ring) {",
-                  "if (zone.weight_without_ring < zone.weight_with_ring) {")])
-    expect_fail("decide-room-before-held", "R2", C,
-                [("    if (zone.held) {\n        return moe_pp_ring_decision::KEEP_HELD;\n    }\n"
-                  "    if (zone.weight_without_ring <= zone.weight_with_ring) {\n"
-                  "        return moe_pp_ring_decision::KEEP_NO_ROOM_RETURNS;\n    }\n",
-                  "    if (zone.weight_without_ring <= zone.weight_with_ring) {\n"
-                  "        return moe_pp_ring_decision::KEEP_NO_ROOM_RETURNS;\n    }\n"
-                  "    if (zone.held) {\n        return moe_pp_ring_decision::KEEP_HELD;\n    }\n")])
-    expect_fail("with-ring-beyond-the-arena", "R2", C,
-                [("        return planned < held ? planned : held;\n", "        return planned;\n")])
-    expect_fail("with-ring-unanswerable-as-room", "R2", C,
-                [("return planned == SIZE_MAX ? floor : planned;", "return planned;")])
-    expect_fail("room-of-an-unanswerable-zone", "R2", C,
-                [("return without_ring < with_ring ? with_ring - without_ring : 0;",
-                  "return with_ring - without_ring;")])
-    expect_fail("dry-answer-held", "R2", C,
-                [("    zone.weight_without_ring = runtime_room;\n    return zone;\n",
-                  "    zone.weight_without_ring = runtime_room;\n    zone.held = true;\n    return zone;\n")])
-    expect_fail("kept-plan-again-at-equal", "R2", C,
-                [("return weight_after < packed_against;", "return weight_after <= packed_against;")])
-    expect_fail("kept-plan-stands-on-less", "R2", C,
-                [("return weight_after < packed_against;", "return false;")])
     expect_fail("planner-zone-ignores-the-mode", "D1", B,
-                [("return ggml_sycl::kv_reads_device_arena(plan.multi_device, ggml_sycl::unified_cache_mode_is_global());",
+                [("return ggml_sycl::kv_reads_device_arena(plan.multi_device, "
+                  "ggml_sycl::unified_cache_mode_is_global());",
                   "return true;")])
     expect_fail("weight-room-ignores-the-planner", "D1", B,
                 [("    if (!ggml_sycl_ring_planner_reads_zone(plan) || cache == nullptr || !cache->arena_active()) {\n",
@@ -841,11 +678,6 @@ def self_test(raws: dict[str, str]) -> int:
                   "ggml_sycl::moe_pp_ring_dry_run_answer(runtime_room)")])
     expect_fail("dry-run-global-keep-says-no-room-needed", "Y1", B,
                 [("        if (!planner_zone) {\n", "        if (false) {\n")])
-    expect_fail("worth-counts-no-use", "R2", C,
-                [("        if (weights[i].uses == MOE_PP_RING_USE_NONE || weights[i].n_experts <= 0) {\n"
-                  "            continue;\n        }\n        bytes += weights[i].bytes;",
-                  "        if (weights[i].n_experts <= 0) {\n"
-                  "            continue;\n        }\n        bytes += weights[i].bytes;")])
     expect_fail("zone-figure-without-floor", "D1", B,
                 [("!ggml_sycl::zone_runtime_reserved_bytes(ggml_sycl::unified_cache_runtime_zone_floor_bytes(), "
                   "requirement,",
@@ -866,9 +698,11 @@ def self_test(raws: dict[str, str]) -> int:
                   "    const size_t                         runtime_with_ring = "
                   "ggml_sycl_planned_runtime_zone_bytes(device);\n")])
     expect_fail("helper-ignores-the-arena", "D1", B,
-                [("    return ggml_sycl::moe_pp_ring_runtime_with_ring(ggml_sycl_planned_runtime_zone_bytes(device), arena,",
-                  "    return ggml_sycl::moe_pp_ring_runtime_with_ring(ggml_sycl_planned_runtime_zone_bytes(device), false,")])
-    # S1-S4, K1: the stage.
+                [("    return ggml_sycl::moe_pp_ring_runtime_with_ring(ggml_sycl_planned_runtime_zone_bytes(device), "
+                  "arena,",
+                  "    return ggml_sycl::moe_pp_ring_runtime_with_ring(ggml_sycl_planned_runtime_zone_bytes(device), "
+                  "false,")])
+    # S1-S5, K1: the stage.
     expect_fail("terms-not-restored", "S1", B, [("    published_before.restore(device);\n", "")])
     expect_fail("dense-left-at-micro-batch", "S1", B,
                 [("        (void) ggml_sycl_publish_load_ubatch_scratch(device, planning_n_ubatch);\n", "")])
@@ -914,20 +748,25 @@ def self_test(raws: dict[str, str]) -> int:
                   "        bool plan_again = false;\n",
                   "        bool plan_again = false;\n"),
                  ("        } else {\n            GGML_LOG_INFO(\n"
-                  "                \"[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop would "
+                  "                \"[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop "
+                  "would "
                   "give the weights \"\n",
                   "        } else {\n            with_ring.put_back(device, planning_n_ubatch);\n"
                   "            GGML_LOG_INFO(\n"
-                  "                \"[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop would "
+                  "                \"[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop "
+                  "would "
                   "give the weights \"\n")])
     expect_fail("held-keep-replans", "K1", B,
-                [("                ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), runtime_room));\n",
-                  "                ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), runtime_room));\n"
+                [("                ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), "
+                  "runtime_room));\n",
+                  "                ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), "
+                  "runtime_room));\n"
                   "            return ggml_sycl_stage_ring_drop::DROPPED;\n")])
     expect_fail("put-back-without-re-ensure", "K1", B,
                 [("            ggml_sycl::zone_arena_refusal refusal;\n"
                   "            if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal,\n"
-                  "                                                                     ggml_sycl_load_arena_options()))"
+                  "                                                                     "
+                  "ggml_sycl_load_arena_options()))"
                   " {\n"
                   "                GGML_LOG_ERROR(\"%s\\n\", ggml_sycl::zone_arena_refusal_text(refusal).c_str());\n"
                   "                return ggml_sycl_stage_ring_drop::REFUSED;\n"
@@ -948,7 +787,8 @@ def self_test(raws: dict[str, str]) -> int:
                   "        bool plan_again = false;\n"
                   "        if (give_back.rebuilt) {\n")])
     expect_fail("kept-rebuild-never-plans-again", "K1", B,
-                [("        if (plan_again) {\n            return ggml_sycl_stage_ring_drop::KEPT_PLAN_AGAIN;\n        }\n",
+                [("        if (plan_again) {\n            return ggml_sycl_stage_ring_drop::KEPT_PLAN_AGAIN;\n        "
+                  "}\n",
                   "")])
     expect_fail("kept-rebuild-judged-on-the-give-back-room", "K1", B,
                 [("ggml_sycl::moe_pp_ring_kept_plan_again(zone.weight_with_ring, weight_kept);",
@@ -984,7 +824,8 @@ def self_test(raws: dict[str, str]) -> int:
                 [("less without it, but something points into the arena, so it could not be rebuilt,",
                   "less without it, but a live model holds the arena, so it could not be rebuilt,")])
     expect_fail("held-warn-without-worth", "K1", B,
-                [("                ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), runtime_room));\n",
+                [("                ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), "
+                  "runtime_room));\n",
                   "                int64_t(0));\n")])
     expect_fail("warn-without-host-count", "K1", B,
                 [("device, ring_bytes / mb, check.host_experts, check.n_weights, runtime_rebuilt / mb,",
@@ -1015,10 +856,13 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    if (!check.displaces_experts()) {\n        return ggml_sycl_stage_ring_drop::KEPT;\n",
                   "    if (!check.displaces_experts() || ggml_sycl_stage_ring_dropped_by_this_load(device)) {\n"
                   "        return ggml_sycl_stage_ring_drop::KEPT;\n")])
-    expect_fail("planner-skips-the-stage-after-an-earlier-pass", "S5", B,
-                [("        switch (ggml_sycl_stage_drop_displacing_ring(ctx->device, plan_candidate, published_before)) {\n",
-                  "        switch (ggml_sycl_stage_ring_dropped_by_this_load(ctx->device) ? ggml_sycl_stage_ring_drop::KEPT :\n"
-                  "                ggml_sycl_stage_drop_displacing_ring(ctx->device, plan_candidate, published_before)) {\n")])
+    expect_fail("planner-skips-the-stage-after-an-earlier-pass", "S3", B,
+                [("        switch (ggml_sycl_stage_drop_displacing_ring(ctx->device, plan_candidate, "
+                  "published_before)) {\n",
+                  "        switch (ggml_sycl_stage_ring_dropped_by_this_load(ctx->device) ? "
+                  "ggml_sycl_stage_ring_drop::KEPT :\n"
+                  "                ggml_sycl_stage_drop_displacing_ring(ctx->device, plan_candidate, "
+                  "published_before)) {\n")])
     expect_fail("multi-refusal-plans-on", "S3", B,
                 [("            case ggml_sycl_stage_ring_drop::REFUSED:\n                return false;\n        }\n"
                   "        if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {",
@@ -1033,16 +877,56 @@ def self_test(raws: dict[str, str]) -> int:
                   "        auto plan_multi_device = [&]() {\n")])
     expect_fail("no-drop-record", "K1", B,
                 [("    g_sycl_ring_drop_marks.mark(device, g_sycl_plan_load_effect_txn);\n", "")])
-    expect_fail("direct-entry-sticky", "S4", C,
-                [("return txn != 0 && device_in_range(device) && load_txn[device] == txn;",
-                  "return device_in_range(device) && load_txn[device] == txn;")])
-    expect_fail("direct-entry-erases-mark", "S4", C,
-                [("if (txn != 0 && device_in_range(device)) {", "if (device_in_range(device)) {")])
     expect_fail("late-pass-asks-for-ring", "S4", B,
                 [("    if (ggml_sycl_stage_ring_dropped_by_this_load(ctx->device) &&\n"
                   "        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx->device) != 0) {\n"
                   "        ggml_sycl_stage_publish_no_ring(ctx->device);\n",
                   "    if (false) {\n")])
+    # Structure: who calls what, and where the stage exits.
+    stage_head = "static ggml_sycl_stage_ring_drop ggml_sycl_stage_drop_displacing_ring(\n"
+    expect_fail("a-third-decision-caller", "D1", B,
+                [(stage_head,
+                  "static int ggml_sycl_ring_decide_elsewhere() {\n"
+                  "    return static_cast<int>(ggml_sycl::moe_pp_ring_decide({}, {}));\n}\n\n" + stage_head)])
+    expect_fail("kept-exit-outside-the-keep-block", "K1", B,
+                [("    return ggml_sycl_stage_ring_drop::DROPPED;\n",
+                  "    if (ring_bytes == 0) {\n        return ggml_sycl_stage_ring_drop::KEPT;\n    }\n"
+                  "    return ggml_sycl_stage_ring_drop::DROPPED;\n")])
+    expect_fail("refusal-outside-an-ensure", "K1", B,
+                [("    const uint32_t planning_n_ubatch = "
+                  "ggml_sycl::placement_load_n_ubatch(g_placement_kv_info.n_ubatch);\n",
+                  "    const uint32_t planning_n_ubatch = "
+                  "ggml_sycl::placement_load_n_ubatch(g_placement_kv_info.n_ubatch);\n"
+                  "    if (ring_bytes == 0) {\n        return ggml_sycl_stage_ring_drop::REFUSED;\n    }\n")])
+    expect_fail("ensure-outside-a-refusal", "K1", B,
+                [("    const uint32_t planning_n_ubatch = "
+                  "ggml_sycl::placement_load_n_ubatch(g_placement_kv_info.n_ubatch);\n",
+                  "    const uint32_t planning_n_ubatch = "
+                  "ggml_sycl::placement_load_n_ubatch(g_placement_kv_info.n_ubatch);\n"
+                  "    (void) ggml_sycl::unified_cache_ensure_planned_arena_zones(device, nullptr,\n"
+                  "                                                             ggml_sycl_load_arena_options());\n")])
+    expect_fail("a-second-stage-caller", "S3", B,
+                [("static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t "
+                  "vram_budget, "
+                  "int budget_pct) {\n",
+                  "static void ggml_sycl_ring_stage_elsewhere(const ggml_sycl::placement_plan & plan) {\n"
+                  "    (void) ggml_sycl_stage_drop_displacing_ring(0, plan, {});\n}\n\n"
+                  "static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx, size_t "
+                  "vram_budget, "
+                  "int budget_pct) {\n")])
+    expect_fail("a-second-reader-caller", "S5", B,
+                [(stage_head,
+                  "static bool ggml_sycl_ring_skip_the_stage(int device) {\n"
+                  "    return ggml_sycl_stage_ring_dropped_by_this_load(device);\n}\n\n" + stage_head)])
+    expect_fail("the-record-read-elsewhere", "S4", B,
+                [(stage_head,
+                  "static bool ggml_sycl_ring_dropped_anywhere(int device) {\n"
+                  "    return g_sycl_ring_drop_marks.dropped(device, 1);\n}\n\n" + stage_head)])
+    expect_fail("give-back-read-elsewhere-in-the-cache", "Z1", U,
+                [("bool unified_cache::ensure_planned_arena_zones(",
+                  "static bool give_back_asked(const zone_arena_ensure_options & options) {\n"
+                  "    return options.give_back != nullptr;\n}\n\n"
+                  "bool unified_cache::ensure_planned_arena_zones(")])
     # Y1: the dry run.
     expect_fail("dry-run-keeps-ring-plan", "Y1", B, [("                plans.back() = plan_single();\n", "")])
     expect_fail("dry-run-gives-back", "Y1", B,
@@ -1057,7 +941,7 @@ def self_test(raws: dict[str, str]) -> int:
                   "    ggml_sycl_put_back_ring_terms(device, with_ring);\n    return true;\n")])
     expect_fail("dry-run-room-with-plan-terms", "Y1", B,
                 [("    terms_before_plan.restore(device);\n", "")])
-    # Z1, Z2: the cache and the zone rules.
+    # Z1: the cache's ensure.
     expect_fail("surplus-without-record", "Z1", U,
                 [("options.give_back != nullptr && zone_arena_runtime_surplus(arena_zones, planned_zones);",
                   "zone_arena_runtime_surplus(arena_zones, planned_zones);")])
@@ -1069,12 +953,7 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("give-back-takes-the-ordinary-rebuild", "Z1", U,
                 [("if (!surplus_asked && (zones_sufficient || options.give_back != nullptr)) {",
                   "if (zones_sufficient && !surplus_asked) {")])
-    expect_fail("surplus-at-equal", "Z2", ZC,
-                [("have.runtime > need.runtime;", "have.runtime >= need.runtime;")])
-    expect_fail("give-back-shrinks-scratch", "Z2", ZC,
-                [("return { std::max(have.scratch, need.scratch),", "return { need.scratch,")])
-    expect_fail("option-removed", "Z2", ZH,
-                [("    zone_arena_give_back * give_back          = nullptr;\n", "    void * give_back = nullptr;\n")])
+    # The NOT APPLIED report must fire on an anchor the sources do not hold, or a stale mutant would pass unseen.
 
     # The NOT APPLIED report must fire on an anchor the sources do not hold, or a stale mutant would pass unseen.
     try:
@@ -1107,10 +986,8 @@ def main(argv: list[str]) -> int:
     except ContractError as e:
         print(e)
         return 1
-    print("PASS: a resident-only PP MoE ring whose weights keep another device prompt route and that displaced experts "
-          "is dropped only where the WEIGHT zone grows once its RUNTIME surplus is given back, and the device planned "
-          "once more; a ring that returns no room or whose arena is held is put back and its plan stands; a ring with "
-          "a staged or SOA use, or a weight with no other route, is kept")
+    print("PASS: the stage and the dry run are the decision's callers; the stage writes through its unpublish, puts a "
+          "kept ring back first, refuses only where an ensure fails and records only a drop; the dry run sizes no zone")
     return 0
 
 
