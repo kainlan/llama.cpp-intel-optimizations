@@ -34,9 +34,11 @@
 //         err_bf16x=<same vs double over RNE bf16(x)> act_rounding=<none|bf16|unclear> match=<Y|N>
 // span_us brackets the calls with two empty kernels on the in-order profiling queue, so it is the device time of
 // every kernel a call launched plus any gap between them; ev_us times only the event the call returned. The native
-// kernel and the conversion print the same fields (arm=native, arm=convert_f32_to_bf16). One summary line per case:
-//   summary case=... native_us=<span> convert_us=<span> route_us=<convert + fork.bf16xbf16.strict>
-//           route_speedup=<native / route>
+// kernel and the conversion print the same fields (arm=native, arm=convert_f32_to_bf16). The native kernel is timed
+// again after the oneDNN arms (arm=native_after), so a card still warming up at the first timing cannot inflate a
+// speedup: every speedup divides the smaller of the two native spans. One summary line per case:
+//   summary case=... native_us=<span> native_after_us=<span> convert_us=<span>
+//           route_us=<convert + fork.bf16xbf16.strict> route_speedup=<native / route>
 //           mixed_strict=<fastest strict mixed arm whose act_rounding is none, or none> mixed_strict_us=<span>
 //           mixed_strict_speedup=<native / it>
 //           mixed_fpmath_bf16=<fastest fpmath_bf16 arm, or none> mixed_fpmath_bf16_us=<span>
@@ -54,8 +56,9 @@
 // Build: ./scripts/sycl-build.sh test-sycl-bf16-onednn-probe
 // Run (lead only: it touches the GPU; once per card, pinned):
 //   source /opt/intel/oneapi/setvars.sh --force
-//   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-sycl-bf16-onednn-probe
-//   ctest --test-dir build -R '^test-sycl-bf16-onednn-probe$' --output-on-failure    (pins level_zero:1)
+//   ONEAPI_DEVICE_SELECTOR=level_zero:0 timeout 300 ./build/bin/test-sycl-bf16-onednn-probe; echo rc=$?
+//   ctest --test-dir build -R '^test-sycl-bf16-onednn-probe$' -V    (pins level_zero:1; -V because the numbers are the
+//                                                                    result and --output-on-failure hides a pass)
 // Env: PROBE_ITERS (calls per timed arm, default 20).
 //      PROBE_SMOKE=1 checks the harness itself on a CPU device (cpu_selector_v; run it with
 //      ONEAPI_DEVICE_SELECTOR=opencl:cpu): small shapes, N = 9 and 16, two calls per arm. Its timings mean nothing and
@@ -514,16 +517,26 @@ int run_shape(sycl::queue &                q,
             }
         }
 
+        std::printf("probe=bf16_onednn case=K%lldxM%lldxN%lld arm=native_after", (long long) K, (long long) M,
+                    (long long) N);
+        const timing tn_after = time_calls(q, iters, native_call);
+        print_timing(tn_after, flop);
+        std::printf("\n");
+
+        double native_us = tn.span_us;
+        if (tn_after.span_us > 0.0 && (native_us <= 0.0 || tn_after.span_us < native_us)) {
+            native_us = tn_after.span_us;
+        }
         auto speedup = [&](double us) {
-            return us > 0.0 && tn.span_us > 0.0 ? tn.span_us / us : -1.0;
+            return us > 0.0 && native_us > 0.0 ? native_us / us : -1.0;
         };
         const double route_us = route_gemm_us > 0.0 && tc.span_us > 0.0 ? route_gemm_us + tc.span_us : -1.0;
         std::printf(
-            "summary case=K%lldxM%lldxN%lld native_us=%.1f convert_us=%.1f route_us=%.1f route_speedup=%.2f "
-            "mixed_strict=%s mixed_strict_us=%.1f mixed_strict_speedup=%.2f mixed_fpmath_bf16=%s "
+            "summary case=K%lldxM%lldxN%lld native_us=%.1f native_after_us=%.1f convert_us=%.1f route_us=%.1f "
+            "route_speedup=%.2f mixed_strict=%s mixed_strict_us=%.1f mixed_strict_speedup=%.2f mixed_fpmath_bf16=%s "
             "mixed_fpmath_bf16_us=%.1f mixed_fpmath_bf16_speedup=%.2f\n",
-            (long long) K, (long long) M, (long long) N, tn.span_us, tc.span_us, route_us, speedup(route_us),
-            strict_arm, strict_us, speedup(strict_us), fpmath_arm, fpmath_us, speedup(fpmath_us));
+            (long long) K, (long long) M, (long long) N, tn.span_us, tn_after.span_us, tc.span_us, route_us,
+            speedup(route_us), strict_arm, strict_us, speedup(strict_us), fpmath_arm, fpmath_us, speedup(fpmath_us));
     }
     return rc;
 }
@@ -532,6 +545,9 @@ int run_shape(sycl::queue &                q,
 #endif  // GGML_SYCL_DNNL
 
 int main() {
+    // Each line is printed in parts around a call that can hang or abort; unbuffered, a killed run still shows which
+    // arm it was in.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
 #if GGML_SYCL_DNNL
     // A failure before setup_done is an absence (no GPU under the selector, no engine): exit 77. A failure after it
     // is a result: exit 1.
