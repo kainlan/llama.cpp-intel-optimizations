@@ -3477,7 +3477,8 @@ void ggml_sycl_queue_profiling_warn_unavailable(const char * diagnostic) {
     // it was enabled without its variable (a test hook, or a trace level the variable does not name).
     GGML_LOG_WARN(
         "[SYCL] %s reads event profiling and the backend's queues do not carry it. "
-        "The knob resolved off before %s asked for profiling (set after the process started, or enabled without its "
-        "variable). It reports no figure. Set %s before the process starts, or set GGML_SYCL_QUEUE_PROFILING=1.\n",
+        "The knob resolved off before %s asked for profiling "
+        "(set after the process started, or enabled without its variable). "
+        "It reports no figure. Set %s before the process starts, or set GGML_SYCL_QUEUE_PROFILING=1.\n",
         name.c_str(), name.c_str(), name.c_str());
 }
