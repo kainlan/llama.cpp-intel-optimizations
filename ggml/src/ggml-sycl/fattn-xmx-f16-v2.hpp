@@ -107,6 +107,15 @@ static constexpr int XMX_V2_BATCH_KV = 32;  // must be divisible by every varian
 static constexpr int XMX_V2_FLOAT_AS_HALF_ELEMS =
     static_cast<int>((sizeof(float) + sizeof(sycl::half) - 1) / sizeof(sycl::half));
 
+// The f32_sv leaf hands each softmax weight p (0 <= p <= 1, float) to the matrix
+// engine as a half, scaled by 2^15 first. Every p >= 2^-29 (about exp(-20.1))
+// then becomes a normal half (>= 2^-14), so the result does not depend on whether
+// the conversion or DPAS flushes half subnormals, and p = 1 becomes 32768, below
+// the half maximum 65504. A smaller p carries less than 2^-29 of the row's largest
+// weight. The scale is exact (a power of two) and is removed once, at the output.
+static constexpr float XMX_V2_F32SV_P_SCALE   = 32768.0f;
+static constexpr float XMX_V2_F32SV_P_UNSCALE = 1.0f / 32768.0f;
+
 // Decode prototype shape for GPT-OSS D=64 TG.  Xe2 reports fp16
 // M=1,K=16,N=64, but with SG16 + ext_intel_packed B only lanes 0..7 expose
 // useful accumulator values.  The decode leaf therefore uses two packed MADs
@@ -466,10 +475,11 @@ inline std::size_t fattn_xmx_v2_pick_variant_cached(ggml_backend_sycl_context & 
 // tile_K[BATCH_KV][D]         — K tile per KV batch
 // tile_V[BATCH_KV][D]         — V tile per KV batch (separate from K)
 // tile_S[ncols][BATCH_KV]     — softmax weights written before S@V. The S
-//                                region is sized for float weights so
-//                                GGML_PREC_F32 can avoid half probability
-//                                quantization; PREC_DEFAULT uses the first
-//                                half-sized portion for the XMX S@V path.
+//                                region is sized for float weights, which the
+//                                scalar S@V of the GGML_PREC_F32 leaf reads.
+//                                The XMX S@V paths (PREC_DEFAULT, and the
+//                                PREC_F32 f32_sv leaf with its float
+//                                accumulator) use its first half-sized portion.
 //
 // All regions start at WORD-aligned offsets.  The ordering above places each
 // region right after the previous one with NO overlap.
@@ -549,6 +559,15 @@ inline sycl::half fp8_e4m3_to_half_v2(uint8_t bits) {
 // Kernel leaf — parameterised on (TM, TK, TN). Today only the (8, 16, 16)
 // instantiation is reachable; the static_assert enforces that until future
 // leaves land with matching lane-ownership math.
+//
+// f32_sv (Acc_t = float only): S@V runs on the matrix engine, P as a half
+// scaled by XMX_V2_F32SV_P_SCALE, into a float joint_matrix accumulator added to
+// the float VKQ. Without it the float leaf does S@V as a scalar loop over float
+// P in SLM. GGML_PREC_F32 asks for F32 accumulation (ggml.h), not for F32
+// operands; the f32_sv leaf keeps the accumulator, the running max and the sum in
+// float, as the CPU-equivalent backends do with a half P (Vulkan
+// flash_attn_cm1.comp, CUDA fattn-mma-f16.cuh) and as this backend's oneDNN SDPA
+// (F16 probabilities) and DPAS (fattn-dpas.cpp) paths already do.
 // =============================================================================
 
 template <int  D,
@@ -559,7 +578,8 @@ template <int  D,
           bool kv_is_fp8,
           int  TM,
           int  TK,
-          int  TN>
+          int  TN,
+          bool f32_sv = false>
 static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                                               const char * __restrict__ K_base,
                                               const char * __restrict__ V_base,
@@ -599,6 +619,7 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
         "Follow-up tasks must add kernel specializations for other leaves.");
     static_assert(D % TK == 0, "D must be divisible by TK");
     static_assert(ncols % TM == 0 || ncols < TM, "ncols must be <= TM or a multiple of TM");
+    static_assert(!f32_sv || std::is_same_v<Acc_t, float>, "f32_sv is the float-accumulator leaf");
 
     using slm_layout            = fattn_v2_slm<D, ncols>;
     constexpr int SG_ROWS_PER_Q = (ncols + TM - 1) / TM;  // ceil(ncols/TM)
@@ -658,11 +679,12 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
     // Per-lane accumulator. `Acc_t` is a template parameter set by the
     // dispatcher: `float` on GGML_PREC_F32 (matches CUDA's KQ_acc_t=float
     // branch) and `afloat` on GGML_PREC_UNDEFINED (picks up the SYCL-F16 build
-    // flag — see ggml-sycl/common.hpp). `KQ_max` / `KQ_sum` stay in full
-    // float: online-softmax state is precision-critical (the
-    // exp(max_old - max_new) rescale cancels rapidly if the running max is
-    // rounded to half), and the FTZ bit manipulation further down assumes a
-    // 32-bit scale_old.
+    // flag — see ggml-sycl/common.hpp). The f32_sv leaf keeps `float` and only
+    // changes how S@V reaches it (the matrix engine, P as a half). `KQ_max` /
+    // `KQ_sum` stay in full float on every leaf: online-softmax state is
+    // precision-critical (the exp(max_old - max_new) rescale cancels rapidly if
+    // the running max is rounded to half), and the FTZ bit manipulation further
+    // down assumes a 32-bit scale_old.
     Acc_t VKQ[TM][D_TILES];  // [query_slot_in_tile][D_tile]
     float KQ_max[TM];
     float KQ_sum[TM];
@@ -826,6 +848,12 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                 KQ_sum[r] *= scale_old;
                 KQ_max[r] = new_max;
 
+                // KQ_sum is the sum of the UNSCALED weights p on every leaf. The
+                // f32_sv leaf scales only the copy of p it hands to the matrix
+                // engine (by XMX_V2_F32SV_P_SCALE), so its VKQ holds
+                // P_SCALE * sum(p * V), and the rescales by exp(max_old - max_new)
+                // and by the sink, which multiply VKQ and KQ_sum alike, keep that
+                // ratio. The output removes the factor once (XMX_V2_F32SV_P_UNSCALE).
                 const float p        = sycl::exp(lane_QK[r] - new_max);
                 const float tile_sum = sycl::reduce_over_group(sg, p, sycl::plus<float>{});
                 KQ_sum[r] += tile_sum;
@@ -833,7 +861,9 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                 const int s_row = sg_q_base + r;
                 const int s_col = kv_col + lane;
                 if (s_row < ncols && s_col < XMX_V2_BATCH_KV) {
-                    if constexpr (std::is_same_v<Acc_t, float>) {
+                    if constexpr (f32_sv) {
+                        tile_S[s_row * XMX_V2_BATCH_KV + s_col] = sycl::half(p * XMX_V2_F32SV_P_SCALE);
+                    } else if constexpr (std::is_same_v<Acc_t, float>) {
                         tile_S_f[s_row * XMX_V2_BATCH_KV + s_col] = p;
                     } else {
                         tile_S[s_row * XMX_V2_BATCH_KV + s_col] = sycl::half(p);
@@ -847,7 +877,46 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
             // before the next tile can update KQ_max.
             sycl::group_barrier(item.get_group());  // Rule 3
 
-            if constexpr (std::is_same_v<Acc_t, float>) {
+            if constexpr (f32_sv) {
+                // The (TM x TK) half P tile times the (TK x TN) V tile, into a
+                // float accumulator added to the float VKQ. Unrolled so that the
+                // d_tile index into VKQ is a compile-time constant, which keeps
+                // VKQ in registers rather than in private memory.
+#    pragma unroll
+                for (int d_tile = 0; d_tile < D_TILES; ++d_tile) {
+                    const int d_start = d_tile * TN;
+
+                    sycl_xmx::joint_matrix<sycl::sub_group, float, sycl_xmx::use::accumulator, TM, TN> mat_SV;
+                    sycl_xmx::joint_matrix_fill(sg, mat_SV, 0.0f);
+
+                    sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::a, TM, TK,
+                                           sycl_xmx::layout::row_major>
+                        mat_S;
+                    sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::b, TK, TN,
+                                           sycl_xmx::layout::row_major>
+                        mat_V;
+
+                    sycl_xmx::joint_matrix_load(
+                        sg, mat_S,
+                        sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                            &tile_S[sg_q_base * XMX_V2_BATCH_KV + kv_col]),
+                        XMX_V2_BATCH_KV);
+
+                    sycl_xmx::joint_matrix_load(
+                        sg, mat_V,
+                        sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                            &tile_V[kv_col * D + d_start]),
+                        D);
+
+                    sycl_xmx::joint_matrix_mad(sg, mat_SV, mat_S, mat_V, mat_SV);
+
+                    int slot = 0;
+                    sycl_xmx::joint_matrix_apply(sg, mat_SV, [&](float & elem) {
+                        VKQ[slot][d_tile] += elem;
+                        ++slot;
+                    });
+                }
+            } else if constexpr (std::is_same_v<Acc_t, float>) {
                 for (int d_tile = 0; d_tile < D_TILES; ++d_tile) {
                     const int d = d_tile * TN + lane;
 
@@ -960,8 +1029,13 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
         // (half under GGML_SYCL_F16+PREC_DEFAULT, float under PREC_F32), so the
         // final multiply promotes to float for the f32 dst_row write expected
         // by the public FA contract.
-        const float inv_sum = (KQ_sum[r] > 0.0f) ? (1.0f / KQ_sum[r]) : 0.0f;
-        float *     dst_row = dst + (int64_t) D * (head + ne02 * (q_abs + ne01 * sequence));
+        // The f32_sv leaf's VKQ carries XMX_V2_F32SV_P_SCALE over the unscaled
+        // KQ_sum; this is the one place the factor comes off (exact: a power of two).
+        float inv_sum = (KQ_sum[r] > 0.0f) ? (1.0f / KQ_sum[r]) : 0.0f;
+        if constexpr (f32_sv) {
+            inv_sum *= XMX_V2_F32SV_P_UNSCALE;
+        }
+        float * dst_row = dst + (int64_t) D * (head + ne02 * (q_abs + ne01 * sequence));
 
 #    pragma unroll
         for (int t = 0; t < D_TILES; ++t) {
@@ -983,7 +1057,8 @@ template <int  D,
           bool kv_is_fp8,
           int  TM,
           int  TK,
-          int  TN>
+          int  TN,
+          bool f32_sv = false>
 static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queue_ptr stream) {
     using slm_layout            = fattn_v2_slm<D, ncols>;
     constexpr int sg_rows_per_q = (ncols + TM - 1) / TM;
@@ -1026,7 +1101,8 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
         cgh.parallel_for(
             sycl::nd_range<3>(grid * block, block),
             [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(XMX_V2_SG)]] {
-                flash_attn_xmx_v2_f16_kernel_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8, TM, TK, TN>(
+                flash_attn_xmx_v2_f16_kernel_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8, TM, TK, TN,
+                                                  f32_sv>(
                     Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, dst_ptr, scale_v, max_bias, m0, m1, n_head_log2, logit_sc,
                     ne01, ne02, nb01, nb02, nb03, ne11, ne12, nb11, nb12, nb13, nb21, nb22, nb23, ne30, ne32, ne33,
                     nb31, nb32, nb33, item, slm.get_multi_ptr<sycl::access::decorated::no>().get());
@@ -2526,7 +2602,13 @@ bool launch_fattn_xmx_v2_decode_gqa_split(ggml_backend_sycl_context & ctx,
 // `if (launcher(...)) return;` idiom.
 // =============================================================================
 
-template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t, bool kv_is_fp8 = false>
+template <int  D,
+          int  ncols,
+          bool use_logit_softcap,
+          typename Q_type,
+          typename Acc_t,
+          bool kv_is_fp8 = false,
+          bool f32_sv    = false>
 bool launch_fattn_xmx_v2_f16_variant(ggml_backend_sycl_context & ctx,
                                      const fattn_params &        params,
                                      dpct::queue_ptr             stream,
@@ -2553,14 +2635,18 @@ bool launch_fattn_xmx_v2_f16_variant(ggml_backend_sycl_context & ctx,
     }
 
     switch (variant_idx) {
-        // variant 1: (16, 16, 16) — larger tile for better XMX utilization
+        // variant 1: (16, 16, 16) — larger tile for better XMX utilization.
+        // Only GGML_SYCL_FA_XMX_V2_VARIANT=tm16 selects it (the hang reproducer
+        // in fattn_xmx_v2_pick_variant_for_shape). It keeps the original leaf
+        // body, so f32_sv has no TM=16 instantiation and that reproducer runs
+        // the same kernel it always did.
         case 1:
             launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8,
                                          /*TM=*/16, /*TK=*/16, /*TN=*/16>(params, stream);
             break;
         default:
             launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8,
-                                         /*TM=*/8, /*TK=*/16, /*TN=*/16>(params, stream);
+                                         /*TM=*/8, /*TK=*/16, /*TN=*/16, f32_sv>(params, stream);
             break;
     }
     return true;
@@ -2570,6 +2656,18 @@ template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Ac
 bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params & params, dpct::queue_ptr stream) {
     return launch_fattn_xmx_v2_f16_variant<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8>(ctx, params, stream,
                                                                                                   -1);
+}
+
+// The float-accumulator leaf with S@V on the matrix engine (f32_sv, see the
+// kernel leaf). Same signature as launch_fattn_xmx_v2_f16 so
+// DISPATCH_NCOLS_CTX_ACC can name it; Acc_t must be float.
+template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t>
+bool launch_fattn_xmx_v2_f16_f32sv(ggml_backend_sycl_context & ctx,
+                                   const fattn_params &        params,
+                                   dpct::queue_ptr             stream) {
+    static_assert(std::is_same_v<Acc_t, float>, "the f32_sv leaf accumulates in float");
+    return launch_fattn_xmx_v2_f16_variant<D, ncols, use_logit_softcap, Q_type, Acc_t, /*kv_is_fp8=*/false,
+                                           /*f32_sv=*/true>(ctx, params, stream, -1);
 }
 
 // =============================================================================
@@ -2582,7 +2680,13 @@ inline bool fattn_xmx_v2_f16_available() {
 
 #else   // !SYCL_XMX_V2_AVAILABLE
 
-template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t, bool kv_is_fp8 = false>
+template <int  D,
+          int  ncols,
+          bool use_logit_softcap,
+          typename Q_type,
+          typename Acc_t,
+          bool kv_is_fp8 = false,
+          bool f32_sv    = false>
 bool launch_fattn_xmx_v2_f16_variant(ggml_backend_sycl_context &, const fattn_params &, dpct::queue_ptr, int) {
     GGML_ABORT("XMX v2 not available at compile time");
     return false;
@@ -2590,6 +2694,12 @@ bool launch_fattn_xmx_v2_f16_variant(ggml_backend_sycl_context &, const fattn_pa
 
 template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t, bool kv_is_fp8 = false>
 bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context &, const fattn_params &, dpct::queue_ptr) {
+    GGML_ABORT("XMX v2 not available at compile time");
+    return false;
+}
+
+template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t>
+bool launch_fattn_xmx_v2_f16_f32sv(ggml_backend_sycl_context &, const fattn_params &, dpct::queue_ptr) {
     GGML_ABORT("XMX v2 not available at compile time");
     return false;
 }

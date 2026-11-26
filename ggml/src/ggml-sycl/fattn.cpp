@@ -3543,7 +3543,10 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             // llama-graph.cpp's unconditional PREC_F32 pin). PREC_DEFAULT picks
             // up the build-time `afloat` typedef — half under GGML_SYCL_F16,
             // float otherwise. Mirrors CUDA's pattern at
-            // ggml/src/ggml-cuda/fattn-wmma-f16.cu:541.
+            // ggml/src/ggml-cuda/fattn-wmma-f16.cu:541. PREC_F32 constrains the
+            // accumulator, not the operand types (ggml.h), so for ne01 > 16 the
+            // float leaf takes P to the matrix engine as a half (f32_sv); the
+            // smaller arms keep the scalar S@V float leaf.
             bool       v2_dispatched = false;
             const bool use_f32_acc   = (params.prec == GGML_PREC_F32 || params.max_bias != 0.0f);
             if (ne01 <= 1) {
@@ -3581,11 +3584,18 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
             } else {
                 GGML_SYCL_KTRACE("fattn_xmx_v2_f16", " D=%d ncols=16 ne01=%d prec=%d", D, ne01, (int) params.prec);
                 if (use_f32_acc) {
-                    DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, float);
+                    // Prompt micro-batches: the float leaf with S@V on the matrix
+                    // engine (P as a half, float accumulator, float softmax state;
+                    // see the f32_sv kernel leaf). The ne01 <= 16 arms above and the
+                    // forced path keep the scalar-S@V float leaf.
+                    DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16_f32sv, float);
+                    dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_ncols16_large_f32sv" :
+                                                          "xmx_v2_f16_ncols16_large_f32sv_rejected");
                 } else {
                     DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, afloat);
+                    dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_ncols16_large" :
+                                                          "xmx_v2_f16_ncols16_large_rejected");
                 }
-                dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_ncols16_large" : "xmx_v2_f16_ncols16_large_rejected");
             }
             if (!v2_dispatched) {
                 use_xmx = false;
@@ -3827,7 +3837,8 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     // Per-op accumulator precision, set with ggml_prec_set_acc. llama-graph's
     // attention builder pins PREC_F32 on every flash-attention op. The XMX-v2
     // dispatcher reads this to force a float-accumulator specialization on
-    // PREC_F32.
+    // PREC_F32; the spec names the accumulator only, so a leaf may still feed
+    // the matrix engine half operands (the ne01 > 16 f32_sv leaf does).
     params.prec = ggml_flash_attn_ext_get_prec(dst);
 
     // Q dimensions: [batch, n_heads, n_queries, head_dim]
