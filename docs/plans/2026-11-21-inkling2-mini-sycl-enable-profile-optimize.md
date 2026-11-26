@@ -6810,6 +6810,70 @@ What step 1d wrote (implementer record, 2026-11-24; device behaviour is the lead
   not compile while `mark` was public).
   (5) r7 (1)'s exit 77 names all three skips: no SYCL GPU, more than one card visible, weights not evictable.
 
+### Task 23: The XMX-v2 prompt attention kernel multiplies P by V on the matrix engine (written 2026-11-26)
+
+**Track:** S3-prompt. **Base:** `482bd96b66`. **Branch:** `task/inkling2-t23`.
+
+Every Inkling prompt micro-batch takes `xmx_v2_f16_ncols16_large`: the attention sinks keep oneDNN SDPA off it, and
+llama-graph pins `GGML_PREC_F32` on every flash-attention node (`src/llama-graph.cpp:3212`, upstream `8841ce3f43`).
+Under that pin the leaf multiplied the softmax weights P by V in scalar float FMAs from SLM (2048 FMAs and about 4K
+SLM loads per lane per 32-key batch), where its half-accumulator twin does the same work in 16 DPAS. On the B70 the
+kernel took 7.7 s of the 4,737-token prompt (480 calls).
+
+**Checkpoint (2026-11-26) and the lead's ruling.** Four steps, each a new dispatch name and its own ruling, S2 to S4
+after S1 merges: S1 P·V on XMX with a float accumulator (below); S2 vectorised K/V copies into SLM (bit-identical);
+S3 more query rows per work-group (ncols32, 4 sub-groups of TM8; TM16 stays off for the dqp2 hang); S4 a
+work-group-uniform skip of 32-key tiles that are -inf for every row (a bound of at most 1.37x on Inkling). The end
+state, a kernel modelled on `fattn-dpas.cpp` with GQA rows and 16 sub-groups, is a separate task.
+
+**S1 (this commit set).** A leaf template flag `f32_sv` (default false) in `fattn-xmx-f16-v2.hpp`, set only by
+`launch_fattn_xmx_v2_f16_f32sv`, which only the `ne01 > 16` arm of the v2 ladder in `fattn.cpp` calls under a float
+accumulator. Dispatch name `xmx_v2_f16_ncols16_large_f32sv`. VKQ and the running max and sum stay float; P is stored
+to the S region as a half pre-scaled by 2^15 (`XMX_V2_F32SV_P_SCALE`); S·V is a `joint_matrix` half x half -> float
+multiply-add into VKQ; `#pragma unroll` on its d_tile loop keeps the VKQ index constant so VKQ stays in registers;
+the output multiplies 1/KQ_sum by 2^-15 once. KQ_sum stays the sum of the unscaled p, and every rescale of VKQ and
+KQ_sum (the tile step and the sink step) multiplies both by the same factor, so the scale cancels only at the output.
+The force path, the TM16 variant (the `tm16` reproducer) and the `ne01 <= 16` arms compile unchanged; f32_sv has no
+TM16 instantiation.
+
+**Precision.** `GGML_PREC_F32` constrains the accumulator, not the operand types: `ggml.h:1325-1336`
+(`ggml_prec_set_acc`, "requires accumulation of the results in F32"); operand precision is the separate
+`ggml_prec_set_src` (`ggml.h:1338-1356`). P in F16 into an F32 accumulator is what the other backends do under the
+same pin, and what this fork's other attention paths already do:
+- Vulkan: `ggml-vulkan.cpp:6824-6836` (`ggml_vk_prec_allows_f16acc` turns off only the f16 accumulator);
+  `flash_attn_cm1.comp:53`, `:483`, `:588` (P in shared memory as the f16 type, then a cooperative-matrix load).
+- CUDA: `fattn-mma-f16.cuh:1016-1020` (P converted to half2 for the MMA; the kernel does not read the op's prec).
+- This fork's oneDNN SDPA: `fattn-onednn.cpp:808` (the probabilities tensor takes the query's data type, F16 under
+  every Mistral PP512).
+- This fork's quantised DPAS kernel: `fattn-dpas.cpp:180-181` (P stored as f16, O accumulated by f16 DPAS).
+- The CPU reference (`ggml-cpu/ops.cpp:9060-9198`) keeps P and VKQ in F32; the leaf already rounds Q*scale to half
+  before Q·K (Phase 0), which costs more than the rounding of P (u = 2^-11, unbiased, an NMSE near 1e-7 against the
+  5e-4 bound). BF16 P is out: V is F16, the matrix combinations pair like types, and its u is 8x worse.
+Subnormals: p in [exp(-20), exp(-9.7)] is a half subnormal unscaled, and whether the conversion or the DPAS flushes
+them on Xe2 is not verified. The 2^15 pre-scale makes every kept p (at least 2^-29) a normal half and keeps p = 1 at
+32768, below the half maximum.
+
+**Tests (RED first).** `tests/test-sycl-fattn-masked-nonfinite.cpp`: the noonednn rows of `d128_pp72` and
+`d128_pp72_row1_masked` move to the new name. Two new cases, each on the noonednn arm and on the force-tile arm (the
+tile kernel keeps P in float: the control):
+- `d128_sinks_window`: GQA 3, one mask per query head (a 512-cell sliding window plus a finite per-head bias), sinks,
+  a ragged 179-row micro-batch over 1,536 cells, all poison variants. The window kills the 25 tiles below cell 800.
+- `d128_tail_mass`: Q = 0, cell 0 with mask 0 and V = 0, 4,096 cells with mask -10 (weight 4.54e-5, a half
+  subnormal) and V = 1, so the tail is the whole output (0.05-0.12 per element). A flush gives an all-zero row and an
+  NMSE of 1; rounding a kept subnormal costs at most 6.6e-4 of the tail. There is no test-only switch to force a flush
+  on the shipped kernel: the harness links the shipped backend, so a switch would need an environment variable or a
+  second build target, and the bound above is the argument instead.
+The new rows' kernel names are predicted, not yet observed. `tests/test-backend-ops.cpp` gains two perf cases (hs
+128, 8 KV heads, GQA 3, 4,864 keys, a 512-row batch, mask, sinks; prec F32 and UNDEFINED), selected with
+`-o FLASH_ATTN_EXT -p 'kv=4864'`. Their mask is the default random one, mostly live, so S4 needs its own geometry.
+
+**S1 acceptance (lead runs, each once unless an ABBA pair).** The masked-nonfinite noonednn and force-tile arms green
+on both cards; `test-backend-ops -o FLASH_ATTN_EXT` on the B70 and the B50 with no case changing from the base; the
+F32 perf case at least 1.8x faster than the base; on the 4,737-token Inkling prompt, `fattn.compute.xmx_v2` device
+time at least 1.8x lower in the kernel profile and pp not slower in an interleaved pair; the long-arm text byte-equal
+run to run and read for sense; the Inkling perplexity A/B within noise; the Inkling gate on all three setups, the
+Mistral B70 and GPT-OSS B50 gates; the two contract sweeps with no new red.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
