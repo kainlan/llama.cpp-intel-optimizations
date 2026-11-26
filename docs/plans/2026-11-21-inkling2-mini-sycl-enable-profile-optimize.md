@@ -6871,12 +6871,16 @@ The conversion costs about 17 us of span at every width. Against double over bf1
       it cannot hold (`zone_walk_ensure_dense_buffer` in `zone-sizing.hpp`, `test-zone-sizing` Case 53).
     - Why: the route has a next path, the tiled kernel; the f16 arm has none. Refusing the whole graph (the backend's
       allocation failure) over the route's demand turned a speedup into a failed prompt.
-    - The src1 plan is one figure for both rows, so a zone that cannot hold the plan itself still refuses (owed item
-      below).
+    - The src1 plan is one figure for both rows, so a zone that cannot hold the plan itself still refuses a graph
+      with an f16 op in it (owed item below, `llama.cpp-ppc2`). With no f16 op asking, a zone short of even the plan
+      leaves the buffer as it was, and the route declines on it (Case 53, `below_plan`).
   - A buffer too short at dispatch, or one that does not resolve on the device, makes the route decline. The decline
-    is loud, as an op that grows a planned buffer is: one WARN per device slot (`planned_scratch_stats::warned`), and
-    a short buffer counts an under-estimate against the `mul-mat-dequant-f16-src1` cohort. Nothing is allocated
-    outside the buffer: the GEMM's scratchpad, 0 B here, comes through the ONEDNN zone.
+    is loud, as an op that grows a planned buffer is: one WARN per device slot. Since the second review it has its own
+    flag (`planned_scratch_stats::route_declined_warned`), so it does not silence the in-op growth WARN of an f16 op
+    sharing the slot (`warned`), nor the reverse. A copy wider than the plan counts an under-estimate against the
+    `mul-mat-dequant-f16-src1` cohort. A copy within the plan that the buffer cannot hold is a zone short of its plan
+    (the walk capped the buffer), not the plan's under-estimate, and the WARN says so. Nothing is allocated outside
+    the buffer: the GEMM's scratchpad, 0 B here, comes through the ONEDNN zone.
   - `docs/backend/sycl-memory-design.md` describes it under "Who the dense f16 dequant plan covers".
 - **Profiler.** The GEMM's row carries op_context `bf16_weight`. The conversion's row is
   `mulmat.bf16_onednn.act_to_bf16`.
@@ -6893,13 +6897,15 @@ The conversion costs about 17 us of span at every width. Against double over bf1
 **Tests.**
 - `test-zone-sizing` Case 52: the fold and the combined row. Case 53: the walk's decision for one buffer (held,
   capped, refused), against a fake RUNTIME zone; it failed on the old decision (refuse whenever max(plan, demand)
-  does not fit) at its first route-only case.
+  does not fit) at its first route-only case. Its `below_plan` case (a zone short of the plan, no f16 op asking) is
+  the only one that reaches the decision's last line; a mutant that refuses there fails it, and no other case.
 - `test-sycl-bf16-mul-mat`: the device rounding against `ggml_fp32_to_bf16` on the specials and on a sweep.
 - `test-sycl-bf16-native-source`: the route (its recording decline before the buffer, the query and the conversion;
   its loud declines; the query before the conversion and the GEMM on the conversion's event), its walk and the walk's
   capping, its planner and adapter terms, and the probe citation. `test_every_route_check_fails_on_its_mutants`
-  applies 27 in-memory mutants, at least one per route check, and fails if any check passes on its mutant or no
-  mutant names a check.
+  applies 31 in-memory mutants, at least one per route check, and fails if any check passes on its mutant or no
+  mutant names a check. The loud declines' mutants include an under-estimate for a copy within the plan, a lost
+  zone-short text, and the growth WARN's flag in place of the route's.
 - `check-sycl-dnnl-decline-consumers.py`: the route's consumers (the query's decline and the run's) and the memo, 210
   mutants.
 - `test-sycl-bf16-mul-mat-backend`: N = 40 held to the amended bounds; it asks the backend's own admission
@@ -6937,6 +6943,15 @@ The follow-up after the review (the walk's capping, the loud declines, the query
 conversion's event as the GEMM's dependency) changes the route's hot path and the device test, so the device tests,
 the backend test and the Inkling timing above are for `eb37e2ffaa`, not for the follow-up's head; they are to be run
 again on it.
+
+**Results at `77123bd7c3`, the follow-up's head (2026-11-26, the lead, each run once).**
+- On the B50, the device test, its opt-out registration and `test-sycl-bf16-mul-mat-backend` pass. On the B70 the
+  device test passes, its strided, three-plane and walk-cap cases included. No kernel faults.
+- Inkling long prompt on the B70: the BF16 dense device time is about 442 ms (the oneDNN GEMM unbatched 233 ms and
+  batched 141 ms, `mulmat.bf16_onednn.act_to_bf16` 69 ms), against the 1,100 ms bar: pass.
+
+The commit after the second review changes the route's decline WARNs and when it counts an under-estimate, not its
+hot path. Its device test differs only in the layout constants' names.
 
 ---
 
@@ -7272,16 +7287,21 @@ interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkli
   (`ggml_sycl_graph_recording_active()`), as the batched F32 route does, so a thread that records nothing also
   declines meanwhile. The per-thread question exists: `ggml_sycl_graph_recording_this_thread()` (`common.hpp:583-598`),
   with the queue's own recording state, which the route also reads. Not changed here.
-- **The walk's cap is one plan figure wide.** The src1 plan is the wider of the f16 and bf16 rows
+- **The walk's cap is one plan figure wide (`llama.cpp-ppc2`).** The src1 plan is the wider of the f16 and bf16 rows
   (`zone_dense_src1_planned_bytes_per_token`), and no f16-only figure is published. So a RUNTIME zone that cannot hold
   a plan the BF16 row widened refuses an f16 demand it could hold (`test-zone-sizing` Case 53 pins this). Splitting
-  the figure needs a new term in the planned-load owner table.
-- **A capped buffer is asked to grow on every prompt graph.** The walk does not remember a failed grow: each graph
-  tries the wide grow once more (one RUNTIME-zone allocation attempt, counted as a zone plan refusal, with a line only
-  under `GGML_SYCL_EXT_ALLOC_TRACE`), and each declined op counts one under-estimate, which takes the zone-sizing
-  mutex. The WARN is once per device slot. Neither the fake zone of Case 53 nor the device test's walk limit exercises
-  the allocator's real failure; the failure path was read, not run (`ggml_sycl_runtime_scratch_ensure` returns before
-  it touches the backing).
+  the figure needs a new term in the planned-load owner table. The second review found no gate model that reaches
+  this.
+  - The BF16 mark is per model and ignores placement: a BF16 weight planned on the host, or on the other card of a
+    split, still widens the src1 plan where the route does not run it. Also in `llama.cpp-ppc2`.
+- **A capped buffer is asked to grow on every prompt graph (`llama.cpp-ppc2`).** The walk does not remember a failed
+  grow: each graph tries the wide grow once more (one RUNTIME-zone allocation attempt, counted as a terminal zone plan
+  refusal, with a line only under `GGML_SYCL_EXT_ALLOC_TRACE`), and each declined op whose copy exceeds the plan
+  counts one under-estimate, which takes the zone-sizing mutex. The WARN is once per device slot. The cure: the
+  walk's wide grow is a request whose next path is planned, so it should carry `alloc_constraints::cascade_step`;
+  `unified_cache_zone_refusal` then counts its refusal as `zone_cascade_miss`, not a terminal plan refusal. Neither
+  the fake zone of Case 53 nor the device test's walk limit exercises the allocator's real failure; the failure path
+  was read, not run (`ggml_sycl_runtime_scratch_ensure` returns before it touches the backing).
 
 *Left by the integration with master and the long-prompt arm (2026-11-24):*
 - **Mistral 7B refuses any prompt longer than one micro-batch with default flags, on master.** The auto micro-batch
