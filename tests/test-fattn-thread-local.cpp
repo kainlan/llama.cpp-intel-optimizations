@@ -16,6 +16,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-sycl.h"
+#include "ggml-sycl/unified-cache.hpp"
 #include "ggml.h"
 #include "sycl-selector-fallback.hpp"
 #include "test-skip.h"
@@ -111,9 +112,24 @@ static size_t buffer_ids_kept(const buffer_group & group, const buffer_ids & a, 
     return kept;
 }
 
+// Whether the context still allocates on `home`. The reuse check below means something only then: a context whose
+// queue changed between two touches is right to replace every buffer. False with its own message.
+static bool context_queue_is(ggml_backend_t backend, const sycl::queue * home, const char * when) {
+    if (ggml_sycl_test_fattn_context_stream(backend) != home) {
+        fprintf(stderr, "The context's queue changed between touches (%s)\n", when);
+        return false;
+    }
+    return true;
+}
+
 // Runs the checks that need a live context on one group. `before` is the group's live count before the context
-// allocated anything, and `other` is a second queue on the context's device.
-static bool buffer_group_check(const buffer_group & group, ggml_backend_t backend, int before, sycl::queue & other) {
+// allocated anything, `home` is the queue the context allocates on, and `other` is a second queue on the same
+// SYCL context and device.
+static bool buffer_group_check(const buffer_group & group,
+                               ggml_backend_t       backend,
+                               int                  before,
+                               const sycl::queue *  home,
+                               sycl::queue &        other) {
     const int expected = before + static_cast<int>(group.per_context);
 
     bool        touched = false;
@@ -121,6 +137,9 @@ static bool buffer_group_check(const buffer_group & group, ggml_backend_t backen
     worker.join();
     if (!touched) {
         fprintf(stderr, "Failed to allocate the context's %s in the worker thread\n", group.name);
+        return false;
+    }
+    if (!context_queue_is(backend, home, "after the first")) {
         return false;
     }
 
@@ -137,7 +156,8 @@ static bool buffer_group_check(const buffer_group & group, ggml_backend_t backen
 
     // The same size again: every buffer is found, none is allocated.
     buffer_ids again;
-    if (!buffer_group_touch(group, backend, SMALL_BYTES, nullptr, again)) {
+    if (!buffer_group_touch(group, backend, SMALL_BYTES, nullptr, again) ||
+        !context_queue_is(backend, home, "after the second")) {
         return false;
     }
     if (group.live() != expected || buffer_ids_kept(group, first, again) != group.per_context) {
@@ -182,9 +202,20 @@ int main(int, char ** argv) {
         return LLAMA_TEST_EXIT_SKIP;
     }
 
-    ggml_backend_t backend = ggml_backend_sycl_init(0);
+    const int      device  = 0;
+    ggml_backend_t backend = ggml_backend_sycl_init(device);
     if (!backend) {
-        fprintf(stderr, "ggml_backend_sycl_init(0) returned null\n");
+        fprintf(stderr, "ggml_backend_sycl_init(%d) returned null\n", device);
+        return 1;
+    }
+
+    // The context allocates on the queue of its device's unified cache, and answers the device's default queue until
+    // that cache exists. A loaded model has created the cache before any op runs. This test loads none, so it creates
+    // the cache here: otherwise the first touch would create it, and the context would be on another queue for the
+    // second touch.
+    if (!ggml_sycl::get_unified_cache_for_device(device)) {
+        fprintf(stderr, "Could not create the unified cache of device %d\n", device);
+        ggml_backend_free(backend);
         return 1;
     }
 
@@ -194,8 +225,9 @@ int main(int, char ** argv) {
         ggml_backend_free(backend);
         return 1;
     }
-    // A second queue on the context's device. It is declared here so that it outlives the backend: the buffers the
-    // last check leaves on it are released by ggml_backend_free().
+    // A second queue on the SYCL context and device of `home`, the cache's queue: the last check is a change of
+    // queue on one device. It is declared here so that it outlives the backend: the buffers that check leaves on it
+    // are released by ggml_backend_free().
     sycl::queue other(home->get_context(), home->get_device());
 
     int before[N_BUFFER_GROUPS];
@@ -204,7 +236,7 @@ int main(int, char ** argv) {
     }
 
     for (size_t g = 0; g < N_BUFFER_GROUPS; ++g) {
-        if (!buffer_group_check(BUFFER_GROUPS[g], backend, before[g], other)) {
+        if (!buffer_group_check(BUFFER_GROUPS[g], backend, before[g], home, other)) {
             ggml_backend_free(backend);
             return 1;
         }
