@@ -113461,6 +113461,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     // existed for it anywhere in the codebase (only ad-hoc invalidation
     // inside specific internal branches of the gate/up dispatch itself).
     ggml_sycl_mxfp4_moe_tg_reuse_new_graph();
+
+    // That state is graph-local, and its copy of a tensor's mem_handle holds a VRAM arena chunk lease: drop it on
+    // every exit from here on, so the last graph before a model release leaves no lease behind.
+    struct mxfp4_moe_tg_reuse_graph_scope {
+        ~mxfp4_moe_tg_reuse_graph_scope() { ggml_sycl_mxfp4_moe_tg_reuse_end_graph(); }
+    } mxfp4_moe_tg_reuse_scope;
 #ifdef GGML_SYCL_GRAPH
     if (sycl_ctx->moe_direct_dispatch_graphs_n_nodes != cgraph->n_nodes ||
         sycl_ctx->moe_direct_dispatch_graphs_is_decode != g_moe_descriptor_capture_decode_phase) {

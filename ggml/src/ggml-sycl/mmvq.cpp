@@ -1984,6 +1984,15 @@ void ggml_sycl_mxfp4_moe_tg_reuse_new_graph() {
     mxfp4_moe_tg_reuse_invalidate();
 }
 
+// The graph-local half is a copy of a tensor's mem_handle, and that copy holds a VRAM arena chunk lease of its own.
+// Left for the next graph's start to drop, the last decode token's copy outlives the model and the last model
+// release finds the arena still leased. The graph compute drops it when it ends instead, on the thread that stored
+// it: a model release never overlaps a graph compute on its contexts, and cannot reach this thread_local itself.
+// The Q8 staging buffers the store owns are untouched, so the next graph reuses them without allocating.
+void ggml_sycl_mxfp4_moe_tg_reuse_end_graph() {
+    mxfp4_moe_tg_reuse_invalidate();
+}
+
 static void mxfp4_moe_tg_reuse_append_ready_dep(std::vector<sycl::event> & deps) {
     const auto & cache = g_mxfp4_moe_tg_reuse;
     if (cache.valid && cache.ready_event_set) {

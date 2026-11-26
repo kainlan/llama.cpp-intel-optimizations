@@ -175,6 +175,10 @@ bool mmvq_moe_prompt_q8_preflight(ggml_backend_sycl_context &     ctx,
 // sibling g_moe_precomputed_mmid_skip family (ggml_sycl_moe_precomputed_skip_new_graph).
 void ggml_sycl_mxfp4_moe_tg_reuse_new_graph();
 
+// Drop the same graph-local state when the graph compute ends: its copy of the GLU output's mem_handle holds an
+// arena chunk lease, which must not outlive the graph into the model's release.
+void ggml_sycl_mxfp4_moe_tg_reuse_end_graph();
+
 bool mmvq_moe_batched_dispatch_pair_glu_mxfp4_soa(ggml_backend_sycl_context &   ctx,
                                                   const ggml_tensor *           gate_weight,
                                                   const ggml_tensor *           up_weight,

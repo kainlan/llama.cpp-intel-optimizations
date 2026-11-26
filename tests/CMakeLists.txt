@@ -5210,6 +5210,17 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 120)
 endif()
 
+# Source gate for the MXFP4 MoE decode reuse store's graph-local handles: the graph compute drops them on every exit
+# after its start, so the last graph's copy of a tensor handle cannot hold an arena chunk lease into a model release.
+# Host-only, reads the sources as text. Same registration shape as test-sycl-last-release-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-mxfp4-moe-tg-reuse-lifetime-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mxfp4-moe-tg-reuse-lifetime-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
 # Source gate for the SCRATCH zone's MoE batched MMVQ scratch bound: nothing waits for an op's scratch release before
 # the next op allocates, so the zone is sized for every expert op's buffers at once. The planner sizes the bound at the
 # context's micro-batch and publishes it, the ensure sizes the zone from it, a rebuild live allocations block keeps the

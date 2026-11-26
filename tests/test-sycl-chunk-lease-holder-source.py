@@ -372,6 +372,24 @@ def claim_report_at_the_callers_level(uc: str) -> bool:
     )
 
 
+# ---- a frame prints as module+offset only, which fits its fixed width and is what addr2line takes ----
+
+FRAME_SIG = "static void chunk_lease_holder_frame_name(const void * pc, char * out, size_t size)"
+FRAME_PRINT = 'snprintf(out, size, "%s+0x%zx", module, static_cast<size_t>(static_cast<const char *>(pc) - base));'
+
+
+def claim_frame_is_module_and_offset(uc: str) -> bool:
+    # dladdr's symbol is the nearest export, wrong for a static function, and a mangled name overruns the frame and
+    # runs into the next one. Every print of the frame is the bare address or module+offset.
+    body = fn_body(code(uc), FRAME_SIG)
+    return (
+        FRAME_PRINT in body
+        and "dli_sname" not in body
+        and "dli_saddr" not in body
+        and body.count("snprintf(") == 2
+    )
+
+
 # ---- checks ----
 
 
@@ -484,6 +502,22 @@ def test_report_at_the_callers_level():
     assert claim_report_at_the_callers_level(UC), (
         "the holders report prints the chunk leases by site or by holder at a fixed level instead of its caller's, "
         "or names the knob when no lease is held or when the knob is already on"
+    )
+
+
+def test_frame_is_module_and_offset():
+    assert claim_frame_is_module_and_offset(UC), (
+        "a holder frame prints more than module+offset: a symbol name is the nearest export (wrong for a static "
+        "function) and a mangled one overruns the frame's fixed width into the next frame"
+    )
+
+
+def test_witness_frame_with_the_symbol():
+    assert not claim_frame_is_module_and_offset(
+        mutate_in(UC, FRAME_SIG, FRAME_PRINT,
+                  'if (info.dli_sname != nullptr) { snprintf(out, size, "%s+0x%zx(%s)", module, '
+                  'static_cast<size_t>(static_cast<const char *>(pc) - base), info.dli_sname); return; } '
+                  + FRAME_PRINT)
     )
 
 

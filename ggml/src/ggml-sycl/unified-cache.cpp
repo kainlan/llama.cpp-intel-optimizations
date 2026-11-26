@@ -32341,8 +32341,9 @@ static uint16_t chunk_lease_holder_claim(const chunk_lease_tag & tag, uint16_t o
     return chunk_lease_holders().claim(tag, stack, depth, origin);
 }
 
-// A frame as module+offset (the offset addr2line takes for that module), with the exported symbol when dladdr knows
-// one. A frame is a return address, so the call it names is the instruction before the offset.
+// A frame as module+offset, the offset `addr2line -f -C -e <module>` takes. No symbol name: dladdr knows only exported
+// symbols, so for a static function it names the nearest export instead, and a mangled name does not fit a frame's
+// fixed width. A frame is a return address, so the call it names is the instruction before the offset.
 static void chunk_lease_holder_frame_name(const void * pc, char * out, size_t size) {
     Dl_info info{};
     if (dladdr(pc, &info) == 0 || info.dli_fname == nullptr) {
@@ -32352,13 +32353,7 @@ static void chunk_lease_holder_frame_name(const void * pc, char * out, size_t si
     const char * slash  = std::strrchr(info.dli_fname, '/');
     const char * module = slash != nullptr ? slash + 1 : info.dli_fname;
     const char * base   = static_cast<const char *>(info.dli_fbase);
-    const size_t offset = static_cast<size_t>(static_cast<const char *>(pc) - base);
-    if (info.dli_sname != nullptr && info.dli_saddr != nullptr) {
-        snprintf(out, size, "%s+0x%zx(%s+0x%zx)", module, offset, info.dli_sname,
-                 static_cast<size_t>(static_cast<const char *>(pc) - static_cast<const char *>(info.dli_saddr)));
-    } else {
-        snprintf(out, size, "%s+0x%zx", module, offset);
-    }
+    snprintf(out, size, "%s+0x%zx", module, static_cast<size_t>(static_cast<const char *>(pc) - base));
 }
 
 int unified_cache::arena_acquire_chunk_lease(const void * ptr) {
