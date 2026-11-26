@@ -150,6 +150,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -478,6 +479,8 @@ static bool build_graph(const fa_case & c, fa_graph & g) {
         const size_t  offs    = (size_t) c.kv_offset * sizeof(ggml_fp16_t);
         ggml_tensor * k_buf   = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F16, n_elems + c.kv_offset);
         ggml_tensor * v_buf   = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F16, n_elems + c.kv_offset);
+        ggml_set_name(k_buf, "masked_nonfinite_k_buf");
+        ggml_set_name(v_buf, "masked_nonfinite_v_buf");
         g.k = ggml_view_4d(g.ctx, k_buf, c.D, c.n_kv, c.H_kv, 1, row, row * c.n_kv, row * c.n_kv * c.H_kv, offs);
         g.v = ggml_view_4d(g.ctx, v_buf, c.D, c.n_kv, c.H_kv, 1, row, row * c.n_kv, row * c.n_kv * c.H_kv, offs);
     } else {
@@ -628,13 +631,21 @@ static bool run_sycl(ggml_backend_t       sycl,
                      const fa_case &      c,
                      const fa_inputs &    in,
                      std::vector<float> & out,
-                     std::string &        kernel) {
+                     std::string &        kernel,
+                     std::string &        why) {
     fa_graph g;
     if (!build_graph(c, g)) {
+        why = "graph build failed";
         return false;
     }
+    // One buffer per tensor that owns storage. A K/V view (kv_offset > 0) owns
+    // none, and ggml_backend_tensor_alloc refuses a view: its parent gets the
+    // buffer, and the view is initialised in it, view_offs bytes past the base.
     ggml_backend_buffer_type_t         buft    = ggml_backend_get_default_buffer_type(sycl);
-    ggml_tensor *                      owned[] = { g.q, g.k, g.v, g.mask, g.sinks, g.out };
+    ggml_tensor *                      k_store = g.k->view_src ? g.k->view_src : g.k;
+    ggml_tensor *                      v_store = g.v->view_src ? g.v->view_src : g.v;
+    ggml_tensor *                      owned[] = { g.q, k_store, v_store, g.mask, g.sinks, g.out };
+    ggml_tensor *                      views[] = { g.k, g.v };
     std::vector<ggml_backend_buffer_t> bufs;
     bool                               ok = true;
     for (ggml_tensor * t : owned) {
@@ -643,10 +654,34 @@ static bool run_sycl(ggml_backend_t       sycl,
         }
         ggml_backend_buffer_t b = alloc_tensor_buffer(buft, t);
         if (!b) {
-            ok = false;
+            why = std::string("buffer allocation failed for ") + t->name;
+            ok  = false;
             break;
         }
         bufs.push_back(b);
+    }
+    for (ggml_tensor * t : views) {
+        if (ok && t->view_src && ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+            why = std::string("view init failed for ") + t->name;
+            ok  = false;
+        }
+    }
+    // An offset case tests the scalar copy only if the 16-byte predicate fails
+    // on it. Its strides are whole rows of D halves (multiples of 16 bytes), so
+    // the start addresses must be off a 16-byte bound. SYCL buffer bases are
+    // 128-byte aligned, so an offset of 4 halves leaves them 8 bytes off.
+    if (ok && c.kv_offset > 0) {
+        const size_t k_mis = (size_t) ((uintptr_t) g.k->data % 16);
+        const size_t v_mis = (size_t) ((uintptr_t) g.v->data % 16);
+        if (k_mis == 0 || v_mis == 0) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          "K/V views start on a 16-byte bound (K %% 16 = %zu, V %% 16 = %zu): the scalar copy would "
+                          "not run",
+                          k_mis, v_mis);
+            why = msg;
+            ok  = false;
+        }
     }
 
     if (ok) {
@@ -660,6 +695,9 @@ static bool run_sycl(ggml_backend_t       sycl,
         ggml_backend_synchronize(sycl);
         if (capturing) {
             kernel = last_selected_kernel(cap.end());
+        }
+        if (!ok) {
+            why = "SYCL compute failed";
         }
         if (ok) {
             out.resize((size_t) ggml_nelements(g.out));
@@ -894,14 +932,15 @@ static void run_case(ggml_backend_t       sycl,
     std::vector<float> ref;
     std::vector<float> got;
     std::string        kernel;
+    std::string        why;
 
     if (!run_cpu(cpu, c, in, ref)) {
         std::printf("FAIL [%s]: CPU reference compute failed\n", label);
         ++g_failures;
         return;
     }
-    if (!run_sycl(sycl, c, in, got, kernel)) {
-        std::printf("FAIL [%s] kernel=%s: SYCL compute failed\n", label, kernel.empty() ? "?" : kernel.c_str());
+    if (!run_sycl(sycl, c, in, got, kernel, why)) {
+        std::printf("FAIL [%s] kernel=%s: %s\n", label, kernel.empty() ? "?" : kernel.c_str(), why.c_str());
         ++g_failures;
         return;
     }
