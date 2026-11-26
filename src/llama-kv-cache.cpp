@@ -100,6 +100,7 @@ void llama_kv_residency_tally_scope::add(const llama_kv_residency_tally & cache)
     }
 }
 
+// Fork-local (llama.cpp-ol6a): see the declaration in llama-kv-cache.h.
 bool llama_kv_cache_type_writable(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft, ggml_type type) {
     ggml_init_params params = {
         /*.mem_size   =*/4 * ggml_tensor_overhead(),
@@ -111,7 +112,9 @@ bool llama_kv_cache_type_writable(ggml_backend_dev_t dev, ggml_backend_buffer_ty
         throw std::runtime_error("failed to create ggml context for the kv cache type probe");
     }
 
-    // one block of one row: the question is the type and the buffer, not the shape
+    // one block of one row: the question is the type and the buffer, not the shape. The source rows are F32 and the
+    // indices I64, as the graphs feed cpy_k/cpy_v today (build_input_k_idxs/build_input_v_idxs make I64 indices); if a
+    // model ever appends F16 or BF16 rows, this probe must ask with that source type too.
     const int64_t n = ggml_blck_size(type);
 
     ggml_tensor * cache = ggml_new_tensor_2d(ctx.get(), type, n, 1);
@@ -119,9 +122,9 @@ bool llama_kv_cache_type_writable(ggml_backend_dev_t dev, ggml_backend_buffer_ty
     ggml_tensor * idxs  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, 1);
     ggml_tensor * op    = ggml_set_rows(ctx.get(), cache, cur, idxs);
 
-    // the cache tensor sits in `buft`, as the real one will, so a backend that keys on the KV buffer type sees it;
-    // a zero-size buffer never reaches the buft's allocator. A device that admits no buffer at all leaves the
-    // tensor unplaced: the allocation that follows reports that failure, not this probe.
+    // the cache tensor sits in `buft`, as the real one will, so a backend that keys on the KV buffer type sees it.
+    // A size-0 buffer is only a wrapper (ggml_backend_buft_alloc_buffer returns before the buft's allocator). A device
+    // that admits no buffer at all leaves the tensor unplaced: the allocation that follows reports that failure.
     ggml_backend_buffer_ptr buf{ ggml_backend_buft_alloc_buffer(buft, 0) };
     if (buf) {
         cache->buffer = buf.get();
@@ -383,25 +386,41 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
-        // A cache no backend can write into this buffer would abort the first graph in the scheduler
-        // ("pre-allocated tensor ... cannot run the operation (SET_ROWS)"); refuse it here, by name (llama.cpp-ol6a).
+        // Fork-local (llama.cpp-ol6a). A cache no backend can write into this buffer would abort the first graph in
+        // the scheduler ("pre-allocated tensor ... cannot run the operation (SET_ROWS)"); refuse it here, by name.
         // The answer depends only on the device, the buffer type and the cache type, so it is asked once for each.
-        for (const bool is_k : { true, false }) {
-            const ggml_type type = is_k ? type_k : type_v;
-            if (!is_k && is_mla) {
-                continue;
-            }
-            const auto key = std::make_tuple(layer_dev, buft, type);
-            auto       it  = writable_memo.find(key);
-            if (it == writable_memo.end()) {
-                it = writable_memo.emplace(key, llama_kv_cache_type_writable(layer_dev, buft, type)).first;
-            }
-            if (!it->second) {
-                throw std::runtime_error(
-                    format("KV cache type %s for %s cannot be written on %s (buffer %s): no backend runs SET_ROWS into "
-                           "that type there; use %s f16",
-                           ggml_type_name(type), is_k ? "K" : "V", layer_dev ? ggml_backend_dev_name(layer_dev) : "CPU",
-                           ggml_backend_buft_name(buft), is_k ? "-ctk" : "-ctv"));
+        // V is checked even for sub-caches whose V may never receive a SET_ROWS (dsa/dsv4 kv_lid, dsv4 kv_csa/kv_hca,
+        // msa kv_idx, the hybrid-idx cache): their V tensor is still allocated in `type_v`, so the refusal is
+        // conservative there, never a missed abort.
+        {
+            const auto writable = [&](ggml_type type) {
+                const auto key = std::make_tuple(layer_dev, buft, type);
+                auto       it  = writable_memo.find(key);
+                if (it == writable_memo.end()) {
+                    it = writable_memo.emplace(key, llama_kv_cache_type_writable(layer_dev, buft, type)).first;
+                }
+                return it->second;
+            };
+            const bool k_ok = writable(type_k);
+            const bool v_ok = is_mla || writable(type_v);
+            if (!k_ok || !v_ok) {
+                std::string named;
+                if (!k_ok) {
+                    named = format("%s for K", ggml_type_name(type_k));
+                }
+                if (!v_ok) {
+                    named += format("%s%s for V", k_ok ? "" : " and ", ggml_type_name(type_v));
+                }
+                // name the fix only where the fix is itself writable on this device and buffer
+                std::string hint;
+                if (writable(GGML_TYPE_F16)) {
+                    hint = format("; use %s%s%s", k_ok ? "" : "-ctk f16 (type_k = GGML_TYPE_F16)",
+                                  !k_ok && !v_ok ? " and " : "", v_ok ? "" : "-ctv f16 (type_v = GGML_TYPE_F16)");
+                }
+                throw std::runtime_error(format(
+                    "KV cache type %s cannot be written on %s (buffer %s): no backend runs SET_ROWS into %s there%s",
+                    named.c_str(), layer_dev ? ggml_backend_dev_name(layer_dev) : "CPU", ggml_backend_buft_name(buft),
+                    !k_ok && !v_ok ? "those types" : "that type", hint.c_str()));
             }
         }
 

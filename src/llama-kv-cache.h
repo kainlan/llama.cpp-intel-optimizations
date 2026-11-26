@@ -90,11 +90,12 @@ struct llama_kv_residency_tally_scope {
     llama_kv_residency_tally * prev_;  // the tally this scope shadows, restored when it closes
 };
 
-// Whether a KV cache of `type` placed in `buft` can be written at all: the rule ggml_backend_sched applies to the
-// SET_ROWS that appends to it. The destination is pre-allocated, so the scheduler aborts the first graph unless the
-// layer's device `dev` (null for a layer that is not offloaded) or the CPU device both supports `buft` and runs
-// SET_ROWS into `type` (ggml_backend_sched_backend_from_buffer). The probe is a no_alloc op over a zero-size buffer
-// of `buft`; it allocates nothing (llama.cpp-ol6a).
+// Fork-local (llama.cpp-ol6a). Whether a KV cache of `type` placed in `buft` can be written at all: the rule
+// ggml_backend_sched applies to the SET_ROWS that appends to it. The destination is pre-allocated, so the scheduler
+// aborts the first graph unless the layer's device `dev` (null for a layer that is not offloaded) or the CPU device
+// both supports `buft` and runs SET_ROWS into `type` (ggml_backend_sched_backend_from_buffer). The probe takes no
+// device or pinned memory and nothing through the buft's allocator: it builds a small host ggml context of no_alloc
+// tensors and a size-0 buffer wrapper of `buft`, both released on return.
 bool llama_kv_cache_type_writable(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft, ggml_type type);
 
 //

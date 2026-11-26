@@ -198,9 +198,15 @@ int main() {
         std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
         init_model(*model, 1);
 
-        for (bool bad_k : { true, false }) {
+        // K alone, V alone, and both: one refusal that names every unwritable cache and, since the CPU writes F16,
+        // the F16 hint for each in both of its spellings
+        const std::string hint_k = "-ctk f16 (type_k = GGML_TYPE_F16)";
+        const std::string hint_v = "-ctv f16 (type_v = GGML_TYPE_F16)";
+        for (int bad = 1; bad <= 3; ++bad) {
+            const bool      bad_k  = bad & 1;
+            const bool      bad_v  = bad & 2;
             const ggml_type type_k = bad_k ? GGML_TYPE_IQ2_XXS : GGML_TYPE_F16;
-            const ggml_type type_v = bad_k ? GGML_TYPE_F16 : GGML_TYPE_IQ2_XXS;
+            const ggml_type type_v = bad_v ? GGML_TYPE_IQ2_XXS : GGML_TYPE_F16;
             std::string     what;
             try {
                 llama_kv_cache kv(*model, false, model->hparams, type_k, type_v, false, false, true, 32, 1, 0,
@@ -208,9 +214,20 @@ int main() {
             } catch (const std::runtime_error & err) {
                 what = err.what();
             }
-            GGML_ASSERT(what.find("KV cache type iq2_xxs") != std::string::npos);
-            GGML_ASSERT(what.find(bad_k ? "for K" : "for V") != std::string::npos);
-            GGML_ASSERT(what.find(bad_k ? "use -ctk f16" : "use -ctv f16") != std::string::npos);
+            std::string named;
+            std::string hints;
+            if (bad_k) {
+                named = "iq2_xxs for K";
+                hints = hint_k;
+            }
+            if (bad_v) {
+                named += std::string(bad_k ? " and " : "") + "iq2_xxs for V";
+                hints += std::string(bad_k ? " and " : "") + hint_v;
+            }
+            GGML_ASSERT(what.find("KV cache type " + named + " cannot be written on CPU (buffer CPU)") == 0);
+            GGML_ASSERT(what.find("; use " + hints) != std::string::npos);
+            GGML_ASSERT(bad_k == (what.find("for K") != std::string::npos));
+            GGML_ASSERT(bad_v == (what.find("for V") != std::string::npos));
         }
     }
 
