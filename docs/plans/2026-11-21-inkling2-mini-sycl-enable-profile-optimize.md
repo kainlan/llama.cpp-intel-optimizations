@@ -6873,8 +6873,11 @@ The conversion costs about 17 us of span at every width. Against double over bf1
 **Departures from the staging plan, by the implementer.**
 1. There is no check that the op runs on the main stream. `ctx.stream()` is the context's one in-order execution
    queue once the cache exists, so the check would be dead code.
-2. The decline while a command graph is recorded is pinned only in source. Prompt graphs are never recorded, and the
-   device test runs with `GGML_SYCL_DISABLE_GRAPH=1`.
+2. The decline while a command graph is recorded is pinned only in source, and the device test runs with
+   `GGML_SYCL_DISABLE_GRAPH=1`. The Inkling prompt is not recorded: under the load plan a prompt split that holds a
+   `MUL_MAT_ID` runs directly. A prompt split without one can be recorded (see the owed items below).
+   `test-sycl-bf16-mul-mat-backend` keeps graphs on: its one-node graph is below `GGML_SYCL_GRAPH_MIN_NODES` (10) and
+   is never recorded.
 
 **Tests.**
 - `test-zone-sizing` Case 52: the fold and the combined row.
@@ -7207,6 +7210,12 @@ interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkli
   item) and could pass it.
 - The route's speed was measured on the Inkling shapes only. Qwen3.8's BF16 matrices (M = 1, 4, 48 and 320) take it
   by the same threshold, unmeasured: at a small M the GEMM may not beat the tiled kernel.
+- **A recorded prompt graph runs the tiled kernel.** The route declines while a graph records, as the batched F32
+  route does. A prompt split with no `MUL_MAT_ID` under the load plan (a dense BF16 model), of at least
+  `GGML_SYCL_GRAPH_MIN_NODES` nodes and with no decode graph active, runs directly on the first micro-batch of a node
+  count (the warmup pass) and is recorded on the next one of that count; every replay then runs the tiled kernel.
+  Whether the route can be recorded (the warmup pass has cached its primitive; its buffer must stay put across
+  replays) has not been examined.
 
 *Left by the integration with master and the long-prompt arm (2026-11-24):*
 - **Mistral 7B refuses any prompt longer than one micro-batch with default flags, on master.** The auto micro-batch

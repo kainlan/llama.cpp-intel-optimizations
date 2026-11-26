@@ -79815,8 +79815,8 @@ static constexpr bool ggml_sycl_bf16_onednn_walk_counted() {
 // graph-entry walk ensured the buffer on, so the copy is ordered after the last op that read the buffer.
 //
 // Returns false, a decline with nothing written to dst, so the executor's native tiled kernel computes the op:
-//   * while a command graph is recorded (the batched F32 route's condition): a primitive the cache has not seen would
-//     be created inside the recording. Prompt graphs are never recorded, so this costs a prompt nothing;
+//   * while a command graph records (the batched F32 route's condition), so no primitive is created inside it. A MoE
+//     model's prompt splits run directly; a dense model's can record from the second same-sized micro-batch on;
 //   * when the planned buffer is shorter than the copy. The graph-entry walk (ggml_sycl_dequant_f16_ensure_for_graph)
 //     sized it for this op before anything was submitted, so this is a node the walk did not predict. The route has a
 //     next path, so a short buffer is a decline: nothing is allocated here, and the buffer does not grow;
