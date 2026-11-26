@@ -100,7 +100,8 @@
 // only at D=64 with one query row, which is the d64_sinks_decode shape.
 //
 // TWO INKLING-SHAPED CASES guard the XMX v2 prompt kernel that multiplies the
-// softmax weights by V on the matrix engine (xmx_v2_f16_ncols16_large_f32sv):
+// softmax weights by V on the matrix engine (xmx_v2_f16_ncols16_large_f32sv,
+// _v8 when the K/V rows are 16-byte aligned and it copies them in vectors):
 //   d128_sinks_window  an Inkling-2-Mini prompt layer: GQA 3, one mask per query
 //                      head (a sliding window plus a finite per-head relative
 //                      bias, FA_MASK_WINDOW_BIAS), attention sinks and a ragged
@@ -112,6 +113,10 @@
 //                      only.
 // Both run under noonednn (XMX v2) and force-tile (the tile kernel, which keeps
 // its weights in float: the control).
+//   d128_pp72_kv_unaligned  d128_pp72 with K and V views that start 8 bytes
+//                      into their buffers, so no row is 16-byte aligned and the
+//                      same kernel takes its scalar copy (no _v8). All variants,
+//                      under the same two arms.
 //
 // NOT COVERED, by construction: the FP8 K/V branches of XMX v1/v2 and ESIMD.
 // This tree has no FP8 ggml type (ggml_sycl_type_is_fp8_e4m3() returns false
@@ -221,6 +226,7 @@ struct fa_case {
     bool         fully_masked_row;  // row 1 (or the only row) masked everywhere
     fa_mask_kind mask_kind = FA_MASK_CAUSAL;
     int          window    = 0;     // FA_MASK_WINDOW_BIAS: cells each row sees, ending at its own position
+    int          kv_offset = 0;     // halves the K and V views start into their buffers (0: plain tensors)
 };
 
 // The mask's head count: per query head for FA_MASK_WINDOW_BIAS, else one
@@ -444,9 +450,21 @@ static bool build_graph(const fa_case & c, fa_graph & g) {
     if (!g.ctx) {
         return false;
     }
-    g.q    = ggml_new_tensor_4d(g.ctx, c.q_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16, c.D, c.ne01, c.H_q, 1);
-    g.k    = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.D, c.n_kv, c.H_kv, 1);
-    g.v    = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.D, c.n_kv, c.H_kv, 1);
+    g.q = ggml_new_tensor_4d(g.ctx, c.q_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16, c.D, c.ne01, c.H_q, 1);
+    if (c.kv_offset > 0) {
+        // Views that start kv_offset halves into a larger buffer, the way a K/V
+        // cache view can start anywhere: same strides, shifted rows.
+        const int64_t n_elems = (int64_t) c.D * c.n_kv * c.H_kv;
+        const size_t  row     = (size_t) c.D * sizeof(ggml_fp16_t);
+        const size_t  offs    = (size_t) c.kv_offset * sizeof(ggml_fp16_t);
+        ggml_tensor * k_buf   = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F16, n_elems + c.kv_offset);
+        ggml_tensor * v_buf   = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F16, n_elems + c.kv_offset);
+        g.k = ggml_view_4d(g.ctx, k_buf, c.D, c.n_kv, c.H_kv, 1, row, row * c.n_kv, row * c.n_kv * c.H_kv, offs);
+        g.v = ggml_view_4d(g.ctx, v_buf, c.D, c.n_kv, c.H_kv, 1, row, row * c.n_kv, row * c.n_kv * c.H_kv, offs);
+    } else {
+        g.k = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.D, c.n_kv, c.H_kv, 1);
+        g.v = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.D, c.n_kv, c.H_kv, 1);
+    }
     g.mask = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.n_kv, c.ne01, mask_heads(c), 1);
     ggml_set_name(g.q, "masked_nonfinite_q");
     ggml_set_name(g.k, "masked_nonfinite_k");
@@ -685,12 +703,14 @@ static const expect_kernel expected_kernels[] = {
     { "default",                   "d64_sinks_pp72_row1_masked",  "xmx_v2_f16_pp_ncols32"                },
 
     // ne01 > 16 under PREC_F32: the F32-accumulator leaf with S*V on the matrix
-    // engine (Task 23). The two d128 Inkling-shaped rows are predicted from the
-    // dispatcher, not yet observed on a card.
-    { "noonednn",                  "d128_pp72",                   "xmx_v2_f16_ncols16_large_f32sv"       },
-    { "noonednn",                  "d128_pp72_row1_masked",       "xmx_v2_f16_ncols16_large_f32sv"       },
-    { "noonednn",                  "d128_sinks_window",           "xmx_v2_f16_ncols16_large_f32sv"       },
-    { "noonednn",                  "d128_tail_mass",              "xmx_v2_f16_ncols16_large_f32sv"       },
+    // engine (Task 23), whose K/V rows are 16-byte aligned here, so it copies
+    // them to SLM in 16-byte vectors (_v8).
+    { "noonednn",                  "d128_pp72",                   "xmx_v2_f16_ncols16_large_f32sv_v8"    },
+    { "noonednn",                  "d128_pp72_row1_masked",       "xmx_v2_f16_ncols16_large_f32sv_v8"    },
+    { "noonednn",                  "d128_sinks_window",           "xmx_v2_f16_ncols16_large_f32sv_v8"    },
+    { "noonednn",                  "d128_tail_mass",              "xmx_v2_f16_ncols16_large_f32sv_v8"    },
+    // Rows that start 8 bytes off a 16-byte bound: the scalar copy.
+    { "noonednn",                  "d128_pp72_kv_unaligned",      "xmx_v2_f16_ncols16_large_f32sv"       },
     { "noonednn",                  "d256_pp16",                   "xmx_v2_f16_ncols16"                   },
 
     { "v1pp",                      "d128_pp72",                   "xmx_v1_f16_ncols8_large_kv"           },
@@ -739,6 +759,7 @@ static const expect_kernel expected_kernels[] = {
     { "force-tile",                "d64_sinks_pp72_row1_masked",  "force_tile_f16"                       },
     { "force-tile",                "d128_sinks_window",           "force_tile_f16"                       },
     { "force-tile",                "d128_tail_mass",              "force_tile_f16"                       },
+    { "force-tile",                "d128_pp72_kv_unaligned",      "force_tile_f16"                       },
 };
 
 static const char * lookup_expected(const char * arm, const char * case_name) {
@@ -1135,6 +1156,24 @@ int main(int, char ** argv) {
         }
         ++n_run;
         run_case(sycl, cpu, c, POISON_NONE, expected);
+    }
+
+    // K/V rows off a 16-byte bound: a kernel that copies rows in 16-byte vectors
+    // must take its scalar copy instead. Every variant, as for d128_pp72.
+    std::printf("== unaligned K/V rows ==\n");
+    const fa_case unaligned[] = {
+        { "d128_pp72_kv_unaligned", 128, 32, 8, 72, 256, 72, false, false, false, FA_MASK_CAUSAL, 0, 4 },
+    };
+    for (const fa_case & c : unaligned) {
+        const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
+        if (g_arm && !expected) {
+            std::printf("-- %s (not covered by arm %s)\n", c.name, g_arm->name);
+            continue;
+        }
+        ++n_run;
+        for (poison_kind p : variants) {
+            run_case(sycl, cpu, c, p, expected);
+        }
     }
 
     ggml_backend_free(cpu);
