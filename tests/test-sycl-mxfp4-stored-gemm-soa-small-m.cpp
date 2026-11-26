@@ -151,8 +151,11 @@ std::vector<double> run_gemm(ggml_backend_t               backend,
     auto *        sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
     sycl::queue & q        = *sycl_ctx->stream();
 
-    // The same parse the kernel profiler and the queue-profiling resolver use, so "0" is not a request.
-    const bool profiling_requested = ggml_sycl_profile_env_flag(std::getenv("GGML_SYCL_KERNEL_PROFILE"), false);
+    // The same parse the kernel profiler and the queue-profiling resolver use, so "0" is not a request. A request
+    // counts only when the queue carries profiling: with GGML_SYCL_QUEUE_PROFILING=0 the resolver refuses it, and
+    // reading an event's profiling info would throw.
+    const bool profiling_requested = ggml_sycl_profile_env_flag(std::getenv("GGML_SYCL_KERNEL_PROFILE"), false) &&
+                                     ggml_sycl_queue_profiling_enabled();
 
     // Bytes moved per call, for deriving per-launch bandwidth: the whole
     // expert's SOA buffer (17 bytes per 32-element block: 16 nibble-packed +
