@@ -156,6 +156,32 @@ def claim_end_drops_the_copied_handle(mmvq: str, mmvqh: str) -> bool:
     )
 
 
+# ---- the model release says when a graph call is still in flight ----
+
+RELEASE_SIG = "static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner)"
+INFLIGHT_READ = "const int inflight = ggml_sycl_graph_inflight_count();"
+INFLIGHT_GUARD = "if (inflight != 0) {"
+INFLIGHT_WARN = ('ggml_sycl_diag_emit_warn( "[SYCL] model slot %u release: %d graph call(s) still in flight; a '
+                 'following [VRAM-ARENA] \\"it stays\\" line may be a lease the MXFP4 MoE decode reuse store of such a '
+                 'call still holds, not a leak\\n", slot, inflight);')
+SLOT_RECLAIM = "ggml_sycl::unified_cache_release_model_slot(slot);"
+
+
+def claim_release_warns_on_a_call_in_flight(gs: str) -> bool:
+    # The drop rests on no graph call being in flight at the model release. The release checks that, and a call still
+    # in flight is named at WARN, with its count, before the slot's reclaim and the last-release arena check, so an E
+    # line that follows is read as that call's lease and not as a leak. Adjacent literals read as one.
+    body = fn_body(code(gs).replace('" "', ""), RELEASE_SIG)
+    w = body.find(INFLIGHT_WARN)
+    g = body.find(INFLIGHT_GUARD)
+    return (
+        body.find(INFLIGHT_READ) != -1
+        and body.find(INFLIGHT_READ) < g < w < body.find(SLOT_RECLAIM)
+        and body[g + len(INFLIGHT_GUARD) : w].strip() == ""
+        and body.count(INFLIGHT_WARN) == 1
+    )
+
+
 # ---- checks ----
 
 
@@ -224,6 +250,38 @@ def test_witness_invalidate_keeps_the_copy():
 def test_witness_second_copy_site():
     assert not claim_end_drops_the_copied_handle(
         mutate_in(MMVQ, STORE_SIG, STORE_COPY, STORE_COPY + " cache.src1_handle = cache.q8_handle;"), MMVQH
+    )
+
+
+def test_release_warns_on_a_call_in_flight():
+    assert claim_release_warns_on_a_call_in_flight(GS), (
+        "ggml_sycl_release_model_slot_resources does not WARN, with the count and before the slot's reclaim, when a "
+        "graph call is still in flight, so an E-level arena line from that call's reuse store reads as a leak"
+    )
+
+
+def release_mutant(old: str, new: str) -> str:
+    return mutate_in(code(GS).replace('" "', ""), RELEASE_SIG, old, new)
+
+
+def test_witness_release_without_the_warn():
+    assert not claim_release_warns_on_a_call_in_flight(release_mutant(INFLIGHT_WARN, ""))
+
+
+def test_witness_release_warns_when_idle():
+    assert not claim_release_warns_on_a_call_in_flight(release_mutant(INFLIGHT_GUARD, "if (inflight == 0) {"))
+
+
+def test_witness_release_warns_below_default_verbosity():
+    assert not claim_release_warns_on_a_call_in_flight(
+        release_mutant(INFLIGHT_WARN, INFLIGHT_WARN.replace("ggml_sycl_diag_emit_warn(", "GGML_LOG_INFO("))
+    )
+
+
+def test_witness_release_warns_after_the_reclaim():
+    moved = release_mutant(INFLIGHT_GUARD + " " + INFLIGHT_WARN + " }", "")
+    assert not claim_release_warns_on_a_call_in_flight(
+        mutate_in(moved, RELEASE_SIG, SLOT_RECLAIM, SLOT_RECLAIM + " " + INFLIGHT_GUARD + " " + INFLIGHT_WARN + " }")
     )
 
 

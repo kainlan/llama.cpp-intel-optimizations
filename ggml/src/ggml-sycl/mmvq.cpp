@@ -1962,33 +1962,29 @@ static void mxfp4_moe_tg_reuse_invalidate() {
     g_mxfp4_moe_tg_reuse.ready_event_set = false;
 }
 
-// llama.cpp-2gag: g_mxfp4_moe_tg_reuse's validity check (mxfp4_moe_tg_reuse_can_use)
-// keys on {device, layer, role, shape, src1_handle pointer-identity} -- and a
-// layer's glu_dst tensor sits at the SAME device address every decode token
-// (it's a persistent graph node), so the pointer-identity check is satisfied
-// trivially across tokens and proves nothing about which token's data is in
-// the buffer. Every call site that invalidates this cache is inside the
-// gate/up dispatch's own internal branches (mmvq.cpp); none of them run
-// unconditionally, and no per-graph reset call exists anywhere for this
-// cache (verified by exhaustive search across the file -- unlike the sibling
-// g_moe_precomputed_mmid_skip family, which IS reset every graph via
-// ggml_sycl_moe_precomputed_skip_new_graph()). If some internal branch of
-// the gate/up dispatch neither re-stores nor invalidates the cache for a
-// given token, while the down-projection dispatch for that same layer still
-// finds mxfp4_moe_tg_reuse_can_use() true, the down projection silently
-// consumes a stale, previous-token GLU-Q8 artifact -- plausible-magnitude,
-// systematically wrong output, not garbage. Exposed here so the canonical
-// per-graph cache invalidation point (ggml_backend_sycl_graph_compute_impl)
-// can reset it exactly like its sibling caches.
+// g_mxfp4_moe_tg_reuse's validity check (mxfp4_moe_tg_reuse_can_use) keys on {device, layer, role, shape,
+// src1_handle pointer identity}, and a layer's glu_dst tensor sits at the same device address every decode token (it
+// is a persistent graph node), so the identity check holds across tokens and proves nothing about which token's data
+// is in the buffer. The invalidations inside the gate/up dispatch's own branches do not run on every path, so if one
+// branch neither re-stores nor invalidates the store for a token while the down projection of that layer still finds
+// it usable, the down projection consumes the previous token's GLU-Q8 artifact: plausible-magnitude, systematically
+// wrong output. Two graph-level resets close that. ggml_backend_sycl_graph_compute_impl calls this one at its start,
+// like the sibling per-graph caches. The scope in ggml_backend_sycl_graph_compute_unchecked calls
+// ggml_sycl_mxfp4_moe_tg_reuse_end_graph() below when every call ends, including the segmented record and replay
+// calls, which never pass through compute_impl.
 void ggml_sycl_mxfp4_moe_tg_reuse_new_graph() {
     mxfp4_moe_tg_reuse_invalidate();
 }
 
 // The graph-local half is a copy of a tensor's mem_handle, and that copy holds a VRAM arena chunk lease of its own.
 // Left for the next graph's start to drop, the last decode token's copy outlives the model and the last model
-// release finds the arena still leased. The graph compute drops it when it ends instead, on the thread that stored
-// it: a model release never overlaps a graph compute on its contexts, and cannot reach this thread_local itself.
-// The Q8 staging buffers the store owns are untouched, so the next graph reuses them without allocating.
+// release finds the arena still leased. The graph compute call drops it when it ends instead, on the thread that
+// stored it. That comes before the model release: a llama_context holds a reference to its model, so llama.cpp frees a
+// model's contexts before the model (common_init_result declares the model first, so it is destroyed last), and no
+// graph call is in flight when the slot release runs. ggml_sycl_release_model_slot_resources WARNs if one is. The
+// release is no place for the drop: it runs on whichever thread calls llama_model_free, which the bundled tools make
+// the thread that decoded but the API does not require, and a thread_local of another thread is out of its reach. The
+// Q8 staging buffers the store owns are untouched, so the next graph reuses them without allocating.
 void ggml_sycl_mxfp4_moe_tg_reuse_end_graph() {
     mxfp4_moe_tg_reuse_invalidate();
 }

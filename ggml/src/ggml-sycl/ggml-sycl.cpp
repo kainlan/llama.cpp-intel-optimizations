@@ -11236,6 +11236,19 @@ static bool ggml_sycl_model_host_weight_baseline(uint64_t model_id, int device, 
 
 static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelToken owner) {
     const uint32_t slot      = owner.owner.slot;
+    // A graph call drops the MXFP4 MoE decode reuse store's tensor handle copy, and the chunk lease that copy holds,
+    // only when it ends (ggml_backend_sycl_graph_compute_unchecked). That is ahead of this release because llama.cpp
+    // frees a model's contexts before the model. A call still in flight here breaks that order, and the last-release
+    // arena check that follows may then name a lease that call still holds: say so first, at WARN so a default run
+    // shows it.
+    const int      inflight  = ggml_sycl_graph_inflight_count();
+    if (inflight != 0) {
+        ggml_sycl_diag_emit_warn(
+            "[SYCL] model slot %u release: %d graph call(s) still in flight; a following "
+            "[VRAM-ARENA] \"it stays\" line may be a lease the MXFP4 MoE decode reuse store of such a call still "
+            "holds, not a leak\n",
+            slot, inflight);
+    }
     const size_t   rows      = ggml_sycl_release_host_weight_extras_for_owner(owner);
     // Graph replay leases pin this owner's weight/MoE cache entries, so they
     // must be dropped before the slot is reclaimed or reclaim_weight_entries()
@@ -11261,9 +11274,14 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
     // the only variable. Clearing here, before the reclaim scan below (same
     // ordering as the graph-lease release above), closes it: this is a
     // thread-local, not per-owner, clear (same caveat as the earlier
-    // MID_LOAD_REPLAN site's own comment), correct here because model
-    // teardown -- like MID_LOAD_REPLAN -- runs on the same thread that owns
-    // this cache's contents, not from an arbitrary other thread.
+    // MID_LOAD_REPLAN site's own comment). It reaches only the cache of the
+    // thread that frees the model: this release runs from ~llama_model() on
+    // whichever thread calls llama_model_free. The bundled tools make that
+    // the thread that decoded (llama-completion and llama-bench are single
+    // threaded; llama-cli's server thread runs start_loop() and then destroys
+    // the server context, model included), so it clears the cache that holds
+    // the leases. An application that frees the model on another thread
+    // leaves the decoding thread's entries to that thread's next graph.
     ggml_sycl_moe_ids_cache_new_graph();
     // Clear only the dying bit under each cache lock. Publishing a whole mask
     // from a prior registry read can erase a concurrently committed model bit.
@@ -128441,7 +128459,8 @@ static ggml_status ggml_backend_sycl_graph_compute_unchecked(ggml_backend_t back
     // mem_handle, and that copy holds a VRAM arena chunk lease. compute_impl() invalidates it at its start, but the
     // segmented record and replay paths below run MoE nodes without compute_impl(), so the drop sits here, where every
     // route starts: on every exit from this call, before the in-flight count falls, the last graph before a model
-    // release leaves no lease behind.
+    // release leaves no lease behind. That holds because llama.cpp frees a model's contexts before the model (a
+    // llama_context holds a reference to it), so no call is in flight at the slot release, which WARNs if one is.
     struct mxfp4_moe_tg_reuse_graph_scope {
         ~mxfp4_moe_tg_reuse_graph_scope() { ggml_sycl_mxfp4_moe_tg_reuse_end_graph(); }
     } mxfp4_moe_tg_reuse_scope;

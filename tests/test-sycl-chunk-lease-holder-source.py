@@ -6,11 +6,11 @@ places. GGML_SYCL_LEASE_HOLDERS=1 names that code. These checks pin its parts:
 
 Every take of a chunk lease records the address it was taken for in its tag: the return address of from_chunk_ptr, of
 a weight lease snapshot, of a weight resolve, and of a copy. A copy records its copier, never its source's address. That
-is one store per take, whatever the knob says, and nothing on a release. Every function in mem-handle.cpp that takes,
-copies or moves a lease reads its own return address, so a new copy path without one fails here. A move hands the lease
-to a new keeper: when the lease is counted in a named holder slot (the knob is on) the move records its own address and
-the cache counts the lease again under the mover's stack, keeping the take it came from; with the knob off that is one
-compare.
+is one store per take, whatever the knob says; with the knob off the take and the release each add one branch on the
+cache's const copy of the flag. Every function in mem-handle.cpp that takes, copies or moves a lease reads its own
+return address, so a new copy path without one fails here. A move hands the lease to a new keeper: when the lease is
+counted in a named holder slot (the knob is on) the move records its own address and the cache counts the lease again
+under the mover's stack, keeping the take it came from; with the knob off that is one compare.
 
 The knob is read once, out of line, in one function, and the cache keeps the answer in a const member. Only when it is
 on does a take walk the call stack, claim a slot in the holder table for the stack from the recorded address outward,
