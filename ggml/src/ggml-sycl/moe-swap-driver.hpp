@@ -651,9 +651,13 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
         }
         // The guard below runs while a throw unwinds, where a throw of its own ends the process. These reserves are what
         // make its pushes safe: room for one unsettled move per admit sent, and for the throw's BUSY reason should it
-        // be new.
+        // be new. The answers are recorded after the transaction has moved what it moved, and a triplet cannot be
+        // taken back, so the lists that record them are reserved here too, one entry per admit sent for each reason
+        // list: an allocation that failed in the middle of the recording would leave the driver not knowing what moved.
         d.unsettled.reserve(d.unsettled.size() + d.batch.size());
-        st.busy.reserve(st.busy.size() + 1);
+        st.busy.reserve(st.busy.size() + d.batch.size());
+        st.refused.reserve(st.refused.size() + d.batch.size());
+        st.dropped.reserve(st.dropped.size() + d.batch.size());
         // If the transaction throws, each admit sent is BUSY for the throw, and its streak advances, so admits whose
         // every transaction throws are dropped under the streak rule (at the settle that finds them not moved). A held
         // admit was not sent, so it stays pending as it is.
@@ -783,8 +787,14 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
         d.batch.push_back(m);
     }
     // The guard below runs while a throw unwinds, where a throw of its own ends the process. This reserve is what makes
-    // its pushes safe: room for one unsettled move per evict sent.
+    // its pushes safe: room for one unsettled move per evict sent. The answers are recorded after the transaction has
+    // moved what it moved, and a triplet cannot be taken back, so the pending list and the reason lists they go into
+    // are reserved here too, one entry per evict sent: an allocation that failed in the middle of the recording would
+    // leave the driver not knowing what moved.
     d.unsettled.reserve(d.unsettled.size() + keep);
+    d.pending.reserve(d.pending.size() + keep);
+    st.busy.reserve(st.busy.size() + keep);
+    st.refused.reserve(st.refused.size() + keep);
     // If the transaction throws, each evict sent waits unsettled for the next view.
     moe_swap_detail::moe_swap_unwind_guard evict_throw([&]() {
         for (size_t i = 0; i < keep; ++i) {

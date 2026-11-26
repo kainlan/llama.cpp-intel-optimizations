@@ -60,7 +60,11 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       transaction twice (admits, evicts), and before each call it reserves the unsettled list, and the busy reasons
       when the guard counts one, each past its size (size() + n, never a bare count), then declares a guard whose
       body sets the unsettled count; the line right after the call dismisses that guard. The guard's body runs while
-      a throw unwinds, where a throw ends the process, so the reserves are what make its pushes safe;
+      a throw unwinds, where a throw ends the process, so the reserves are what make its pushes safe. The same
+      reserves cover what the step records once the transaction has answered, since a moved triplet cannot be taken
+      back and an allocation that failed in the middle of the recording would leave the driver not knowing what
+      moved: before the admit call the busy, refused and dropped reason lists, and before the evict call the pending
+      list and the busy and refused reason lists;
   D18 the hold of an admit refused for device room has its two inputs: the caller hands the step the device WEIGHT
       zone's room epoch (unified_cache::zone_room_epoch), read before the step; and the refusal's cause reaches the
       move typed, not as text: the preparation leaves the size of a refused device mint on the prepared triplet,
@@ -158,6 +162,15 @@ GUARD_DECL = re.compile(r"\bmoe_swap_detail::moe_swap_unwind_guard\s+(\w+)\s*\("
 # Each reserve grows its list past what it already holds: a bare count can be below the size, and reserves nothing.
 UNSETTLED_RESERVE = re.compile(r"\bd\.unsettled\.reserve\(\s*d\.unsettled\.size\(\)\s*\+\s*\w")
 BUSY_RESERVE = re.compile(r"\bst\.busy\.reserve\(\s*st\.busy\.size\(\)\s*\+\s*\w")
+
+
+def _reserve_past_size(name: str) -> re.Pattern:
+    return re.compile(r"\b" + re.escape(name) + r"\.reserve\(\s*" + re.escape(name) + r"\.size\(\)\s*\+\s*\w")
+
+
+# What each transaction call's answers are recorded into, which the step reserves before the call: the admits' call
+# (the first) counts reasons, the evicts' call (the second) also pushes the pending admits.
+RECORDING_RESERVES = (("st.busy", "st.refused", "st.dropped"), ("d.pending", "st.busy", "st.refused"))
 HANDLER = re.compile(r"\b(?:try|catch)\b")
 LITERAL = re.compile(r"\"(?:\\.|[^\"\\\n])*\"")
 SAME_LOAD = "const bool same_load = snap && snap->model_id == inst.model_id && snap->load_txn_id == inst.load_txn_id;"
@@ -620,6 +633,10 @@ def check(raw: dict[str, str]) -> None:
         if "moe_swap_count_reason(st.busy," in guarded and not BUSY_RESERVE.search(before):
             fail("D17", f"the busy reasons are not reserved past their size before guard `{guard.group(1)}`, which "
                         "counts one")
+        for name in RECORDING_RESERVES[calls.index(at)]:
+            if not _reserve_past_size(name).search(seg):
+                fail("D17", f"`{name}` is not reserved past its size before the transaction call that sends its "
+                            "batch, so recording what moved can throw after it moved")
         if not step[at + len(TXN_CALL):].startswith(f" {guard.group(1)}.dismiss();"):
             fail("D17", f"guard `{guard.group(1)}` is not dismissed on the line right after the transaction returns")
         prev = at + len(TXN_CALL)
@@ -826,7 +843,20 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("evict-guard-never-dismissed", "D17", [("driver", STEP_SIG, "evict_throw.dismiss();", "")])
     expect_fail("evict-guard-pushes-unreserved", "D17",
                 [("driver", STEP_SIG, "d.unsettled.reserve(d.unsettled.size() + keep);", "")])
-    expect_fail("admit-guard-counts-unreserved", "D17", [("driver", STEP_SIG, "st.busy.reserve(st.busy.size() + 1);", "")])
+    expect_fail("admit-guard-counts-unreserved", "D17",
+                [("driver", STEP_SIG, "st.busy.reserve(st.busy.size() + d.batch.size());", "")])
+    expect_fail("admit-batch-records-refusals-unreserved", "D17",
+                [("driver", STEP_SIG, "st.refused.reserve(st.refused.size() + d.batch.size());", "")])
+    expect_fail("admit-batch-records-drops-unreserved", "D17",
+                [("driver", STEP_SIG, "st.dropped.reserve(st.dropped.size() + d.batch.size());", "")])
+    expect_fail("evict-batch-pushes-pending-unreserved", "D17",
+                [("driver", STEP_SIG, "d.pending.reserve(d.pending.size() + keep);", "")])
+    expect_fail("evict-batch-records-busy-unreserved", "D17",
+                [("driver", STEP_SIG, "st.busy.reserve(st.busy.size() + keep);", "")])
+    expect_fail("evict-batch-records-refusals-unreserved", "D17",
+                [("driver", STEP_SIG, "st.refused.reserve(st.refused.size() + keep);", "")])
+    expect_fail("evict-batch-reserves-a-bare-count", "D17",
+                [("driver", STEP_SIG, "d.pending.reserve(d.pending.size() + keep);", "d.pending.reserve(keep);")])
     expect_fail("evict-guard-reserves-a-bare-count", "D17",
                 [("driver", STEP_SIG, "d.unsettled.reserve(d.unsettled.size() + keep);", "d.unsettled.reserve(keep);")])
     expect_fail("evict-sent-without-a-guard", "D17",
