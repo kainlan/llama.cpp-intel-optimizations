@@ -287,7 +287,7 @@ void test_swap_view_reads_residency_admissibility_and_eligibility() {
     CHECK(v.eligible[2] == 0);  // the split triplet
     CHECK(v.eligible[3] == 0);  // bulk-staged
     CHECK(v.file_mapped == 2);  // layer 1's two host triplets
-    CHECK(v.pair_bytes[0] == 3 * 4096);
+    CHECK(v.pair_bytes[0] == 3 * (4096 + ggml_sycl::tlsf_allocator::block_grain));
     CHECK(v.device_held && v.single_device);
     // Each block's admissible cells, counted when the view is built, so a boundary reads one count per block.
     CHECK(v.admissible_count.size() == 4);
@@ -345,6 +345,28 @@ void test_swap_view_memoises_the_bulk_answers() {
     CHECK(first.eligible == second.eligible && first.file_mapped == second.file_mapped);
 }
 
+// An evict's three pinned copies each cost the pool's aligned size and one more TLSF grain, as the host zone's plan
+// counts a block (tlsf_bound): a trim that left the grain out would admit one pair too many, which the evict's mint
+// then refuses.
+void test_swap_view_sizes_a_pair_with_a_grain_per_member() {
+    placement_plan plan{};
+    const size_t   sizes[3] = { 100, 4096, 5000 };
+    for (int e = 0; e < 3; ++e) {
+        for (int r = 0; r < 3; ++r) {
+            placement_entry pe = make_entry(0, e, r, e < 2 ? 0 : -1);
+            pe.src_size        = sizes[r];
+            plan.entries.push_back(pe);
+        }
+    }
+    plan.build_index();
+    const ggml_sycl::moe_swap_plan_view v = swap_view(plan, 1, 3);
+    CHECK(v.pair_bytes.size() == 1);
+    if (v.pair_bytes.size() == 1) {
+        const size_t g = ggml_sycl::tlsf_allocator::block_grain;
+        CHECK(v.pair_bytes[0] == (128 + g) + (4096 + g) + (5056 + g));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -360,6 +382,7 @@ int main() {
     test_swap_view_reads_the_card_hold_and_the_device_span();
     test_swap_view_of_a_larger_route_table();
     test_swap_view_memoises_the_bulk_answers();
+    test_swap_view_sizes_a_pair_with_a_grain_per_member();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-expert-move-validate: %d failure(s)\n", failures);
