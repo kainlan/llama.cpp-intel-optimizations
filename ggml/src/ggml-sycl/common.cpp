@@ -3437,8 +3437,9 @@ static const ggml_sycl_queue_profiling_decision & ggml_sycl_queue_profiling_stat
             decision.reason == ggml_sycl_queue_profiling_reason::BAD_VALUE_DIAGNOSTIC) {
             GGML_LOG_WARN(
                 "[SYCL] %s is set, so the backend's queues carry event profiling and every command reads a device "
-                "timestamp: this run is slower than an unprofiled one (decode measured 12 to 26 %% slower on the Level "
-                "Zero v2 adapter) and its figures include that cost. GGML_SYCL_QUEUE_PROFILING=0 refuses profiling.\n",
+                "timestamp: this run is slower than an unprofiled one "
+                "(unprofiled decode measured 12 to 26 %% faster on the Level Zero v2 adapter) and its figures "
+                "include that cost. GGML_SYCL_QUEUE_PROFILING=0 refuses profiling.\n",
                 requested);
         }
         return decision;
@@ -3466,18 +3467,15 @@ void ggml_sycl_queue_profiling_warn_unavailable(const char * diagnostic) {
     }
     if (ggml_sycl_queue_profiling_resolved_reason() == ggml_sycl_queue_profiling_reason::KNOB_OFF) {
         GGML_LOG_WARN(
-            "[SYCL] %s reads event profiling, which the backend's queues do not carry because "
-            "GGML_SYCL_QUEUE_PROFILING=0; "
-            "it reports no figure. Set GGML_SYCL_QUEUE_PROFILING=1 to read it.\n",
+            "[SYCL] %s reads event profiling and the backend's queues do not carry it: GGML_SYCL_QUEUE_PROFILING=0. "
+            "It reports no figure. Set GGML_SYCL_QUEUE_PROFILING=1 to read it.\n",
             name.c_str());
         return;
     }
     // Not the knob: the diagnostic's variable was set after the queues were built, so the one resolution did not see it.
     GGML_LOG_WARN(
-        "[SYCL] %s reads event profiling, which the backend's queues do not carry: the knob was resolved off when the "
-        "first "
-        "queue was built, before %s asked for profiling. It reports no figure. Set %s before the process starts, or "
-        "set "
-        "GGML_SYCL_QUEUE_PROFILING=1.\n",
+        "[SYCL] %s reads event profiling and the backend's queues do not carry it. "
+        "The knob was resolved off when the first queue was built, before %s asked for profiling. "
+        "It reports no figure. Set %s before the process starts, or set GGML_SYCL_QUEUE_PROFILING=1.\n",
         name.c_str(), name.c_str(), name.c_str());
 }

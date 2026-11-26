@@ -215,12 +215,17 @@ def check_predicate(src: dict[str, str]) -> list[str]:
                 bad.append(f"{STATE_FN}'s static initialiser does not read {ENV_NAME}")
             if DECIDE + "(" not in init or REQUESTED + "(" not in init:
                 bad.append(f"{STATE_FN}'s static initialiser does not resolve through {REQUESTED} and {DECIDE}")
-            if not re.search(r"reason\s*==\s*ggml_sycl_queue_profiling_reason::DIAGNOSTIC.*?GGML_LOG_WARN\s*\(.*?requested\s*\)\s*;",
-                             init, re.S):
-                bad.append(f"{STATE_FN} does not WARN, naming the requested diagnostic, when the knob is unset and a "
-                           "diagnostic turns profiling on")
-            if not re.search(r"BAD_VALUE_OFF.*?GGML_LOG_WARN\s*\(", init, re.S):
-                bad.append(f"{STATE_FN} does not WARN once for a value that is neither 0 nor 1")
+            guards = [(frozenset(re.findall(r"reason::(\w+)", cond)), args.strip())
+                      for cond, args in re.findall(r"if\s*\(([^{}]*?)\)\s*\{\s*GGML_LOG_WARN\s*\((.*?)\)\s*;\s*\}", init, re.S)]
+            if not any(reasons == {"DIAGNOSTIC", "BAD_VALUE_DIAGNOSTIC"} and re.search(r",\s*requested$", args)
+                       for reasons, args in guards):
+                bad.append(f"{STATE_FN}: the turned-on WARN does not name the requested diagnostic for exactly "
+                           "DIAGNOSTIC and BAD_VALUE_DIAGNOSTIC (a bad knob value with a requested diagnostic turns "
+                           "profiling on too)")
+            if not any(reasons == {"BAD_VALUE_OFF", "BAD_VALUE_DIAGNOSTIC"} and re.search(r",\s*knob$", args)
+                       for reasons, args in guards):
+                bad.append(f"{STATE_FN}: the bad-value WARN does not print for exactly BAD_VALUE_OFF and "
+                           "BAD_VALUE_DIAGNOSTIC")
         tail = cpp[body[1]:]
         enabled_body = body_of(tail, r"bool\s+%s\s*\(\s*\)" % PREDICATE)
         if enabled_body is None or STATE_FN + "()" not in tail[enabled_body[0]:enabled_body[1]]:
@@ -612,7 +617,7 @@ def test_predicate_mutants():
     # no WARN naming the diagnostic that turned it on
     assert flags(check_predicate(mutate(SOURCES, COMMON_CPP, "                requested);\n        }\n        return decision;",
                                         "                \"x\");\n        }\n        return decision;")),
-                 "does not WARN, naming the requested diagnostic")
+                 "the turned-on WARN does not name the requested diagnostic")
     # the warning is not a WARN
     body = body_of(mask_comments(SOURCES[COMMON_CPP]), r"void\s+%s\s*\([^)]*\)" % WARN)
     assert body is not None
@@ -626,6 +631,30 @@ def test_predicate_mutants():
     # the once-per-name test inverted: the first call is dropped and every later one warns
     mutant[COMMON_CPP] = (text[:body[0]] + text[body[0]:body[1]].replace("!warned.insert", "warned.insert") + text[body[1]:])
     assert flags(check_predicate(mutant), "once per diagnostic")
+
+
+def test_state_warn_condition_mutants():
+    # Both WARNs of the one resolution are pinned for every reason that must print them, not for one arm each: the
+    # bad-value WARN for BAD_VALUE_OFF and BAD_VALUE_DIAGNOSTIC, the "turned on" WARN for DIAGNOSTIC and
+    # BAD_VALUE_DIAGNOSTIC (a bad knob value with a requested diagnostic turns profiling on too).
+    R = "ggml_sycl_queue_profiling_reason::"
+    cases = (
+        ("bad-value WARN dropped for BAD_VALUE_DIAGNOSTIC",
+         r"decision\.reason\s*==\s*%sBAD_VALUE_OFF\s*\|\|\s*decision\.reason\s*==\s*%sBAD_VALUE_DIAGNOSTIC\s*\)" % (R, R),
+         "decision.reason == %sBAD_VALUE_OFF)" % R, "the bad-value WARN"),
+        ("bad-value WARN dropped for BAD_VALUE_OFF",
+         r"decision\.reason\s*==\s*%sBAD_VALUE_OFF\s*\|\|\s*decision\.reason\s*==\s*%sBAD_VALUE_DIAGNOSTIC\s*\)" % (R, R),
+         "decision.reason == %sBAD_VALUE_DIAGNOSTIC)" % R, "the bad-value WARN"),
+        ("turned-on WARN dropped for BAD_VALUE_DIAGNOSTIC",
+         r"decision\.reason\s*==\s*%sDIAGNOSTIC\s*\|\|\s*decision\.reason\s*==\s*%sBAD_VALUE_DIAGNOSTIC\s*\)" % (R, R),
+         "decision.reason == %sDIAGNOSTIC)" % R, "the turned-on WARN"),
+        ("turned-on WARN dropped for DIAGNOSTIC",
+         r"decision\.reason\s*==\s*%sDIAGNOSTIC\s*\|\|\s*decision\.reason\s*==\s*%sBAD_VALUE_DIAGNOSTIC\s*\)" % (R, R),
+         "decision.reason == %sBAD_VALUE_DIAGNOSTIC)" % R, "the turned-on WARN"),
+    )
+    for label, pattern, new, needle in cases:
+        mutant = mutate_re(SOURCES, COMMON_CPP, pattern, new)
+        assert flags(check_predicate(mutant), needle), f"{label} was not caught"
 
 
 def test_list_mutants():
