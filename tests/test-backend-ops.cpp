@@ -14144,6 +14144,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 17, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, false, false, 0, 1.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // a logit softcap at D=256 (Gemma-2's head size) and at D=64 with ALiBi, which the head-size loop
+    // softcaps only at D=128: on SYCL these reach the F32-Q softcap leaves of the XMX-v2 prompt kernel
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, { 1, 1 }, 512, 32, true, false, 0, 10.0f,
+                                                    GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, { 1, 1 }, 512, 32, true, false, 8.0f, 10.0f,
+                                                    GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
@@ -15061,6 +15067,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // Same non-causal vision-encoder shape for the other head size padded in-kernel by the CUDA MMA kernels
     test_cases.emplace_back(new test_flash_attn_ext(40, 40, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // SYCL fork: an Inkling-2-Mini full-attention prompt layer (8 KV heads, GQA 3, a 512-token micro-batch at the
+    // end of a 4864-key window, attention sinks). The sinks keep oneDNN SDPA off it, so it times the native XMX-v2
+    // prompt kernel: F32 is the accumulator llama-graph pins, UNDEFINED the build's half accumulator. Select with
+    // -o FLASH_ATTN_EXT -p 'kv=4864'.
+    for (ggml_prec prec : { GGML_PREC_F32, GGML_PREC_UNDEFINED }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, { 3, 1 }, 4864, 512, true, true, 0, 0, prec,
+                                                        GGML_TYPE_F16, GGML_TYPE_F16));
+    }
 
     // Sparse flash attention (n_kv_max hint) decode across KV depths.
     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.

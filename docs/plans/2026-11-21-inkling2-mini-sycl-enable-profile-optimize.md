@@ -6953,6 +6953,157 @@ again on it.
 The commit after the second review changes the route's decline WARNs and when it counts an under-estimate, not its
 hot path. Its device test differs only in the layout constants' names.
 
+### Task 23: The XMX-v2 prompt attention kernel multiplies P by V on the matrix engine (written 2026-11-26)
+
+**Track:** S3-prompt. **Base:** `482bd96b66`. **Branch:** `task/inkling2-t23`.
+
+Every Inkling prompt micro-batch takes `xmx_v2_f16_ncols16_large`: the attention sinks keep oneDNN SDPA off it, and
+llama-graph pins `GGML_PREC_F32` on every flash-attention node (`src/llama-graph.cpp:3212`, upstream `8841ce3f43`).
+Under that pin the leaf multiplied the softmax weights P by V in scalar float FMAs from SLM (2048 FMAs and about 4K
+SLM loads per lane per 32-key batch), where its half-accumulator twin does the same work in 16 DPAS. On the B70 the
+kernel took 7.7 s of the 4,737-token prompt (480 calls).
+
+**Checkpoint (2026-11-26) and the lead's ruling.** Four steps, each a new dispatch name and its own ruling, S2 to S4
+after S1 merges: S1 P·V on XMX with a float accumulator (below); S2 vectorised K/V copies into SLM (bit-identical);
+S3 more query rows per work-group (ncols32, 4 sub-groups of TM8; TM16 stays off for the dqp2 hang); S4 a
+work-group-uniform skip of 32-key tiles that are -inf for every row (a bound of at most 1.37x on Inkling). The end
+state, a kernel modelled on `fattn-dpas.cpp` with GQA rows and 16 sub-groups, is a separate task.
+
+**S1 (this commit set).** A leaf template flag `f32_sv` (default false) in `fattn-xmx-f16-v2.hpp`, set only by
+`launch_fattn_xmx_v2_f16_f32sv`, which only the `ne01 > 16` arm of the v2 ladder in `fattn.cpp` calls under a float
+accumulator. Dispatch name `xmx_v2_f16_ncols16_large_f32sv`. VKQ and the running max and sum stay float; P is stored
+to the S region as a half pre-scaled by 2^15 (`XMX_V2_F32SV_P_SCALE`); S·V is a `joint_matrix` half x half -> float
+multiply-add into VKQ; `#pragma unroll` on its d_tile loop keeps the VKQ index constant so VKQ stays in registers;
+the output multiplies 1/KQ_sum by 2^-15 once. KQ_sum stays the sum of the unscaled p, and every rescale of VKQ and
+KQ_sum (the tile step and the sink step) multiplies both by the same factor, so the scale cancels only at the output.
+The force path, the TM16 variant (the `tm16` reproducer) and the `ne01 <= 16` arms compile unchanged; f32_sv has no
+TM16 instantiation, so under `GGML_SYCL_FA_XMX_V2_VARIANT=tm16` the arm names the leaf that runs,
+`xmx_v2_f16_ncols16_large` (`fattn_xmx_v2_f32sv_leaf_runs`; S1 itself named it `_f32sv` there, fixed by the S1
+review commit).
+
+**Precision.** `GGML_PREC_F32` constrains the accumulator, not the operand types: `ggml.h:1325-1336`
+(`ggml_prec_set_acc`, "requires accumulation of the results in F32"); operand precision is the separate
+`ggml_prec_set_src` (`ggml.h:1338-1356`). P in F16 into an F32 accumulator is what the other backends do under the
+same pin, and what this fork's other attention paths already do:
+- Vulkan: `ggml-vulkan.cpp:6824-6836` (`ggml_vk_prec_allows_f16acc` turns off only the f16 accumulator);
+  `flash_attn_cm1.comp:53`, `:483`, `:588` (P in shared memory as the f16 type, then a cooperative-matrix load).
+- CUDA: `fattn-mma-f16.cuh:1016-1020` (P converted to half2 for the MMA; the kernel does not read the op's prec).
+- This fork's oneDNN SDPA: `fattn-onednn.cpp:808` (the probabilities tensor takes the query's data type, F16 under
+  every Mistral PP512).
+- This fork's quantised DPAS kernel: `fattn-dpas.cpp:180-181` (P stored as f16, O accumulated by f16 DPAS).
+- The CPU reference (`ggml-cpu/ops.cpp:9060-9198`) keeps P and VKQ in F32; the leaf already rounds Q*scale to half
+  before Q·K (Phase 0), which costs more than the rounding of P (u = 2^-11, unbiased, an NMSE near 1e-7 against the
+  5e-4 bound). BF16 P is out: V is F16, the matrix combinations pair like types, and its u is 8x worse.
+Subnormals: unscaled, p in [2^-24, 2^-14) (about exp(-16.6) to exp(-9.7)) is a half subnormal and p below 2^-25
+(about exp(-17.3)) rounds to 0, and whether the conversion or the DPAS flushes the subnormals on Xe2 is not verified.
+The 2^15 pre-scale makes every kept p (at least 2^-29) a normal half and keeps p = 1 at 32768, below the half maximum.
+(This section's first version and the message of `fbece03f8b` gave the subnormal range as [exp(-20), exp(-9.7)]: the
+lower bound was wrong.)
+
+**Tests (RED first).** `tests/test-sycl-fattn-masked-nonfinite.cpp`: the noonednn rows of `d128_pp72` and
+`d128_pp72_row1_masked` move to the new name. Two new cases, each on the noonednn arm and on the force-tile arm (the
+tile kernel keeps P in float: the control):
+- `d128_sinks_window`: GQA 3, one mask per query head (a 512-cell sliding window plus a finite per-head bias), sinks,
+  a ragged 179-row micro-batch over 1,536 cells, all poison variants. The window kills the 25 tiles below cell 800.
+- `d128_tail_mass`: Q = 0, cell 0 with mask 0 and V = 0, 4,096 cells with mask -10 (weight 4.54e-5, a half
+  subnormal) and V = 1, so the tail is the whole output (0.05-0.12 per element). It guards the removal of the 2^15
+  pre-scale on hardware that flushes half subnormals: such a kernel gives an all-zero row and an NMSE of 1, while
+  rounding a kept subnormal costs at most 6.6e-4 of the tail. It cannot fail on the shipped leaf, whose pre-scale
+  makes this weight 1.49, a normal half, and it has no positive control on Xe2: whether the B50 and B70 flush half
+  subnormals there has not been measured. There is no test-only switch to force a flush: the harness links the
+  shipped backend, so a switch would need an environment variable or a second build target.
+The new rows' kernel names were predicted, then observed on both cards at `d135812c1`. The S1 review added leaf
+coverage (rows predicted then, observed on the B70 at `0ad930f0eb`, see the branch acceptance result below):
+`d256_pp72`, `d128_pp72_softcap` and `d256_pp72_softcap` on the noonednn arm and
+`d64_sinks_pp32`, `d64_sinks_pp32_softcap` on the noesimd arm, all with F16 Q and each with a force-tile control,
+plus two `test-backend-ops` eval cases for the F32-Q softcap leaves at D=256 and D=64 (the D=64 one with ALiBi, which
+keeps the D=64 batched paths off it). `tests/test-backend-ops.cpp` gains two perf cases (hs
+128, 8 KV heads, GQA 3, 4,864 keys, a 512-row batch, mask, sinks; prec F32 and UNDEFINED), selected with
+`-o FLASH_ATTN_EXT -p 'kv=4864'`. Their mask is the default random one, mostly live, so S4 needs its own geometry.
+
+**S1 acceptance (lead runs, each once unless an ABBA pair).** The masked-nonfinite noonednn and force-tile arms green
+on both cards; `test-backend-ops -o FLASH_ATTN_EXT` on the B70 and the B50 with no case changing from the base; the
+F32 perf case at least 1.8x faster than the base; on the 4,737-token Inkling prompt, `fattn.compute.xmx_v2` device
+time at least 1.8x lower in the kernel profile and pp not slower in an interleaved pair; the long-arm text byte-equal
+run to run and read for sense; the Inkling perplexity A/B within noise; the Inkling gate on all three setups, the
+Mistral B70 and GPT-OSS B50 gates; the two contract sweeps with no new red.
+
+**S1 result and the revised ruling (2026-11-26).** S1 was correct on both cards: the masked-nonfinite noonednn and
+force-tile arms passed, `test-backend-ops -o FLASH_ATTN_EXT` passed 1350/1350, and no fault line was logged. On the
+B70, `fattn.compute.xmx_v2` on the 4,737-token prompt went from 7,695 ms to 5,515 ms over 480 launches (1.40x; pp
+119.6 t/s), short of the 1.8x bar above. The lead's ruling replaces that bar: S1 stays as committed and does not merge
+alone, and the branch continues with three steps, each its own commit with its RED (a new dispatch name) and the
+existing guards green:
+- S2: the K/V copy into SLM in 16-byte vectors where the rows allow it, bit-identical to the scalar copy, with an
+  alignment check and the scalar copy as the fallback, plus an L1 prefetch of the next batch's K/V rows (clamped to
+  the KV extent like the copy) instead of a second SLM buffer (`fattn-dpas.cpp:384-392` is the in-tree precedent).
+  Dispatch name `xmx_v2_f16_ncols16_large_f32sv_v8`; unaligned rows keep `_f32sv`.
+- S3: ncols32 on the large arm, 4 sub-groups and the S region in half, so one K/V tile serves 32 query rows.
+- S2b: sub-group barriers in place of the two work-group barriers inside the kv_tile loop that guard only a
+  sub-group's own tile_S rows; a barrier that guards the shared K/V copy stays a work-group barrier.
+Branch acceptance: `fattn.compute.xmx_v2` device time at most 3,100 ms on the 4,737-token Inkling prompt (at least
+2.5x below 7,695 ms), correctness as for S1 on both cards, and at merge the model gates and an interleaved pp pair. The
+ruling names S2, S3 and S2b; S4 stays as described in the checkpoint above.
+
+**S2 (2026-11-26).** Why S1 gave 1.40x, derived from the code and not measured: per sub-group and 32-key batch at
+D=128, the scalar K/V copy issues about 512 two-byte memory messages, about four in five of all the sub-group's memory
+messages, and S1 did not touch it; one work-group holds 22 KB of SLM, so a core keeps only about 10 threads resident (4
+if the core has 64 KB, the unverified B580 figure), too few to hide those messages. S2 adds the `kv_v8` leaf of the
+f32_sv kernel (`xmx_v2_f16_ncols16_large_f32sv_v8`): when `fattn_xmx_v2_kv_rows_v8()` finds K and V both F16, both
+base pointers and all six strides on 16-byte bounds, the copy moves 16-byte chunks (32 load messages per sub-group and
+batch, and 32 to 128 dword-store messages depending on whether IGC merges them, unverified), zeroes a dead cell's
+non-finite V halves bit for bit as the scalar copy does (`fattn_v8_zero_if_dead`), and prefetches the next batch's K/V
+rows to L1 after the copy barrier, clamped to `ne11` and to each row's last byte. Unaligned rows keep the scalar copy
+and the name `_f32sv`. The P tile is loaded once per kv_tile in the TM=8 matrix-engine S·V bodies (f32_sv and the half
+accumulator's), so GPT-OSS's `xmx_v2_f16_pp_ncols32` is recompiled too. The TM=16 half leaf, the hang reproducer,
+keeps its in-loop load: S2 moved it as well, and the S2 review fix put its code back. The masked-nonfinite harness
+compares `d128_pp72` (`_v8`) with `d128_pp72_kv_unaligned` (scalar copy, same inputs) bit for bit. The first device
+run of `d128_pp72_kv_unaligned` aborted in the harness, before any kernel: it allocated the K/V views as tensors of
+their own. The fix allocates their parents and checks that the views start off a 16-byte bound. The acceptance run
+must confirm with `GGML_SYCL_FA_DISPATCH_DEBUG=1` that the Inkling prompt ran `_f32sv_v8`; it has not yet (see the
+branch acceptance result below).
+
+**S3 (2026-11-26).** The ne01 > 16 arm under a float accumulator launches the f32_sv leaf at ncols=32: four TM=8
+sub-groups per work-group share each K/V batch in SLM, and the S region is half-sized (`fattn_v2_slm<..., s_half>`),
+because that leaf writes P only as a half. Names: `xmx_v2_f16_ncols32_large_f32sv_v8` and `_f32sv`.
+`GGML_SYCL_FA_XMX_V2_VARIANT=tm16` keeps the TM=16 leaf at ncols=16 (`xmx_v2_f16_ncols16_large`), the geometry of the
+hang it reproduces. Derived, not measured: 26 KB of SLM per work-group at D=128, so 16 resident threads per core at
+128 KB of SLM (10 at S2) and 8 at 64 KB (4 at S2); the half S region alone changes neither count at D=128 (28 KB with a
+float one gives the same), only at D=64. Each K/V batch now serves 32 query rows, which halves the kernel's global K/V
+reads and its copy messages per query row; the number of threads launched does not change. Two costs: a cell masked
+for only some rows keeps a non-finite V, and the NaN it spills into the rows that mask it (a deliberate deviation, see
+`fattn_mask_is_dead_for_rows`) now reaches up to 32 rows of a work-group, where it reached 16. And S2's `kv_v8` twin
+doubled the f32_sv leaves from 12 to 24 (three head sizes, two Q types, softcap on or off), each a separate device
+compile in the link; S3 instantiates them at ncols=32 only, so the count stays 24. The link time it adds is not
+measured.
+
+**S2b (2026-11-26).** In the f32_sv leaf the barrier between the softmax (P into tile_S) and S·V is a sub-group
+barrier. It is one statement in the kv_tile loop, run twice per 32-key batch (the "two barriers" of the ruling), and
+it guards only the sub-group's own tile_S rows: between the K/V copy barrier and the end-of-batch barrier a sub-group
+writes and reads only its own eight tile_S rows and only reads tile_Q, tile_K and tile_V. The copy barrier and the
+end-of-batch barrier (the next copy overwrites tile_K and tile_V) stay work-group barriers on every leaf, and the
+other leaves keep their in-loop work-group barrier. No name change and no new hang path, so no dispatch suffix.
+
+**Branch acceptance result (lead, `0ad930f0eb`, 2026-11-26; each run once, no kernel fault).** Correctness: the
+masked-nonfinite noonednn, noesimd and force-tile arms passed on both cards (the B50's per-case log was not kept, so
+there the evidence is the arms' expected-kernel check passing), and `test-backend-ops -o FLASH_ATTN_EXT` passed
+1352/1352 on both. On the B70 the `_v8` against scalar-copy comparison found 0 of 294,912 values different in all
+seven input sets (clean, k_poison, v_poison, k_partial, v_partial, v_underflow, neginf_qk; not compared under
+force-tile), and the kernels were observed by name: on the noonednn arm `xmx_v2_f16_ncols32_large_f32sv_v8` for
+`d128_pp72`, its row1_masked, softcap, sinks_window and tail_mass cases and both `d256_pp72` cases, `_f32sv` for
+`d128_pp72_kv_unaligned`, `xmx_v2_f16_ncols16` for `d256_pp16` and `xmx_v2_f16_pp_ncols32` for both `d64_sinks_pp72`
+cases; on the noesimd arm `_f32sv_v8` for both `d64_sinks_pp32` cases and `xmx_v2_f16_ncols8` for `d64_sinks_mq4`;
+`force_tile_f16` for every force-tile case. In the `kv=4864` perf cases on the B70, all 32 dispatch lines printed
+(the print's default cap) name `_f32sv_v8`. Speed: on the 4,737-token Inkling prompt on the B70, `fattn.compute.xmx_v2`
+took 2,131 ms per pass (480 calls, mean 4.44 ms), against 7,704 ms at the base (7,695 ms in the S1 comparison) and
+5,515 ms at S1, so the 3,100 ms bar is met (3.6x); prompt eval ran at 181.7 t/s under the profiler. Gap: that run
+does not show which leaf the Inkling prompt took. The prompt launcher labels every leaf it runs
+`fattn.compute.xmx_v2` (`_f32sv_v8` and `_f32sv` alike), and `GGML_SYCL_FA_DISPATCH_DEBUG=1` prints only the first
+32 dispatches (`GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT`, default 32), all of them warm-up decode (ne1 = 1, `esimd_f16`).
+No code change closes it: one rerun with `GGML_SYCL_FA_DISPATCH_DEBUG=1 GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT=1000000`
+(the limit the masked-nonfinite harness sets for itself) prints every dispatch. Still owed at merge: that rerun, the
+Mistral B70 and GPT-OSS B50 gates (running when this was written), and the interleaved pp pair.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)

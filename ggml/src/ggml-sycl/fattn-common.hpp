@@ -44,7 +44,10 @@ static inline float fattn_mask_apply(float score, float slope, sycl::half mask_v
 // deliberate deviation. The alternative, zeroing the value, would give the
 // rows that see it a finite, wrong result and hide real garbage in the
 // cache. The spill keeps it visible, and it is confined to one tile of rows
-// that already contains a NaN answer.
+// that already contains a NaN answer: the n_rows the test spans, which is the
+// work-group's query rows, since all of them multiply the same V row. That is
+// up to ncols rows, 32 for the XMX-v2 float-accumulator prompt leaf at
+// ncols=32 (Inkling task 23, S3), where it was 16 before.
 static inline bool fattn_mask_is_dead_for_rows(const sycl::half * mask, int64_t row_stride, int n_rows, int kv) {
     if (mask == nullptr || n_rows <= 0) {
         return false;
@@ -84,6 +87,35 @@ static inline sycl::half4 fattn_v_zero_if_dead(sycl::half4        v,
                         sycl::isfinite(static_cast<float>(v.z())) && sycl::isfinite(static_cast<float>(v.w()));
     if (!finite && fattn_mask_is_dead_for_rows(mask, row_stride, n_rows, kv)) {
         return sycl::half4(0.0f);
+    }
+    return v;
+}
+
+// The form for a copy that moves eight V halves at once, as the four dwords of
+// a 16-byte load. Each non-finite half of a dead cell becomes +0 and every other
+// half keeps its bits, which is what the half overload does element by element,
+// so a 16-byte copy and a scalar copy fill SLM with the same bits. (The half4
+// overload zeroes all four halves of a vector that holds any non-finite one,
+// finite ones included: in a dead cell that changes no output, but it does not
+// give the scalar copy's bits.) A half is non-finite exactly when its five
+// exponent bits are all set.
+static inline sycl::uint4 fattn_v8_zero_if_dead(sycl::uint4        v,
+                                                const sycl::half * mask,
+                                                int64_t            row_stride,
+                                                int                n_rows,
+                                                int                kv) {
+    sycl::uint4 nonfinite(0u);
+    bool        any = false;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const uint32_t w  = v[q];
+        const uint32_t lo = (w & 0x00007C00u) == 0x00007C00u ? 0x0000FFFFu : 0u;
+        const uint32_t hi = (w & 0x7C000000u) == 0x7C000000u ? 0xFFFF0000u : 0u;
+        nonfinite[q]      = lo | hi;
+        any               = any || (lo | hi) != 0u;
+    }
+    if (any && fattn_mask_is_dead_for_rows(mask, row_stride, n_rows, kv)) {
+        v &= ~nonfinite;
     }
     return v;
 }

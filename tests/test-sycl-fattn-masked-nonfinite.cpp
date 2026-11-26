@@ -99,6 +99,37 @@
 // The XMX v2 decode kernels are reachable only through their force paths and
 // only at D=64 with one query row, which is the d64_sinks_decode shape.
 //
+// TWO INKLING-SHAPED CASES guard the XMX v2 prompt kernel that multiplies the
+// softmax weights by V on the matrix engine (xmx_v2_f16_ncols32_large_f32sv,
+// _v8 when the K/V rows are 16-byte aligned and it copies them in vectors):
+//   d128_sinks_window  an Inkling-2-Mini prompt layer: GQA 3, one mask per query
+//                      head (a sliding window plus a finite per-head relative
+//                      bias, FA_MASK_KIND_WINDOW_BIAS), attention sinks and a ragged
+//                      179-row micro-batch. The window leaves the 32-key tiles
+//                      before it dead for every row of a query block. All
+//                      variants.
+//   d128_tail_mass     a long tail of keys whose softmax weight is a half
+//                      subnormal (FA_MASK_KIND_TAIL_MASS). Clean only. It
+//                      guards the kernel's 2^15 pre-scale of those weights; it
+//                      cannot fail on the shipped kernel and has no positive
+//                      control on Xe2 (see TAIL_MASS_MASK).
+// Both run under noonednn (XMX v2) and force-tile (the tile kernel, which keeps
+// its weights in float: the control).
+//   d128_pp72_kv_unaligned  d128_pp72 with K and V views that start 8 bytes
+//                      into their buffers, so no row is 16-byte aligned and the
+//                      same kernel takes its scalar copy (no _v8). All variants,
+//                      under the same two arms. The inputs are d128_pp72's, and
+//                      the two copies put the same halves into the same SLM
+//                      cells, so wherever d128_pp72 ran <name>_v8 and this case
+//                      ran <name>, the two outputs must agree bit for bit (two
+//                      NaNs count as equal): a difference is a copy defect.
+// LEAF COVERAGE of that kernel, clean only: d256_pp72, d128_pp72_softcap and
+// d256_pp72_softcap under noonednn, d64_sinks_pp32 and d64_sinks_pp32_softcap
+// under noesimd (D=64 reaches it only below the 64-row XMX-v2 PP batch with
+// ESIMD off), all with F16 Q, and each under force-tile as the control. The
+// kernel's F32-Q leaves are test-backend-ops' FLASH_ATTN_EXT cases, which
+// build Q as F32 and cannot make it F16.
+//
 // NOT COVERED, by construction: the FP8 K/V branches of XMX v1/v2 and ESIMD.
 // ggml_sycl_type_is_fp8_e4m3() returns false for every type, GGML_TYPE_F8_E4M3
 // included, so the SYCL backend declines FP8 K/V and no FLASH_ATTN_EXT graph
@@ -119,6 +150,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -149,6 +181,24 @@ enum poison_kind {
 // enough that exp(score - max) is exactly 0 in f32, still representable in f16.
 static constexpr float UNDERFLOW_MASK = -60000.0f;
 
+// FA_MASK_KIND_TAIL_MASS: Q is zero, so every score is its mask value. Cell 0
+// has mask 0 and V = 0; cells 1 .. n_used-1 have this mask and V = 1. Their
+// weight exp(-10) = 4.54e-5 is below the smallest normal half (6.10e-5), and
+// 4096 of them carry 0.186 of cell 0's weight, so every output element is
+// 0.05-0.12 (the head's sink sets where).
+// What it guards: removing the XMX-v2 prompt kernel's 2^15 pre-scale of the
+// weights it hands to the matrix engine as halves (XMX_V2_F32SV_P_SCALE), on
+// hardware whose half conversion or matrix engine flushes half subnormals.
+// Such a kernel loses the whole tail: an all-zero row and an NMSE of 1.
+// Rounding a kept subnormal costs at most 2^-25 / 4.54e-5 = 6.6e-4 of the
+// tail, an NMSE far below the bound.
+// What it cannot do: fail on the shipped kernel, whose pre-scale makes this
+// weight 1.49, a normal half; or show the flush on Xe2. Whether the B50 and
+// B70 flush half subnormals in that conversion or in DPAS has not been
+// measured, so on these cards the case has no positive control: a kernel
+// without the pre-scale may pass it too.
+static constexpr float TAIL_MASS_MASK = -10.0f;
+
 static const char * poison_name(poison_kind p) {
     switch (p) {
         case POISON_NONE:
@@ -169,6 +219,19 @@ static const char * poison_name(poison_kind p) {
     return "?";
 }
 
+// How build_mask fills a case's mask.
+enum fa_mask_kind {
+    // One mask for every head: row r sees the live cells up to its own position,
+    // except the interleaved dead cells.
+    FA_MASK_KIND_CAUSAL,
+    // One mask per query head (ne32 = H_q), Inkling-shaped: row r sees the last
+    // `window` cells up to its own position, except the interleaved dead cells,
+    // each with a finite per-head relative-position bias (window_bias).
+    FA_MASK_KIND_WINDOW_BIAS,
+    // The subnormal-weight tail of TAIL_MASS_MASK, one mask for every head.
+    FA_MASK_KIND_TAIL_MASS,
+};
+
 struct fa_case {
     const char * name;
     int          D;
@@ -180,7 +243,24 @@ struct fa_case {
     bool         sinks;
     bool         q_f32;             // D=512 routes require F32 Q; elsewhere F16 matches production
     bool         fully_masked_row;  // row 1 (or the only row) masked everywhere
+    fa_mask_kind mask_kind = FA_MASK_KIND_CAUSAL;
+    int          window    = 0;     // FA_MASK_KIND_WINDOW_BIAS: cells each row sees, ending at its own position
+    int          kv_offset = 0;     // halves the K and V views start into their buffers (0: plain tensors)
+    float        softcap   = 0.0f;  // logit softcap (0: none)
 };
+
+// The mask's head count: per query head for FA_MASK_KIND_WINDOW_BIAS, else one
+// broadcast over all heads.
+static int mask_heads(const fa_case & c) {
+    return c.mask_kind == FA_MASK_KIND_WINDOW_BIAS ? c.H_q : 1;
+}
+
+// A finite relative-position bias that differs per head, the way Inkling adds
+// its per-head bias table to the window mask: 0 at distance 0, down to
+// -(0.5 + 0.25 * head).
+static float window_bias(int head, int distance) {
+    return -(0.5f + 0.25f * (float) head) * (float) (distance % 37) / 37.0f;
+}
 
 // Interleaved dead cells inside the live window: masked for every query row, the
 // way another sequence's cells or a freed cell look to this ubatch.
@@ -241,19 +321,34 @@ static float poison_value(size_t i) {
 }
 
 // Query row r is the r-th of the last ne01 positions of the live window and sees
-// every live cell up to and including its own position, except the interleaved
-// dead cells. With fully_masked_row, one row sees nothing at all.
+// every live cell up to and including its own position (only the last `window`
+// of them for FA_MASK_KIND_WINDOW_BIAS), except the interleaved dead cells. With
+// fully_masked_row, one row sees nothing at all. The mask is [mask_heads][ne01]
+// [n_kv]; a visible cell holds 0, or the head's window_bias.
 static void build_mask(const fa_case & c, std::vector<ggml_fp16_t> & mask) {
-    mask.assign((size_t) c.n_kv * c.ne01, ggml_fp32_to_fp16(-INFINITY));
-    const int fully_masked = c.fully_masked_row ? (c.ne01 > 1 ? 1 : 0) : -1;
-    for (int r = 0; r < c.ne01; ++r) {
-        if (r == fully_masked) {
-            continue;
+    const int heads = mask_heads(c);
+    mask.assign((size_t) heads * c.ne01 * c.n_kv, ggml_fp32_to_fp16(-INFINITY));
+    if (c.mask_kind == FA_MASK_KIND_TAIL_MASS) {
+        for (int r = 0; r < c.ne01; ++r) {
+            for (int t = 0; t < c.n_used; ++t) {
+                mask[(size_t) r * c.n_kv + t] = ggml_fp32_to_fp16(t == 0 ? 0.0f : TAIL_MASS_MASK);
+            }
         }
-        const int last_visible = c.n_used - c.ne01 + r;
-        for (int t = 0; t <= last_visible; ++t) {
-            if (!is_interleaved_dead(t, c.n_used)) {
-                mask[(size_t) r * c.n_kv + t] = ggml_fp32_to_fp16(0.0f);
+        return;
+    }
+    const int fully_masked = c.fully_masked_row ? (c.ne01 > 1 ? 1 : 0) : -1;
+    for (int h = 0; h < heads; ++h) {
+        for (int r = 0; r < c.ne01; ++r) {
+            if (r == fully_masked) {
+                continue;
+            }
+            const int last_visible  = c.n_used - c.ne01 + r;
+            const int first_visible = c.window > 0 ? std::max(0, last_visible - c.window + 1) : 0;
+            for (int t = first_visible; t <= last_visible; ++t) {
+                if (!is_interleaved_dead(t, c.n_used)) {
+                    const float m = c.mask_kind == FA_MASK_KIND_WINDOW_BIAS ? window_bias(h, last_visible - t) : 0.0f;
+                    mask[((size_t) h * c.ne01 + r) * c.n_kv + t] = ggml_fp32_to_fp16(m);
+                }
             }
         }
     }
@@ -301,6 +396,19 @@ static fa_inputs make_inputs(const fa_case & c, poison_kind poison) {
     if (c.sinks) {
         fill_f32(in.sinks, (size_t) c.H_q, rng, -1.0f, 1.0f);
     }
+    if (c.mask_kind == FA_MASK_KIND_TAIL_MASS) {
+        // Zero Q makes every score its mask value; V is 0 at cell 0 and 1 in the
+        // live tail, so the tail's weight is the whole output (see TAIL_MASS_MASK).
+        std::fill(in.q_f16.begin(), in.q_f16.end(), ggml_fp32_to_fp16(0.0f));
+        std::fill(in.q_f32.begin(), in.q_f32.end(), 0.0f);
+        for (int h = 0; h < c.H_kv; ++h) {
+            for (int t = 0; t < c.n_used; ++t) {
+                for (int d = 0; d < c.D; ++d) {
+                    in.v[((size_t) h * c.n_kv + t) * c.D + d] = ggml_fp32_to_fp16(t == 0 ? 0.0f : 1.0f);
+                }
+            }
+        }
+    }
 
     if (poison != POISON_NONE) {
         const bool                 is_k    = poison == POISON_K || poison == POISON_K_PARTIAL;
@@ -308,10 +416,13 @@ static fa_inputs make_inputs(const fa_case & c, poison_kind poison) {
         std::vector<ggml_fp16_t> & dst     = is_k ? in.k : in.v;
         const std::vector<int> cells = rowwise ? std::vector<int>{ partial_cell(c) } : poison_cells(c.n_kv, c.n_used);
         if (poison == POISON_V_UNDERFLOW) {
-            for (int r = 0; r < c.ne01; ++r) {
-                ggml_fp16_t & m = in.mask[(size_t) r * c.n_kv + cells[0]];
-                if (ggml_fp16_to_fp32(m) == 0.0f) {
-                    m = ggml_fp32_to_fp16(UNDERFLOW_MASK);
+            // Every visible entry of the cell (0, or a head's finite bias).
+            for (int h = 0; h < mask_heads(c); ++h) {
+                for (int r = 0; r < c.ne01; ++r) {
+                    ggml_fp16_t & m = in.mask[((size_t) h * c.ne01 + r) * c.n_kv + cells[0]];
+                    if (std::isfinite(ggml_fp16_to_fp32(m))) {
+                        m = ggml_fp32_to_fp16(UNDERFLOW_MASK);
+                    }
                 }
             }
         }
@@ -359,18 +470,31 @@ static bool build_graph(const fa_case & c, fa_graph & g) {
     if (!g.ctx) {
         return false;
     }
-    g.q    = ggml_new_tensor_4d(g.ctx, c.q_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16, c.D, c.ne01, c.H_q, 1);
-    g.k    = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.D, c.n_kv, c.H_kv, 1);
-    g.v    = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.D, c.n_kv, c.H_kv, 1);
-    g.mask = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.n_kv, c.ne01, 1, 1);
+    g.q = ggml_new_tensor_4d(g.ctx, c.q_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16, c.D, c.ne01, c.H_q, 1);
+    if (c.kv_offset > 0) {
+        // Views that start kv_offset halves into a larger buffer, the way a K/V
+        // cache view can start anywhere: same strides, shifted rows.
+        const int64_t n_elems = (int64_t) c.D * c.n_kv * c.H_kv;
+        const size_t  row     = (size_t) c.D * sizeof(ggml_fp16_t);
+        const size_t  offs    = (size_t) c.kv_offset * sizeof(ggml_fp16_t);
+        ggml_tensor * k_buf   = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F16, n_elems + c.kv_offset);
+        ggml_tensor * v_buf   = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F16, n_elems + c.kv_offset);
+        ggml_set_name(k_buf, "masked_nonfinite_k_buf");
+        ggml_set_name(v_buf, "masked_nonfinite_v_buf");
+        g.k = ggml_view_4d(g.ctx, k_buf, c.D, c.n_kv, c.H_kv, 1, row, row * c.n_kv, row * c.n_kv * c.H_kv, offs);
+        g.v = ggml_view_4d(g.ctx, v_buf, c.D, c.n_kv, c.H_kv, 1, row, row * c.n_kv, row * c.n_kv * c.H_kv, offs);
+    } else {
+        g.k = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.D, c.n_kv, c.H_kv, 1);
+        g.v = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.D, c.n_kv, c.H_kv, 1);
+    }
+    g.mask = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.n_kv, c.ne01, mask_heads(c), 1);
     ggml_set_name(g.q, "masked_nonfinite_q");
     ggml_set_name(g.k, "masked_nonfinite_k");
     ggml_set_name(g.v, "masked_nonfinite_v");
     ggml_set_name(g.mask, "masked_nonfinite_mask");
 
     const float scale = 1.0f / std::sqrt((float) c.D);
-    g.out             = ggml_flash_attn_ext(g.ctx, g.q, g.k, g.v, g.mask, scale, /*max_bias=*/0.0f,
-                                            /*logit_softcap=*/0.0f);
+    g.out             = ggml_flash_attn_ext(g.ctx, g.q, g.k, g.v, g.mask, scale, /*max_bias=*/0.0f, c.softcap);
     if (c.sinks) {
         g.sinks = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, c.H_q);
         ggml_set_name(g.sinks, "masked_nonfinite_sinks");
@@ -507,13 +631,21 @@ static bool run_sycl(ggml_backend_t       sycl,
                      const fa_case &      c,
                      const fa_inputs &    in,
                      std::vector<float> & out,
-                     std::string &        kernel) {
+                     std::string &        kernel,
+                     std::string &        why) {
     fa_graph g;
     if (!build_graph(c, g)) {
+        why = "graph build failed";
         return false;
     }
+    // One buffer per tensor that owns storage. A K/V view (kv_offset > 0) owns
+    // none, and ggml_backend_tensor_alloc refuses a view: its parent gets the
+    // buffer, and the view is initialised in it, view_offs bytes past the base.
     ggml_backend_buffer_type_t         buft    = ggml_backend_get_default_buffer_type(sycl);
-    ggml_tensor *                      owned[] = { g.q, g.k, g.v, g.mask, g.sinks, g.out };
+    ggml_tensor *                      k_store = g.k->view_src ? g.k->view_src : g.k;
+    ggml_tensor *                      v_store = g.v->view_src ? g.v->view_src : g.v;
+    ggml_tensor *                      owned[] = { g.q, k_store, v_store, g.mask, g.sinks, g.out };
+    ggml_tensor *                      views[] = { g.k, g.v };
     std::vector<ggml_backend_buffer_t> bufs;
     bool                               ok = true;
     for (ggml_tensor * t : owned) {
@@ -522,10 +654,34 @@ static bool run_sycl(ggml_backend_t       sycl,
         }
         ggml_backend_buffer_t b = alloc_tensor_buffer(buft, t);
         if (!b) {
-            ok = false;
+            why = std::string("buffer allocation failed for ") + t->name;
+            ok  = false;
             break;
         }
         bufs.push_back(b);
+    }
+    for (ggml_tensor * t : views) {
+        if (ok && t->view_src && ggml_backend_view_init(t) != GGML_STATUS_SUCCESS) {
+            why = std::string("view init failed for ") + t->name;
+            ok  = false;
+        }
+    }
+    // An offset case tests the scalar copy only if the 16-byte predicate fails
+    // on it. Its strides are whole rows of D halves (multiples of 16 bytes), so
+    // the start addresses must be off a 16-byte bound. SYCL buffer bases are
+    // 128-byte aligned, so an offset of 4 halves leaves them 8 bytes off.
+    if (ok && c.kv_offset > 0) {
+        const size_t k_mis = (size_t) ((uintptr_t) g.k->data % 16);
+        const size_t v_mis = (size_t) ((uintptr_t) g.v->data % 16);
+        if (k_mis == 0 || v_mis == 0) {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg),
+                          "K/V views start on a 16-byte bound (K %% 16 = %zu, V %% 16 = %zu): the scalar copy would "
+                          "not run",
+                          k_mis, v_mis);
+            why = msg;
+            ok  = false;
+        }
     }
 
     if (ok) {
@@ -539,6 +695,9 @@ static bool run_sycl(ggml_backend_t       sycl,
         ggml_backend_synchronize(sycl);
         if (capturing) {
             kernel = last_selected_kernel(cap.end());
+        }
+        if (!ok) {
+            why = "SYCL compute failed";
         }
         if (ok) {
             out.resize((size_t) ggml_nelements(g.out));
@@ -579,8 +738,14 @@ struct expect_kernel {
     const char * kernel;
 };
 
-// The kernel each arm must reach per case, as observed on the B50 and B70. A
-// case missing from an arm (after inheritance) is not run under that arm.
+// The kernel each arm must reach per case. A case missing from an arm (after
+// inheritance) is not run under that arm. Where each row comes from: every
+// noonednn, noesimd and force-tile row was observed by name on the B70 at
+// 0ad930f0eb (Task 23 S2, S3 and S2b), and those three arms passed on the B50
+// at the same commit; a pass checks every row's kernel, but the B50's per-case
+// log was not kept. Before that, the noonednn and force-tile rows of the cases
+// that existed at d135812c1 were observed on the B50 and B70 there. The other
+// arms' rows were observed on the B50 and B70 when they were written.
 static const expect_kernel expected_kernels[] = {
     { "default",                   "d128_decode",                 "esimd_f16"                            },
     { "default",                   "d128_pp72",                   "onednn"                               },
@@ -599,8 +764,23 @@ static const expect_kernel expected_kernels[] = {
     { "default",                   "d64_sinks_mq4_row1_masked",   "esimd_f16_batched"                    },
     { "default",                   "d64_sinks_pp72_row1_masked",  "xmx_v2_f16_pp_ncols32"                },
 
-    { "noonednn",                  "d128_pp72",                   "xmx_v2_f16_ncols16_large"             },
-    { "noonednn",                  "d128_pp72_row1_masked",       "xmx_v2_f16_ncols16_large"             },
+    // ne01 > 16 under PREC_F32: the F32-accumulator leaf with S*V on the matrix
+    // engine (Task 23). These four ran as _f32sv at d135812c1. Their K/V rows
+    // are 16-byte aligned, so from S2 on the leaf copies them to SLM in 16-byte
+    // vectors (_v8), and from S3 on a work-group takes 32 query rows (ncols32),
+    // as every row of this leaf below does. Observed: B70, 0ad930f0eb.
+    { "noonednn",                  "d128_pp72",                   "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noonednn",                  "d128_pp72_row1_masked",       "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noonednn",                  "d128_sinks_window",           "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noonednn",                  "d128_tail_mass",              "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    // Rows that start 8 bytes off a 16-byte bound take the scalar copy, and its
+    // output is d128_pp72's bit for bit. Observed: B70, 0ad930f0eb.
+    { "noonednn",                  "d128_pp72_kv_unaligned",      "xmx_v2_f16_ncols32_large_f32sv"       },
+    // The same leaf at D=256 and with a logit softcap (F16 Q). Observed: B70,
+    // 0ad930f0eb.
+    { "noonednn",                  "d256_pp72",                   "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noonednn",                  "d128_pp72_softcap",           "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noonednn",                  "d256_pp72_softcap",           "xmx_v2_f16_ncols32_large_f32sv_v8"    },
     { "noonednn",                  "d256_pp16",                   "xmx_v2_f16_ncols16"                   },
 
     { "v1pp",                      "d128_pp72",                   "xmx_v1_f16_ncols8_large_kv"           },
@@ -623,6 +803,11 @@ static const expect_kernel expected_kernels[] = {
     { "noesimd",                   "d64_sinks_pp72",              "xmx_v2_f16_pp_ncols32"                },
     { "noesimd",                   "d64_sinks_pp72_row1_masked",  "xmx_v2_f16_pp_ncols32"                },
     { "noesimd",                   "d512_mq4",                    "tile_d512"                            },
+    // D=64 below the 64-row XMX-v2 PP batch, with ESIMD off and the sinks
+    // keeping oneDNN out, reaches the F32-accumulator leaf of Task 23.
+    // Observed: B70, 0ad930f0eb.
+    { "noesimd",                   "d64_sinks_pp32",              "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noesimd",                   "d64_sinks_pp32_softcap",      "xmx_v2_f16_ncols32_large_f32sv_v8"    },
 
     { "force-v2-decode",           "d64_sinks_decode",            "force_xmx_v2_decode_m1n64"            },
     { "force-v2-decode",           "d64_sinks_decode_all_masked", "force_xmx_v2_decode_m1n64"            },
@@ -647,6 +832,16 @@ static const expect_kernel expected_kernels[] = {
     { "force-tile",                "d128_mq4_row1_masked",        "force_tile_f16"                       },
     { "force-tile",                "d64_sinks_mq4_row1_masked",   "force_tile_f16"                       },
     { "force-tile",                "d64_sinks_pp72_row1_masked",  "force_tile_f16"                       },
+    { "force-tile",                "d128_sinks_window",           "force_tile_f16"                       },
+    { "force-tile",                "d128_tail_mass",              "force_tile_f16"                       },
+    // The controls of the cases added after d135812c1. Observed: B70,
+    // 0ad930f0eb.
+    { "force-tile",                "d128_pp72_kv_unaligned",      "force_tile_f16"                       },
+    { "force-tile",                "d256_pp72",                   "force_tile_f16"                       },
+    { "force-tile",                "d128_pp72_softcap",           "force_tile_f16"                       },
+    { "force-tile",                "d256_pp72_softcap",           "force_tile_f16"                       },
+    { "force-tile",                "d64_sinks_pp32",              "force_tile_f16"                       },
+    { "force-tile",                "d64_sinks_pp32_softcap",      "force_tile_f16"                       },
 };
 
 static const char * lookup_expected(const char * arm, const char * case_name) {
@@ -726,11 +921,15 @@ static bool ends_with(const std::string & s, const char * suffix) {
     return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
 
-static void run_case(ggml_backend_t  sycl,
-                     ggml_backend_t  cpu,
-                     const fa_case & c,
-                     poison_kind     poison,
-                     const char *    expected) {
+// sycl_out and kernel_out, when given, receive the SYCL output and the kernel
+// name, for a comparison between cases (see check_v8_bit_identical).
+static void run_case(ggml_backend_t       sycl,
+                     ggml_backend_t       cpu,
+                     const fa_case &      c,
+                     poison_kind          poison,
+                     const char *         expected,
+                     std::vector<float> * sycl_out   = nullptr,
+                     std::string *        kernel_out = nullptr) {
     char label[160];
     std::snprintf(label, sizeof(label), "%s %s D=%d H_q=%d H_kv=%d ne01=%d n_kv=%d used=%d sinks=%d", c.name,
                   poison_name(poison), c.D, c.H_q, c.H_kv, c.ne01, c.n_kv, c.n_used, (int) c.sinks);
@@ -739,14 +938,15 @@ static void run_case(ggml_backend_t  sycl,
     std::vector<float> ref;
     std::vector<float> got;
     std::string        kernel;
+    std::string        why;
 
     if (!run_cpu(cpu, c, in, ref)) {
         std::printf("FAIL [%s]: CPU reference compute failed\n", label);
         ++g_failures;
         return;
     }
-    if (!run_sycl(sycl, c, in, got, kernel)) {
-        std::printf("FAIL [%s] kernel=%s: SYCL compute failed\n", label, kernel.empty() ? "?" : kernel.c_str());
+    if (!run_sycl(sycl, c, in, got, kernel, why)) {
+        std::printf("FAIL [%s] kernel=%s: %s\n", label, kernel.empty() ? "?" : kernel.c_str(), why.c_str());
         ++g_failures;
         return;
     }
@@ -754,6 +954,12 @@ static void run_case(ggml_backend_t  sycl,
         std::printf("FAIL [%s]: output size mismatch (sycl=%zu cpu=%zu)\n", label, got.size(), ref.size());
         ++g_failures;
         return;
+    }
+    if (sycl_out) {
+        *sycl_out = got;
+    }
+    if (kernel_out) {
+        *kernel_out = kernel;
     }
 
     // dst is [D, H_q, ne01]: one row per (query, head).
@@ -918,6 +1124,51 @@ static void run_case(ggml_backend_t  sycl,
     }
 }
 
+// The 16-byte K/V copy of a kernel (name suffix _v8) against its scalar copy:
+// d128_pp72 and d128_pp72_kv_unaligned share their inputs, and the two copies
+// move the same halves into the same SLM cells, so the outputs must agree bit
+// for bit (two NaNs count as equal whatever their payloads). Compared only when
+// the aligned run named <name>_v8 and the unaligned run <name>; any other pair
+// (force-tile's, or a routing failure, which run_case already fails) is not.
+static void check_v8_bit_identical(poison_kind                poison,
+                                   const std::string &        k_aligned,
+                                   const std::vector<float> & aligned,
+                                   const std::string &        k_unaligned,
+                                   const std::vector<float> & unaligned) {
+    if (k_unaligned.empty() || k_aligned != k_unaligned + "_v8") {
+        std::printf("  -- v8 bit identity [%s]: not compared, kernels %s and %s are not a <name>_v8 / <name> pair\n",
+                    poison_name(poison), k_aligned.empty() ? "<none>" : k_aligned.c_str(),
+                    k_unaligned.empty() ? "<none>" : k_unaligned.c_str());
+        return;
+    }
+    size_t n_diff = 0;
+    size_t first  = 0;
+    if (aligned.size() == unaligned.size()) {
+        for (size_t i = 0; i < aligned.size(); ++i) {
+            uint32_t a = 0;
+            uint32_t b = 0;
+            std::memcpy(&a, &aligned[i], sizeof(a));
+            std::memcpy(&b, &unaligned[i], sizeof(b));
+            if (a != b && !(std::isnan(aligned[i]) && std::isnan(unaligned[i]))) {
+                first = n_diff == 0 ? i : first;
+                ++n_diff;
+            }
+        }
+    }
+    const bool same_size = aligned.size() == unaligned.size();
+    const bool ok        = same_size && n_diff == 0;
+    std::printf("%s [v8 bit identity %s] kernel=%s vs %s: %zu of %zu values differ%s\n", ok ? "OK" : "FAIL",
+                poison_name(poison), k_aligned.c_str(), k_unaligned.c_str(), n_diff, aligned.size(),
+                same_size ? "" : ", and the output sizes differ");
+    if (n_diff > 0) {
+        std::printf("  first difference at %zu: %s %.9g, %s %.9g; the 16-byte copy must be bit-identical\n", first,
+                    k_aligned.c_str(), aligned[first], k_unaligned.c_str(), unaligned[first]);
+    }
+    if (!ok) {
+        ++g_failures;
+    }
+}
+
 int main(int, char ** argv) {
     // First statement: it may re-exec the process (see sycl-selector-fallback.hpp).
     sycl_test_selector_fallback(argv, "level_zero:1");
@@ -966,26 +1217,37 @@ int main(int, char ** argv) {
     }
     int n_run = 0;
 
-    // name, D, H_q, H_kv, ne01, n_kv, n_used, sinks, q_f32, fully_masked_row
+    // name, D, H_q, H_kv, ne01, n_kv, n_used, sinks, q_f32, fully_masked_row, mask_kind, window,
+    // kv_offset, softcap (the last four default to the causal mask, 0, 0 and 0)
     const fa_case cases[] = {
         // Decode on a Mistral-shaped layer (ESIMD by default, VEC under GGML_SYCL_FA_ESIMD=0).
-        { "d128_decode",      128, 32, 8, 1,  256, 72, false, false, false },
+        { "d128_decode",       128, 32, 8, 1,   256,  72,   false, false, false, FA_MASK_KIND_CAUSAL,      0   },
         // Prefill of a 72-token prompt into a 256-cell window (oneDNN by default,
         // XMX v2 under GGML_SYCL_FA_ONEDNN=0, XMX v1 with GGML_SYCL_FA_XMX_V1_PP=1).
-        { "d128_pp72",        128, 32, 8, 72, 256, 72, false, false, false },
+        { "d128_pp72",         128, 32, 8, 72,  256,  72,   false, false, false, FA_MASK_KIND_CAUSAL,      0   },
         // Small multi-query batch: the D=128 guard sends it to the tile kernel.
-        { "d128_mq4",         128, 32, 8, 4,  256, 72, false, false, false },
+        { "d128_mq4",          128, 32, 8, 4,   256,  72,   false, false, false, FA_MASK_KIND_CAUSAL,      0   },
         // GPT-OSS-shaped layers with attention sinks.
-        { "d64_sinks_decode", 64,  64, 8, 1,  256, 72, true,  false, false },
-        { "d64_sinks_mq4",    64,  64, 8, 4,  256, 72, true,  false, false },
-        { "d64_sinks_pp72",   64,  64, 8, 72, 256, 72, true,  false, false },
-        { "d256_pp16",        256, 16, 4, 16, 256, 72, false, false, false },
+        { "d64_sinks_decode",  64,  64, 8, 1,   256,  72,   true,  false, false, FA_MASK_KIND_CAUSAL,      0   },
+        { "d64_sinks_mq4",     64,  64, 8, 4,   256,  72,   true,  false, false, FA_MASK_KIND_CAUSAL,      0   },
+        { "d64_sinks_pp72",    64,  64, 8, 72,  256,  72,   true,  false, false, FA_MASK_KIND_CAUSAL,      0   },
+        { "d256_pp16",         256, 16, 4, 16,  256,  72,   false, false, false, FA_MASK_KIND_CAUSAL,      0   },
         // gemma4-shaped global layers (ESIMD decode by default, tile_d512 otherwise).
-        { "d512_decode",      512, 8,  2, 1,  256, 72, false, true,  false },
-        { "d512_mq4",         512, 8,  2, 4,  256, 72, false, true,  false },
+        { "d512_decode",       512, 8,  2, 1,   256,  72,   false, true,  false, FA_MASK_KIND_CAUSAL,      0   },
+        { "d512_mq4",          512, 8,  2, 4,   256,  72,   false, true,  false, FA_MASK_KIND_CAUSAL,      0   },
+        // Inkling-2-Mini-shaped prompt layer (GQA 3, per-head window-plus-bias
+        // mask, sinks, ragged 179 rows). Row r sees cells 810+r .. 1321+r, so
+        // the 25 tiles below cell 800 are dead for every row; 1500..1535 is pad.
+        { "d128_sinks_window", 128, 6,  2, 179, 1536, 1500, true,  false, false, FA_MASK_KIND_WINDOW_BIAS, 512 },
     };
     const poison_kind variants[] = { POISON_NONE,      POISON_K,           POISON_V,        POISON_K_PARTIAL,
                                      POISON_V_PARTIAL, POISON_V_UNDERFLOW, POISON_NEGINF_QK };
+    constexpr size_t  N_VARIANTS = sizeof(variants) / sizeof(variants[0]);
+
+    // d128_pp72's SYCL outputs and kernels, per variant, for the bit-identity
+    // check of d128_pp72_kv_unaligned.
+    std::vector<float> pp72_out[N_VARIANTS];
+    std::string        pp72_kernel[N_VARIANTS];
 
     for (const fa_case & c : cases) {
         const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
@@ -995,8 +1257,10 @@ int main(int, char ** argv) {
         }
         std::printf("== %s ==\n", c.name);
         ++n_run;
-        for (poison_kind p : variants) {
-            run_case(sycl, cpu, c, p, expected);
+        const bool keep = std::strcmp(c.name, "d128_pp72") == 0;
+        for (size_t v = 0; v < N_VARIANTS; ++v) {
+            run_case(sycl, cpu, c, variants[v], expected, keep ? &pp72_out[v] : nullptr,
+                     keep ? &pp72_kernel[v] : nullptr);
         }
     }
 
@@ -1016,6 +1280,68 @@ int main(int, char ** argv) {
         { "d64_sinks_pp72_row1_masked",  64,  64, 8, 72, 256, 72, true,  false, true  },
     };
     for (const fa_case & c : fully_masked) {
+        const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
+        if (g_arm && !expected) {
+            std::printf("-- %s (not covered by arm %s)\n", c.name, g_arm->name);
+            continue;
+        }
+        ++n_run;
+        run_case(sycl, cpu, c, POISON_NONE, expected);
+    }
+
+    // Softmax weights that are half subnormals (see TAIL_MASS_MASK). Clean K/V
+    // only: the case is about precision, not about dead cells.
+    std::printf("== subnormal-weight tail ==\n");
+    const fa_case tail_mass[] = {
+        { "d128_tail_mass", 128, 4, 2, 32, 4160, 4097, true, false, false, FA_MASK_KIND_TAIL_MASS, 0 },
+    };
+    for (const fa_case & c : tail_mass) {
+        const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
+        if (g_arm && !expected) {
+            std::printf("-- %s (not covered by arm %s)\n", c.name, g_arm->name);
+            continue;
+        }
+        ++n_run;
+        run_case(sycl, cpu, c, POISON_NONE, expected);
+    }
+
+    // K/V rows off a 16-byte bound: a kernel that copies rows in 16-byte vectors
+    // must take its scalar copy instead, and give d128_pp72's bits (see
+    // check_v8_bit_identical). Every variant, as for d128_pp72.
+    std::printf("== unaligned K/V rows ==\n");
+    const fa_case unaligned[] = {
+        { "d128_pp72_kv_unaligned", 128, 32, 8, 72, 256, 72, false, false, false, FA_MASK_KIND_CAUSAL, 0, 4 },
+    };
+    for (const fa_case & c : unaligned) {
+        const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
+        if (g_arm && !expected) {
+            std::printf("-- %s (not covered by arm %s)\n", c.name, g_arm->name);
+            continue;
+        }
+        ++n_run;
+        for (size_t v = 0; v < N_VARIANTS; ++v) {
+            std::vector<float> out;
+            std::string        kernel;
+            run_case(sycl, cpu, c, variants[v], expected, &out, &kernel);
+            check_v8_bit_identical(variants[v], pp72_kernel[v], pp72_out[v], kernel, out);
+        }
+    }
+
+    // More leaves of the F32-accumulator XMX-v2 prompt kernel (see LEAF
+    // COVERAGE above). Clean K/V only: the poison variants exercise the copy
+    // and the mask, which these leaves share with d128_pp72. A softcap of 0.5
+    // keeps the tanh out of its linear range: with Q and K uniform in [-1, 1],
+    // x = q.k * scale / softcap has a standard deviation of about 0.67 at every
+    // D here, where tanh(x) is already 13% below x.
+    std::printf("== leaf coverage ==\n");
+    const fa_case leaves[] = {
+        { "d256_pp72",              256, 16, 4, 72, 256, 72, false, false, false, FA_MASK_KIND_CAUSAL, 0, 0, 0.0f },
+        { "d128_pp72_softcap",      128, 32, 8, 72, 256, 72, false, false, false, FA_MASK_KIND_CAUSAL, 0, 0, 0.5f },
+        { "d256_pp72_softcap",      256, 16, 4, 72, 256, 72, false, false, false, FA_MASK_KIND_CAUSAL, 0, 0, 0.5f },
+        { "d64_sinks_pp32",         64,  64, 8, 32, 256, 72, true,  false, false, FA_MASK_KIND_CAUSAL, 0, 0, 0.0f },
+        { "d64_sinks_pp32_softcap", 64,  64, 8, 32, 256, 72, true,  false, false, FA_MASK_KIND_CAUSAL, 0, 0, 0.5f },
+    };
+    for (const fa_case & c : leaves) {
         const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
         if (g_arm && !expected) {
             std::printf("-- %s (not covered by arm %s)\n", c.name, g_arm->name);
