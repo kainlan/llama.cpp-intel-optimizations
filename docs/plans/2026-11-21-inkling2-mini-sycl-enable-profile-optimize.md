@@ -6817,11 +6817,12 @@ What step 1d wrote (implementer record, 2026-11-24; device behaviour is the lead
 (`mulmat.bf16_native`), which has no XMX path: 4.43 s of device time on the long prompt.
 
 **What it does.** Above `SKINNY_MAX_COLS` (8) columns, `ggml_sycl_mul_mat_bf16_weight` first offers the op to
-`ggml_sycl_mul_mat_bf16_onednn`. That route rounds the F32 activations to bf16 (nearest even,
+`ggml_sycl_mul_mat_bf16_onednn`. That route asks `gemm()` with `query_only` (a primitive oneDNN cannot create, or a
+declined scratchpad, ends it before anything is written), rounds the F32 activations to bf16 (nearest even,
 `ggml_sycl_bf16::f32_to_bf16_rne`) into the planned dense src1 buffer, then submits one `DnnlGemmWrapper::gemm` of bf16
-x bf16 -> f32 with strict float math, in `gemm()`'s own orientation, on the weight as it is placed. A declined route has
-written nothing to dst, and the tiled kernel computes the op as before. Decode and the widths of 8 or fewer keep the
-skinny kernel.
+x bf16 -> f32 with strict float math, in `gemm()`'s own orientation, on the weight as it is placed, with the
+conversion's event as its dependency. A declined route has written nothing to dst, and the tiled kernel computes the
+op as before. Decode and the widths of 8 or fewer keep the skinny kernel.
 
 **Probe (2026-11-26).** `test-sycl-bf16-onednn-probe` at `4a0b8b6d2`, run once per card by the lead. The outputs are
 committed as `docs/backend/data/inkling2/t22-probe-b70-4a0b8b6d2.txt` and `t22-probe-b50-4a0b8b6d2.txt`. On both cards
@@ -6862,10 +6863,20 @@ The conversion costs about 17 us of span at every width. Against double over bf1
   - The adapter marks a dense 2-D BF16 weight that is not an expert stack.
   - The planned src1 row is the wider of the f16 arm's and the route's, each counted where its consumer is compiled
     in (`zone_dense_src1_planned_bytes_per_token`, `test-zone-sizing` Case 52).
-  - The graph-entry walk counts the copy with the executor's own predicates. It ensures max(plan, demand), or refuses
-    and names the op.
-  - A buffer too short at dispatch makes the route decline. Nothing is allocated outside the buffer: the GEMM's
-    scratchpad, 0 B here, comes through the ONEDNN zone.
+  - The graph-entry walk counts the copy with the executor's own predicates, apart from the f16 arm's demand. It
+    ensures max(plan, demand).
+    - *Changed 2026-11-26, after the review of `eb37e2ffaa`.* The walk used to refuse the graph and name the op
+      whenever the RUNTIME zone could not hold max(plan, demand). It now holds max(plan, f16 demand) when only the
+      route's copy is too wide, and the route declines on the short buffer. It still refuses, by name, an f16 demand
+      it cannot hold (`zone_walk_ensure_dense_buffer` in `zone-sizing.hpp`, `test-zone-sizing` Case 53).
+    - Why: the route has a next path, the tiled kernel; the f16 arm has none. Refusing the whole graph (the backend's
+      allocation failure) over the route's demand turned a speedup into a failed prompt.
+    - The src1 plan is one figure for both rows, so a zone that cannot hold the plan itself still refuses (owed item
+      below).
+  - A buffer too short at dispatch, or one that does not resolve on the device, makes the route decline. The decline
+    is loud, as an op that grows a planned buffer is: one WARN per device slot (`planned_scratch_stats::warned`), and
+    a short buffer counts an under-estimate against the `mul-mat-dequant-f16-src1` cohort. Nothing is allocated
+    outside the buffer: the GEMM's scratchpad, 0 B here, comes through the ONEDNN zone.
   - `docs/backend/sycl-memory-design.md` describes it under "Who the dense f16 dequant plan covers".
 - **Profiler.** The GEMM's row carries op_context `bf16_weight`. The conversion's row is
   `mulmat.bf16_onednn.act_to_bf16`.
@@ -6880,21 +6891,52 @@ The conversion costs about 17 us of span at every width. Against double over bf1
    is never recorded.
 
 **Tests.**
-- `test-zone-sizing` Case 52: the fold and the combined row.
+- `test-zone-sizing` Case 52: the fold and the combined row. Case 53: the walk's decision for one buffer (held,
+  capped, refused), against a fake RUNTIME zone; it failed on the old decision (refuse whenever max(plan, demand)
+  does not fit) at its first route-only case.
 - `test-sycl-bf16-mul-mat`: the device rounding against `ggml_fp32_to_bf16` on the specials and on a sweep.
-- `test-sycl-bf16-native-source`: the route, its walk, its planner and adapter terms, and the probe citation, with
-  each new test shown to fail on a mutant.
-- `check-sycl-dnnl-decline-consumers.py`: the route's consumers and the memo, 207 mutants.
-- `test-sycl-bf16-mul-mat-backend`: N = 40 held to the amended bounds.
+- `test-sycl-bf16-native-source`: the route (its recording decline before the buffer, the query and the conversion;
+  its loud declines; the query before the conversion and the GEMM on the conversion's event), its walk and the walk's
+  capping, its planner and adapter terms, and the probe citation. `test_every_route_check_fails_on_its_mutants`
+  applies 27 in-memory mutants, at least one per route check, and fails if any check passes on its mutant or no
+  mutant names a check.
+- `check-sycl-dnnl-decline-consumers.py`: the route's consumers (the query's decline and the run's) and the memo, 210
+  mutants.
+- `test-sycl-bf16-mul-mat-backend`: N = 40 held to the amended bounds; it asks the backend's own admission
+  (`ggml_sycl_onednn_pp_type_admitted`) whether the route runs.
 - The device test `test-sycl-bf16-onednn-mul-mat-device` and its opt-out registration `-opt-out`. It covers:
   - the Inkling shapes at N = 9, 129, 512 and 2048;
   - Qwen3.8's BF16 matrices (hc_inject, ssm_alpha, hc_down and the shared-expert gate) at N = 9 and 512;
   - N = 1 and 8 declined;
-  - a first case whose planned buffer is empty, which must decline.
+  - every taken case with a decline injected on the query (nothing written) and on the GEMM (the conversion written),
+    whose native outputs must be bit-identical;
+  - a first case whose planned buffer is empty, which must decline and count one under-estimate;
+  - a second case with the walk's grows limited below the route's copy (`ggml_sycl::test_set_dequant_f16_walk_limit`),
+    which must compute, decline and count one under-estimate (the old walk refused this graph);
+  - the up projection at N = 129 with src1 columns wider than K (NaN padding), dst columns wider than M (a sentinel
+    padding that must survive) and src1 of three planes.
 
 **Acceptance (the lead's runs).** On the Inkling long prompt the BF16 dense device time is expected to go from
 4.43 s to about 0.2-0.3 s. The acceptance gate stays at 1,100 ms or less. The probe covers only the Inkling shapes,
 so the Qwen shapes are in the device test for correctness, not speed.
+
+**Results at `eb37e2ffaa` (2026-11-26, the lead, each run once).**
+- `test-sycl-bf16-onednn-mul-mat-device` passes on the B50 and the B70, its opt-out registration on the B50, and
+  `test-sycl-bf16-mul-mat-backend` on the B50. No kernel faults.
+- Inkling long prompt (4,737 tokens) on the B70: 26.66 s, 177.7 t/s prompt processing. The BF16 dense device time is
+  about 455 ms against the 1,100 ms bar: pass.
+- Perplexity, 6 chunks at `-c 2048`, base against new, with no refusals, aborts or kernel faults:
+  - Inkling on the B70: 7.5792 ± 0.247 against 7.5776 ± 0.247;
+  - Inkling on the B50: 7.5837 against 7.5884;
+  - Qwen3.6 NVFP4 on the B50: 15.7422 ± 0.600 against 15.7615 ± 0.602.
+  Every delta is well inside one standard error: the bf16-rounded activations do not move quality.
+- Qwen3.8 GSQ-RCO IQ3_XXS long prompt on the B70, new build only: it loads and gives coherent text; 4,485 tokens at
+  88.1 t/s prompt processing and 19.9 t/s generation, peak host backing 33 GiB.
+
+The follow-up after the review (the walk's capping, the loud declines, the query before the conversion and the
+conversion's event as the GEMM's dependency) changes the route's hot path and the device test, so the device tests,
+the backend test and the Inkling timing above are for `eb37e2ffaa`, not for the follow-up's head; they are to be run
+again on it.
 
 ---
 
@@ -7196,15 +7238,19 @@ interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkli
   in F32. No Inkling prompt graph is recorded today.
 - No device test reaches the ready-event path of the route: the device test's operands are complete when the node
   runs. The cover is the source contract and `tests/test-sycl-chain-same-queue-source.py`.
-- `scripts/check-sycl-dnnl-decline-consumers.py` is not a usable gate: one of its mutants survives ("caller 1
-  rethrows the named error as std::exception"), so it is red before and after any change.
+- ~~`scripts/check-sycl-dnnl-decline-consumers.py` is not a usable gate~~ *Corrected 2026-11-26:* it passes on
+  `185b44aa8e` (193 mutants killed) and on `eb37e2ffaa` (207); the line was wrong by then. Task 22's follow-up raises
+  it to 210.
 - The NVFP4 prompt kernel is now the largest part of an Inkling prompt: about 3.2 s of a 6.9 s 691-token prompt.
 
 *Left by Task 22 (2026-11-26):*
 - **The oneDNN primitive cache grows by one entry per distinct prompt-ubatch token count for each dense BF16 shape.**
   The route's key contains N, as Task 20's batched key contains T. A server that sees many prompt lengths keeps one
-  primitive per (shape, N) for the life of the process. The same cures apply (runtime dimensions, or a bound on the
-  cache), and neither is adopted.
+  primitive per (shape, N) for the life of the process. Each new N also pays a host-side JIT creation of the
+  primitive for every dense BF16 shape on its first use, and every prompt's last micro-batch (its remainder) is
+  usually a new N. The device-time profile (`GGML_SYCL_KERNEL_PROFILE`) does not show that host cost. A
+  `DNNL_RUNTIME_DIM_VAL` N would cure both the growth and the per-N creation; a bound on the cache would cure only
+  the growth. Neither is adopted.
 - `gemm()`'s negative memo for a primitive oneDNN cannot create exists now, opt-in
   (`GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE`). The batched F32 route still throws on a refused creation (Task 20's R5
   item) and could pass it.
@@ -7216,6 +7262,26 @@ interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkli
   count (the warmup pass) and is recorded on the next one of that count; every replay then runs the tiled kernel.
   Whether the route can be recorded (the warmup pass has cached its primitive; its buffer must stay put across
   replays) has not been examined.
+  - Affected BF16 weights include gemma4's `per_layer_model_proj` (named with Qwen3.8's in the comment at
+    `ggml-sycl.cpp:14203`): a dense model whose prompt splits carry no `MUL_MAT_ID`.
+  - Such a prompt mixes arithmetics: the warmup micro-batch of a node count runs the route on bf16-rounded
+    activations, and the replays of that count run the tiled kernel in F32. Both are within the R8 bounds (2e-4 and
+    1e-4 of sum |w*x| against their references, 4e-3 between them), so the mix is a precision difference between
+    micro-batches, not an error.
+- **The route's recording predicate is process-wide.** It declines while any thread records
+  (`ggml_sycl_graph_recording_active()`), as the batched F32 route does, so a thread that records nothing also
+  declines meanwhile. The per-thread question exists: `ggml_sycl_graph_recording_this_thread()` (`common.hpp:583-598`),
+  with the queue's own recording state, which the route also reads. Not changed here.
+- **The walk's cap is one plan figure wide.** The src1 plan is the wider of the f16 and bf16 rows
+  (`zone_dense_src1_planned_bytes_per_token`), and no f16-only figure is published. So a RUNTIME zone that cannot hold
+  a plan the BF16 row widened refuses an f16 demand it could hold (`test-zone-sizing` Case 53 pins this). Splitting
+  the figure needs a new term in the planned-load owner table.
+- **A capped buffer is asked to grow on every prompt graph.** The walk does not remember a failed grow: each graph
+  tries the wide grow once more (one RUNTIME-zone allocation attempt, counted as a zone plan refusal, with a line only
+  under `GGML_SYCL_EXT_ALLOC_TRACE`), and each declined op counts one under-estimate, which takes the zone-sizing
+  mutex. The WARN is once per device slot. Neither the fake zone of Case 53 nor the device test's walk limit exercises
+  the allocator's real failure; the failure path was read, not run (`ggml_sycl_runtime_scratch_ensure` returns before
+  it touches the backing).
 
 *Left by the integration with master and the long-prompt arm (2026-11-24):*
 - **Mistral 7B refuses any prompt longer than one micro-batch with default flags, on master.** The auto micro-batch
