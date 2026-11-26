@@ -21903,11 +21903,11 @@ struct ggml_sycl_expert_loan_result {
     uint32_t     n_remaining      = 0;  // a refill's: the lent triplets its armed cursor still holds after it ran
     uint32_t     n_dropped        = 0;  // a refill's: the lent triplets it dropped from the ledger, to stay on the host
     uint64_t     room_self_delta  = 0;  // a named move's: how far its own give-backs moved the WEIGHT zone's room epoch
-    // A named move's cost to the boundary thread, in microseconds (ggml_sycl_expert_prepared_give_back).
+    // The parts of a named move's cost to the boundary thread that the body times, in microseconds
+    // (ggml_sycl_expert_prepared_give_back). A call refused before its preparation leaves them 0.
     uint64_t     meta_us          = 0;
     uint64_t     copy_us          = 0;
     uint64_t     remap_us         = 0;
-    uint64_t     total_us         = 0;
     const char * reason           = "none";
 };
 
@@ -22346,12 +22346,11 @@ struct ggml_sycl_expert_prepared_give_back {
     ggml_sycl_expert_loan_result *                   answer;
     // A named move's cost to the boundary thread, written to the body's answer with the room figure on every exit: the
     // batch's host time the transaction counts (the members' metadata lookups, the cache's copy submissions and id
-    // handovers) and the time since `start`, which includes this release of the leases. On a throw the entry never
-    // copies that answer on, so a transaction that threw is neither reported nor counted.
+    // handovers). The whole call's time is the entry's (ggml_sycl_expert_move_transaction_run). On a throw the entry
+    // never copies that answer on, so a transaction that threw is neither reported nor counted.
     const uint64_t &                                 meta_us;
     const uint64_t &                                 copy_us;
     const uint64_t &                                 remap_us;
-    std::chrono::steady_clock::time_point            start;
 
     ~ggml_sycl_expert_prepared_give_back() {
         meter.give_back([this] { prepared.clear(); });
@@ -22360,7 +22359,6 @@ struct ggml_sycl_expert_prepared_give_back {
             answer->meta_us         = meta_us;
             answer->copy_us         = copy_us;
             answer->remap_us        = remap_us;
-            answer->total_us        = ggml_sycl::expert_move_us_since(start);
         }
     }
 };
@@ -22585,9 +22583,6 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     ggml_sycl_expert_loan_result *               out,
     bool                                         warn_busy,
     std::vector<ggml_sycl_expert_move_outcome> * named_moves = nullptr) {
-    // For the named move's cost: its total runs from here, so the time outside its timed parts shows.
-    const auto txn_start = std::chrono::steady_clock::now();
-
     const bool                   refill = direction == ggml_sycl_expert_txn_direction::REFILL;
     const bool                   named  = direction == ggml_sycl_expert_txn_direction::NAMED;
     ggml_sycl_expert_loan_result result{};
@@ -22717,8 +22712,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     uint64_t                            remap_us = 0;
     // A named move measures what its own give-backs do to the zone's room epoch, for the swap driver's hold.
     ggml_sycl_expert_room_meter         room_meter{ named ? cache : nullptr };
-    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, meta_us, copy_us,
-                                                   remap_us, txn_start };
+    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr,
+                                                   meta_us,  copy_us,    remap_us };
 
     const char * stop      = nullptr;
     bool         transient = false;
@@ -23142,9 +23137,11 @@ struct ggml_sycl_expert_move_result {
     size_t                                     bytes_admitted  = 0;  // device storage the admitted triplets took
     // How far the call's own give-backs moved the device WEIGHT zone's room epoch (ggml_sycl_expert_room_meter).
     uint64_t                                   room_self_delta = 0;
-    // The call's cost to the boundary thread, in microseconds, as a refused call reports it too. A call that threw
-    // reports none of it: the entry rethrows before it copies the answer, and the swap driver counts a transaction
-    // only once it has returned.
+    // The call's cost to the boundary thread, in microseconds, which a refused call reports too. total_us is the
+    // whole call, on every exit that returns, a refusal before any preparation included. meta_us, copy_us and
+    // remap_us are the parts the body times, so a call refused before its preparation leaves them 0. A call that
+    // threw reports none of it: the entry rethrows before it copies the answer, and the swap driver counts a
+    // transaction only once it has returned.
     uint64_t                                   meta_us         = 0;
     uint64_t                                   copy_us         = 0;
     uint64_t                                   remap_us        = 0;
@@ -23175,7 +23172,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int           
         moves[i].triplet   = i < n_evict ? request.evict[i] : request.admit[i - n_evict];
     }
     ggml_sycl_expert_loan_result answer;
-    const ggml_sycl_txn_result   code = ggml_sycl_expert_txn_run(
+    const auto                   call_start = std::chrono::steady_clock::now();
+    const ggml_sycl_txn_result   code       = ggml_sycl_expert_txn_run(
         ggml_sycl_expert_txn_direction::NAMED, device, moves.size(), 0, false, resolver, &answer, false, &moves);
     // A triplet the body never decided takes the call's answer: a refusal of the whole call refuses each, and a triplet
     // the cache moved under a plan that was never published (a lost swap) has not moved. An accepted call decided every
@@ -23200,7 +23198,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int           
         r.meta_us         = answer.meta_us;
         r.copy_us         = answer.copy_us;
         r.remap_us        = answer.remap_us;
-        r.total_us        = answer.total_us;
+        r.total_us        = ggml_sycl::expert_move_us_since(call_start);
         for (ggml_sycl_expert_move_outcome & m : moves) {
             if (m.moved) {
                 ++(m.to_device ? r.n_admitted : r.n_evicted);
@@ -23676,11 +23674,29 @@ struct ggml_sycl_moe_swap_instance {
 // the caches are gone.
 static auto * const g_sycl_moe_swap = new ggml_sycl_moe_swap_instance[GGML_SYCL_MAX_DEVICES];
 
-// Releases an instance's claim on every way out, an exception's included.
-struct ggml_sycl_moe_swap_claim_release {
+// An instance's claim: constructing it tries to take the claim, `held` says whether it did, and destroying it gives a
+// held claim back on every way out, an exception's included. The boundary, the report at backend free and the private
+// tests' hook all claim through it.
+struct ggml_sycl_moe_swap_claim {
     std::atomic<bool> & claimed;
+    const bool          held;
 
-    ~ggml_sycl_moe_swap_claim_release() { claimed.store(false, std::memory_order_release); }
+    explicit ggml_sycl_moe_swap_claim(std::atomic<bool> & flag) : claimed(flag), held(try_take(flag)) {}
+
+    ~ggml_sycl_moe_swap_claim() {
+        if (held) {
+            claimed.store(false, std::memory_order_release);
+        }
+    }
+
+    ggml_sycl_moe_swap_claim(const ggml_sycl_moe_swap_claim &)             = delete;
+    ggml_sycl_moe_swap_claim & operator=(const ggml_sycl_moe_swap_claim &) = delete;
+
+  private:
+    static bool try_take(std::atomic<bool> & flag) {
+        bool expected = false;
+        return flag.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+    }
 };
 
 // The boundaries counted before a claim, into the driver's figures. Under the claim.
@@ -23725,10 +23741,9 @@ static void ggml_sycl_moe_swap_report_at_free(int device) {
     if (!ggml_sycl_moe_swap_enabled() || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
-    ggml_sycl_moe_swap_instance & inst     = g_sycl_moe_swap[device];
-    bool                          expected = false;
-    if (inst.claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        const ggml_sycl_moe_swap_claim_release release{ inst.claimed };
+    ggml_sycl_moe_swap_instance &  inst = g_sycl_moe_swap[device];
+    const ggml_sycl_moe_swap_claim claim{ inst.claimed };
+    if (claim.held) {
         ggml_sycl_moe_swap_report(inst, device);
     }
 }
@@ -23966,7 +23981,11 @@ static void ggml_sycl_run_expert_swap_claimed(int                               
                 ggml_sycl_moe_swap_warn_zone_refusal(cache, device, zone_refused, request.admit.size(),
                                                      zone_refused_max);
             }
-            const ggml_sycl::moe_swap_txn_cost cost{ result.copy_us, result.remap_us, result.meta_us, result.total_us };
+            ggml_sycl::moe_swap_txn_cost cost;
+            cost.copy_us  = result.copy_us;
+            cost.remap_us = result.remap_us;
+            cost.meta_us  = result.meta_us;
+            cost.total_us = result.total_us;
             return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };
         });
 }
@@ -23995,12 +24014,11 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
         inst.skipped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    bool expected = false;
-    if (!inst.claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    const ggml_sycl_moe_swap_claim claim{ inst.claimed };
+    if (!claim.held) {
         inst.skipped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    const ggml_sycl_moe_swap_claim_release release{ inst.claimed };
 
     // The graphs this boundary stands for: every one since the driver last ran for this context, so a skipped
     // boundary's graphs count at the next one that runs.
@@ -29288,19 +29306,32 @@ static void test_fail_next_cache_allocation_once(void * context) {
 // between the driver and the named move runs on a real cache. The driver's own decisions are
 // tests/test-sycl-moe-swap-driver.cpp's.
 
+namespace {
+
 // One boundary as the backend's synchronize runs it once the instance is claimed: `decodes` decode graphs and `graphs`
 // graphs of any kind since the last one. False when the instance was claimed already.
 bool test_swap_boundary(int                                      device,
                         uint64_t                                 decodes,
                         uint64_t                                 graphs,
                         const ::ggml_sycl_expert_loan_resolver * resolver) {
-    ::ggml_sycl_moe_swap_instance & inst     = ::g_sycl_moe_swap[device];
-    bool                            expected = false;
-    if (!inst.claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    ::ggml_sycl_moe_swap_instance &  inst = ::g_sycl_moe_swap[device];
+    const ::ggml_sycl_moe_swap_claim claim{ inst.claimed };
+    if (!claim.held) {
         return false;
     }
-    const ::ggml_sycl_moe_swap_claim_release release{ inst.claimed };
     ::ggml_sycl_run_expert_swap_claimed(device, decodes, graphs, resolver);
+    return true;
+}
+
+// The report the backend's free prints, as a boundary leaves it: nothing when every boundary was reported already.
+// False when the instance was claimed already.
+bool test_swap_report(int device) {
+    ::ggml_sycl_moe_swap_instance &  inst = ::g_sycl_moe_swap[device];
+    const ::ggml_sycl_moe_swap_claim claim{ inst.claimed };
+    if (!claim.held) {
+        return false;
+    }
+    ::ggml_sycl_moe_swap_report(inst, device);
     return true;
 }
 
@@ -29326,7 +29357,6 @@ void test_swap_forget(int device) {
     inst.reported    = 0;
     inst.skipped.store(0, std::memory_order_relaxed);
     inst.off_multithreaded.store(0, std::memory_order_relaxed);
-    g_sycl_expert_lent_count[device].store(0, std::memory_order_release);
 }
 
 struct test_swap_scope {
@@ -29353,6 +29383,10 @@ std::string test_swap_prepare(test_loan_fixture & fx, int host_expert, int n_tab
     if (!fx.cache) {
         return "no unified cache for device 0";
     }
+    // A case starts with no triplet lent: a loan an earlier case leaked is its failure to report, not a count to wipe.
+    if (g_sycl_expert_lent_count[fx.device].load(std::memory_order_acquire) != 0) {
+        return "a triplet is still lent on the device from an earlier case";
+    }
     if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * test_loan_expert_bytes())) {
         return "no WEIGHT zone could be reserved";
     }
@@ -29367,7 +29401,9 @@ std::string test_swap_prepare(test_loan_fixture & fx, int host_expert, int n_tab
         return "the retained store did not drain before the boundaries";
     }
     fx.cache->process_deferred_frees_public();
-    (void) moe_route_counts_install(fx.device, 1, n_table_experts);
+    if (!moe_route_counts_install(fx.device, 1, n_table_experts)) {
+        return "the route table could not be installed";
+    }
     return {};
 }
 
@@ -29378,6 +29414,8 @@ void test_swap_route(int device, int expert, int pairs) {
         table->add_decode(0, expert, /*on_device=*/true);
     }
 }
+
+}  // namespace
 
 std::string test_expert_swap_boundary_maps_an_evict_then_an_admit() {
     // The driver's boundary on a real cache: the first boundary reaches the policy's period and sends the evict of the
@@ -29435,6 +29473,14 @@ std::string test_expert_swap_boundary_maps_an_evict_then_an_admit() {
             d->stats.refused.size(), d->stats.busy.size(), d->pending.size(),
             d->stats.off_reason ? d->stats.off_reason : "none");
     }
+    // The transaction's cost reached the driver's figures: one transaction sent, its copies submitted and its whole
+    // call timed.
+    if (d->stats.txn_sent != 1 || d->stats.txn_total_us == 0 || d->stats.txn_copy_us == 0) {
+        return test_loan_fail(
+            "after the evict boundary: txn_sent=%llu txn_total_us=%llu txn_copy_us=%llu (want 1, >0, >0)",
+            (unsigned long long) d->stats.txn_sent, (unsigned long long) d->stats.txn_total_us,
+            (unsigned long long) d->stats.txn_copy_us);
+    }
     if (d->pending[0].block != 0 || d->pending[0].admit_expert != 2 || d->pending[0].evict_expert != 0 ||
         d->pending[0].restore) {
         return test_loan_fail("the pending admit is block %d expert %d for evicted expert %d (restore=%d), not 0, 2, 0",
@@ -29490,6 +29536,12 @@ std::string test_expert_swap_boundary_maps_an_evict_then_an_admit() {
             d->stats.refused.size(), d->stats.busy.size(), (unsigned long long) d->stats.boundaries,
             (unsigned long long) d->stats.decode_graphs);
     }
+    if (d->stats.txn_sent != 2 || d->stats.txn_total_us == 0 || d->stats.txn_copy_us == 0) {
+        return test_loan_fail(
+            "after the admit boundary: txn_sent=%llu txn_total_us=%llu txn_copy_us=%llu (want 2, >0, >0)",
+            (unsigned long long) d->stats.txn_sent, (unsigned long long) d->stats.txn_total_us,
+            (unsigned long long) d->stats.txn_copy_us);
+    }
     if (std::string why = fx.readmitted(0, 2); !why.empty()) {
         return "the driver's admit: " + why;
     }
@@ -29543,7 +29595,9 @@ std::string test_expert_swap_boundary_carries_or_drops_what_is_in_flight() {
     }
 
     // The carry: a fresh table of the same shape.
-    (void) moe_route_counts_install(device, 1, 3);
+    if (!moe_route_counts_install(device, 1, 3)) {
+        return "the route table of the same shape could not be installed";
+    }
     test_swap_route(device, 0, 100);  // the evicted expert is now the hot one
     test_swap_route(device, 1, 5);
     if (!test_swap_boundary(device, 1, 1, &resolver)) {
@@ -29582,9 +29636,26 @@ std::string test_expert_swap_boundary_carries_or_drops_what_is_in_flight() {
     }
 
     // The drop: a table of another shape. The old driver's pending admit is counted as an open slot and the old driver
-    // reports, though it has no unreported boundary left to force the print.
+    // reports, though it has no unreported boundary left to force the print: its boundaries are all reported first,
+    // so only the forced report can print. The control is a report with nothing new to say, which prints nothing.
     test_loan_warn_capture capture;
-    (void) moe_route_counts_install(device, 1, 4);
+    auto                   summaries = [&capture]() {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        size_t                      n = 0;
+        for (const std::string & line : capture.lines) {
+            n += line.find("[MOE-SWAP] device 0: accepted transactions") != std::string::npos ? 1 : 0;
+        }
+        return n;
+    };
+    if (!test_swap_report(device) || summaries() != 1) {
+        return "the report of the driver about to be replaced did not print its summary once";
+    }
+    if (!test_swap_report(device) || summaries() != 1) {
+        return "a report with every boundary already reported printed its summary again";
+    }
+    if (!moe_route_counts_install(device, 1, 4)) {
+        return "the route table of another shape could not be installed";
+    }
     if (!test_swap_boundary(device, 1, 1, &resolver)) {
         return "the device's swap instance was claimed";
     }
@@ -29605,8 +29676,9 @@ std::string test_expert_swap_boundary_carries_or_drops_what_is_in_flight() {
                                   line.find("open slots 1;") != std::string::npos);
         }
     }
-    if (!printed) {
-        return "the replaced driver did not print its summary with the dropped admit counted as one open slot";
+    if (summaries() != 2 || !printed) {
+        return "the replaced driver did not print its summary again, forced, with the dropped admit counted as one "
+               "open slot";
     }
     return {};
 }

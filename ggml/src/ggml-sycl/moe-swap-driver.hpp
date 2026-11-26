@@ -280,7 +280,8 @@ struct moe_swap_driver_stats {
     uint64_t                           settled_moved            = 0;  // their moves the next view showed had moved
     uint64_t                           unsettled_moves          = 0;  // moves of a thrown batch not settled yet
     uint32_t                           pending_high_water       = 0;
-    // Transactions sent, accepted or refused (one that threw is not counted), and their cost to the boundary thread.
+    // Transactions sent, accepted or refused (one that threw is not counted), and their cost to the boundary thread:
+    // the copy, remap and meta parts the move times (0 for a call refused before its preparation) and the whole call.
     uint64_t                           txn_sent                 = 0;
     uint64_t                           txn_copy_us              = 0;
     uint64_t                           txn_remap_us             = 0;
@@ -370,8 +371,9 @@ inline void moe_swap_driver_note_off(moe_swap_driver_state & d, const char * rea
 
 namespace moe_swap_detail {
 
-// One transaction's cost, summed into the stats whatever its answer was: a refused one still took the time. A
-// transaction that threw returns nothing to sum, so it is neither reported nor counted.
+// One transaction's cost, summed into the stats whatever its answer was: a refused one still took the time, its whole
+// call in total_us and, when it was refused before the preparation, 0 in the three parts. A transaction that threw
+// returns nothing to sum, so it is neither reported nor counted.
 inline void moe_swap_count_cost(moe_swap_driver_stats & st, const moe_swap_txn_cost & c) {
     ++st.txn_sent;
     st.txn_copy_us += c.copy_us;

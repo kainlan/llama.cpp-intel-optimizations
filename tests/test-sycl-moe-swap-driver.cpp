@@ -799,8 +799,10 @@ static void test_an_evict_batch_that_threw_is_settled_from_the_next_view() {
     r.decode[r.index(0, 9)]  = 30;
     r.decode[r.index(0, 10)] = 20;
     r.throw_after            = 1;
+    r.txn_cost               = moe_swap_txn_cost{ 10, 20, 30, 100 };
     r.to_period();
     CHECK(r.throws == 1);
+    CHECK(r.d.stats.txn_sent == 0 && r.d.stats.txn_total_us == 0);  // a transaction that threw is not counted
     CHECK(r.calls.size() == 1 && r.last().size() == 3);
     CHECK(r.d.unsettled.size() == 3);
     CHECK(r.d.pending.empty());

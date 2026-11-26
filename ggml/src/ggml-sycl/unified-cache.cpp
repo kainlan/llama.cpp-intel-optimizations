@@ -11547,9 +11547,7 @@ bool unified_cache::has_expert_source(ggml_sycl_cache_id key, bool to_device) co
     std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
     std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
     std::lock(direct_lock, cache_lock);
-    const auto it =
-        entries_.find(to_device ? unified_cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 } :
-                                  make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));
+    const auto it = entries_.find(to_device ? expert_host_key(key) : expert_device_key(key));
     return it != entries_.end() && !it->second.retired;
 }
 
@@ -11943,7 +11941,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         std::lock(direct_lock, cache_lock);
         for (int i = 0; i < 3 && !refusal; ++i) {
             const ggml_sycl_cache_id & key = members[i].key;
-            const unified_cache_key    host_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+            const unified_cache_key    host_key = expert_host_key(key);
             const auto                 it = entries_.find(host_key);
             if (it == entries_.end() || it->second.retired || !it->second.device_ptr ||
                 it->second.state == cache_entry_state::EVICTING || it->second.state == cache_entry_state::FAILED) {
@@ -11985,8 +11983,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                 refusal = "host copy not published";
                 break;
             }
-            if (entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS)) !=
-                entries_.end()) {
+            if (entries_.find(expert_device_key(key)) != entries_.end()) {
                 refusal = "device entry exists";
                 break;
             }
@@ -12100,7 +12097,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         // Each host copy is still the one checked and still what resolves its id, and no device entry has appeared.
         for (int i = 0; i < 3 && !refusal; ++i) {
             const ggml_sycl_cache_id & key = members[i].key;
-            const unified_cache_key    host_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+            const unified_cache_key    host_key = expert_host_key(key);
             const auto                 it     = entries_.find(host_key);
             const auto                 mirror = direct_expert_entries_.find(key);
             const auto                 mapped = id_to_key_.find(key);
@@ -12108,8 +12105,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                 it->second.direct_alloc_owner.owner_control_id() != src_control[i] ||
                 mirror == direct_expert_entries_.end() || mirror->second.ptr != it->second.device_ptr ||
                 mapped == id_to_key_.end() || !(mapped->second == host_key) ||
-                entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS)) !=
-                    entries_.end()) {
+                entries_.find(expert_device_key(key)) != entries_.end()) {
                 refusal = "entry changed";
             } else {
                 // The device entry replaces this host copy, so it belongs to the copy's models as they are now,
@@ -12124,15 +12120,13 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         if (!refusal) {
             try {
                 for (int i = 0; i < 3; ++i) {
-                    const unified_cache_key device_key =
-                        make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+                    const unified_cache_key device_key = expert_device_key(members[i].key);
                     device_entry[i].last_access = time_++;
                     entries_.emplace(device_key, device_entry[i]);
                     ++inserted;
                 }
                 for (int i = 0; i < 3; ++i) {
-                    const unified_cache_key device_key =
-                        make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+                    const unified_cache_key device_key = expert_device_key(members[i].key);
                     unified_cache_entry & stored = entries_.find(device_key)->second;
                     device_mirror[i].handle =
                         make_direct_entry_handle(device_key, cache_device, stored, "expert_refill/mirror");
@@ -12148,10 +12142,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                 throw;
             } catch (...) {
                 for (int i = 0; i < inserted; ++i) {
-                    (void) transition_to_retired_locked(
-                        entries_
-                            .find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS))
-                            ->second);
+                    (void) transition_to_retired_locked(entries_.find(expert_device_key(members[i].key))->second);
                 }
                 refusal = "publication failed";
             }
@@ -12167,10 +12158,9 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
             for (int i = 0; i < 3; ++i) {
                 const ggml_sycl_cache_id & key = members[i].key;
                 std::swap(direct_expert_entries_.find(key)->second, device_mirror[i]);
-                id_to_key_.find(key)->second =
-                    make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);
+                id_to_key_.find(key)->second = expert_device_key(key);
                 for (const ggml_sycl_cache_id & id : members[i].host_keys) {
-                    const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };
+                    const unified_cache_key host_key = expert_host_key(id);
                     const auto              host = entries_.find(host_key);
                     if (host != entries_.end() && !host->second.retired &&
                         host->second.direct_alloc_owner.owner_control_id() == src_control[i]) {

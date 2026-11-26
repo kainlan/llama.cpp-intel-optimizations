@@ -142,7 +142,14 @@ CORE_DECL = ("static void ggml_sycl_run_expert_swap_claimed(int device, uint64_t
 CORE_OUTER_CALL = "ggml_sycl_run_expert_swap_claimed(device, decodes, graphs, nullptr);"
 CORE_MAKE_CALL = "ggml_sycl_moe_swap_make_call(inst, cache, device, decodes, graphs);"
 CORE_TXN = "ggml_sycl_expert_move_transaction_run(device, request, resolver, &result);"
-CLAIM_RELEASE = "ggml_sycl_moe_swap_claim_release release{ inst.claimed };"
+# The one way an instance is claimed: a guard that tries on construction and releases on every way out.
+CLAIM_SIG = "struct ggml_sycl_moe_swap_claim {"
+CLAIM_DECL = "ggml_sycl_moe_swap_claim claim{ inst.claimed };"
+CLAIM_LOST = "if (!claim.held) {"
+CLAIM_TAKE = "return flag.compare_exchange_strong(expected, true, std::memory_order_acq_rel);"
+REPORT_AT_FREE_SIG = "static void ggml_sycl_moe_swap_report_at_free("
+REPORT_IF_HELD = "if (claim.held) { ggml_sycl_moe_swap_report(inst, device); }"
+CLAIM_GIVE_BACK = "if (held) { claimed.store(false, std::memory_order_release); }"
 CALLER_CALL = "ggml_sycl_run_expert_swap_at_boundary(backend);"
 REFILL_CALL = "ggml_sycl_run_expert_refill_at_boundary(backend);"
 STEP_CALL = "moe_swap_driver_step("
@@ -163,7 +170,7 @@ NO_GROWTH_ROOM_SIG = "size_t unified_cache::host_zone_no_growth_room("
 HELPER_DEF = re.compile(r"^static\s+[\w:<>,\s\*&]*?\b(ggml_sycl_moe_swap_\w+)\s*\(", re.MULTILINE)
 
 GATES = ("ggml_sycl_moe_swap_enabled()", "g_sycl_graph_multithreaded", "unified_cache_is_graph_compute_active()",
-         "ggml_sycl_graph_inflight_count()", "compare_exchange_strong(")
+         "ggml_sycl_graph_inflight_count()", CLAIM_DECL)
 TABLE_ROW = re.compile(r"\{\s*ggml_sycl::MOE_SWAP_ENV\s*,\s*&g_ggml_sycl_moe_swap\s*,\s*0\s*\}")
 ROW_OVERWRITE = re.compile(r"g_ggml_sycl_moe_swap\s*=\s*ggml_sycl_moe_swap_enabled\(\)\s*\?\s*1\s*:\s*0\s*;")
 PARSE_LOOP = "*setting.dest = get_sycl_env(setting.name, setting.default_value);"
@@ -251,24 +258,30 @@ ENTRY_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run("
 ROOM_STOOD_SIG = "inline bool moe_swap_room_stood("
 METER_MEASURE = ("const uint64_t before = cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT); release(); "
                  "moved += cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) - before;")
-GIVE_BACK_FIELDS = ("meter.give_back([this] { prepared.clear(); });", "answer->room_self_delta = meter.moved;",
-                    "answer->total_us = ggml_sycl::expert_move_us_since(start);")
+GIVE_BACK_FIELDS = ("meter.give_back([this] { prepared.clear(); });", "answer->room_self_delta = meter.moved;")
 GIVE_BACK_DECL = ("ggml_sycl_expert_room_meter room_meter{ named ? cache : nullptr }; "
                   "ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, "
-                  "meta_us, copy_us, remap_us, txn_start };")
+                  "meta_us, copy_us, remap_us };")
 PREPARE_CALL = "stop = ggml_sycl_expert_prepare_triplet("
 REFUSED_GIVE_BACK = ("room_meter.give_back([&triplet] { for (ggml_sycl::expert_move_member & m : triplet.members) { "
                      "m.owner = ggml_sycl::mem_handle{}; } });")
 REFILL_BRANCH = "} else if (refill && !transient) {"
 ENTRY_SELF_DELTA = "r.room_self_delta = answer.room_self_delta;"
-ENTRY_COST = "r.total_us = answer.total_us;"
+# The entry carries the body's three parts and times the whole call itself, so a refusal before any preparation has a
+# total too.
+ENTRY_COST = ("r.meta_us = answer.meta_us;", "r.copy_us = answer.copy_us;", "r.remap_us = answer.remap_us;",
+              "r.total_us = ggml_sycl::expert_move_us_since(call_start);")
+ENTRY_CLOCK = ("ggml_sycl_expert_loan_result answer; const auto call_start = std::chrono::steady_clock::now(); "
+               "const ggml_sycl_txn_result code = ggml_sycl_expert_txn_run(")
 COUNT_COST = ("moe_swap_detail::moe_swap_count_cost(st, room.cost);",
               "moe_swap_detail::moe_swap_count_cost(st, answer.cost);")
 # The read comes right after the transaction's call, with nothing between them.
 EPOCH_AFTER_READ = ("ggml_sycl_expert_move_transaction_run(device, request, resolver, &result); "
                     "const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;")
-TXN_ROOM_RETURN = ("const ggml_sycl::moe_swap_txn_cost cost{ result.copy_us, result.remap_us, result.meta_us, "
-                   "result.total_us }; "
+# The cost is built field by field: the result orders its parts meta, copy, remap and the cost copy, remap, meta.
+TXN_COST_FIELDS = ("ggml_sycl::moe_swap_txn_cost cost; cost.copy_us = result.copy_us; cost.remap_us = result.remap_us; "
+                   "cost.meta_us = result.meta_us; cost.total_us = result.total_us; ")
+TXN_ROOM_RETURN = (TXN_COST_FIELDS +
                    "return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };")
 ROOM_STOOD_BODY = "return room.epoch_after - before == room.self_delta;"
 ADMIT_TXN = "const moe_swap_txn_room room = txn(d.batch);"
@@ -508,6 +521,13 @@ def check(raw: dict[str, str]) -> None:
     if not ordered(caller[:step_at], *GATES):
         fail("D5", "the swap driver is not gated, in order, by the switch, the multithreaded latch, the compute flag, "
                    "the graphs in flight and the claim of its instance before the step")
+    claim_n = norm(body(sycl, CLAIM_SIG))
+    if (claim_n.count(CLAIM_TAKE) != 1 or claim_n.count(CLAIM_GIVE_BACK) != 1 or "claimed.compare_exchange" in sycl
+            or norm(sycl).count(CLAIM_DECL) != 4
+            or norm(body(sycl, REPORT_AT_FREE_SIG)).count(REPORT_IF_HELD) != 1):
+        fail("D5", "an instance is not claimed through the one guard that takes it with a strong compare-exchange at "
+                   "acq_rel and gives a held claim back with a release store, at the boundary, the backend free's "
+                   "report (which reports only a claim it holds) and the private tests' boundary and report hooks")
 
     # D22 --------------------------------------------------------------------------------------------------------------
     outer_n, core_n = norm(outer), norm(core)
@@ -517,14 +537,13 @@ def check(raw: dict[str, str]) -> None:
     if re.search(r"\bctx\b", core):
         fail("D22", "the claimed body reads the backend context, so a test cannot run it without one")
     if (outer_n.count(CORE_CALL) != 1 or outer_n.count(CORE_OUTER_CALL) != 1
-            or not ordered(outer_n, "compare_exchange_strong(", CLAIM_RELEASE, CORE_CALL)):
+            or not ordered(outer_n, CLAIM_DECL, CLAIM_LOST, CORE_CALL)):
         fail("D22", "the gated boundary does not call the claimed body once, after the claim, with no resolver")
     if core_n.count(CORE_MAKE_CALL) != 1 or "moe_swap_driver_call call;" in core_n:
         fail("D22", "the claimed body does not take the driver's call from ggml_sycl_moe_swap_make_call")
     if core_n.count(CORE_TXN) != 1 or norm(core).count("nullptr, &result") != 0:
         fail("D22", "the claimed body does not send the named move through the resolver it was given")
-    if sycl.count(CORE_CALL) != 3 or not hook_n or not ordered(hook_n, "compare_exchange_strong(", CLAIM_RELEASE,
-                                                                CORE_CALL):
+    if sycl.count(CORE_CALL) != 3 or not hook_n or not ordered(hook_n, CLAIM_DECL, CLAIM_LOST, CORE_CALL):
         fail("D22", "the private tests' hook is not the one other caller of the claimed body, claiming the device's "
                     "instance before it")
 
@@ -742,8 +761,11 @@ def check(raw: dict[str, str]) -> None:
             or sycl.count(".give_back(") != 2):
         fail("D20", "a refused named triplet's minted members are not given back measured, in the named-refusal "
                     "branch")
-    if norm(body(sycl, ENTRY_SIG)).count(ENTRY_SELF_DELTA) != 1 or norm(body(sycl, ENTRY_SIG)).count(ENTRY_COST) != 1:
-        fail("D20", "the named move's entry does not carry the measured sum to its caller")
+    entry = norm(body(sycl, ENTRY_SIG))
+    if (entry.count(ENTRY_SELF_DELTA) != 1 or any(entry.count(c) != 1 for c in ENTRY_COST)
+            or entry.count(ENTRY_CLOCK) != 1 or re.search(r"\btxn_start\b", sycl)):
+        fail("D20", "the named move's entry does not carry the measured sum to its caller, or does not time the whole "
+                    "call from before the transaction runs")
     if (norm(callback).count(EPOCH_AFTER_READ) != 1 or norm(callback).count(TXN_ROOM_RETURN) != 1
             or sycl.count("moe_swap_txn_room{") != 1):
         fail("D20", "the transaction callback does not read the room epoch right after the transaction returns and "
@@ -869,14 +891,25 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("graphs-in-flight-ignored", "D5",
                 [("sycl", CALLER_SIG, "ggml_sycl_graph_inflight_count()", "0")])
     expect_fail("instance-not-claimed", "D5",
-                [("sycl", CALLER_SIG, "compare_exchange_strong(", "compare_exchange_weak(")])
+                [("sycl", CLAIM_SIG, "compare_exchange_strong(", "compare_exchange_weak(")])
+    expect_fail("claim-weaker-than-acq-rel", "D5",
+                [("sycl", CLAIM_SIG, "std::memory_order_acq_rel", "std::memory_order_relaxed")])
+    expect_fail("claim-never-released", "D5",
+                [("sycl", CLAIM_SIG, "claimed.store(false, std::memory_order_release);", "")])
+    expect_fail("claim-released-though-not-held", "D5", [("sycl", CLAIM_SIG, "if (held) {", "if (true) {")])
+    expect_fail("claim-taken-by-hand", "D5",
+                [("sycl", CALLER_SIG, "if (!claim.held) {",
+                  "bool expected = false;\n    if (!inst.claimed.compare_exchange_strong(expected, true)) {")])
     expect_fail("claim-deleted", "D5",
                 [("sycl", CALLER_SIG,
-                  "    bool expected = false;\n"
-                  "    if (!inst.claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {\n"
+                  "    const ggml_sycl_moe_swap_claim claim{ inst.claimed };\n"
+                  "    if (!claim.held) {\n"
                   "        inst.skipped.fetch_add(1, std::memory_order_relaxed);\n"
                   "        return;\n"
                   "    }\n", "")])
+    expect_fail("claim-lost-ignored", "D22", [("sycl", CALLER_SIG, "if (!claim.held) {", "if (false) {")])
+    expect_fail("report-at-free-unclaimed", "D5",
+                [("sycl", REPORT_AT_FREE_SIG, "if (claim.held) {", "if (true) {")])
     expect_fail("claimed-body-reads-the-context", "D22",
                 [("sycl", CORE_SIG, "const int                             nb    = d.policy.n_blocks;",
                   "(void) ctx->device;\n    const int                             nb    = d.policy.n_blocks;")])
@@ -886,8 +919,11 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", CORE_SIG, CORE_MAKE_CALL, CORE_MAKE_CALL + "\n    ggml_sycl::moe_swap_driver_call call;")])
     expect_fail("boundary-hands-a-resolver", "D22",
                 [("sycl", CALLER_SIG, "/*resolver=*/nullptr", "/*resolver=*/&fixture")])
-    expect_fail("hook-does-not-claim", "D22",
-                [("sycl", HOOK_SIG, "const ::ggml_sycl_moe_swap_claim_release release{ inst.claimed };", "")])
+    expect_fail("hook-does-not-claim", "D5",
+                [("sycl", HOOK_SIG, "const ::ggml_sycl_moe_swap_claim claim{ inst.claimed };", "")])
+    call = "    ::ggml_sycl_run_expert_swap_claimed(device, decodes, graphs, resolver);\n"
+    expect_fail("hook-claims-after-the-call", "D22",
+                [("sycl", HOOK_SIG, call, ""), ("sycl", HOOK_SIG, "    if (!claim.held) {", call + "    if (!claim.held) {")])
     expect_fail("env-spelled-in-the-backend", "D6",
                 [("sycl", "", "ggml_sycl::MOE_SWAP_ENV)", "\"GGML_SYCL_MOE_SWAP\")")])
     expect_fail("env-read-at-every-boundary", "D6",
@@ -1067,9 +1103,8 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", TXN_SIG, "room_meter.give_back([&triplet] {", "std::invoke([&triplet] {")])
     expect_fail("prepared-list-given-back-unmeasured", "D20",
                 [("sycl", GIVE_BACK_SIG, "meter.give_back([this] { prepared.clear(); });", "prepared.clear();")])
-    guard_decl = ("    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, "
-                  "meta_us, copy_us,\n"
-                  "                                                   remap_us, txn_start };\n")
+    guard_decl = ("    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr,\n"
+                  "                                                   meta_us,  copy_us,    remap_us };\n")
     after_preparation = "    if (named && prepared.empty()) {\n"
     expect_fail("give-back-guard-declared-after-the-preparation", "D20",
                 [("sycl", TXN_SIG, guard_decl, ""),
@@ -1084,6 +1119,15 @@ def self_test(raw: dict[str, str]) -> int:
                   "const uint64_t epoch_after = 0;")])
     expect_fail("self-delta-not-returned", "D20",
                 [("sycl", CORE_SIG, "{ epoch_after, result.room_self_delta, cost }", "{ epoch_after, 0, cost }")])
+    for field, wrong in (("copy", "meta"), ("remap", "copy"), ("meta", "remap")):
+        pad = " " * (len("remap") - len(field))
+        expect_fail(f"{field}-cost-from-the-wrong-part", "D20",
+                    [("sycl", CORE_SIG, f"cost.{field}_us {pad}= result.{field}_us;",
+                      f"cost.{field}_us {pad}= result.{wrong}_us;")])
+    expect_fail("cost-built-positionally", "D20",
+                [("sycl", CORE_SIG, "cost.copy_us  = result.copy_us;\n", ""),
+                 ("sycl", CORE_SIG, "ggml_sycl::moe_swap_txn_cost cost;", "ggml_sycl::moe_swap_txn_cost cost{ 0, 0, "
+                  "result.meta_us, 0 };")])
     expect_fail("admit-cost-not-counted", "D20", [("driver", "", "        " + COUNT_COST[0] + "\n", "")])
     expect_fail("evict-cost-not-counted", "D20",
                 [("driver", "", "    " + COUNT_COST[1] + "\n    for (size_t i = 0; i < keep",
@@ -1091,10 +1135,18 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("cost-not-returned", "D20",
                 [("sycl", CORE_SIG, "{ epoch_after, result.room_self_delta, cost }",
                   "{ epoch_after, result.room_self_delta, {} }")])
-    expect_fail("cost-not-carried-by-the-entry", "D20",
-                [("sycl", ENTRY_SIG, "r.total_us        = answer.total_us;", "")])
-    expect_fail("cost-not-written-to-the-answer", "D20",
-                [("sycl", GIVE_BACK_SIG, "answer->total_us        = ggml_sycl::expert_move_us_since(start);", "")])
+    for field, anchor in (("meta", "r.meta_us         = answer.meta_us;"), ("copy", "r.copy_us         = answer.copy_us;"),
+                          ("remap", "r.remap_us        = answer.remap_us;"),
+                          ("total", "r.total_us        = ggml_sycl::expert_move_us_since(call_start);")):
+        expect_fail(f"{field}-cost-not-carried-by-the-entry", "D20", [("sycl", ENTRY_SIG, anchor, "")])
+    clock = "    const auto                   call_start = std::chrono::steady_clock::now();\n"
+    expect_fail("entry-clock-after-the-run", "D20",
+                [("sycl", ENTRY_SIG, clock, ""),
+                 ("sycl", ENTRY_SIG, "    // Each outcome goes back to its own list",
+                  clock + "    // Each outcome goes back to its own list")])
+    expect_fail("entry-total-from-the-body", "D20",
+                [("sycl", ENTRY_SIG, "r.total_us        = ggml_sycl::expert_move_us_since(call_start);",
+                  "r.total_us        = answer.meta_us + answer.copy_us + answer.remap_us;")])
     used = "arena_zones_[static_cast<int>(record_zone)].used);\n"
     bump = "arena_note_room_grew(arena_allocator_group_index(zone));\n"
     for name, call, indent in (("kv-zone-arm", "zone_used_free(*z.allocator, zone_offset, ", " " * 16),

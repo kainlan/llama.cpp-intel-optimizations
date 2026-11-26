@@ -190,7 +190,7 @@ ROW_WRITE_ALLOWLIST = {
         1,
         "id_to_key_: the loan's rollback hands the id back to the restored device entry",
     ),
-    ("copy_host_triplet_to_device", "id_to_key_.find(key)->second ="): (
+    ("copy_host_triplet_to_device", "id_to_key_.find(key)->second = expert_device_key(key);"): (
         1,
         "id_to_key_: the copy to the device hands the id to the new device entry",
     ),

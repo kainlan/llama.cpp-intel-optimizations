@@ -84,7 +84,8 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
       transaction that threw is neither reported, since the entry rethrows before it copies the answer, nor counted
       by the swap driver): the
       microseconds the cache spent in each move's copy step and in its id handover and retire, the transaction in the
-      members' metadata lookups, and the call's whole time from its first statement. Each cache body, the loan's and
+      members' metadata lookups. The call's whole time is the entry's, taken on every exit that returns (a refusal
+      before any preparation included, whose three parts stay 0). Each cache body, the loan's and
       the copy to the device, records its two times in the move record, the preparation times its resolver call, and
       the body sums all three as each call returns, into counters declared before the guard.
 
@@ -429,13 +430,10 @@ BODY_COUNT = "if (!m.to_device) { ++n_evicted; }"
 NAMED_LINE_ARGS = "device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason);"
 # M1: what the body sums into the line, and where each figure is measured.
 SUM_META = "meta_us += triplet.resolve_us;"
-# The cost's total runs from the transaction's first statement, before the lock and the preparation.
-TXN_START = "const auto txn_start = std::chrono::steady_clock::now();"
 COST_GUARD = ("ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, meta_us, "
-              "copy_us, remap_us, txn_start };")
+              "copy_us, remap_us };")
 COST_COUNTERS = "uint64_t meta_us = 0; uint64_t copy_us = 0; uint64_t remap_us = 0;"
-COST_WRITE = ("answer->meta_us = meta_us; answer->copy_us = copy_us; answer->remap_us = remap_us; "
-              "answer->total_us = ggml_sycl::expert_move_us_since(start);")
+COST_WRITE = "answer->meta_us = meta_us; answer->copy_us = copy_us; answer->remap_us = remap_us;"
 SUM_CACHE = "copy_us += record.copy_us; remap_us += record.remap_us;"
 CACHE_TIMES = ("out.copy_us = copy_took;", "out.remap_us = remap_took;")
 PREP_TIMED = "const bool resolved = resolver(*e, target); out.resolve_us += ggml_sycl::expert_move_us_since(resolve_from);"
@@ -689,11 +687,9 @@ def check(raw: dict[str, str]) -> None:
             or not ordered(txn, "loaned = cache->refill_lent_triplet(triplet.members, record); break; }", SUM_CACHE,
                            "if (!loaned && (admit || evict)) {")
             or not ordered(txn, SUM_CACHE, NAMED_LINE)
-            or "GGML_LOG_WARN(\"[MOE-EXEC] named move" in txn
-            or txn.count(TXN_START) != 1 or not txn.startswith("{ " + TXN_START)):
+            or "GGML_LOG_WARN(\"[MOE-EXEC] named move" in txn):
         fail("M1", "the named move's result line is not one DEBUG line, or the batch's copy submission, id remap and "
-                   "meta lookup times are not each summed as its call returns, with the transaction's total from its "
-                   "start")
+                   "meta lookup times are not each summed as its call returns")
     if (txn.count(COST_GUARD) != 1 or txn.count(COST_COUNTERS) != 1 or not ordered(txn, COST_COUNTERS, COST_GUARD)
             or sycl.count(COST_WRITE) != 1):
         fail("M1", "the named move's cost is not written to its answer by the guard that writes the room figure, on "
@@ -766,10 +762,8 @@ def self_test(raw: dict[str, str]) -> int:
                   "    const char * stop      = nullptr;\n    uint64_t meta_us = 0;\n    uint64_t copy_us = 0;\n"
                   "    uint64_t remap_us = 0;\n")])
     expect_fail("meta-lookup-unsummed", "M1", [("sycl", TXN_SIG, "meta_us += triplet.resolve_us;", "")])
-    start_line = "    " + TXN_START + "\n"
-    lock_line = "    std::unique_lock lock(g_tensor_inventory_mutex);\n"
-    expect_fail("total-from-the-lock", "M1", [("sycl", TXN_SIG, start_line, ""),
-                                             ("sycl", TXN_SIG, lock_line, lock_line + start_line)])
+    expect_fail("copy-cost-not-written", "M1", [("sycl", "", "answer->copy_us         = copy_us;", "")])
+    expect_fail("meta-cost-not-written", "M1", [("sycl", "", "answer->meta_us         = meta_us;", "")])
     expect_fail("loan-copy-untimed", "M1", [("cache", LOAN_SIG, "out.copy_us  = copy_took;", "")])
     expect_fail("entry-renamed", "A0", [("sycl", "", "ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int ",
                                          "ggml_sycl_txn_result ggml_sycl_expert_move_run(int ")])

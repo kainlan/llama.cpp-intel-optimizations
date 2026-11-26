@@ -912,7 +912,7 @@ MINT_MIRROR = ("device_mirror[i].handle = make_direct_entry_handle(device_key, c
 MINT_OUT = ("out.handles[i] = mem_handle::from_weight_lease_locked(device_key, cache_device, stored.device_ptr, "
             "stored.layout, true, &stored);")
 SWAP_MIRROR = "std::swap(direct_expert_entries_.find(key)->second, device_mirror[i]);"
-REMAP_ID = "id_to_key_.find(key)->second = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);"
+REMAP_ID = "id_to_key_.find(key)->second = expert_device_key(key);"
 HOST_RETIRE = ("if (host != entries_.end() && !host->second.retired && "
                "host->second.direct_alloc_owner.owner_control_id() == src_control[i]) "
                "{ (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
@@ -1531,8 +1531,7 @@ SOURCE_SIG = "bool unified_cache::has_expert_source(ggml_sycl_cache_id key, bool
 SHARED_CACHE_LOCKS = ("std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock); "
                       "std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock); "
                       "std::lock(direct_lock, cache_lock);")
-SOURCE_FIND = ("const auto it = entries_.find(to_device ? unified_cache_key{ cache_entry_type::MOE_EXPERT, key, -1, "
-               "-1 } : make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));")
+SOURCE_FIND = "const auto it = entries_.find(to_device ? expert_host_key(key) : expert_device_key(key));"
 SOURCE_RETURN = "return it != entries_.end() && !it->second.retired;"
 # A loan copies the expert's own bytes from offset 0 of the device entry, which must hold them, into a host copy that
 # holds them too; the entry's padded tail stays on the device.
@@ -1710,28 +1709,53 @@ def test_mutant_rollback_takes_the_id_from_another_registrant_fails():
         _once_in(CACHE, HAND_BACK_SIG, " && !held_by_another", ""))
 
 
+# The functions that look an expert's entries up by key, and the least number of times each names the two keys through
+# the helpers (the loan's checks, hand-over, rollback and restore; the copy to the device's checks, its device entries
+# and the host copies it retires; the source probe's one lookup).
+KEY_HELPER_USERS = ((LOAN_SIG, 4, 3), (REFILL_BODY_SIG, 6, 3), (SOURCE_SIG, 1, 1))
+HAND_BUILT_HOST_KEY = re.compile(r"\{\s*cache_entry_type::MOE_EXPERT\s*,")
+
+
 def claim_the_loan_names_its_keys_through_the_helpers(cache: str) -> bool:
-    """The loan's checks, hand-over, rollback and restore build no key by hand: a second spelling of the device entry's
-    layout or of the host key's sentinels is one a helper edit would leave behind."""
-    loan = body(norm(cache), LOAN_SIG)
-    return (bool(loan) and "make_direct_stage_key(" not in loan and "cache_entry_type::MOE_EXPERT" not in loan
-            and loan.count("expert_device_key(") >= 4 and loan.count("expert_host_key(") >= 3)
+    """The loan, the copy to the device and the source probe build no key by hand: a second spelling of the device
+    entry's layout or of the host key's sentinels is one a helper edit would leave behind."""
+    for signature, device_uses, host_uses in KEY_HELPER_USERS:
+        text = body(norm(cache), signature)
+        if (not text or "make_direct_stage_key(" in text or HAND_BUILT_HOST_KEY.search(text)
+                or text.count("expert_device_key(") < device_uses or text.count("expert_host_key(") < host_uses):
+            return False
+    return True
 
 
 def test_the_loan_names_its_keys_through_the_helpers():
     assert claim_the_loan_names_its_keys_through_the_helpers(CACHE)
 
 
-def test_mutant_loan_spells_the_device_key_by_hand_fails():
-    assert not claim_the_loan_names_its_keys_through_the_helpers(
-        _once_in(CACHE, LOAN_SIG, "entries_.find(expert_device_key(members[i].key))",
-                 "entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS))"))
+DEVICE_KEY_BY_HAND = "make_direct_stage_key(cache_entry_type::MOE_EXPERT, {0}, GGML_LAYOUT_AOS)"
+HOST_KEY_BY_HAND = "unified_cache_key{{ cache_entry_type::MOE_EXPERT, {0}, -1, -1 }}"
 
 
-def test_mutant_loan_spells_the_host_key_by_hand_fails():
-    assert not claim_the_loan_names_its_keys_through_the_helpers(
-        _once_in(CACHE, LOAN_SIG, "entries_.find(expert_host_key(host_id))",
-                 "entries_.find({ cache_entry_type::MOE_EXPERT, host_id, -1, -1 })"))
+KEY_BY_HAND_MUTANTS = (
+    ("loan-device", LOAN_SIG, "entries_.find(expert_device_key(members[i].key))",
+     "entries_.find(" + DEVICE_KEY_BY_HAND.format("members[i].key") + ")"),
+    ("loan-host", LOAN_SIG, "entries_.find(expert_host_key(host_id))",
+     "entries_.find(" + HOST_KEY_BY_HAND.format("host_id") + ")"),
+    ("copy-device", REFILL_BODY_SIG, "entries_.find(expert_device_key(key)) != entries_.end()) { refusal = "
+     "\"device entry exists\";",
+     "entries_.find(" + DEVICE_KEY_BY_HAND.format("key") + ") != entries_.end()) { refusal = "
+     "\"device entry exists\";"),
+    ("copy-host", REFILL_BODY_SIG, "const unified_cache_key host_key = expert_host_key(id);",
+     "const unified_cache_key host_key = " + HOST_KEY_BY_HAND.format("id") + ";"),
+    ("source-host", SOURCE_SIG, "entries_.find(to_device ? expert_host_key(key) : expert_device_key(key))",
+     "entries_.find(to_device ? " + HOST_KEY_BY_HAND.format("key") + " : expert_device_key(key))"),
+    ("source-device", SOURCE_SIG, "entries_.find(to_device ? expert_host_key(key) : expert_device_key(key))",
+     "entries_.find(to_device ? expert_host_key(key) : " + DEVICE_KEY_BY_HAND.format("key") + ")"),
+)
+
+
+def test_mutant_a_key_spelled_by_hand_fails():
+    for name, signature, old, new in KEY_BY_HAND_MUTANTS:
+        assert not claim_the_loan_names_its_keys_through_the_helpers(_once_in(CACHE, signature, old, new)), name
 
 
 def test_mutant_hand_over_moves_whatever_the_id_names_fails():
@@ -2696,8 +2720,7 @@ def test_mutant_refill_mints_after_the_swap_fails():
 
 
 def test_mutant_refill_builds_a_mapping_node_after_the_swap_fails():
-    mutant = _once(CACHE, REMAP_ID, "id_to_key_[key] = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, "
-                                    "GGML_LAYOUT_AOS);")
+    mutant = _once(CACHE, REMAP_ID, "id_to_key_[key] = expert_device_key(key);")
     assert not claim_refill_allocates_before_it_changes_anything(mutant)
 
 
@@ -3173,7 +3196,7 @@ def test_mutant_source_query_finds_a_retired_entry_fails():
 
 def test_mutant_source_query_reads_one_side_fails():
     """Both directions looking up the same key: a refill would ask for the device entry, a loan for the host's."""
-    mutant = _once_in(CACHE, SOURCE_SIG, "to_device ? unified_cache_key{", "!to_device ? unified_cache_key{")
+    mutant = _once_in(CACHE, SOURCE_SIG, "to_device ? expert_host_key(key)", "!to_device ? expert_host_key(key)")
     assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
 
 
