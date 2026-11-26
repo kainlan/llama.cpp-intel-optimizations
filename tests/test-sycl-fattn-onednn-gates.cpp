@@ -1144,6 +1144,8 @@ static bool test_planner_rejects_per_head_mask() {
         TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT,
                     "a per-head mask (ne32 > 1) must reject oneDNN: its mask descriptor has extent 1 on the head "
                     "axes and would apply head 0's mask to every head (llama.cpp-44d0)");
+        TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::MASK_PER_HEAD_UNSUPPORTED,
+                    "a per-head mask reject reason should be explicit (MASK_PER_HEAD_UNSUPPORTED)");
     }
     return true;
 }
