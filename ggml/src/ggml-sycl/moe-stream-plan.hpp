@@ -1316,8 +1316,10 @@ static inline bool moe_loan_layout_lendable(const placement_entry & e) {
 // WEIGHT allocation, so no single expert can be handed back. The load path also compares layouts (after
 // ggml_sycl_adjust_layout_for_tensor, which the plan cannot see); that comparison is not mirrored, so a disagreement
 // still reads as bulk here: the fail-safe over-skip. Checks that need runtime state (tensor->data,
-// GGML_SYCL_MOE_BULK_STAGE=0) are likewise not mirrored; each can only make the load path not bulk where this says bulk,
-// which skips more, never less.
+// GGML_SYCL_MOE_BULK_STAGE=0) are likewise not mirrored, nor is the AOS slot-stride decline (an AOS tensor is not
+// bulk-staged when an expert's triplet has a slot past the one stride its staged bytes give, since the bulk copy has
+// no room for the slot), which needs the staged bytes the load computes. Each can only make the load path not bulk
+// where this says bulk, which skips more, never less.
 static inline bool moe_loan_tensor_bulk_staged(const placement_plan & plan, const std::string & name, int device) {
     int n_experts = 0;
     for (const placement_entry & e : plan.entries) {

@@ -72,8 +72,8 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       again at every boundary, and no unit test sees it;
   D19 a boundary whose transaction refused admits for device room says so in one WARN line: the callback counts the
       answers that carry a refused size and keeps the refused triplet that asks the most in all with its refused
-      member's size, and the largest free block any refusal saw, and after its loop over the batch, on that count
-      alone (so a batch that moved nothing prints it too, and no admit prints its own), calls
+      member's size and the largest free block at its refusal, all three of that one refusal, and after its loop over
+      the batch, on that count alone (so a batch that moved nothing prints it too, and no admit prints its own), calls
       ggml_sycl_moe_swap_warn_zone_refusal once with the admits it sent; the helper reads the WEIGHT zone's free
       figures together (unified_cache::zone_free_figures) and logs moe_swap_zone_refusal_line at WARN,
       and on the device's first such boundary alone (a flag on the instance, set before it prints) logs the zone's
@@ -219,8 +219,8 @@ ZONE_ASK_OUTCOME = ("(*named_moves)[triplet.named].zone_room_ask = transient ? t
                     "ggml_sycl::expert_triplet_zone_ask{};")
 ZONE_REFUSED_COUNT = ("if (o.zone_room_bytes != 0) { ++zone_refused; "
                       "if (zone_refused_member == 0 || o.zone_room_ask.total > zone_refused_ask.total) { "
-                      "zone_refused_member = o.zone_room_bytes; zone_refused_ask = o.zone_room_ask; } "
-                      "zone_refused_free = std::max(zone_refused_free, o.zone_largest_free_at_refusal); }")
+                      "zone_refused_member = o.zone_room_bytes; zone_refused_ask = o.zone_room_ask; "
+                      "zone_refused_free = o.zone_largest_free_at_refusal; } }")
 # The loop over the batch ends on the refusal WARN's call; the zone-refusal line comes right after it, on the count.
 ZONE_WARN_AFTER_LOOP = (WARN_CALL + " } if (zone_refused != 0) { ggml_sycl_moe_swap_warn_zone_refusal(inst, cache, "
                         "device, zone_refused, request.admit.size(), zone_refused_member, zone_refused_ask, "
@@ -232,7 +232,10 @@ ZONE_WARN_FIELDS = ("(void) cache->zone_free_figures(ggml_sycl::vram_zone_id::WE
                     'GGML_LOG_WARN("%s\\n", line.c_str());')
 ZONE_CENSUS_ONCE = "if (inst.zone_census_printed || !cache) { return; } inst.zone_census_printed = true;"
 ZONE_CENSUS_READ = "if (cache->zone_free_block_sizes(ggml_sycl::vram_zone_id::WEIGHT, free_sizes)) {"
+ZONE_CENSUS_BLOCK = ("const size_t member_block = ggml_sycl::tlsf_allocator::round_request(member, "
+                     "ggml_sycl::tlsf_allocator::block_grain);")
 ZONE_CENSUS_LOG = ("const std::string census = ggml_sycl::moe_swap_zone_free_census_line(device, free_sizes, member, "
+                   "member_block, "
                    'GGML_SYCL_MOE_SWAP_ZONE_CENSUS_TOP); GGML_LOG_WARN("%s\\n", census.c_str());')
 METER_SIG = "struct ggml_sycl_expert_room_meter {"
 GIVE_BACK_SIG = "struct ggml_sycl_expert_prepared_give_back {"
@@ -681,7 +684,8 @@ def check(raw: dict[str, str]) -> None:
         fail("D19", "ggml_sycl_moe_swap_warn_zone_refusal does not log moe_swap_zone_refusal_line at WARN with the "
                     "WEIGHT zone's free figures read together")
     if not (zone_warn.count(ZONE_CENSUS_ONCE) == 1 and zone_warn.count(ZONE_CENSUS_READ) == 1
-            and zone_warn.count(ZONE_CENSUS_LOG) == 1
+            and zone_warn.count(ZONE_CENSUS_LOG) == 1 and zone_warn.count(ZONE_CENSUS_BLOCK) == 1
+            and ordered(zone_warn, ZONE_CENSUS_BLOCK, ZONE_CENSUS_LOG)
             and ordered(zone_warn, ZONE_WARN_FIELDS[1], ZONE_CENSUS_ONCE, ZONE_CENSUS_READ, ZONE_CENSUS_LOG)
             and len(re.findall(r"\bzone_census_printed\s*=(?!=)", sycl)) == 2):
         fail("D19", "the WEIGHT zone's free-block census is not logged at WARN once per device, at its first refusal "
@@ -1009,9 +1013,18 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", ZONE_WARN_SIG, "ask.slot, ask.total,", "ask.slot, 3 * member,")])
     expect_fail("census-counts-by-slot", "D19",
                 [("sycl", ZONE_WARN_SIG, "free_sizes, member,", "free_sizes, ask.slot,")])
+    expect_fail("census-counts-by-the-unrounded-member", "D19",
+                [("sycl", ZONE_WARN_SIG, "free_sizes, member, member_block,", "free_sizes, member, member,")])
+    expect_fail("census-block-not-the-allocators-rounding", "D19",
+                [("sycl", ZONE_WARN_SIG, "ggml_sycl::tlsf_allocator::round_request(member, "
+                  "ggml_sycl::tlsf_allocator::block_grain);", "member;")])
     expect_fail("largest-free-at-refusal-not-kept", "D19",
+                [("sycl", CALLER_SIG, "zone_refused_free   = o.zone_largest_free_at_refusal;", "")])
+    expect_fail("largest-free-at-refusal-of-another-refusal", "D19",
                 [("sycl", CALLER_SIG,
-                  "zone_refused_free = std::max(zone_refused_free, o.zone_largest_free_at_refusal);", "")])
+                  "zone_refused_free   = o.zone_largest_free_at_refusal;\n                        }",
+                  "}\n                        zone_refused_free = std::max(zone_refused_free, "
+                  "o.zone_largest_free_at_refusal);")])
     expect_fail("self-delta-dropped-from-the-comparison", "D20",
                 [("driver", ROOM_STOOD_SIG, "room.epoch_after - before == room.self_delta", "room.epoch_after == before")])
     expect_fail("refused-admit-held-though-room-arrived", "D20", [("driver", STEP_SIG, " && room_stood;", ";")])

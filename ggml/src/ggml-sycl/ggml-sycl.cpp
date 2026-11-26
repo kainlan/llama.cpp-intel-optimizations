@@ -23867,10 +23867,14 @@ static void ggml_sycl_moe_swap_warn_zone_refusal(ggml_sycl_moe_swap_instance &  
         return;
     }
     inst.zone_census_printed = true;
+    // The block the zone takes for the refused member: an allocation's size rounded to the allocator's grain.
+    const size_t member_block =
+        ggml_sycl::tlsf_allocator::round_request(member, ggml_sycl::tlsf_allocator::block_grain);
+
     std::vector<size_t> free_sizes;
     if (cache->zone_free_block_sizes(ggml_sycl::vram_zone_id::WEIGHT, free_sizes)) {
-        const std::string census =
-            ggml_sycl::moe_swap_zone_free_census_line(device, free_sizes, member, GGML_SYCL_MOE_SWAP_ZONE_CENSUS_TOP);
+        const std::string census = ggml_sycl::moe_swap_zone_free_census_line(device, free_sizes, member, member_block,
+                                                                             GGML_SYCL_MOE_SWAP_ZONE_CENSUS_TOP);
         GGML_LOG_WARN("%s\n", census.c_str());
     }
 }
@@ -24012,8 +24016,9 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
 
             // Each move's answer comes back in its own list, in list order. The call answers every triplet it was
             // given; a move it did not answer takes the call's own answer. The admits refused for device room are
-            // counted, with the largest triplet the zone refused (the most it asks in all, with the member refused and
-            // its slot) and the largest free block any refusal saw, for the boundary's one line below.
+            // counted, with the largest triplet the zone refused (the most it asks in all, with the member refused, its
+            // slot and the largest free block when it was refused, all of that one refusal), for the boundary's one
+            // line below.
             size_t                             next_evict          = 0;
             size_t                             next_admit          = 0;
             size_t                             zone_refused        = 0;
@@ -24036,8 +24041,8 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
                         if (zone_refused_member == 0 || o.zone_room_ask.total > zone_refused_ask.total) {
                             zone_refused_member = o.zone_room_bytes;
                             zone_refused_ask    = o.zone_room_ask;
+                            zone_refused_free   = o.zone_largest_free_at_refusal;
                         }
-                        zone_refused_free = std::max(zone_refused_free, o.zone_largest_free_at_refusal);
                     }
                 } else {
                     m.outcome = ggml_sycl_moe_swap_outcome_of(false, code);

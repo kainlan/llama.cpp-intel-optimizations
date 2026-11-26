@@ -1265,19 +1265,26 @@ static void test_the_zone_refusal_line_names_its_figures() {
 // counted.
 static void test_the_zone_free_census_line_names_the_largest_sizes() {
     const std::vector<size_t> free_sizes = { 262144, 917504, 2000000, 917504, 262144, 921344, 917504, 262144, 262144 };
-    const std::string         line       = ggml_sycl::moe_swap_zone_free_census_line(1, free_sizes, 921856, 3);
+    const std::string         line       = ggml_sycl::moe_swap_zone_free_census_line(1, free_sizes, 921856, 921856, 3);
     CHECK(line ==
           "[MOE-SWAP] device 1: WEIGHT zone free blocks at the first refusal: 9 blocks, 6722432 bytes, room for 2 "
           "allocations of the refused member's 921856 bytes; largest: 2000000 x 1, 921344 x 1, 917504 x 3, and 4 "
           "blocks of 1 smaller size");
     std::printf("  zone-census line: %s\n", line.c_str());
 
-    const std::string all = ggml_sycl::moe_swap_zone_free_census_line(0, { 512, 1024, 512 }, 2048, 8);
+    const std::string all = ggml_sycl::moe_swap_zone_free_census_line(0, { 512, 1024, 512 }, 2048, 2048, 8);
     CHECK(all ==
           "[MOE-SWAP] device 0: WEIGHT zone free blocks at the first refusal: 3 blocks, 2048 bytes, room for 0 "
           "allocations of the refused member's 2048 bytes; largest: 1024 x 1, 512 x 2");
 
-    const std::string none = ggml_sycl::moe_swap_zone_free_census_line(0, {}, 2048, 8);
+    // An unslotted member off the zone's grain (921816 bytes) takes a 921856-byte block, so a 921840-byte block holds
+    // none and a block one byte short of two allocations holds one, not the two its own size would divide into.
+    const std::string unaligned = ggml_sycl::moe_swap_zone_free_census_line(0, { 1843711, 921840 }, 921816, 921856, 8);
+    CHECK(unaligned ==
+          "[MOE-SWAP] device 0: WEIGHT zone free blocks at the first refusal: 2 blocks, 2765551 bytes, room for 1 "
+          "allocations of the refused member's 921816 bytes; largest: 1843711 x 1, 921840 x 1");
+
+    const std::string none = ggml_sycl::moe_swap_zone_free_census_line(0, {}, 2048, 2048, 8);
     CHECK(none ==
           "[MOE-SWAP] device 0: WEIGHT zone free blocks at the first refusal: 0 blocks, 0 bytes, room for 0 "
           "allocations of the refused member's 2048 bytes; largest: none");

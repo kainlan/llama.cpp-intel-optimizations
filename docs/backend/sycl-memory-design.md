@@ -399,7 +399,8 @@ is at most 1/128 of those sizes. A triplet whose members differ by quant type
 its members keeps its own staged size everywhere, and the swap can still
 fragment such a zone (a gate split from a freed down-sized block). Every
 planner pass that re-lays out experts re-charges the triplets after it (the
-single-device PP gate/up preparation, the triplet pack, the I8 upgrades and the
+single-device PP gate/up preparation, the triplet pack, the I8 upgrades on a
+single-device plan and on a multi-device plan of any card count, and the
 multi-device layout passes; `placement_entries_recharge_expert_slots_on`): a
 member moved into AOS is charged the slot its triplet now has, a triplet that
 lost its slot charges its AOS members their own staged sizes again, and the

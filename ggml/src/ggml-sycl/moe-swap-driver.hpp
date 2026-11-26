@@ -951,12 +951,16 @@ inline std::string moe_swap_zone_refusal_line(int      device,
 }
 
 // The WEIGHT zone's free blocks, printed once per device at the first refusal for room: how many there are and their
-// bytes, how many allocations of `member` bytes (the refused member's size) they hold, each block whole as an
-// allocation cannot span two, and the `top` largest sizes with their counts, largest first, the rest counted. Free
-// bytes that hold no such allocation are holes, and the sizes say which grain of the zone they come from.
+// bytes, how many allocations of `member` bytes (the refused member's size) they hold, and the `top` largest sizes
+// with their counts, largest first, the rest counted. Each block counts whole, as an allocation cannot span two, and
+// each allocation as `member_block` bytes, the block the zone takes for `member` (its size rounded to the zone's
+// grain, which the caller asks of the allocator), so a member off the grain is not counted into the bytes its
+// rounding takes. Free bytes that hold no such allocation are holes, and the sizes say which grain of the zone they
+// come from.
 inline std::string moe_swap_zone_free_census_line(int                         device,
                                                   const std::vector<size_t> & free_sizes,
                                                   size_t                      member,
+                                                  size_t                      member_block,
                                                   size_t                      top) {
     std::vector<size_t> sizes = free_sizes;
     std::sort(sizes.begin(), sizes.end(), [](size_t a, size_t b) { return a > b; });
@@ -964,7 +968,7 @@ inline std::string moe_swap_zone_free_census_line(int                         de
     size_t fitted = 0;
     for (const size_t s : sizes) {
         bytes += s;
-        fitted += member != 0 ? s / member : 0;
+        fitted += member_block != 0 ? s / member_block : 0;
     }
     char head[256];
     std::snprintf(head, sizeof(head),

@@ -4052,6 +4052,10 @@ DOWN_I8_RECHARGE = SINGLE_RECHARGE + ' "I8 down layout upgrades");'
 GATE_UP_I8_CALL = "maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);"
 GATE_UP_I8_RECHARGE = SINGLE_RECHARGE + ' "I8 gate/up layout upgrades");'
 MULTI_DOWN_I8_RECHARGE = MULTI_RECHARGE + ' "I8 down layout upgrades");'
+MULTI_GATE_UP_I8_RECHARGE = MULTI_RECHARGE + ' "I8 gate/up layout upgrades");'
+ONE_CARD_GATE_UP_CALL = "const size_t gate_up_charged = maybe_upgrade_moe_gate_up_layouts_to_i8("
+ONE_CARD_DOWN_I8 = MULTI_DOWN_I8_RECHARGE + " " + ONE_CARD_GATE_UP_CALL
+ONE_CARD_GATE_UP_I8 = "plan, remaining[d], device_budgets[d].device_id, n_experts); " + MULTI_GATE_UP_I8_RECHARGE
 PLAN_SLOT_SIG = "static inline size_t moe_expert_triplet_slot_bytes(const placement_entry * const (&t)[3])"
 PLAN_SLOT_CALL = "return expert_triplet_slot_bytes(staged);"
 PLAN_ENTRY_STAGED = "return staged_expert_bytes(e.layout, e.type, e.ne[0], e.src_size);"
@@ -4134,8 +4138,10 @@ def claim_every_member_mint_takes_the_triplet_slot(sycl: str, cache: str, plan_h
             and ordered(multi_upgrade, MULTI_LAYOUT_SET, UPGRADE_RECHARGE)
             and c.count(PACK_PREPARE) == 1 and ordered(c, PACK_PREPARE, PACK_HOST_SET, PACK_RECHARGE)
             and ordered(c, PACK_RECHARGE, DOWN_I8_RECHARGE, GATE_UP_I8_CALL, GATE_UP_I8_RECHARGE)
-            and c.count(SINGLE_RECHARGE) == 3 and c.count(MULTI_DOWN_I8_RECHARGE) == 2
-            and len(re.findall(r"\bplanner_recharge_expert_slots\(", c)) == 8
+            and c.count(SINGLE_RECHARGE) == 3 and c.count(MULTI_DOWN_I8_RECHARGE) == 3
+            and c.count(ONE_CARD_DOWN_I8) == 1 and c.count(ONE_CARD_GATE_UP_I8) == 1
+            and c.count(MULTI_GATE_UP_I8_RECHARGE) == 1
+            and len(re.findall(r"\bplanner_recharge_expert_slots\(", c)) == 10
             and body(p, PLAN_SLOT_SIG).count(PLAN_SLOT_CALL) == 1
             and len(re.findall(r"\bexpert_triplet_slot_bytes\(", p)) == 1
             and PLAN_ENTRY_STAGED in p and p.count(CHARGE_SET) == 1 and ordered(p, CHARGE_SIG, CHARGE_SET)
@@ -4319,6 +4325,17 @@ def test_mutant_single_i8_recharge_before_the_gate_up_upgrade_fails():
 def test_mutant_multi_i8_down_skips_the_recharge_fails():
     n = norm(CACHE)
     mutant = n.replace(MULTI_DOWN_I8_RECHARGE, "", 1)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_one_card_multi_plan_i8_down_skips_the_recharge_fails():
+    """A multi-device plan left with one ready card runs the single-card I8 upgrades: each needs its re-charge too."""
+    mutant = _once(CACHE, ONE_CARD_DOWN_I8, ONE_CARD_GATE_UP_CALL)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_one_card_multi_plan_i8_gate_up_skips_the_recharge_fails():
+    mutant = _once(CACHE, ONE_CARD_GATE_UP_I8, "plan, remaining[d], device_budgets[d].device_id, n_experts);")
     assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
 
 

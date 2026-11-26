@@ -34880,7 +34880,9 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
         }
     }
 
-    // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot.
+    // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot. A member moved
+    // out of AOS can leave its triplet with no slot, and the re-charge then gives the slot back: each AOS member of
+    // that triplet goes back to its own staged size.
     planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
                                   "per-target layouts");
 
@@ -34978,8 +34980,9 @@ static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
             soa_entries++;
         }
     }
-    // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot. Only this
-    // device's entries changed, so only its totals move.
+    // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot. A member moved
+    // out of AOS can leave its triplet with no slot, and the re-charge then gives the slot back: each AOS member of
+    // that triplet goes back to its own staged size. Only this device's entries changed, so only its totals move.
     planner_recharge_expert_slots(plan,
                                   planner_recharge_device(device_id, remaining, &plan.per_device_vram[device_index]),
                                   "primary executor layout upgrades");
@@ -41343,8 +41346,14 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                         add_single_moe_pp_executable_alternates(plan, remaining[d], device_budgets[d].device_id,
                                                                 kv_info, envelope, &plan.per_device_vram[d]);
                     }
+                    // An I8 member leaves AOS: its triplet's AOS members give back the slot it lost, before the
+                    // gate/up upgrade reads the room, and again after it.
+                    planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
+                                                  "I8 down layout upgrades");
                     const size_t gate_up_charged = maybe_upgrade_moe_gate_up_layouts_to_i8(
                         plan, remaining[d], device_budgets[d].device_id, n_experts);
+                    planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
+                                                  "I8 gate/up layout upgrades");
                     plan.per_device_vram[d] += down_charged + gate_up_charged;
                 }
             } else {

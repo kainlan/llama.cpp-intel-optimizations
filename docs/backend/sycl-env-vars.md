@@ -633,8 +633,8 @@ counted the moves it had in flight as open slots)
   block at refusal %zu bytes; after the batch zone_available %zu bytes, zone_largest_free %zu bytes`: one line for
   each boundary whose transaction refused at least one admit because the device WEIGHT zone had no room, whether or
   not anything else in the batch moved: the admits refused of the admits sent, what the largest refused triplet asks
-  of the zone in all, the largest free block the zone had when a mint was refused (the largest any refusal saw), and
-  what the zone had free after the batch, read together (`unified_cache::zone_free_figures`). `<need>` is
+  of the zone in all, the largest free block the zone had when that triplet's mint was refused, and what the zone
+  had free after the batch, read together (`unified_cache::zone_free_figures`). `<need>` is
   `3 x %zu = %zu bytes` for a triplet with a slot, whose three members each take it, and `%zu bytes, its members at
   their own sizes (no slot)` for one with none, the members' own staged sizes summed (`expert_triplet_zone_ask_of`,
   each member at `expert_triplet_member_bytes`). `zone_available` at or above that need with the largest block below
@@ -644,10 +644,12 @@ counted the moves it had in flight as open slots)
 - WARN `[MOE-SWAP] device %d: WEIGHT zone free blocks at the first refusal: %zu blocks, %zu bytes, room for %zu
   allocations of the refused member's %zu bytes; largest: <size> x <count>, ...`: once per device, right after the
   first refusal line: the WEIGHT zone's free blocks (`unified_cache::zone_free_block_sizes`), their bytes, how many
-  allocations of the size the largest refused triplet's refused member asked they hold, each block whole, and the
-  six largest sizes with their counts, largest first, then how many smaller blocks of how many sizes remain. For a
-  triplet with a slot that size is the slot, so three allocations hold one triplet; for one with none it is one
-  member's own size. Free bytes that hold no such allocation are holes, and their sizes say where they come from.
+  allocations of the size the largest refused triplet's refused member asked they hold, each block whole and each
+  allocation counted as the block the zone takes for it (that size rounded to the TLSF grain,
+  `tlsf_allocator::round_request`), and the six largest sizes with their counts, largest first, then how many
+  smaller blocks of how many sizes remain. For a triplet with a slot that size is the slot, so three allocations
+  hold one triplet; for one with none it is one member's own size. Free bytes that hold no such allocation are
+  holes, and their sizes say where they come from.
 - WARN `[MOE-SWAP] device %d: no driver ran: %llu boundaries off (multithreaded graphs), %llu skipped (a graph in
   flight, or the instance claimed)`: at backend free, for a device whose boundaries were all turned off or skipped
   before a driver existed (the multithreaded latch set from the first graph, say).
