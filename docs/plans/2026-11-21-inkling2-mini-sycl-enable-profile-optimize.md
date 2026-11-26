@@ -6870,7 +6870,8 @@ tile kernel keeps P in float: the control):
   subnormals there has not been measured. There is no test-only switch to force a flush: the harness links the
   shipped backend, so a switch would need an environment variable or a second build target.
 The new rows' kernel names were predicted, then observed on both cards at `d135812c1`. The S1 review added leaf
-coverage (predicted rows): `d256_pp72`, `d128_pp72_softcap` and `d256_pp72_softcap` on the noonednn arm and
+coverage (rows predicted then, observed on the B70 at `0ad930f0eb`, see the branch acceptance result below):
+`d256_pp72`, `d128_pp72_softcap` and `d256_pp72_softcap` on the noonednn arm and
 `d64_sinks_pp32`, `d64_sinks_pp32_softcap` on the noesimd arm, all with F16 Q and each with a force-tile control,
 plus two `test-backend-ops` eval cases for the F32-Q softcap leaves at D=256 and D=64 (the D=64 one with ALiBi, which
 keeps the D=64 batched paths off it). `tests/test-backend-ops.cpp` gains two perf cases (hs
@@ -6916,7 +6917,8 @@ keeps its in-loop load: S2 moved it as well, and the S2 review fix put its code 
 compares `d128_pp72` (`_v8`) with `d128_pp72_kv_unaligned` (scalar copy, same inputs) bit for bit. The first device
 run of `d128_pp72_kv_unaligned` aborted in the harness, before any kernel: it allocated the K/V views as tensors of
 their own. The fix allocates their parents and checks that the views start off a 16-byte bound. The acceptance run
-must confirm with `GGML_SYCL_FA_DISPATCH_DEBUG=1` that the Inkling prompt ran `_f32sv_v8`.
+must confirm with `GGML_SYCL_FA_DISPATCH_DEBUG=1` that the Inkling prompt ran `_f32sv_v8`; it has not yet (see the
+branch acceptance result below).
 
 **S3 (2026-11-26).** The ne01 > 16 arm under a float accumulator launches the f32_sv leaf at ncols=32: four TM=8
 sub-groups per work-group share each K/V batch in SLM, and the S region is half-sized (`fattn_v2_slm<..., s_half>`),
@@ -6938,6 +6940,26 @@ it guards only the sub-group's own tile_S rows: between the K/V copy barrier and
 writes and reads only its own eight tile_S rows and only reads tile_Q, tile_K and tile_V. The copy barrier and the
 end-of-batch barrier (the next copy overwrites tile_K and tile_V) stay work-group barriers on every leaf, and the
 other leaves keep their in-loop work-group barrier. No name change and no new hang path, so no dispatch suffix.
+
+**Branch acceptance result (lead, `0ad930f0eb`, 2026-11-26; each run once, no kernel fault).** Correctness: the
+masked-nonfinite noonednn, noesimd and force-tile arms passed on both cards (the B50's per-case log was not kept, so
+there the evidence is the arms' expected-kernel check passing), and `test-backend-ops -o FLASH_ATTN_EXT` passed
+1352/1352 on both. On the B70 the `_v8` against scalar-copy comparison found 0 of 294,912 values different in all
+seven input sets (clean, k_poison, v_poison, k_partial, v_partial, v_underflow, neginf_qk; not compared under
+force-tile), and the kernels were observed by name: on the noonednn arm `xmx_v2_f16_ncols32_large_f32sv_v8` for
+`d128_pp72`, its row1_masked, softcap, sinks_window and tail_mass cases and both `d256_pp72` cases, `_f32sv` for
+`d128_pp72_kv_unaligned`, `xmx_v2_f16_ncols16` for `d256_pp16` and `xmx_v2_f16_pp_ncols32` for both `d64_sinks_pp72`
+cases; on the noesimd arm `_f32sv_v8` for both `d64_sinks_pp32` cases and `xmx_v2_f16_ncols8` for `d64_sinks_mq4`;
+`force_tile_f16` for every force-tile case. In the `kv=4864` perf cases on the B70, all 32 dispatch lines printed
+(the print's default cap) name `_f32sv_v8`. Speed: on the 4,737-token Inkling prompt on the B70, `fattn.compute.xmx_v2`
+took 2,131 ms per pass (480 calls, mean 4.44 ms), against 7,704 ms at the base (7,695 ms in the S1 comparison) and
+5,515 ms at S1, so the 3,100 ms bar is met (3.6x); prompt eval ran at 181.7 t/s under the profiler. Gap: that run
+does not show which leaf the Inkling prompt took. The prompt launcher labels every leaf it runs
+`fattn.compute.xmx_v2` (`_f32sv_v8` and `_f32sv` alike), and `GGML_SYCL_FA_DISPATCH_DEBUG=1` prints only the first
+32 dispatches (`GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT`, default 32), all of them warm-up decode (ne1 = 1, `esimd_f16`).
+No code change closes it: one rerun with `GGML_SYCL_FA_DISPATCH_DEBUG=1 GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT=1000000`
+(the limit the masked-nonfinite harness sets for itself) prints every dispatch. Still owed at merge: that rerun, the
+Mistral B70 and GPT-OSS B50 gates (running when this was written), and the interleaved pp pair.
 
 ---
 

@@ -739,11 +739,13 @@ struct expect_kernel {
 };
 
 // The kernel each arm must reach per case. A case missing from an arm (after
-// inheritance) is not run under that arm. Where each row comes from: a row
-// under a "Predicted" comment was read from the dispatcher and has not run on a
-// card yet. The other noonednn and force-tile rows were observed on the B50 and
-// B70 at d135812c1; the other arms' rows were observed on the B50 and B70 when
-// they were written.
+// inheritance) is not run under that arm. Where each row comes from: every
+// noonednn, noesimd and force-tile row was observed by name on the B70 at
+// 0ad930f0eb (Task 23 S2, S3 and S2b), and those three arms passed on the B50
+// at the same commit; a pass checks every row's kernel, but the B50's per-case
+// log was not kept. Before that, the noonednn and force-tile rows of the cases
+// that existed at d135812c1 were observed on the B50 and B70 there. The other
+// arms' rows were observed on the B50 and B70 when they were written.
 static const expect_kernel expected_kernels[] = {
     { "default",                   "d128_decode",                 "esimd_f16"                            },
     { "default",                   "d128_pp72",                   "onednn"                               },
@@ -763,17 +765,19 @@ static const expect_kernel expected_kernels[] = {
     { "default",                   "d64_sinks_pp72_row1_masked",  "xmx_v2_f16_pp_ncols32"                },
 
     // ne01 > 16 under PREC_F32: the F32-accumulator leaf with S*V on the matrix
-    // engine (Task 23). Predicted: these four ran as _f32sv at d135812c1; their
-    // K/V rows are 16-byte aligned, so from S2 on the leaf copies them to SLM
-    // in 16-byte vectors (_v8), and from S3 on a work-group takes 32 query rows
-    // (ncols32), as every row of this leaf below does.
+    // engine (Task 23). These four ran as _f32sv at d135812c1. Their K/V rows
+    // are 16-byte aligned, so from S2 on the leaf copies them to SLM in 16-byte
+    // vectors (_v8), and from S3 on a work-group takes 32 query rows (ncols32),
+    // as every row of this leaf below does. Observed: B70, 0ad930f0eb.
     { "noonednn",                  "d128_pp72",                   "xmx_v2_f16_ncols32_large_f32sv_v8"    },
     { "noonednn",                  "d128_pp72_row1_masked",       "xmx_v2_f16_ncols32_large_f32sv_v8"    },
     { "noonednn",                  "d128_sinks_window",           "xmx_v2_f16_ncols32_large_f32sv_v8"    },
     { "noonednn",                  "d128_tail_mass",              "xmx_v2_f16_ncols32_large_f32sv_v8"    },
-    // Predicted: rows that start 8 bytes off a 16-byte bound take the scalar copy.
+    // Rows that start 8 bytes off a 16-byte bound take the scalar copy, and its
+    // output is d128_pp72's bit for bit. Observed: B70, 0ad930f0eb.
     { "noonednn",                  "d128_pp72_kv_unaligned",      "xmx_v2_f16_ncols32_large_f32sv"       },
-    // Predicted: the same leaf at D=256 and with a logit softcap (F16 Q).
+    // The same leaf at D=256 and with a logit softcap (F16 Q). Observed: B70,
+    // 0ad930f0eb.
     { "noonednn",                  "d256_pp72",                   "xmx_v2_f16_ncols32_large_f32sv_v8"    },
     { "noonednn",                  "d128_pp72_softcap",           "xmx_v2_f16_ncols32_large_f32sv_v8"    },
     { "noonednn",                  "d256_pp72_softcap",           "xmx_v2_f16_ncols32_large_f32sv_v8"    },
@@ -799,8 +803,9 @@ static const expect_kernel expected_kernels[] = {
     { "noesimd",                   "d64_sinks_pp72",              "xmx_v2_f16_pp_ncols32"                },
     { "noesimd",                   "d64_sinks_pp72_row1_masked",  "xmx_v2_f16_pp_ncols32"                },
     { "noesimd",                   "d512_mq4",                    "tile_d512"                            },
-    // Predicted: D=64 below the 64-row XMX-v2 PP batch, with ESIMD off and the
-    // sinks keeping oneDNN out, reaches the F32-accumulator leaf of Task 23.
+    // D=64 below the 64-row XMX-v2 PP batch, with ESIMD off and the sinks
+    // keeping oneDNN out, reaches the F32-accumulator leaf of Task 23.
+    // Observed: B70, 0ad930f0eb.
     { "noesimd",                   "d64_sinks_pp32",              "xmx_v2_f16_ncols32_large_f32sv_v8"    },
     { "noesimd",                   "d64_sinks_pp32_softcap",      "xmx_v2_f16_ncols32_large_f32sv_v8"    },
 
@@ -829,7 +834,8 @@ static const expect_kernel expected_kernels[] = {
     { "force-tile",                "d64_sinks_pp72_row1_masked",  "force_tile_f16"                       },
     { "force-tile",                "d128_sinks_window",           "force_tile_f16"                       },
     { "force-tile",                "d128_tail_mass",              "force_tile_f16"                       },
-    // Predicted: the controls of the cases added after d135812c1.
+    // The controls of the cases added after d135812c1. Observed: B70,
+    // 0ad930f0eb.
     { "force-tile",                "d128_pp72_kv_unaligned",      "force_tile_f16"                       },
     { "force-tile",                "d256_pp72",                   "force_tile_f16"                       },
     { "force-tile",                "d128_pp72_softcap",           "force_tile_f16"                       },
