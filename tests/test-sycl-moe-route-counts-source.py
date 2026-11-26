@@ -67,7 +67,7 @@ RESOLVE = "auto resolve = ["
 BUILD_FN = "static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_build("
 INIT_FN = "static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {"
 PROMPT_HELPER = "static void ggml_sycl_moe_route_counts_add_prompt("
-SWAP_FN = "static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {"
+SWAP_FN = "static void ggml_sycl_run_expert_swap_claimed("
 REPORT_FN = "void moe_route_counts_report_final(int device, int64_t tokens) {"
 INSTALL_FN = "std::shared_ptr<moe_route_counts> moe_route_counts_install("
 COUNT_GUARD = "if (record->route_counts && record->route_block >= 0) {"
@@ -213,9 +213,31 @@ def squash(text: str) -> str:
     return re.sub(r" \)", ")", t)
 
 
+def without_private_testing(text: str) -> str:
+    """`text` with each `#if defined(GGML_SYCL_PRIVATE_TESTING)` region blanked, newlines kept, so the pins read what
+    production runs: the private device tests count into a table and take it from the registry on purpose."""
+    out: list[str] = []
+    depth = 0  # nesting of conditionals inside the private region; 0 outside it
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if depth == 0:
+            if re.match(r"#\s*if\s+defined\(GGML_SYCL_PRIVATE_TESTING\)\s*$", stripped):
+                depth = 1
+                out.append("")
+            else:
+                out.append(line)
+            continue
+        if re.match(r"#\s*if", stripped):
+            depth += 1
+        elif re.match(r"#\s*endif", stripped):
+            depth -= 1
+        out.append("")
+    return "\n".join(out)
+
+
 class Sources:
     def __init__(self, backend: str, prefetch: str, header: str, docs: str):
-        self.backend = Source(backend)
+        self.backend = Source(without_private_testing(backend))
         self.prefetch = Source(prefetch)
         self.header = Source(header)
         self.docs = docs

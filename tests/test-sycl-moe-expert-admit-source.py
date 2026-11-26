@@ -48,7 +48,7 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
       pinned" otherwise), while a refill's owner need only hold the entry, as the loan that lent it requires;
   A9  a named move WARNs no refusal (its refusals skip the loan's WARN; its caller reads each answer from the
       outcomes), and outside the private test fixtures the entry has exactly one caller, the decode-boundary swap driver
-      (ggml_sycl_run_expert_swap_at_boundary), which calls it once;
+      (ggml_sycl_run_expert_swap_claimed, which the boundary and the private tests' hook call), which calls it once;
   A10 the named selection takes the published plan's verdict (moe_expert_move_validate) and moves only the triplets it
       lets through;
   A11 every refusal either cache body assigns, the copy to the device and the loan's copy to the host, is classed
@@ -338,8 +338,8 @@ NAMED_FORMAT = ('"[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u 
                 '(%s); copy submit %llu us, id remap %llu us, meta lookup %llu us, total %llu us\\n"')
 NAMED_LINE = "GGML_LOG_WARN(" + NAMED_FORMAT
 ENTRY_NAME = "ggml_sycl_expert_move_transaction_run("
-# The entry's one production caller: the swap driver at the synchronize boundary.
-DRIVER_SIG = "static void ggml_sycl_run_expert_swap_at_boundary("
+# The entry's one production caller: the swap driver's claimed body, which the synchronize boundary runs.
+DRIVER_SIG = "static void ggml_sycl_run_expert_swap_claimed("
 
 VALIDATE = ("const ggml_sycl::moe_expert_move_check check = ggml_sycl::moe_expert_move_validate(plan, device, evict, "
             "admit);")
@@ -869,7 +869,7 @@ def self_test(raw: dict[str, str]) -> int:
                                              "static void ggml_sycl_admit_everything(int d) {\n"
                                              "    (void) ggml_sycl_expert_move_transaction_run(d, {}, nullptr, nullptr);"
                                              "\n}\n\n" + ENTRY_SIG)])
-    driver_call = "ggml_sycl_expert_move_transaction_run(device, request, nullptr, &result)"
+    driver_call = "ggml_sycl_expert_move_transaction_run(device, request, resolver, &result)"
     expect_fail("driver-calls-twice", "A9", [("sycl", DRIVER_SIG, driver_call + ";",
                                               driver_call + ";\n        (void) " + driver_call + ";")])
     expect_fail("driver-drops-its-call", "A9", [("sycl", DRIVER_SIG, driver_call, "ggml_sycl_txn_result::BUSY")])
