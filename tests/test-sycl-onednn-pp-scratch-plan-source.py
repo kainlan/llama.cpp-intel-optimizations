@@ -66,12 +66,16 @@ sycl = root / "ggml/src/ggml-sycl"
 
 # The exits of unified_cache::ensure_planned_arena_zones that keep the ONEDNN zone as it was built, so it stays
 # described by the larger plan it was built from (onednn_zone_plan_keep_and_store): an arena whose zones hold the plan,
-# or one a RUNTIME give-back has no surplus to take from; a RUNTIME give-back that the arena's holders refuse, kept as
-# built; a blocked rebuild whose other zones hold while it keeps a short SCRATCH zone; and a give-back rebuild, which
-# rebuilds the ONEDNN zone as it was. Only the rebuilt-zone exit stores the live plan alone.
+# a RUNTIME give-back that the arena's holders refuse, kept as built; a blocked rebuild whose other zones hold while it
+# keeps a short SCRATCH zone; and a give-back rebuild, which rebuilds the ONEDNN zone as it was. Only the rebuilt-zone
+# exit stores the live plan alone. A RUNTIME give-back with no surplus to take keeps the arena as built at the first
+# exit too, but stores the plan only where the zones hold it: where the plan needs a zone larger than built, it changes
+# nothing and stores nothing, so the stored plan stays the one the zone was built or kept with, not a live plan that
+# describes room the zone does not hold.
 _KEEP = r"keep_arena_as_built\(\);\s*onednn_zone_plan_keep_and_store\(live_plan\);\s*"
 KEPT_ZONE_EXITS = {
-    "sufficient": r"if \(!surplus_asked && \(zones_sufficient\b[^{]*\{\s*" + _KEEP + r"return true;",
+    "sufficient": r"if \(!surplus_asked && \(zones_sufficient\b[^{]*\{\s*keep_arena_as_built\(\);\s*"
+                  r"if \(zones_sufficient\) \{\s*onednn_zone_plan_keep_and_store\(live_plan\);\s*\}\s*return true;",
     "give-back held": r"options\.give_back->held = true;\s*" + _KEEP + r"return true;",
     "short scratch kept": r"if \(others_hold\) \{\s*" + _KEEP,
     "give-back rebuilt": r"if \(giving_back\) \{\s*" + _KEEP + r"options\.give_back->rebuilt = true;\s*return true;",
@@ -915,6 +919,8 @@ if args.self_test and not failed:
         ("kept-zone exit describes the zone by the live plan", KEPT_ZONE_EXITS_CHECK,
          (backend, mutate_in_func(cache, ensure_sig, "onednn_zone_plan_keep_and_store(live_plan)",
                                   "onednn_zone_plan_store(live_plan)"), cache_hpp)),
+        ("short give-back keep stores the live plan", KEPT_ZONE_EXITS_CHECK,
+         (backend, mutate_in_func(cache, ensure_sig, "if (zones_sufficient) {", "if (true) {"), cache_hpp)),
         ("held give-back describes the zone by the live plan", KEPT_ZONE_EXITS_CHECK,
          (backend, mutate_in_func(cache, ensure_sig,
                                   "options.give_back->held = true;\n            keep_arena_as_built();\n"

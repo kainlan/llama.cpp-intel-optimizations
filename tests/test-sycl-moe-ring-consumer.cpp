@@ -12,14 +12,17 @@
 // an answer whose WEIGHT zone grows, so a case that says it drops the ring is decided by its plan. An expert the plan
 // does not place on a device is on the host, by the plan's own convention (placement_plan::expert_on_device), whether
 // it has a host entry, a name-keyed fallback entry on the host or no entry. A section then names every outcome of the
-// decision (moe_pp_ring_decide), the arena's on a model of the arena's zones; the next pins the RUNTIME figures the load
-// stage and the plan dry run ask first, through the one cap both read; the last pins the per-device marks a load's later
-// passes read. Each case names the answer it pins and the placement or zones that decide it.
+// decision (moe_pp_ring_decide), the arena's on a model of the arena's zones in one chunk and in several; the next pins
+// when the plan made with a ring kept after a give-back rebuild is made once more (moe_pp_ring_kept_plan_again); the
+// next the RUNTIME figures the load stage and the plan dry run ask first, through the one cap both read; the last the
+// per-device marks a load's later passes read. Each case names the answer it pins and the placement or zones that
+// decide it.
 //
 // Host-only: synthetic plans, no queue, no device, no model.
 
 #include "ggml-sycl.h"
 #include "ggml-sycl/moe-ring-consumer.hpp"
+#include "ggml-sycl/zone-sizing.hpp"
 
 #include <cinttypes>
 #include <cstdint>
@@ -50,9 +53,13 @@ constexpr size_t kMiB     = 1024 * 1024;
 constexpr size_t kInklingB50RuntimeWithRing    = 559 * kMiB;
 constexpr size_t kInklingB50RuntimeWithoutRing = 512 * kMiB;
 constexpr size_t kRuntimeFloor                 = 512 * kMiB;
-// A premise, not read by this tree: the 69c4ea428 runs' lines printed a RUNTIME zone of 726.4 MB with the ring and
-// without it for Qwen3.6 NVFP4 on the B50, sized by another consumer.
-constexpr size_t kQwenB50RuntimePremise        = 726 * kMiB;
+// The RUNTIME zone of the Qwen3.6-35B NVFP4 B50 runs, rounded to the MiB. The load's early pass read 726.4 MB with the
+// ring and without it (the line the 69c4ea428 runs printed), so it kept the ring for want of room; its late pass dropped
+// the ring and rebuilt the zone at 726.4 MB, 421.0 MB less than the 1147.4 MB it held with the ring (the lead's runs at
+// f011d5d1f2, docs/backend/data/inkling2/t21-lead-rulings.md).
+constexpr size_t kQwenB50RuntimeEarly          = 726 * kMiB;
+constexpr size_t kQwenB50RuntimeLateWithRing   = 1147 * kMiB;
+constexpr size_t kQwenB50RuntimeWithoutRing    = 726 * kMiB;
 
 // An arena of one chunk, as the reserve lays it out: the ONEDNN, RUNTIME and SCRATCH zones at the chunk's tail and the
 // WEIGHT zone, which the KV cache shares, the rest. The chunk and the ONEDNN and SCRATCH zones are premises, not read
@@ -66,29 +73,42 @@ struct single_chunk_arena {
     size_t weight() const { return chunk - (onednn + runtime + scratch); }
 };
 
-// An arena of several chunks: the tail chunk holds the ONEDNN, RUNTIME and SCRATCH zones and a KV share, no larger than
-// the per-chunk cap, and the WEIGHT zone is the rest of the allocation. With the tail chunk at its cap, a smaller zone at
-// its tail grows the KV share at its head, not the WEIGHT zone. Every figure is a premise.
+// An arena of several chunks, laid out by the reserve's own rule (zone_arena_tail_chunk_bytes): a tail chunk that holds
+// the ONEDNN, RUNTIME and SCRATCH zones and a KV share of 128 to 512 MiB (zone_arena_tail_kv_reserve), no larger than
+// the per-chunk cap, and the WEIGHT zone the rest of the allocation. The B70's arena is always one: the lead's runs
+// reserve 30552 MB against a 29472 MB safe per-allocation cap. A B50 arena reserved right after a destroy has fallen
+// back to one, two chunks of the same 14292 MB whose WEIGHT zone is the 128 MiB KV share smaller than one chunk's would
+// be (11476.6 against 11604.6 MB, docs/backend/data/inkling2/t8b-lead-runs-0f4060d0f.txt). The tail rule is the
+// reserve's; the allocation, the cap and the ONEDNN and SCRATCH zones are premises (the B50 defaults: one chunk's
+// premises and the 15179 MB cap that run printed).
 struct n_chunk_arena {
-    size_t alloc           = 30720 * kMiB;
-    size_t per_chunk_cap   = 4096 * kMiB;
-    size_t tail_kv_reserve = 4096 * kMiB;
-    size_t onednn          = 64 * kMiB;
-    size_t runtime         = kInklingB50RuntimeWithRing;
-    size_t scratch         = 256 * kMiB;
+    size_t alloc         = 14336 * kMiB;
+    size_t per_chunk_cap = 15179 * kMiB;
+    size_t onednn        = 64 * kMiB;
+    size_t runtime       = kInklingB50RuntimeWithRing;
+    size_t scratch       = 256 * kMiB;
 
     size_t tail_chunk() const {
-        const size_t wanted = onednn + runtime + scratch + tail_kv_reserve;
-        const size_t capped = wanted < per_chunk_cap ? wanted : per_chunk_cap;
-        return capped < alloc ? capped : alloc;
+        return ggml_sycl::zone_arena_tail_chunk_bytes(alloc, per_chunk_cap, onednn + runtime + scratch,
+                                                      ggml_sycl::zone_arena_tail_kv_reserve(alloc));
     }
 
     size_t weight() const { return alloc - tail_chunk(); }
 };
 
+// The B70's arena: several chunks always, the allocation over the safe per-allocation cap.
+n_chunk_arena b70_arena() {
+    n_chunk_arena arena;
+    arena.alloc         = 30552 * kMiB;
+    arena.per_chunk_cap = 29472 * kMiB;
+    return arena;
+}
+
 // What the load stage reads from an arena asked for its RUNTIME surplus without the ring: the WEIGHT zone before and
-// after, and whether something pointed into the arena, so it was kept as built.
-template <typename Arena> moe_pp_ring_zone_answer arena_answer(const Arena & with_ring, const Arena & without_ring) {
+// after, and whether something pointed into the arena, so it was kept as built. The two may differ in layout: a rebuild
+// can land in several chunks where the arena was one.
+template <typename With, typename Without>
+moe_pp_ring_zone_answer arena_answer(const With & with_ring, const Without & without_ring) {
     moe_pp_ring_zone_answer zone;
     zone.weight_with_ring    = with_ring.weight();
     zone.weight_without_ring = without_ring.weight();
@@ -258,6 +278,24 @@ expert_spot on_host(ggml_layout_mode layout = GGML_LAYOUT_AOS) {
 
 void expect_bytes(const char * what, size_t got, size_t want) {
     std::printf("%s: %zu (want %zu)\n", what, got, want);
+    if (got != want) {
+        std::printf("FAIL: %s\n", what);
+        ++failures;
+    }
+}
+
+void expect_true(const char * what, bool got) {
+    std::printf("%s: %d\n", what, got ? 1 : 0);
+    if (!got) {
+        std::printf("FAIL: %s\n", what);
+        ++failures;
+    }
+}
+
+void expect_plan_again(const char * what, size_t packed_against, size_t weight_after, bool want) {
+    const bool got = ggml_sycl::moe_pp_ring_kept_plan_again(packed_against, weight_after);
+    std::printf("%s: %zu MiB packed against, %zu MiB after: %s (want %s)\n", what, packed_against / kMiB,
+                weight_after / kMiB, got ? "plan again" : "stands", want ? "plan again" : "stands");
     if (got != want) {
         std::printf("FAIL: %s\n", what);
         ++failures;
@@ -476,15 +514,31 @@ int main() {
         one_grain.runtime -= 256;
         expect_decision("nvfp4 host-tiered, a RUNTIME zone one arena grain smaller and nothing else: dropped", tiered,
                         arena_answer(with_ring, one_grain), D::DROP);
-        n_chunk_arena n_chunk_with_ring;
-        n_chunk_arena n_chunk_without_ring = n_chunk_with_ring;
-        n_chunk_without_ring.runtime       = kInklingB50RuntimeWithoutRing;
-        expect_bytes("the n-chunk premise's tail chunk is at its cap with the ring", n_chunk_with_ring.tail_chunk(),
-                     n_chunk_with_ring.per_chunk_cap);
+
+        // Several chunks. The tail chunk is the zones beside WEIGHT and the KV share, far below either card's cap, so a
+        // smaller RUNTIME zone shrinks it and the WEIGHT zone takes the room, as in one chunk.
+        expect_bytes("the B50 fallback's KV share, as its run printed",
+                     ggml_sycl::zone_arena_tail_kv_reserve(14336 * kMiB), 128 * kMiB);
+        expect_bytes("the B70's KV share, the allocation over 128 (its run printed 238.7 MB)",
+                     ggml_sycl::zone_arena_tail_kv_reserve(30552 * kMiB), 30552 * kMiB / 128);
+        const n_chunk_arena b70_with_ring = b70_arena();
+        expect_true("the B70's tail chunk is below its cap", b70_with_ring.tail_chunk() < b70_with_ring.per_chunk_cap);
+        n_chunk_arena b70_without_ring = b70_with_ring;
+        b70_without_ring.runtime       = kInklingB50RuntimeWithoutRing;
         expect_decision(
-            "nvfp4 host-tiered, RUNTIME 559 -> 512 MiB in an n-chunk arena whose tail chunk is at its cap: the KV "
-            "share takes the room, the WEIGHT zone does not grow, so kept",
-            tiered, arena_answer(n_chunk_with_ring, n_chunk_without_ring), D::KEEP_NO_ROOM_RETURNS);
+            "nvfp4 host-tiered, RUNTIME 559 -> 512 MiB in the B70's arena of several chunks: its tail chunk shrinks, "
+            "and the WEIGHT zone takes the 47 MiB, so dropped",
+            tiered, arena_answer(b70_with_ring, b70_without_ring), D::DROP);
+        n_chunk_arena fallback_without_ring;
+        fallback_without_ring.runtime = kInklingB50RuntimeWithoutRing;
+        expect_true("the B50 fallback's tail chunk is below its cap",
+                    fallback_without_ring.tail_chunk() < fallback_without_ring.per_chunk_cap);
+        expect_bytes("the B50 give-back rebuilt in two chunks: WEIGHT 47 MiB larger and 128 MiB smaller",
+                     with_ring.weight() - fallback_without_ring.weight(), 81 * kMiB);
+        expect_decision(
+            "nvfp4 host-tiered, RUNTIME 559 -> 512 MiB on the B50 whose give-back rebuild falls back from one chunk to "
+            "two: the KV share costs more than the RUNTIME zone returns, the WEIGHT zone shrinks, so kept",
+            tiered, arena_answer(with_ring, fallback_without_ring), D::KEEP_NO_ROOM_RETURNS);
         single_chunk_arena smaller = runtime_only;
         smaller.scratch += 2 * (kInklingB50RuntimeWithRing - kInklingB50RuntimeWithoutRing);
         expect_decision("nvfp4 host-tiered, a WEIGHT zone smaller without the ring: kept", tiered,
@@ -493,8 +547,10 @@ int main() {
         held_with_room.held                    = true;
         expect_decision("nvfp4 host-tiered, held although the figures read room: held, asked first", tiered,
                         held_with_room, D::KEEP_HELD);
-        expect_decision("nvfp4 host-tiered on a device with no arena: no zone, so no room returns", tiered,
-                        moe_pp_ring_zone_answer{}, D::KEEP_NO_ROOM_RETURNS);
+        expect_decision(
+            "nvfp4 host-tiered where the planner reads no WEIGHT zone (no active arena, or a multi-device plan in "
+            "GLOBAL cache mode, which packs every device to its budget): both figures 0, so no room returns",
+            tiered, moe_pp_ring_zone_answer{}, D::KEEP_NO_ROOM_RETURNS);
 
         expect_decision("nvfp4 all on device 0: no expert on the host, whatever the arena",
                         check_of(make_plan(w, [](size_t, int) { return on_device(0); }), r), inkling_b50_give_back(),
@@ -528,8 +584,8 @@ int main() {
         expect_decision("a device with no ring published: no ring weight", moe_pp_ring_resident_check{},
                         inkling_b50_give_back(), D::KEEP_NO_RING_WEIGHT);
 
-        // The plan dry run's answer (moe_pp_ring_dry_run_answer): the RUNTIME room alone, as a give-back on one chunk
-        // nothing points into.
+        // The plan dry run's answer (moe_pp_ring_dry_run_answer): the RUNTIME room alone, as a give-back nothing points
+        // into on an arena whose layout it keeps.
         expect_decision(
             "dry run, nvfp4 host-tiered with 47 MiB of RUNTIME room: dropped", tiered,
             ggml_sycl::moe_pp_ring_dry_run_answer(kInklingB50RuntimeWithRing - kInklingB50RuntimeWithoutRing), D::DROP);
@@ -540,6 +596,25 @@ int main() {
             std::printf("FAIL: the dry run's answer must be unheld, counted from 0, the room its WEIGHT growth\n");
             ++failures;
         }
+    }
+
+    // The plan made with a ring kept after a give-back rebuild (moe_pp_ring_kept_plan_again). The give-back rebuilt the
+    // arena without the ring and the WEIGHT zone did not grow, so the ring is put back and the zones are asked for again
+    // with it: an ordinary rebuild, whose layout is the reserve's to choose. Where it lands in two chunks on the B50, the
+    // WEIGHT zone is the KV share smaller than the one chunk that plan packed against, and that plan, standing, would
+    // place more than the zone holds: it is made once more. The same room or more, and the plan stands.
+    {
+        const single_chunk_arena packed;
+        const n_chunk_arena      re_ensured;
+        expect_bytes("the second ensure in two chunks: the 128 MiB KV share less",
+                     packed.weight() - re_ensured.weight(), 128 * kMiB);
+        expect_plan_again("the second ensure lands in two chunks: less room than the plan packed against",
+                          packed.weight(), re_ensured.weight(), true);
+        expect_plan_again("the second ensure lands in one chunk again: the same room", packed.weight(), packed.weight(),
+                          false);
+        expect_plan_again("more room than the plan packed against", packed.weight(), packed.weight() + kMiB, false);
+        expect_plan_again("one byte less", packed.weight(), packed.weight() - 1, true);
+        expect_plan_again("no WEIGHT zone read either time", 0, 0, false);
     }
 
     // The RUNTIME figures the load stage and the plan dry run ask before the arena, through the one cap both read
@@ -565,8 +640,10 @@ int main() {
         expect_bytes("no less without the ring: no room", moe_pp_ring_runtime_room(floor, floor), 0);
         expect_bytes("more without the ring: no room", moe_pp_ring_runtime_room(floor, with), 0);
         expect_bytes("unanswerable without the ring: no room", moe_pp_ring_runtime_room(with, SIZE_MAX), 0);
-        expect_bytes("qwen3.6 b50, the premise of another consumer's zone: no room",
-                     moe_pp_ring_runtime_room(kQwenB50RuntimePremise, kQwenB50RuntimePremise), 0);
+        expect_bytes("qwen3.6 b50, the early pass: the zone another consumer sizes, as large without the ring: no room",
+                     moe_pp_ring_runtime_room(kQwenB50RuntimeEarly, kQwenB50RuntimeWithoutRing), 0);
+        expect_bytes("qwen3.6 b50, the late pass: 421 MiB of room, the drop's",
+                     moe_pp_ring_runtime_room(kQwenB50RuntimeLateWithRing, kQwenB50RuntimeWithoutRing), 421 * kMiB);
 
         // The dry run that read an unanswerable zone with the ring uncapped printed a room of ~1.8e13 MB and dropped:
         // with no arena, the zone with the ring is the floor, the floor without it gives no room, and the ring is kept.
@@ -610,8 +687,15 @@ int main() {
 
     // The per-device marks a load's later passes read (moe_pp_ring_drop_marks). A load's pass marks a device with its
     // transaction; a direct planner entry (transaction 0) marks nothing and never erases a load's mark. One load is open
-    // at a time (the lifecycle registry refuses a second begin), so a later load's mark replaces a finished one's.
+    // at a time (the lifecycle registry refuses a second begin), so a later load's mark replaces a finished one's. Only a
+    // drop marks: a pass that keeps the ring leaves no mark, so a later pass of the same load decides afresh, and its drop
+    // holds from then on (Qwen3.6 NVFP4 on the B50 keeps the ring in the early pass and drops it in the late one).
     {
+        moe_pp_ring_drop_marks keep_then_drop;
+        expect_mark("load 9's early pass kept the ring: no mark", keep_then_drop.dropped(0, 9), false);
+        keep_then_drop.mark(0, 9);
+        expect_mark("load 9's late pass dropped it: its later passes see the drop", keep_then_drop.dropped(0, 9), true);
+
         moe_pp_ring_drop_marks marks;
         expect_mark("no mark before a drop", marks.dropped(0, 7), false);
         marks.mark(0, 7);
