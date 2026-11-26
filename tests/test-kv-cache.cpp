@@ -2,6 +2,7 @@
 #include "llama-kv-cache.h"
 #include "llama-model.h"
 
+#include <cstdio>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -224,11 +225,16 @@ int main() {
                 named += std::string(bad_k ? " and " : "") + "iq2_xxs for V";
                 hints += std::string(bad_k ? " and " : "") + hint_v;
             }
-            GGML_ASSERT(what.find("KV cache type " + named + " cannot be written on CPU (buffer CPU)") == 0);
-            GGML_ASSERT(what.find("; use " + hints) != std::string::npos);
-            GGML_ASSERT(bad_k == (what.find("for K") != std::string::npos));
-            GGML_ASSERT(bad_v == (what.find("for V") != std::string::npos));
+            const std::string expected = "KV cache type " + named +
+                                         " cannot be written on CPU (buffer CPU): no backend runs SET_ROWS into " +
+                                         (bad_k && bad_v ? "those types" : "that type") + " there; use " + hints;
+            if (what != expected) {
+                fprintf(stderr, "refusal mismatch:\n  got:      %s\n  expected: %s\n", what.c_str(), expected.c_str());
+                GGML_ABORT("KV cache type refusal text");
+            }
         }
+        // The branch that drops the "; use ..." hint when F16 itself is not writable is not reachable here, since
+        // the CPU always writes F16; it is untested.
     }
 
     llama_backend_free();
