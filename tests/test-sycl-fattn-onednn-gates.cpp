@@ -1150,6 +1150,31 @@ static bool test_planner_rejects_per_head_mask() {
     return true;
 }
 
+// llama.cpp-44d0, second half: a per-head mask the planner declines at D=512
+// lands on the tile_d512 route. flash_attn_tile reads ONE mask plane per
+// block (head0 % ne32), so the launcher may group the Q heads of a K/V head
+// into a block (ncols2 > 1) only when the mask has no head axis. This pins
+// the launcher's grouping predicate on the host; the numerics are the
+// test-backend-ops D=512 per-head cases.
+static bool test_tile_d512_groups_heads_only_for_head_broadcast_mask() {
+    fattn_params params = masked_mha_like_params(/*mask_heads=*/1);
+    params.ne00         = 512;
+    params.ne10         = 512;
+    TEST_ASSERT(params.ne11 % 256 == 0, "fixture must keep n_kv a multiple of FATTN_KQ_STRIDE");
+    TEST_ASSERT(ggml_sycl_fattn_tile_d512_use_gqa_opt(params),
+                "tile_d512 should still group GQA heads for a head-broadcast mask (ne32 == 1)");
+
+    for (int32_t mask_heads : { 2, 8 }) {
+        params      = masked_mha_like_params(mask_heads);
+        params.ne00 = 512;
+        params.ne10 = 512;
+        TEST_ASSERT(!ggml_sycl_fattn_tile_d512_use_gqa_opt(params),
+                    "tile_d512 must not group GQA heads for a per-head mask (ne32 > 1): the grouped heads would "
+                    "share one mask plane (llama.cpp-44d0)");
+    }
+    return true;
+}
+
 // Only two descriptor fields follow the planner's decision -- `required` and the
 // `bytes_per_tensor` derived from it. Every geometry field is filled the same
 // way whether the plan came back DIRECT or MATERIALIZE_REQUIRED, so those stay
@@ -1350,6 +1375,7 @@ int main() {
     ok &= test_planner_rejects_paged_layout();
     ok &= test_planner_accepts_head_broadcast_mask();
     ok &= test_planner_rejects_per_head_mask();
+    ok &= test_tile_d512_groups_heads_only_for_head_broadcast_mask();
     ok &= test_planner_accepts_prescaled_q_at_d80();
     ok &= test_planner_accepts_prescaled_q_at_d256();
     ok &= test_planner_rejects_nonfinite_scale();
