@@ -231,15 +231,21 @@ ggml_sycl_onednn_fa_layout_plan ggml_sycl_flash_attn_ext_onednn_plan(const fattn
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::MASK_TYPE_UNSUPPORTED);
     }
     // A mask with a head axis (ne32 > 1) holds a different bias per Q head,
-    // which ggml applies as head % ne32 (Inkling 2 Mini folds a per-head
-    // relative-position bias into it, src/llama-graph.cpp). The SDPA graph
-    // below describes the mask with extent 1 on every head axis, so such a
-    // mask would get head 0's rows on every head: silently wrong attention
-    // (llama.cpp-44d0). Declined by name rather than described: a strided
-    // head extent cannot express head % ne32 for 1 < ne32 < H_q, and the
-    // native kernels already index the mask that way. ne32 is 0 when there is
-    // no mask, hence the pointer test. The mask's sequence axis (ne33) needs
-    // no check here: anything but 1 is BATCH_UNSUPPORTED above.
+    // which ggml applies as head % ne32. The SDPA graph below describes the
+    // mask with extent 1 on every head axis, so such a mask would get head 0's
+    // rows on every head: silently wrong attention (llama.cpp-44d0).
+    // Inkling 2 Mini builds this shape (a per-head relative-position bias
+    // folded into the mask, src/llama-graph.cpp), but its node also carries
+    // sinks and is declined earlier, by SINKS_UNSUPPORTED; this check is what
+    // stops a sinks-free per-head mask.
+    // Declining is the chosen simple form, not the only possible one: the
+    // descriptor could take a real head extent and stride for some shapes
+    // (ne32 == H_q, or ne32 == N_rep in the 5-D GQA view), each of which would
+    // need its own device verification. The fallback kernels index the mask
+    // by head % ne32 (xmx_v2 and tile_f16; tile_d512 since llama.cpp-44d0's
+    // fattn-tile.hpp fix). ne32 is 0 when there is no mask, hence the pointer
+    // test. The mask's sequence axis (ne33) needs no check here: anything but
+    // 1 is BATCH_UNSUPPORTED above.
     if (params.mask && params.ne32 != 1) {
         return ggml_sycl_onednn_fa_reject(ggml_sycl_onednn_fa_layout_reason::MASK_PER_HEAD_UNSUPPORTED);
     }
