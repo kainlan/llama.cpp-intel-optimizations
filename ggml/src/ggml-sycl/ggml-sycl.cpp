@@ -58163,6 +58163,9 @@ void ggml_sycl_sdpa_cache_destroy(void * ptr);
 // Forward declaration — implemented in fattn.cpp (which owns fattn-xmx-f16-v2.hpp).
 void ggml_sycl_fattn_xmx_v2_cache_destroy(void * ptr);
 
+// Implemented in fattn.cpp, which allocates the buffers it releases.
+void ggml_sycl_fattn_release_context_buffers(ggml_backend_sycl_context & ctx);
+
 void ggml_sycl::UnifiedKernelDeleter::operator()(ggml_sycl::UnifiedKernel * ptr) const {
     delete ptr;
 }
@@ -58417,6 +58420,11 @@ ggml_backend_sycl_context::~ggml_backend_sycl_context() {
         ggml_sycl_fattn_xmx_v2_cache_destroy(fattn_xmx_v2_cache);
         fattn_xmx_v2_cache = nullptr;
     }
+
+    // The staged FlashAttention operands, the sequence-id buffers and the auto-V2 buffers end with the context that
+    // owns them. The queues were waited on above and the executable graph is destroyed, so no queued kernel and no
+    // recorded graph still reads them.
+    ggml_sycl_fattn_release_context_buffers(*this);
 }
 
 std::pair<void *, size_t> ggml_backend_sycl_context::get_staging_buffer(size_t needed_bytes, sycl::queue & queue) {

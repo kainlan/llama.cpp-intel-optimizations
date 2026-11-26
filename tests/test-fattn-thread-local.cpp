@@ -1,8 +1,16 @@
-// Unit test for flash-attn thread-local device buffer cleanup
+// Device test: FlashAttention's sequence-id device buffers belong to the backend context.
+//
+// The buffers used to be thread_local, so they ended with the thread that ran the op and, on a thread that
+// never exits, outlived every model. They are members of the backend context now. This test allocates a
+// context's four buffers from a worker thread and checks that
+//   - they are still allocated after that thread has exited (a thread's end releases nothing), and
+//   - freeing the backend releases all four, on a thread that stays alive.
+// The file keeps its name from the thread_local era: its registration and the test inventory carry it.
 //
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-fattn-thread-local
 
+#include "ggml-backend.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
 #include "sycl-selector-fallback.hpp"
@@ -10,8 +18,6 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <memory>
-#include <sycl/sycl.hpp>
 #include <thread>
 
 #if !defined(GGML_USE_SYCL)
@@ -22,78 +28,67 @@ int main() {
 #else
 
 extern "C" {
-int  ggml_sycl_test_seq_id_buffer_instances();
 int  ggml_sycl_test_seq_id_buffer_allocs();
-void ggml_sycl_test_fattn_set_shutdown(int value);
-void ggml_sycl_test_seq_id_buffers_free_all();
-bool ggml_sycl_test_seq_id_buffers_touch(sycl::queue * stream);
+bool ggml_sycl_test_seq_id_buffers_touch(ggml_backend_t backend);
 }
+
+// The buffers a context's sequence-id group holds once every one of them is allocated.
+static const int SEQ_ID_BUFFERS_PER_CONTEXT = 4;
 
 int main(int, char ** argv) {
     sycl_test_selector_fallback(argv, "level_zero:0");
 
-    sycl::queue q;
-    try {
-        printf("Using device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
-    } catch (const sycl::exception & e) {
-        fprintf(stderr, "SYCL error: %s\n", e.what());
+    if (ggml_backend_sycl_get_device_count() <= 0) {
+        fprintf(stderr, "SKIP: no usable SYCL GPU\n");
+        return LLAMA_TEST_EXIT_SKIP;
+    }
+
+    ggml_backend_t backend = ggml_backend_sycl_init(0);
+    if (!backend) {
+        fprintf(stderr, "ggml_backend_sycl_init(0) returned null\n");
         return 1;
     }
 
-    const int instances_before = ggml_sycl_test_seq_id_buffer_instances();
-    const int allocs_before    = ggml_sycl_test_seq_id_buffer_allocs();
+    const int allocs_before = ggml_sycl_test_seq_id_buffer_allocs();
 
-    auto        queue = std::make_unique<sycl::queue>(sycl::default_selector_v);
-    std::thread worker([&queue]() {
-        if (!ggml_sycl_test_seq_id_buffers_touch(queue.get())) {
-            fprintf(stderr, "Failed to touch seq-id buffers in worker thread\n");
-        }
-    });
+    bool        touched = false;
+    std::thread worker([&]() { touched = ggml_sycl_test_seq_id_buffers_touch(backend); });
     worker.join();
-
-    const int instances_after = ggml_sycl_test_seq_id_buffer_instances();
-    const int allocs_after    = ggml_sycl_test_seq_id_buffer_allocs();
-
-    if (instances_after != instances_before) {
-        fprintf(stderr, "Thread-local buffer instances leaked (before=%d after=%d)\n", instances_before,
-                instances_after);
+    if (!touched) {
+        fprintf(stderr, "Failed to allocate the context's seq-id buffers in the worker thread\n");
+        ggml_backend_free(backend);
         return 1;
     }
 
-    if (allocs_after != allocs_before) {
-        fprintf(stderr, "Thread-local device allocations leaked (before=%d after=%d)\n", allocs_before, allocs_after);
+    // The worker has exited. The buffers are the context's, so they are still allocated.
+    const int allocs_after_thread_exit = ggml_sycl_test_seq_id_buffer_allocs();
+    if (allocs_after_thread_exit != allocs_before + SEQ_ID_BUFFERS_PER_CONTEXT) {
+        fprintf(stderr, "Seq-id buffers did not outlive the thread that allocated them (before=%d after=%d)\n",
+                allocs_before, allocs_after_thread_exit);
+        ggml_backend_free(backend);
         return 1;
     }
 
-    // Validate shutdown guard: free_all should no-op when shutdown flag is set.
-    ggml_sycl_test_fattn_set_shutdown(0);
-    if (!ggml_sycl_test_seq_id_buffers_touch(&q)) {
-        fprintf(stderr, "Failed to touch seq-id buffers for shutdown test\n");
+    // A second touch finds the buffers and allocates nothing.
+    if (!ggml_sycl_test_seq_id_buffers_touch(backend) ||
+        ggml_sycl_test_seq_id_buffer_allocs() != allocs_after_thread_exit) {
+        fprintf(stderr, "A second touch did not reuse the context's seq-id buffers (count=%d, expected %d)\n",
+                ggml_sycl_test_seq_id_buffer_allocs(), allocs_after_thread_exit);
+        ggml_backend_free(backend);
         return 1;
     }
 
-    const int allocs_after_touch = ggml_sycl_test_seq_id_buffer_allocs();
-    ggml_sycl_test_fattn_set_shutdown(1);
-    ggml_sycl_test_seq_id_buffers_free_all();
+    // The context's end is their end: this thread does not exit, and nothing else releases them.
+    ggml_backend_free(backend);
 
-    const int allocs_after_noop = ggml_sycl_test_seq_id_buffer_allocs();
-    if (allocs_after_noop != allocs_after_touch) {
-        fprintf(stderr, "Shutdown guard freed buffers unexpectedly (before=%d after=%d)\n", allocs_after_touch,
-                allocs_after_noop);
+    const int allocs_after_free = ggml_sycl_test_seq_id_buffer_allocs();
+    if (allocs_after_free != allocs_before) {
+        fprintf(stderr, "Freeing the backend left seq-id buffers allocated (before=%d after=%d)\n", allocs_before,
+                allocs_after_free);
         return 1;
     }
 
-    ggml_sycl_test_fattn_set_shutdown(0);
-    ggml_sycl_test_seq_id_buffers_free_all();
-
-    const int allocs_final = ggml_sycl_test_seq_id_buffer_allocs();
-    if (allocs_final != allocs_before) {
-        fprintf(stderr, "Seq-id buffers not freed after shutdown reset (before=%d after=%d)\n", allocs_before,
-                allocs_final);
-        return 1;
-    }
-
-    printf("Thread-local buffers cleaned up successfully\n");
+    printf("Context-owned seq-id buffers released with the backend\n");
     return 0;
 }
 

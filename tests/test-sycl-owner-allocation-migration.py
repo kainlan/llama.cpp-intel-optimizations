@@ -106,7 +106,7 @@ with gate('fattn-owner-first'):
     )
     owner_first(
         region(FATTN, "static bool ggml_sycl_fattn_alloc_device_owner", "template <typename T>"),
-        "owner = new ggml_sycl::mem_handle",
+        "owner = std::move(handle)",
     )
     owner_first(
         region(FATTN, "bool ggml_sycl_fattn_xmx_materialize_packed_k", "static void ggml_sycl_fattn_xmx_v2_free"),

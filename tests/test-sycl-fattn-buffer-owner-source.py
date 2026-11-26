@@ -18,9 +18,10 @@ every tool frees it before the model, so the buffers end before the last model's
       a ggml_sycl::mem_handle held by value, never a pointer to one;
   C3. the three users reach the buffers through the context they were passed: the op (staged operands, sequence ids,
       auto-V2) and the auto-V2 pre-allocation;
-  C4. one function releases every owner of the three groups, unconditionally (no early return, no branch);
-  C5. a buffer is released by resetting its handle, whose destructor is the release: fattn.cpp never news or deletes
-      a mem_handle;
+  C4. one function releases the three groups, each through the function that releases every owner of that group,
+      all of them unconditionally (no early return, no branch);
+  C5. a buffer is released by resetting its handle, whose destructor is the release: fattn.cpp never news a
+      mem_handle and never deletes an owner, and the counted release of a sequence-id buffer ends in that reset;
   C6. the context's destructor calls that function exactly once, after it has waited for its queues (so no queued
       kernel still reads a buffer) and after it has destroyed its executable graph (which baked their addresses);
   C7. no process-exit switch turns the release off: fattn.cpp registers no atexit handler and has no shutdown flag.
@@ -115,6 +116,15 @@ PREALLOC_SIG = "void ggml_sycl_v2_pre_allocate_buffers(ggml_backend_sycl_context
 RELEASE_SIG = "void ggml_sycl_fattn_release_context_buffers(ggml_backend_sycl_context & ctx) {"
 RELEASE_OWNER_SIG = ("template <typename T> static void ggml_sycl_fattn_release_owner(T *& ptr, size_t & capacity, "
                      "ggml_sycl::mem_handle & owner) {")
+RELEASE_OWNER_CALL = "ggml_sycl_fattn_release_owner(ptr, bytes, owner);"
+SEQ_ID_FREE_SIG = ("static void ggml_sycl_fattn_seq_ids_free(int32_t *& ptr, size_t & bytes, ggml_sycl::mem_handle & "
+                   "owner) {")
+V2_AUTO_FREE_SIG = ("static void ggml_sycl_fattn_v2_auto_free_all(ggml_backend_sycl_context::fattn_v2_auto_buffers & "
+                    "buffers) {")
+SEQ_IDS_FREE_SIG = ("static void ggml_sycl_fattn_seq_ids_free_all(ggml_backend_sycl_context::fattn_seq_id_buffers & "
+                    "buffers) {")
+STAGE_FREE_SIG = ("static void ggml_sycl_fattn_operand_stage_free_all(ggml_backend_sycl_context::fattn_operand_stage & "
+                  "stage) {")
 RELEASE_CALL = "ggml_sycl_fattn_release_context_buffers(*this);"
 MEMBER_DECL = "} fattn_buffers;"
 HANDLE_BY_VALUE = re.compile(r"\bggml_sycl::mem_handle (\w+);")
@@ -124,8 +134,17 @@ HANDLE_POINTER = re.compile(r"\bmem_handle\s*\*")
 V2_AUTO_OWNERS = ("block_table_owner", "seq_lens_owner", "temp_buf_owner")
 SEQ_ID_OWNERS = ("q_seq_ids_owner", "kv_seq_ids_owner", "seq_q_offsets_owner", "seq_kv_offsets_owner")
 STAGE_SLOTS = ("sinks", "mask")
-RELEASED = (tuple("v2_auto." + o for o in V2_AUTO_OWNERS) + tuple("seq_ids." + o for o in SEQ_ID_OWNERS) +
-            tuple("operand_stage." + s + ".owner" for s in STAGE_SLOTS))
+# The release, group by group: the call the context-level function makes, the function it calls, and the owners
+# that function must hand to a release.
+GROUP_RELEASES = (
+    ("ggml_sycl_fattn_v2_auto_free_all(ctx.fattn_buffers.v2_auto);", V2_AUTO_FREE_SIG,
+     tuple("buffers." + o for o in V2_AUTO_OWNERS)),
+    ("ggml_sycl_fattn_seq_ids_free_all(ctx.fattn_buffers.seq_ids);", SEQ_IDS_FREE_SIG,
+     tuple("buffers." + o for o in SEQ_ID_OWNERS)),
+    ("ggml_sycl_fattn_operand_stage_free_all(ctx.fattn_buffers.operand_stage);", STAGE_FREE_SIG,
+     tuple("stage." + s + ".owner" for s in STAGE_SLOTS)),
+)
+CONTROL_FLOW = re.compile(r"\b(?:return|if|else|while|for|goto|switch)\b")
 
 # Types that are, or own, a unified-cache allocation.
 OWNING_TYPES = ("mem_handle", "alloc_owner", "alloc_handle", "allocation_result")
@@ -197,18 +216,33 @@ def users_reach_the_context(fattn: str) -> bool:
             "ctx.fattn_buffers.v2_auto" in prealloc)
 
 
+def passes_owner_to_a_release(group_body: str, owner: str) -> bool:
+    """The owner is the last argument of a release call in the body."""
+    return re.search(r"_(?:free|release_owner)\([^()]*\b" + re.escape(owner) + r"\);", group_body) is not None
+
+
 def release_reaches_every_owner(fattn: str) -> bool:
-    """C4: one function releases every owner, with no early return and no branch."""
+    """C4: one function releases the three groups, each group's function releases every owner of the group, and
+    none of them returns early or branches."""
     b = body(fattn, RELEASE_SIG)
-    return (bool(b) and fattn.count(RELEASE_SIG) == 1 and all(("." + r) in b for r in RELEASED) and
-            not re.search(r"\b(?:return|if|while|for|goto|switch)\b", b))
+    if not b or fattn.count(RELEASE_SIG) != 1 or CONTROL_FLOW.search(b):
+        return False
+    for call, sig, owners in GROUP_RELEASES:
+        group_body = body(fattn, sig)
+        if b.count(call) != 1 or not group_body or CONTROL_FLOW.search(group_body):
+            return False
+        if not all(passes_owner_to_a_release(group_body, o) for o in owners):
+            return False
+    return True
 
 
 def release_is_the_handle_destructor(fattn: str) -> bool:
-    """C5: a buffer is released by resetting its handle; no mem_handle is newed or deleted."""
+    """C5: a buffer is released by resetting its handle; no mem_handle is newed and no owner deleted."""
     b = body(fattn, RELEASE_OWNER_SIG)
-    return (bool(b) and "owner = {};" in b and not re.search(r"\bnew ggml_sycl::mem_handle\b", fattn) and
-            not re.search(r"\bdelete owner\b", fattn) and not HANDLE_POINTER.search(fattn))
+    counted = body(fattn, SEQ_ID_FREE_SIG)
+    return (bool(b) and "owner = {};" in b and not CONTROL_FLOW.search(b) and
+            counted.endswith(RELEASE_OWNER_CALL + " }") and not re.search(r"\breturn\b", counted) and
+            not re.search(r"\bnew ggml_sycl::mem_handle\b", fattn) and not re.search(r"\bdelete owner\b", fattn))
 
 
 def destructor_releases_after_drain(dtor: str) -> bool:
@@ -267,11 +301,11 @@ def test_users_reach_the_buffers_through_the_context():
 
 def test_release_reaches_every_owner_unconditionally():
     assert release_reaches_every_owner(FATTN), (
-        "ggml_sycl_fattn_release_context_buffers() must release every owner of the three groups, with no early "
-        f"return and no branch: {RELEASED}")
+        "ggml_sycl_fattn_release_context_buffers() must release the three groups, and each group's free_all every "
+        "owner of its group, with no early return and no branch")
     assert release_is_the_handle_destructor(FATTN), (
-        "a FlashAttention buffer is released by resetting its mem_handle (owner = {}); fattn.cpp must not new or "
-        "delete a mem_handle, nor hold a pointer to one")
+        "a FlashAttention buffer is released by resetting its mem_handle (owner = {}); fattn.cpp must not new a "
+        "mem_handle or delete an owner")
 
 
 def test_destructor_releases_after_the_queues_are_drained():
@@ -325,9 +359,11 @@ def test_mutant_group_dropped_from_the_member():
 
 
 def test_mutant_owner_by_pointer():
-    for owner in ("block_table_owner", "q_seq_ids_owner", "owner"):
-        m = _mutate(COMMON, f"ggml_sycl::mem_handle {owner};", f"ggml_sycl::mem_handle * {owner} = nullptr;")
-        assert not owners_held_by_value(m)
+    # Each mutation is made inside its own group, so it cannot land on another struct's handle.
+    for sig, owner in ((V2_AUTO_SIG, "block_table_owner"), (SEQ_IDS_SIG, "q_seq_ids_owner"), (STAGE_SIG, "owner")):
+        group = body(COMMON, sig)
+        by_pointer = _mutate(group, f"ggml_sycl::mem_handle {owner};", f"ggml_sycl::mem_handle * {owner} = nullptr;")
+        assert not owners_held_by_value(_mutate(COMMON, group, by_pointer)), owner
 
 
 def test_mutant_owner_dropped():
@@ -342,23 +378,43 @@ def test_mutant_user_reads_a_global():
         assert not users_reach_the_context(m)
 
 
-def test_mutant_release_skips_an_owner():
+def test_mutant_release_skips_a_group():
     release = body(FATTN, RELEASE_SIG)
-    for r in RELEASED:
-        m = _mutate(FATTN, release, release.replace("." + r, ".skipped"))
-        assert not release_reaches_every_owner(m), r
+    for call, _, _ in GROUP_RELEASES:
+        m = _mutate(FATTN, release, _mutate(release, call, ""))
+        assert not release_reaches_every_owner(m), call
+
+
+def test_mutant_group_release_skips_an_owner():
+    for _, sig, owners in GROUP_RELEASES:
+        group_body = body(FATTN, sig)
+        for owner in owners:
+            m = _mutate(FATTN, group_body, _mutate(group_body, owner + ");", "skipped);"))
+            assert not release_reaches_every_owner(m), owner
 
 
 def test_mutant_release_returns_early():
     release = body(FATTN, RELEASE_SIG)
     m = _mutate(FATTN, release, "{ if (g_leave_buffers) { return; } " + release[1:])
     assert not release_reaches_every_owner(m)
+    for _, sig, _ in GROUP_RELEASES:
+        group_body = body(FATTN, sig)
+        m = _mutate(FATTN, group_body, "{ if (g_leave_buffers) { return; } " + group_body[1:])
+        assert not release_reaches_every_owner(m), sig
 
 
 def test_mutant_owner_deleted_by_hand():
     m = _mutate(FATTN, "owner = {};", "delete owner;")
     assert not release_is_the_handle_destructor(m)
     m = FATTN + " static void leak() { auto * owner = new ggml_sycl::mem_handle(); (void) owner; }"
+    assert not release_is_the_handle_destructor(m)
+
+
+def test_mutant_counted_release_keeps_the_handle():
+    counted = body(FATTN, SEQ_ID_FREE_SIG)
+    m = _mutate(FATTN, counted, _mutate(counted, RELEASE_OWNER_CALL, "ptr = nullptr;"))
+    assert not release_is_the_handle_destructor(m)
+    m = _mutate(FATTN, counted, _mutate(counted, RELEASE_OWNER_CALL, "return; " + RELEASE_OWNER_CALL))
     assert not release_is_the_handle_destructor(m)
 
 
