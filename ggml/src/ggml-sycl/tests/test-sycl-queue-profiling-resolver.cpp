@@ -1,19 +1,32 @@
-// The queue-profiling resolver's pure parts (queue-profiling.hpp, common.cpp): ggml_sycl_queue_profiling_decide() and
-// ggml_sycl_queue_profiling_requested_diagnostic(). No SYCL device is opened and no model is loaded: the test calls two
-// functions of libggml-sycl that take plain values and an injected getenv, and the shared parse helpers of the header.
-// The memoised wrapper (ggml_sycl_queue_profiling_enabled) is deliberately not called: it reads this process's
-// environment once, at the first queue.
+// The queue-profiling resolver (queue-profiling.hpp, common.cpp). Two parts, neither opens a SYCL device or loads a
+// model:
+//
+//  1. The pure parts, ggml_sycl_queue_profiling_decide() and ggml_sycl_queue_profiling_requested_diagnostic(), called
+//     with plain values and an injected getenv, plus the shared parse helpers of the header.
+//  2. The memoised wrapper, ggml_sycl_queue_profiling_enabled() and ggml_sycl_queue_profiling_resolved_reason(), which
+//     read this process's environment once and print their WARN lines once. Each arm runs in a forked child, so each
+//     resolves fresh: the child sets its environment, captures the log with ggml_log_set, asks twice, changes the
+//     environment, asks again, and checks the reason, the answer and the WARN lines it saw.
 //
 // The states under test: GGML_SYCL_QUEUE_PROFILING unset is off unless a profiling diagnostic is requested, then on;
 // "1" is on; "0" is off whatever is requested; any other value counts as unset. A diagnostic counts as requested by its
 // own parse of its own variable, and a diagnostic that considers itself enabled is always one the resolver names.
 
 #include "../queue-profiling.hpp"
+#include "ggml.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
+#include <utility>
+#include <vector>
+
+#ifndef _WIN32
+#    include <sys/wait.h>
+#    include <unistd.h>
+#endif
 
 namespace {
 
@@ -56,6 +69,156 @@ std::string requested_with(const char * name, const char * value) {
     const char * r = ggml_sycl_queue_profiling_requested_diagnostic(fake_getenv);
     return r ? r : "";
 }
+
+#ifndef _WIN32
+
+// The WARN lines of the SYCL backend that one child process saw, in order.
+std::vector<std::string> g_warns;
+
+void capture_log(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+    if (level == GGML_LOG_LEVEL_WARN && std::strncmp(text, "[SYCL]", 6) == 0) {
+        g_warns.emplace_back(text);
+    }
+}
+
+const char * const KNOB = "GGML_SYCL_QUEUE_PROFILING";
+
+using env_list = std::vector<std::pair<const char *, const char *>>;
+
+struct resolver_arm {
+    const char *              name;
+    // set before the first question
+    env_list                  env;
+    bool                      want_enabled;
+    reason                    want_reason;
+    // a part of each WARN the resolution prints, in order
+    std::vector<const char *> want_warns;
+    // After the resolution the arm asks the refusing reader's WARN twice for one diagnostic and once for another: one
+    // line per diagnostic, and the text names this cause. Null: the arm does not ask.
+    const char *              want_unavailable;
+};
+
+// Runs one arm in the current process, which is a fresh child. Returns the number of failed checks.
+int run_resolver_arm(const resolver_arm & arm) {
+    g_failures = 0;
+    for (size_t i = 0; i < ggml_sycl_queue_profiling_diagnostic_count; ++i) {
+        unsetenv(ggml_sycl_queue_profiling_diagnostics[i]);
+    }
+    unsetenv(KNOB);
+    for (const auto & kv : arm.env) {
+        setenv(kv.first, kv.second, 1);
+    }
+    g_warns.clear();
+    ggml_log_set(capture_log, nullptr);
+
+    const bool   first        = ggml_sycl_queue_profiling_enabled();
+    const bool   second       = ggml_sycl_queue_profiling_enabled();
+    const reason first_reason = ggml_sycl_queue_profiling_resolved_reason();
+    CHECK(first == arm.want_enabled, "%s: answers %d, want %d", arm.name, (int) first, (int) arm.want_enabled);
+    CHECK(second == first, "%s: the second question answered %d after %d", arm.name, (int) second, (int) first);
+    CHECK(first_reason == arm.want_reason, "%s: reason %d, want %d", arm.name, (int) first_reason,
+          (int) arm.want_reason);
+    CHECK(g_warns.size() == arm.want_warns.size(), "%s: %zu WARN lines, want %zu", arm.name, g_warns.size(),
+          arm.want_warns.size());
+    for (size_t i = 0; i < arm.want_warns.size() && i < g_warns.size(); ++i) {
+        CHECK(g_warns[i].find(arm.want_warns[i]) != std::string::npos, "%s: WARN %zu is `%s`, want it to hold `%s`",
+              arm.name, i, g_warns[i].c_str(), arm.want_warns[i]);
+    }
+
+    // the answer is fixed for the process: flip the knob and the diagnostic the other way, ask again, and nothing moves
+    setenv(KNOB, arm.want_enabled ? "0" : "1", 1);
+    setenv("GGML_SYCL_KERNEL_PROFILE", arm.want_enabled ? "0" : "1", 1);
+    CHECK(ggml_sycl_queue_profiling_enabled() == first, "%s: the answer changed after setenv", arm.name);
+    CHECK(ggml_sycl_queue_profiling_resolved_reason() == first_reason, "%s: the reason changed after setenv", arm.name);
+    CHECK(g_warns.size() == arm.want_warns.size(), "%s: %zu WARN lines after setenv, want %zu", arm.name,
+          g_warns.size(), arm.want_warns.size());
+
+    if (arm.want_unavailable != nullptr) {
+        const size_t before = g_warns.size();
+        ggml_sycl_queue_profiling_warn_unavailable("GGML_SYCL_KERNEL_PROFILE");
+        ggml_sycl_queue_profiling_warn_unavailable("GGML_SYCL_KERNEL_PROFILE");
+        ggml_sycl_queue_profiling_warn_unavailable("GGML_SYCL_MXFP4_TG_PROFILE");
+        CHECK(g_warns.size() == before + 2, "%s: %zu refusal WARN lines, want one per diagnostic (2)", arm.name,
+              g_warns.size() - before);
+        for (size_t i = before; i < g_warns.size(); ++i) {
+            CHECK(g_warns[i].find(arm.want_unavailable) != std::string::npos,
+                  "%s: refusal WARN `%s` does not hold `%s`", arm.name, g_warns[i].c_str(), arm.want_unavailable);
+        }
+        if (g_warns.size() >= before + 2) {
+            CHECK(g_warns[before].find("GGML_SYCL_KERNEL_PROFILE ") == 7 &&
+                      g_warns[before + 1].find("GGML_SYCL_MXFP4_TG_PROFILE ") == 7,
+                  "%s: each refusal WARN names its own diagnostic first", arm.name);
+        }
+    }
+    return g_failures;
+}
+
+// Forks one child per arm, so each resolves the knob fresh in its own process. The parent never asks the memoised
+// wrapper.
+void check_resolver_arms() {
+    const char * const bad_value_warn = "GGML_SYCL_QUEUE_PROFILING=yes is neither 0 nor 1; treating it as unset";
+    const char * const kernel_warn = "GGML_SYCL_KERNEL_PROFILE is set, so the backend's queues carry event profiling";
+    const char * const mxfp4_warn  = "GGML_SYCL_MXFP4_TG_PROFILE is set, so the backend's queues carry event profiling";
+
+    std::vector<resolver_arm> arms;
+    // a diagnostic set after the answer was fixed is refused, and no variable names that cause for a test hook
+    arms.push_back({ "default off", {}, false, reason::DEFAULT_OFF, {}, "resolved off before" });
+    arms.push_back({ "diagnostic turns it on",
+                     { { "GGML_SYCL_KERNEL_PROFILE", "1" } },
+                     true,
+                     reason::DIAGNOSTIC,
+                     { kernel_warn },
+                     nullptr });
+    arms.push_back({ "knob 1", { { KNOB, "1" } }, true, reason::KNOB_ON, {}, nullptr });
+    arms.push_back({
+        "knob 0 refuses a requested diagnostic",
+        { { KNOB, "0" }, { "GGML_SYCL_KERNEL_PROFILE", "1" } },
+        false,
+        reason::KNOB_OFF,
+        {},
+        "GGML_SYCL_QUEUE_PROFILING=0"
+    });
+    arms.push_back({ "bad value, nothing requested",
+                     { { KNOB, "yes" } },
+                     false,
+                     reason::BAD_VALUE_OFF,
+                     { bad_value_warn },
+                     nullptr });
+    arms.push_back({
+        "bad value, diagnostic requested",
+        { { KNOB, "yes" }, { "GGML_SYCL_MXFP4_TG_PROFILE", "1" } },
+        true,
+        reason::BAD_VALUE_DIAGNOSTIC,
+        { bad_value_warn,  mxfp4_warn                            },
+        nullptr
+    });
+    for (const resolver_arm & arm : arms) {
+        std::fflush(stdout);
+        std::fflush(stderr);
+        const pid_t pid = fork();
+        if (pid < 0) {
+            CHECK(false, "%s: fork failed", arm.name);
+            continue;
+        }
+        if (pid == 0) {
+            const int failed = run_resolver_arm(arm);
+            std::fflush(stdout);
+            std::fflush(stderr);
+            _exit(failed == 0 ? 0 : 1);  // no static destructors of the runtime in a child that never opened a device
+        }
+        int status = 0;
+        CHECK(waitpid(pid, &status, 0) == pid, "%s: waitpid failed", arm.name);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "%s: the child failed (status %d)", arm.name, status);
+    }
+}
+
+#else
+
+void check_resolver_arms() {
+    std::printf("SKIP the forked resolver arms: no fork on this platform\n");
+}
+
+#endif
 
 }  // namespace
 
@@ -142,6 +305,9 @@ int main() {
               ggml_sycl_profile_env_flag(nullptr, true) && !ggml_sycl_profile_env_flag(nullptr, false) &&
               ggml_sycl_profile_env_flag("", true),
           "an unset variable is the default of its parse");
+
+    // the memoised wrapper, one forked child per state
+    check_resolver_arms();
 
     if (g_failures == 0) {
         std::printf("PASS test-sycl-queue-profiling-resolver\n");
