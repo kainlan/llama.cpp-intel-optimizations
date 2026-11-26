@@ -424,9 +424,13 @@ struct fattn_xmx_v2_device_cache {
     int                   dpas_workspace_state = 0;  // 0 not tried, 1 allocated, -1 allocation failed
 };
 
-// Bytes of SLM required for the fallback leaf's worst case (D=256, NCOLS=32).
-// fattn_v2_slm<D, ncols>::TOTAL is in sycl::half units, so multiply by sizeof(half).
-// NCOLS=32 covers the D=64 batched-PP fast path that reuses K/V across wider query blocks.
+// Bytes of SLM required for the prompt leaves' worst case (D=256, NCOLS=32,
+// float-sized S region), 52 KB. fattn_v2_slm<D, ncols>::TOTAL is in sycl::half
+// units, so multiply by sizeof(half). NCOLS=32 covers the D=64 batched-PP fast
+// path that reuses K/V across wider query blocks, and the float-accumulator
+// f32_sv arm (fattn.cpp, ne01 > 16), which runs ncols=32 at D=128 and D=256
+// (and at D=64). That arm's S region is half-sized (s_half), 50 KB at D=256,
+// so this float-S bound is conservative for it.
 static constexpr size_t fattn_xmx_v2_required_slm_bytes() {
     constexpr size_t D_max     = 256;
     constexpr size_t ncols_max = 32;
@@ -747,12 +751,21 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
         // ---- Phase 1: Load tile_K and tile_V from global to SLM ----
         if constexpr (kv_v8) {
             // 16-byte vectors. Consecutive work-items take consecutive 16-byte
-            // chunks of a row, so a sub-group reads 256 contiguous bytes, and
-            // each work-item issues a group of loads before their stores. Rows
-            // at or past kv_count are zero-padded, as in the scalar copy. SLM
-            // is written as dwords: the leaf already reads the S region as
-            // float, so the SLM base is dword-aligned, and nothing promises
-            // more.
+            // chunks, so the 16 work-items of a sub-group read 256 bytes: one
+            // row at D=128, half a row at D=256, two rows at D=64 (contiguous
+            // only if nb11 == 128). Each work-item issues a group of loads
+            // before their stores. Rows at or past kv_count are zero-padded,
+            // as in the scalar copy.
+            //
+            // SLM is written as dwords. K_OFFSET and V_OFFSET (asserted below),
+            // a row (D halves, D % 8 == 0) and a chunk (8 halves) are all even
+            // numbers of halves, so every store is dword-aligned if the SLM
+            // base is. The base is the leaf launcher's local_accessor<half>,
+            // one declaration for every leaf, and the leaves with a float S
+            // region read it through a float pointer (tile_S_f); the element
+            // type alone promises 2 bytes, and nothing promises more than 4.
+            static_assert(slm_layout::K_OFFSET % 2 == 0 && slm_layout::V_OFFSET % 2 == 0,
+                          "tile_K and tile_V start on a dword of the SLM base");
             constexpr int ROW_CHUNKS = D / 8;
             constexpr int CHUNKS     = XMX_V2_BATCH_KV * ROW_CHUNKS;
             constexpr int GROUP      = 2;  // per work-item: 2 K and 2 V chunks in flight (16 GRF)
@@ -1057,7 +1070,7 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                         VKQ[r][d_tile] += acc;
                     }
                 }
-            } else {
+            } else if constexpr (TM == XMX_V2_TM) {
                 // The P tile is the same for every d_tile, so it is loaded once
                 // (the rows past ne01 are read stale here too; see the f32_sv
                 // branch for why that is harmless).
@@ -1079,6 +1092,45 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                     sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::b, TK, TN,
                                            sycl_xmx::layout::row_major>
                         mat_V;
+                    sycl_xmx::joint_matrix_load(
+                        sg, mat_V,
+                        sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                            &tile_V[kv_col * D + d_start]),
+                        D);
+
+                    sycl_xmx::joint_matrix_mad(sg, mat_SV, mat_S, mat_V, mat_SV);
+
+                    {
+                        int slot = 0;
+                        sycl_xmx::joint_matrix_apply(sg, mat_SV, [&](float & elem) {
+                            VKQ[slot][d_tile] += elem;
+                            ++slot;
+                        });
+                    }
+                }
+            } else {
+                // The TM=16 leaf, a hang reproducer (see
+                // fattn_xmx_v2_pick_variant_for_shape): its code does not move,
+                // so it keeps loading the P tile inside the d_tile loop.
+                for (int d_tile = 0; d_tile < D_TILES; ++d_tile) {
+                    const int d_start = d_tile * TN;
+
+                    sycl_xmx::joint_matrix<sycl::sub_group, float, sycl_xmx::use::accumulator, TM, TN> mat_SV;
+                    sycl_xmx::joint_matrix_fill(sg, mat_SV, 0.0f);
+
+                    sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::a, TM, TK,
+                                           sycl_xmx::layout::row_major>
+                        mat_S;
+                    sycl_xmx::joint_matrix<sycl::sub_group, sycl::half, sycl_xmx::use::b, TK, TN,
+                                           sycl_xmx::layout::row_major>
+                        mat_V;
+
+                    sycl_xmx::joint_matrix_load(
+                        sg, mat_S,
+                        sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
+                            &tile_S[sg_q_base * XMX_V2_BATCH_KV + kv_col]),
+                        XMX_V2_BATCH_KV);
+
                     sycl_xmx::joint_matrix_load(
                         sg, mat_V,
                         sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(
@@ -2796,15 +2848,18 @@ bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context & ctx, const fattn_params
 }
 
 // Whether every K and V row of this call starts on a 16-byte bound, so the
-// f32_sv leaf may copy them to SLM in 16-byte vectors (kv_v8): F16 K/V whose
-// two base pointers and six row, head and sequence strides are all multiples
-// of 16 bytes. Otherwise the leaf takes its scalar copy. The f32sv launcher
-// picks the leaf from it and fattn.cpp the kernel's name.
+// f32_sv leaf may copy them to SLM in 16-byte vectors (kv_v8): K and V both
+// GGML_TYPE_F16 (the copy moves 8 halves per vector, so any other type, FP8
+// included, is out), with two base pointers and six row, head and sequence
+// strides that are all multiples of 16 bytes. Otherwise the leaf takes its
+// scalar copy. The f32sv launcher picks the leaf from it and fattn.cpp the
+// kernel's name.
 inline bool fattn_xmx_v2_kv_rows_v8(const fattn_params & params) noexcept {
     const auto a16 = [](int64_t x) {
         return (x & 15) == 0;
     };
-    return !params.kv_is_fp8 && a16((int64_t) reinterpret_cast<uintptr_t>(params.K)) &&
+    return params.K_type == GGML_TYPE_F16 && params.V_type == GGML_TYPE_F16 &&
+           a16((int64_t) reinterpret_cast<uintptr_t>(params.K)) &&
            a16((int64_t) reinterpret_cast<uintptr_t>(params.V)) && a16(params.nb11) && a16(params.nb12) &&
            a16(params.nb13) && a16(params.nb21) && a16(params.nb22) && a16(params.nb23);
 }

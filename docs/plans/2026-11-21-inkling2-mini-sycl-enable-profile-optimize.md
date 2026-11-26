@@ -6905,15 +6905,18 @@ ruling names S2, S3 and S2b; S4 stays as described in the checkpoint above.
 D=128, the scalar K/V copy issues about 512 two-byte memory messages, about four in five of all the sub-group's memory
 messages, and S1 did not touch it; one work-group holds 22 KB of SLM, so a core keeps only about 10 threads resident (4
 if the core has 64 KB, the unverified B580 figure), too few to hide those messages. S2 adds the `kv_v8` leaf of the
-f32_sv kernel (`xmx_v2_f16_ncols16_large_f32sv_v8`): when `fattn_xmx_v2_kv_rows_v8()` finds both K/V base pointers
-and all six strides on 16-byte bounds, the copy moves 16-byte chunks (32 load messages per sub-group and batch, and 32
-to 128 dword-store messages depending on whether IGC merges them, unverified), zeroes a dead cell's non-finite V
-halves bit for bit as the scalar copy does (`fattn_v8_zero_if_dead`), and prefetches the next batch's K/V rows to L1
-after the copy barrier, clamped to `ne11` and to each row's last byte. Unaligned rows keep the scalar copy and the
-name `_f32sv`. The P tile is loaded once per kv_tile in both matrix-engine S·V bodies, so GPT-OSS's
-`xmx_v2_f16_pp_ncols32` is recompiled too. The masked-nonfinite harness compares `d128_pp72` (`_v8`) with
-`d128_pp72_kv_unaligned` (scalar copy, same inputs) bit for bit. Nothing of S2 has run on a card yet; the acceptance
-run must confirm with `GGML_SYCL_FA_DISPATCH_DEBUG=1` that the Inkling prompt ran `_f32sv_v8`.
+f32_sv kernel (`xmx_v2_f16_ncols16_large_f32sv_v8`): when `fattn_xmx_v2_kv_rows_v8()` finds K and V both F16, both
+base pointers and all six strides on 16-byte bounds, the copy moves 16-byte chunks (32 load messages per sub-group and
+batch, and 32 to 128 dword-store messages depending on whether IGC merges them, unverified), zeroes a dead cell's
+non-finite V halves bit for bit as the scalar copy does (`fattn_v8_zero_if_dead`), and prefetches the next batch's K/V
+rows to L1 after the copy barrier, clamped to `ne11` and to each row's last byte. Unaligned rows keep the scalar copy
+and the name `_f32sv`. The P tile is loaded once per kv_tile in the TM=8 matrix-engine S·V bodies (f32_sv and the half
+accumulator's), so GPT-OSS's `xmx_v2_f16_pp_ncols32` is recompiled too. The TM=16 half leaf, the hang reproducer,
+keeps its in-loop load: S2 moved it as well, and the S2 review fix put its code back. The masked-nonfinite harness
+compares `d128_pp72` (`_v8`) with `d128_pp72_kv_unaligned` (scalar copy, same inputs) bit for bit. The first device
+run of `d128_pp72_kv_unaligned` aborted in the harness, before any kernel: it allocated the K/V views as tensors of
+their own. The fix allocates their parents and checks that the views start off a 16-byte bound. The acceptance run
+must confirm with `GGML_SYCL_FA_DISPATCH_DEBUG=1` that the Inkling prompt ran `_f32sv_v8`.
 
 **S3 (2026-11-26).** The ne01 > 16 arm under a float accumulator launches the f32_sv leaf at ncols=32: four TM=8
 sub-groups per work-group share each K/V batch in SLM, and the S region is half-sized (`fattn_v2_slm<..., s_half>`),
@@ -6922,7 +6925,12 @@ because that leaf writes P only as a half. Names: `xmx_v2_f16_ncols32_large_f32s
 hang it reproduces. Derived, not measured: 26 KB of SLM per work-group at D=128, so 16 resident threads per core at
 128 KB of SLM (10 at S2) and 8 at 64 KB (4 at S2); the half S region alone changes neither count at D=128 (28 KB with a
 float one gives the same), only at D=64. Each K/V batch now serves 32 query rows, which halves the kernel's global K/V
-reads and its copy messages per query row; the number of threads launched does not change.
+reads and its copy messages per query row; the number of threads launched does not change. Two costs: a cell masked
+for only some rows keeps a non-finite V, and the NaN it spills into the rows that mask it (a deliberate deviation, see
+`fattn_mask_is_dead_for_rows`) now reaches up to 32 rows of a work-group, where it reached 16. And S2's `kv_v8` twin
+doubled the f32_sv leaves from 12 to 24 (three head sizes, two Q types, softcap on or off), each a separate device
+compile in the link; S3 instantiates them at ncols=32 only, so the count stays 24. The link time it adds is not
+measured.
 
 **S2b (2026-11-26).** In the f32_sv leaf the barrier between the softmax (P into tile_S) and S·V is a sub-group
 barrier. It is one statement in the kv_tile loop, run twice per 32-key batch (the "two barriers" of the ruling), and

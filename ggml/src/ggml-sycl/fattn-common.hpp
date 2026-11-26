@@ -44,7 +44,10 @@ static inline float fattn_mask_apply(float score, float slope, sycl::half mask_v
 // deliberate deviation. The alternative, zeroing the value, would give the
 // rows that see it a finite, wrong result and hide real garbage in the
 // cache. The spill keeps it visible, and it is confined to one tile of rows
-// that already contains a NaN answer.
+// that already contains a NaN answer: the n_rows the test spans, which is the
+// work-group's query rows, since all of them multiply the same V row. That is
+// up to ncols rows, 32 for the XMX-v2 float-accumulator prompt leaf at
+// ncols=32 (Inkling task 23, S3), where it was 16 before.
 static inline bool fattn_mask_is_dead_for_rows(const sycl::half * mask, int64_t row_stride, int n_rows, int kv) {
     if (mask == nullptr || n_rows <= 0) {
         return false;
