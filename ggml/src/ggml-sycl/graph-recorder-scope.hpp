@@ -45,17 +45,18 @@
 // otherwise to the buffer that holds the tensor.
 // The sink above only collects handles released during recording.
 // One exception: when sinks, or a mask that is not a staged input, resolve
-// to non-device memory, FA normally bakes its thread_local weight-staging
-// slot (g_tl_fattn_weight_stage, fattn.cpp) instead. It keeps the resolved
-// address instead (the model's weight for sinks, the context's compute buffer
-// for a mask) when the tensor has zero bytes or staging cannot allocate; that
-// address matches the drift check and its owner above keeps it valid, so such
-// a graph is safe to replay.
-// Neither the model nor the retained handles own the slot, and it can be
-// regrown or freed independently of the graph. A graph that baked the slot
-// is kept from replaying only because the drift check compares the tensor's
-// own address with the staged one, which never match, so every such call
-// records again.
+// to non-device memory, FA normally bakes its operand-staging slot (the
+// backend context's fattn_buffers.operand_stage, filled in fattn.cpp)
+// instead. It keeps the resolved address instead (the model's weight for
+// sinks, the context's compute buffer for a mask) when the tensor has zero
+// bytes or staging cannot allocate; that address matches the drift check and
+// its owner above keeps it valid, so such a graph is safe to replay.
+// The backend context owns the slot and releases it in its destructor, after
+// it has destroyed its executable graph, but the graph's retained handles do
+// not hold it, and a larger operand or a changed stream regrows or frees it
+// while the graph lives. A graph that baked the slot is kept from replaying
+// only because the drift check compares the tensor's own address with the
+// staged one, which never match, so every such call records again.
 // On the context the snapshot stays until the next recording, a drift check or
 // a failed recording clears it, and it outlives a cleared graph there only as
 // dead data. In a dense range entry it stays until the range is re-recorded or

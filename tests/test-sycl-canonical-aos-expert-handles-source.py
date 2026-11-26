@@ -260,7 +260,7 @@ def test_moe_metadata_registry_is_value_only_and_consumers_retain_sources() -> N
                     "has_stable_owner_identity()", "out.handle.resolve"):
         assert witness in resolver, witness
     materialize = function(source, "static bool ggml_sycl_materialize_planned_expert_layout")
-    assert "meta_value = m" in materialize
+    assert "meta_value = g_moe_expert_meta[r]" in materialize
     assert "ggml_sycl_resolve_moe_meta_source(*meta, device)" in materialize
 
     # The legacy name lookup remains fail-closed. Prefetch uses a value-owned

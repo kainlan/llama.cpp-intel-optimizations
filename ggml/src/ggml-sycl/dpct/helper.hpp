@@ -15,6 +15,7 @@
 
 #include "../alloc-registry.hpp"
 #include "../async-failure.hpp"
+#include "../queue-profiling.hpp"
 
 #include <map>
 #include <optional>
@@ -833,31 +834,21 @@ namespace dpct
 
       /// Caller should acquire resource \p m_mutex before calling this
       /// function.
-      // enable_profiling is added UNCONDITIONALLY here, not gated on
-      // `#ifdef DPCT_PROFILING_ENABLED` (llama.cpp-yke2). These
-      // create_queue_impl() overloads, like the rest of device_ext, are
-      // header-only inlines: any translation unit that includes this header
-      // compiles its own copy, and ordinary ELF symbol resolution lets
-      // whichever TU's copy the linker happens to pick interpose over every
-      // other TU's for the whole process -- including the ggml-sycl shared
-      // library's own copy, which used to be the only one built with the
-      // macro defined (it was a PRIVATE compile definition of the
-      // `ggml-sycl` CMake target). A test executable that includes
-      // ggml-sycl/common.hpp (and so this header) compiled its copy WITHOUT
-      // the macro, and that copy silently won process-wide, dropping
-      // enable_profiling from dpct::device_ext::default_queue() (and
-      // everything built through it -- roughly five dozen call sites across
-      // ggml-sycl.cpp/common.cpp/unified-cache.cpp/etc. that call
-      // ggml_sycl_get_device(...).default_queue() directly, not just the
-      // unified cache's owner queue). A macro read inside a header-only
-      // inline can never be interposition-safe, because "which TU's copy
-      // wins" is exactly what interposition means; the fix is to stop the
-      // property from depending on a macro at all, matching this backend's
-      // own default_queue_properties() (ggml-sycl/common.hpp), which has
-      // always added enable_profiling unconditionally for every queue IT
-      // constructs directly. Every TU now compiles an IDENTICAL copy of
-      // these inlines regardless of DPCT_PROFILING_ENABLED, so which one the
-      // linker resolves no longer matters for this property.
+      // enable_profiling is added here through ggml_sycl_queue_profiling_enabled() (queue-profiling.hpp), NOT gated on
+      // `#ifdef DPCT_PROFILING_ENABLED`. On the Level Zero v2 adapter a profiling queue reads a device timestamp for
+      // every command it submits, and only diagnostics read the result; without the property GPT-OSS 20B decode
+      // measured 12 to 26 % faster and a Qwen prefill 34 % faster, nothing slower (driver 26.44, 2026-11-24). The
+      // predicate answers on only for GGML_SYCL_QUEUE_PROFILING=1 or for the knob unset with a profiling diagnostic
+      // requested.
+      //
+      // These create_queue_impl() overloads, like the rest of device_ext, are header-only inlines: any translation unit
+      // that includes this header compiles its own copy, and ordinary ELF symbol resolution lets whichever TU's copy
+      // the linker happens to pick interpose over every other TU's for the whole process. A macro read inside a
+      // header-only inline can never be interposition-safe, because "which TU's copy wins" is exactly what
+      // interposition means; the property therefore depends on no macro at all. It depends on the answer of the
+      // out-of-line resolver in libggml-sycl (common.cpp), which reads the environment once per process, so every copy
+      // of these inlines gets the same answer. When it answers on, the list is enable_profiling first and the caller's
+      // properties after it, matching this backend's own default_queue_properties() (ggml-sycl/common.hpp).
       template <class... Properties>
       sycl::queue create_queue_impl(bool enable_exception_handler,
                                     Properties... properties) {
@@ -867,8 +858,11 @@ namespace dpct
         (void) enable_exception_handler;
         const sycl::async_handler eh = ggml_sycl_async_handler(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED);
         sycl::context ctx(*this, eh);
-        _queues.push_back(
-            sycl::queue(ctx, *this, eh, sycl::property_list(sycl::property::queue::enable_profiling(), properties...)));
+        const sycl::property_list props =
+            ggml_sycl_queue_profiling_enabled() ?
+                sycl::property_list(sycl::property::queue::enable_profiling(), properties...) :
+                sycl::property_list(properties...);
+        _queues.push_back(sycl::queue(ctx, *this, eh, props));
 
         return _queues.back();
       }
@@ -883,8 +877,11 @@ namespace dpct
         (void) enable_exception_handler;
         const sycl::async_handler eh = ggml_sycl_async_handler(GGML_SYCL_ASYNC_FAILURE_SLOT_SHARED);
         sycl::context ctx(device, eh);
-        _queues.push_back(sycl::queue(ctx, device, eh,
-                                      sycl::property_list(sycl::property::queue::enable_profiling(), properties...)));
+        const sycl::property_list props =
+            ggml_sycl_queue_profiling_enabled() ?
+                sycl::property_list(sycl::property::queue::enable_profiling(), properties...) :
+                sycl::property_list(properties...);
+        _queues.push_back(sycl::queue(ctx, device, eh, props));
 
         return _queues.back();
       }

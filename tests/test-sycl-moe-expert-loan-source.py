@@ -19,7 +19,7 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     it in place, all three before any entry changes, since minting allocates; then each device entry's last write
     becomes its copy (has_write_event stamped from the copy, and the copy ran behind the fill), so
     release_entry_allocation_locked queues the free behind the copy; then it retires each entry exactly, registers
-    the host copy behind its copy event, and only then drops the leases;
+    the host copy behind its copy event, and only then hands the leases to the transaction (a rollback drops them);
   - the retire is exact: it withdraws only the device entry's key, and its mirror only while it names that entry, so
     the loan never calls the id-wide retire_expert_entry_exact;
   - a host registration the checks could not foresee failing puts every device entry back (un-retired, recounted,
@@ -138,6 +138,7 @@ it fail.
 Pytest-style (module-level test_* functions): register with llama_test_pytest.
 """
 
+import functools
 import re
 from pathlib import Path
 
@@ -149,6 +150,27 @@ _LEXEME_RE = re.compile(
 )
 
 
+# The mutant tests below each rebuild the claims on a copy of one source with one edit. The unmutated sources stay
+# cached because every mutant reads them; a mutated text is used for its one claim and evicted. The caches are small on
+# purpose: a key holds a whole source, so a large cache would keep hundreds of dead mutants in memory. A hit returns
+# what the same text gave before, so each mutant is still judged on its own text.
+_WHOLE_SOURCE = 1 << 20  # a text this long is a whole source or a whole stripped copy of one, not a body cut from it
+
+
+def content_cache(fn):
+    """Cache `fn` by its text argument in two tiers: the few whole-source texts stay hot, and the many short texts cut
+    from them are held in a larger cache whose keys are each under a megabyte."""
+    short = functools.lru_cache(maxsize=256)(fn)
+    whole = functools.lru_cache(maxsize=8)(fn)
+
+    @functools.wraps(fn)
+    def cached(text):
+        return (whole if len(text) >= _WHOLE_SOURCE else short)(text)
+
+    return cached
+
+
+@functools.lru_cache(maxsize=8)
 def strip_comments(src: str) -> str:
     def repl(m: re.Match) -> str:
         tok = m.group(0)
@@ -169,6 +191,7 @@ def strip_cmake_comments(src: str) -> str:
 _INVENTORY_GUARD_RE = re.compile(r"std::(lock_guard|unique_lock) ?<[^<>;]*> ?(\w+)\(g_tensor_inventory_mutex\)")
 
 
+@content_cache
 def norm(text: str) -> str:
     """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so neither a clang-format
     re-wrap nor a re-split format string can turn a claim red, and every guard on g_tensor_inventory_mutex in its
@@ -285,8 +308,9 @@ HOLD = 'held[i] = make_direct_entry_handle(device_key, cache_device, *device_ent
 ENTRY_CHANGED = '{ refusal = "entry changed"; break; }'
 DEVICE_RETIRE = "out.retire_status[i] = retire_expert_entry_at_locked(device_key, &device_nodes[i]);"
 REGISTER = ("register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS, "
-            "k == 0 ? &out.handles[i] : nullptr, m.owner, &out.copy_events[i], false)")
+            "k == 0 ? &out.handles[i] : nullptr, m.owner, &out.copy_events[i], false, &out.device_keys[i])")
 DROP_HELD = "for (std::shared_ptr<mem_handle> & lease : held) { lease.reset(); }"
+HAND_HELD = "for (int i = 0; i < 3; ++i) { out.retired_leases[i] = std::move(held[i]); }"
 
 
 def claim_device_free_gated_on_the_copy(cache: str, sycl: str) -> bool:
@@ -294,10 +318,11 @@ def claim_device_free_gated_on_the_copy(cache: str, sycl: str) -> bool:
     bodies = loan_bodies(cache, sycl)
     once = (SRC_IS_OWNER, COPY, STAMP_EVENT, STAMP_FLAG, HOLD, DEVICE_RETIRE, REGISTER)
     return (all(bodies) and not any("host_task" in x for x in bodies) and all(b.count(x) == 1 for x in once)
-            and all(d in b for d in DEPS) and b.count(DROP_HELD) == 2 and b.count(ENTRY_CHANGED) == 1
+            and all(d in b for d in DEPS) and b.count(DROP_HELD) == 1 and b.count(HAND_HELD) == 1
+            and b.count(ENTRY_CHANGED) == 1
             and ordered(b, SRC_IS_OWNER, DMA_QUEUE, COPY, ENTRY_CHANGED, HOLD, STAMP_EVENT, STAMP_FLAG, DEVICE_RETIRE,
                         REGISTER)
-            and b.find(DROP_HELD) > b.find(REGISTER))
+            and b.find(DROP_HELD) > b.find(REGISTER) and b.find(HAND_HELD) > b.find(REGISTER))
 
 
 # --- the retire is exact --------------------------------------------------------------------------------------------
@@ -327,8 +352,7 @@ MIRROR_BACK = ("if (!released.mirror.empty() && direct_expert_entries_.find(exac
                "{ direct_expert_entries_.insert(std::move(released.mirror)); }")
 HOST_WITHDRAW = ("if (host != entries_.end() && host->second.direct_alloc_owner.owner_control_id() == host_control) "
                  "{ (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
-RESTORE_CALL = ("restore_expert_entry_at_locked(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, "
-                "GGML_LAYOUT_AOS), device_nodes[i]);")
+RESTORE_CALL = "restore_expert_entry_at_locked(expert_device_key(members[i].key), device_nodes[i]);"
 REGISTRATION_REFUSED = 'out.reason = "host registration failed";'
 RELEASED_SIZED = ("std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + "
                   "members[1].host_keys.size() + members[2].host_keys.size());")
@@ -383,7 +407,7 @@ def claim_registration_catches_everything(cache: str) -> bool:
 LOAD_EFFECT = 'if (acquire_bound_load_effect().failed()) { out.reason = "load effect unavailable"; return false; }'
 COHERENCE = ("if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) "
              '{ out.reason = "plan not coherent"; return false; }')
-HOST_EXISTS = ("const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }); "
+HOST_EXISTS = ("const auto host = entries_.find(expert_host_key(host_id)); "
                "if (host != entries_.end()) { "
                'refusal = host->second.retired ? "host entry retiring" : "host entry exists"; break; }')
 REFUSE_EARLY = "if (refusal) { out.reason = refusal; return false; }"
@@ -398,10 +422,11 @@ def claim_registration_checked_before_the_copies(cache: str) -> bool:
 # --- an existing host entry is never replaced (c-mwmr-3) ------------------------------------------------------------
 
 OWNED_SIG = "bool unified_cache::register_host_expert_owned("
-REG_BODY_SIG = "const mem_handle & typed_owner, const sycl::event * ready_event, bool replace_existing)"
+REG_BODY_SIG = ("const mem_handle & typed_owner, const sycl::event * ready_event, bool replace_existing, "
+                "const unified_cache_key * moved_from)")
 NO_REPLACE = "if (old != entries_.end()) { if (!replace_existing) { return false; }"
 REPLACE = "erase_entry_locked(old);"
-FORWARD = "ready_event, replace_existing);"
+FORWARD = "ready_event, replace_existing, moved_from);"
 STOP_FROM_RECORD = "stop = record.reason;"
 REFUSE_STOP = "return refuse(stop_code, stop);"
 # A loan never sets `transient`, so its refusals stay REFUSED; only a refill's transient refusal is BUSY.
@@ -634,7 +659,7 @@ def claim_batched_dispatch_skips_a_repeated_ready_event(sycl: str) -> bool:
 LAYOUT_CHECK = 'if (e.layout != GGML_LAYOUT_AOS) { refusal = "layout"; break; }'
 OWNER_CHECK = ("if (e.storage_owner || e.pool_allocated || !e.direct_alloc_owner.owner_metadata(&md) || "
                "md.ptr != e.device_ptr || md.size != e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) "
-               '{ refusal = "shared storage"; break; }')
+               "{ refusal = MOE_EXPERT_MOVE_SHARED_STORAGE; break; }")
 USE_CHECK = 'if (e.direct_alloc_owner.owner_use_count() != 1) { refusal = "storage still referenced"; break; }'
 
 
@@ -910,7 +935,7 @@ MINT_MIRROR = ("device_mirror[i].handle = make_direct_entry_handle(device_key, c
 MINT_OUT = ("out.handles[i] = mem_handle::from_weight_lease_locked(device_key, cache_device, stored.device_ptr, "
             "stored.layout, true, &stored);")
 SWAP_MIRROR = "std::swap(direct_expert_entries_.find(key)->second, device_mirror[i]);"
-REMAP_ID = "id_to_key_.find(key)->second = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);"
+REMAP_ID = "id_to_key_.find(key)->second = expert_device_key(key);"
 HOST_RETIRE = ("if (host != entries_.end() && !host->second.retired && "
                "host->second.direct_alloc_owner.owner_control_id() == src_control[i]) "
                "{ (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
@@ -989,11 +1014,14 @@ def claim_refill_checks_before_copying(cache: str) -> bool:
             and ordered(b, REFILL_LOAD_EFFECT, COHERENCE, *REFILL_CHECKS, REFILL_SRC, REFUSE_EARLY, REFILL_COPY))
 
 
-# A move to the device mints its storage at the staged size the layout gives the expert's tensor's bytes per expert,
-# refill and admit alike, never at a host copy's size.
-DEVICE_BYTES = ("const size_t staged = ggml_sycl::staged_expert_bytes(e->layout, target.type, target.ncols, "
+# A move to the device mints every member's storage at what the load gave it (expert_triplet_member_bytes): its
+# triplet's slot when it has one, else its own staged size, from the staged sizes the layout gives the three members'
+# tensors' bytes per expert, refill and admit alike, never at a host copy's size. The load stages each member of a
+# slotted triplet at the slot, so the block an admitted member takes is one any evicted member gave back.
+DEVICE_BYTES = ("staged[r] = ggml_sycl::staged_expert_bytes(e->layout, target.type, target.ncols, "
                 "target.logical_bytes);")
-DEVICE_ALLOC = "storage = ggml_sycl_device_expert_alloc(device, staged);"
+DEVICE_MEMBER = "const size_t member_bytes = ggml_sycl::expert_triplet_member_bytes(staged, r);"
+DEVICE_ALLOC = "storage = ggml_sycl_device_expert_alloc(device, member_bytes);"
 ZONE_ALLOC = ("ggml_sycl::allocation_result allocation = ggml_sycl::unified_cache_zone_allocate_owner(device, "
               "ggml_sycl::vram_zone_id::WEIGHT, size);")
 
@@ -1225,7 +1253,7 @@ def claim_final_refusals_name_the_cache_refusals(cache: str, sycl: str) -> bool:
 
 # --- a lent triplet the refill can never prepare leaves the ledger, WARNed (llama.cpp-sif1) -------------------------
 
-RESOLVE_FAILED = "if (!e || !resolver(*e, target) || !target.extra) { return texts.no_tensor; }"
+RESOLVE_FAILED = "if (!resolved || !target.extra) { return texts.no_tensor; }"
 # The refill's row of the kind table: the words its preparation and its log use.
 REFILL_TEXTS = ('case ggml_sycl_expert_move_kind::REFILL: return { "no tensor for a lent expert", "not lent", '
                 '"exception while refilling", "refill" };')
@@ -1529,8 +1557,7 @@ SOURCE_SIG = "bool unified_cache::has_expert_source(ggml_sycl_cache_id key, bool
 SHARED_CACHE_LOCKS = ("std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock); "
                       "std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock); "
                       "std::lock(direct_lock, cache_lock);")
-SOURCE_FIND = ("const auto it = entries_.find(to_device ? unified_cache_key{ cache_entry_type::MOE_EXPERT, key, -1, "
-               "-1 } : make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));")
+SOURCE_FIND = "const auto it = entries_.find(to_device ? expert_host_key(key) : expert_device_key(key));"
 SOURCE_RETURN = "return it != entries_.end() && !it->second.retired;"
 # A loan copies the expert's own bytes from offset 0 of the device entry, which must hold them, into a host copy that
 # holds them too; the entry's padded tail stays on the device.
@@ -1538,28 +1565,33 @@ LOAN_ENTRY_GUARD = 'if (e.size < members[i].logical_bytes) { refusal = "device e
 LOAN_SIZE_GUARD = 'if (host_md[i].size < members[i].logical_bytes) { refusal = "host storage too small"; break; }'
 LOAN_COPY_BYTES = "bytes[i] = members[i].logical_bytes; device_size[i] = e.size;"
 # A refill and an admit copy the expert's own bytes from a host copy that holds them, into device storage of exactly
-# the staged size of those bytes.
+# what the load gives each member (expert_triplet_member_bytes), from the three members' staged sizes as AOS.
+REFILL_STAGED = ("staged[i] = staged_expert_bytes(GGML_LAYOUT_AOS, members[i].type, members[i].ncols, "
+                 "members[i].logical_bytes);")
 REFILL_SIZE_GUARD = ('const size_t logical = members[i].logical_bytes; if (e.size < logical) { '
-                     'refusal = "host copy size"; break; } const size_t staged = staged_expert_bytes(e.layout, '
-                     "members[i].type, members[i].ncols, logical); if (device_size[i] != staged || "
-                     'staged < logical) { refusal = "device storage size"; break; }')
+                     'refusal = "host copy size"; break; } const size_t member_bytes = '
+                     'expert_triplet_member_bytes(staged, i); if (device_size[i] != member_bytes || '
+                     'member_bytes < logical) { refusal = "device storage size"; break; }')
 
 
 def claim_copies_are_sized_from_the_tensor(cache: str, sycl: str) -> bool:
     """The preparation mints each member's copy from its tensor's bytes per expert, never from a cache entry's size
-    or the plan's dst_size: a loan's host copy at those bytes, a refill's and an admit's device storage at the staged
-    size the layout gives them. The cache is asked only whether the source entry is there, under its two locks, and
-    the cache's size checks stay as the guards: a loan's against the device entry and the host copy, a refill's against
-    the host copy and the device storage. So an expert that goes to the host and back does not grow."""
+    or the plan's dst_size: a loan's host copy at those bytes, a refill's and an admit's device storage at what the
+    load gives each member, its triplet's slot or else its own staged size. The cache is asked only
+    whether the source entry is there, under its two locks, and the cache's size checks stay as the guards: a loan's
+    against the device entry and the host copy, a refill's against the host copy and the device storage. So an
+    expert that goes to the host and back does not grow."""
     s = norm(sycl)
     txn = body(s, TXN_SIG)
     prep = body(s, PREP_SIG)
     c = norm(cache)
     source = body(c, SOURCE_SIG)
     loan = body(c, LOAN_SIG)
-    return (prep.count(SOURCE_CHECK) == 1 and prep.count(DEVICE_BYTES) == 1 and prep.count(DEVICE_ALLOC) == 1
-            and prep.count(HOST_ALLOC) == 1
-            and ordered(prep, RESOLVE_FAILED, SOURCE_CHECK, DEVICE_BYTES, DEVICE_ALLOC, HOST_ALLOC)
+    refill = body(c, REFILL_BODY_SIG)
+    return (prep.count(SOURCE_CHECK) == 1 and prep.count(DEVICE_BYTES) == 1 and prep.count(DEVICE_MEMBER) == 1
+            and prep.count(DEVICE_ALLOC) == 1 and prep.count(HOST_ALLOC) == 1
+            and len(re.findall(r"\bggml_sycl_device_expert_alloc\(", prep)) == 1
+            and ordered(prep, RESOLVE_FAILED, SOURCE_CHECK, DEVICE_BYTES, DEVICE_MEMBER, DEVICE_ALLOC, HOST_ALLOC)
             and "dst_size" not in prep and "staged_expert_bytes(" not in txn
             and source.count(SHARED_CACHE_LOCKS) == 1 and source.count(SOURCE_FIND) == 1
             and source.count(SOURCE_RETURN) == 1 and ordered(source, SHARED_CACHE_LOCKS, SOURCE_FIND, SOURCE_RETURN)
@@ -1567,7 +1599,263 @@ def claim_copies_are_sized_from_the_tensor(cache: str, sycl: str) -> bool:
             and "loan_copy_bytes(" not in c and "refill_copy_bytes(" not in c
             and loan.count(LOAN_ENTRY_GUARD) == 1 and loan.count(LOAN_SIZE_GUARD) == 1
             and loan.count(LOAN_COPY_BYTES) == 1 and ordered(loan, LOAN_ENTRY_GUARD, LOAN_SIZE_GUARD, LOAN_COPY_BYTES)
-            and body(c, REFILL_BODY_SIG).count(REFILL_SIZE_GUARD) == 1)
+            and refill.count(REFILL_STAGED) == 1 and refill.count(REFILL_SIZE_GUARD) == 1
+            and ordered(refill, REFILL_STAGED, REFILL_SIZE_GUARD))
+
+
+# --- a moved copy belongs to its source's models --------------------------------------------------------------------
+
+# A model load's end tags what it staged, and a model teardown never reclaims an untagged entry, so a copy a move
+# publishes after the load would outlive its model unless it is tagged by inheritance. Each copy takes the owners and
+# tag of the entry it replaces, and that entry's pending load when the copy's own stamp left none, through one helper:
+# the device entry an admit or a refill publishes, under the locks that re-check the host copy it replaces and before
+# it is inserted, its mirror keeping the entry's pending load; and the host copy a loan or an evict
+# registers, from the device entry the loan retired and holds in place, before the registration inserts it.
+INHERIT_DEF = ("void inherit_entry_ownership(unified_cache_entry & dst, const unified_cache_entry & src) noexcept { "
+               "dst.owner_mask |= src.owner_mask; dst.owner_tagged = dst.owner_tagged || src.owner_tagged; "
+               "if (dst.pending_load_txn_id == 0) { dst.pending_load_txn_id = src.pending_load_txn_id; } }")
+ADMIT_INHERIT = "inherit_entry_ownership(device_entry[i], it->second);"
+ADMIT_MIRROR = "device_mirror[i].pending_load_txn_id = device_entry[i].pending_load_txn_id;"
+REGISTER_BODY_SIG = ("bool unified_cache::register_host_expert(ggml_sycl_cache_id key, void * ptr, size_t size, "
+                     "ggml_layout_mode layout, mem_handle * out_handle, std::shared_ptr<void> allocation_owner, "
+                     "const mem_handle & typed_owner,")
+REGISTER_OWNED_SIG = "bool unified_cache::register_host_expert_owned("
+REGISTER_STAMP = "stamp_pending_owner(cache_entry, load_effect_guard);"
+REGISTER_INHERIT = ("if (source) { inherit_entry_ownership(cache_entry, *source); "
+                    "mirror_pending_txn = cache_entry.pending_load_txn_id; }")
+REGISTER_INSERT = "entries_[cache_key] = cache_entry;"
+REGISTER_MIRROR_TXN = "entry.pending_load_txn_id = mirror_pending_txn;"
+LOAN_DEVICE_KEY = "out.device_keys[i] = device_key;"
+
+
+def claim_a_moved_copy_belongs_to_its_sources_models(cache: str) -> bool:
+    c = norm(cache)
+    admit = body(c, REFILL_BODY_SIG)
+    reg = body(c, REGISTER_BODY_SIG)
+    owned = body(c, REGISTER_OWNED_SIG)
+    loan = body(c, LOAN_SIG)
+    return (c.count(INHERIT_DEF) == 1 and c.count("inherit_entry_ownership(") == 3
+            and admit.count(ADMIT_INHERIT) == 1 and admit.count(ADMIT_MIRROR) == 1
+            and ordered(admit, REFILL_SESSION, CACHE_LOCKS, ADMIT_INHERIT, ADMIT_MIRROR, EMPLACE, SWAP_MIRROR)
+            and reg.count(REGISTER_INHERIT) == 1 and reg.count(REGISTER_MIRROR_TXN) == 1
+            and ordered(reg, REGISTER_STAMP, REGISTER_INHERIT, REGISTER_INSERT, REGISTER_MIRROR_TXN)
+            and owned.count(FORWARD) == 2
+            and loan.count(REGISTER) == 1 and ordered(loan, LOAN_DEVICE_KEY, REGISTER))
+
+
+# A moved copy whose source entry is gone would be published owned by nobody, and a model teardown never reclaims an
+# untagged entry. The mover holds its source in place until its registrations return, so a missing source means the
+# move is not what it was checked to be: the registration looks the source up first, under its locks, and refuses with
+# one WARN that names the key, before it can erase an existing entry under the key, insert the copy or write its
+# mirror row. The loan's rollback then withdraws the copies it registered and puts the device entries back.
+REGISTER_SOURCE_FIND = ("const unified_cache_entry * source = nullptr; if (moved_from) { "
+                        "const auto found = entries_.find(*moved_from); if (found == entries_.end()) {")
+REGISTER_SOURCE_WARN = ('GGML_LOG_WARN("[UNIFIED-CACHE] register_host_expert refused model=%llu name_hash=0x%llx: '
+                        'the entry its moved copy replaces is gone\\n", (unsigned long long) key.model_id, '
+                        "(unsigned long long) key.name_hash);")
+REGISTER_SOURCE_REFUSE = "return false; } source = &found->second; }"
+REGISTER_OLD_ERASE = "erase_entry_locked(old);"
+
+
+def claim_a_missing_source_refuses_before_the_insert(cache: str) -> bool:
+    reg = body(norm(cache), REGISTER_BODY_SIG)
+    return (reg.count(REGISTER_SOURCE_FIND) == 1
+            and ordered(reg, CACHE_LOCKS, REGISTER_SOURCE_FIND, REGISTER_SOURCE_WARN, REGISTER_SOURCE_REFUSE,
+                        REGISTER_OLD_ERASE, REGISTER_INSERT, REGISTER_MIRROR_TXN))
+
+
+# --- the evict hands the id over before it retires ------------------------------------------------------------------
+
+# Direct staging maps the id to the device entry, so a retire that found the mapping still there walked every entry of
+# the cache under both locks looking for another to hand it to (13.6 ms a triplet at 75k entries). The loan names the
+# host copy's key first, as an admit names the device entry before it retires the host copy, so its retire finds the id
+# handed over and walks nothing, and the deferred-free pass that erases the entry later finds the same. A rollback hands
+# the id back to the device entry before it withdraws any host copy, so neither walk runs there either, unless the host
+# key is another registrant's live entry, which keeps it. A registration that fails after it named its copy under the
+# id hands the id back to the entry it was to replace, which its mover puts back, so the rollback finds the id to hand
+# back without building a mapping. The remap counts each walk, which the device test reads across an evict.
+LOAN_HOST_KEY = "const unified_cache_key host_key = expert_host_key(members[i].key);"
+LOAN_REPOINT = "expert_id_hand_over(id_to_key_, members[i].key, device_key, host_key);"
+LOAN_HAND_BACK = ("expert_id_hand_back(id_to_key_, members[i].key, host_key, device_key, held_by_another, "
+                  "spare_mapping[i]);")
+# The three helpers the loan and its rollback call, which hold the mapping edits; the key helpers name the two keys.
+HAND_OVER_SIG = "static void expert_id_hand_over("
+HAND_BACK_SIG = "static void expert_id_hand_back("
+SPARE_SIG = "static typename Map::node_type expert_spare_mapping("
+HAND_OVER_BODY = ("const auto mapped = ids.find(id); if (mapped != ids.end() && mapped->second == device_key) "
+                  "{ mapped->second = host_key; }")
+HAND_BACK_BODY = ("const auto mapped = ids.find(id); if (mapped != ids.end() && mapped->second == host_key && "
+                  "!held_by_another) { mapped->second = device_key; } else if (mapped == ids.end() && !spare.empty()) "
+                  "{ ids.insert(std::move(spare)); }")
+SPARE_BODY = ("const auto mapped = ids.find(id); if (mapped == ids.end() || !(mapped->second == device_key)) "
+              "{ return {}; } Map spare; return spare.extract(spare.emplace(id, device_key).first);")
+DEVICE_KEY_BODY = "return make_direct_stage_key(cache_entry_type::MOE_EXPERT, id, GGML_LAYOUT_AOS);"
+HOST_KEY_BODY = "return unified_cache_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };"
+LOAN_HELD_BY_ANOTHER = ("const bool held_by_another = host != entries_.end() && !host->second.retired && "
+                        "host->second.direct_alloc_owner.owner_control_id() != members[i].owner.owner_control_id();")
+REGISTER_HAND_BACK = ("if (id != id_to_key_.end() && id->second == cache_key) { if (moved_from && "
+                      "detail::cache_id_equal(moved_from->id, key)) { id->second = *moved_from; } "
+                      "else { id_to_key_.erase(id); } }")
+REMAP_EARLY = "if (mapped == id_to_key_.end() || !(mapped->second == removed_key)) { return; }"
+REMAP_WALK_COUNT = "id_remap_walks_.fetch_add(1, std::memory_order_relaxed);"
+REMAP_WALK = "for (const auto & pair : entries_) {"
+
+
+def claim_the_evict_hands_the_id_over_before_it_retires(cache: str) -> bool:
+    c = norm(cache)
+    loan = body(c, LOAN_SIG)
+    reg = body(c, REGISTER_BODY_SIG)
+    remap = body(c, REMAP_SIG)
+    return (loan.count(LOAN_REPOINT) == 1 and loan.count(LOAN_HAND_BACK) == 1 and loan.count(LOAN_HELD_BY_ANOTHER) == 1
+            and body(c, HAND_OVER_SIG).count(HAND_OVER_BODY) == 1 and body(c, HAND_BACK_SIG).count(HAND_BACK_BODY) == 1
+            and body(c, "static unified_cache_key expert_device_key(").count(DEVICE_KEY_BODY) == 1
+            and body(c, "static unified_cache_key expert_host_key(").count(HOST_KEY_BODY) == 1
+            and ordered(loan, STAMP_FLAG, LOAN_HOST_KEY, LOAN_REPOINT, DEVICE_RETIRE, REGISTER)
+            and ordered(loan, REGISTER_CATCH, LOAN_HELD_BY_ANOTHER, LOAN_HAND_BACK, HOST_WITHDRAW, RESTORE_CALL)
+            and reg.count(REGISTER_HAND_BACK) == 1
+            and remap.count(REMAP_WALK_COUNT) == 1 and ordered(remap, REMAP_EARLY, REMAP_WALK_COUNT, REMAP_WALK))
+
+
+def test_the_evict_hands_the_id_over_before_it_retires():
+    assert claim_the_evict_hands_the_id_over_before_it_retires(CACHE)
+
+
+def test_mutant_evict_retires_with_the_id_still_on_the_device_entry_fails():
+    """Without the hand-over the retire finds the id on its entry and walks the whole cache for a replacement."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(_once_in(CACHE, LOAN_SIG, LOAN_REPOINT, ""))
+
+
+def test_mutant_evict_hands_the_id_over_after_the_retire_fails():
+    moved = _once_in(CACHE, LOAN_SIG, LOAN_REPOINT, "")
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(moved, LOAN_SIG, DEVICE_RETIRE, DEVICE_RETIRE + " " + LOAN_REPOINT))
+
+
+def test_mutant_rollback_leaves_the_id_on_the_host_key_fails():
+    """The rollback puts the device entry back with the id still naming the host key its withdrawn copy held."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(_once_in(CACHE, LOAN_SIG, LOAN_HAND_BACK, ""))
+
+
+def test_mutant_rollback_takes_the_id_from_another_registrant_fails():
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, HAND_BACK_SIG, " && !held_by_another", ""))
+
+
+# The functions that look an expert's entries up by key, and the least number of times each names the two keys through
+# the helpers (the loan's checks, hand-over, rollback and restore; the copy to the device's checks, its device entries
+# and the host copies it retires; the source probe's one lookup).
+KEY_HELPER_USERS = ((LOAN_SIG, 4, 3), (REFILL_BODY_SIG, 6, 3), (SOURCE_SIG, 1, 1))
+HAND_BUILT_HOST_KEY = re.compile(r"\{\s*cache_entry_type::MOE_EXPERT\s*,")
+
+
+def claim_the_loan_names_its_keys_through_the_helpers(cache: str) -> bool:
+    """The loan, the copy to the device and the source probe build no key by hand: a second spelling of the device
+    entry's layout or of the host key's sentinels is one a helper edit would leave behind."""
+    for signature, device_uses, host_uses in KEY_HELPER_USERS:
+        text = body(norm(cache), signature)
+        if (not text or "make_direct_stage_key(" in text or HAND_BUILT_HOST_KEY.search(text)
+                or text.count("expert_device_key(") < device_uses or text.count("expert_host_key(") < host_uses):
+            return False
+    return True
+
+
+def test_the_loan_names_its_keys_through_the_helpers():
+    assert claim_the_loan_names_its_keys_through_the_helpers(CACHE)
+
+
+DEVICE_KEY_BY_HAND = "make_direct_stage_key(cache_entry_type::MOE_EXPERT, {0}, GGML_LAYOUT_AOS)"
+HOST_KEY_BY_HAND = "unified_cache_key{{ cache_entry_type::MOE_EXPERT, {0}, -1, -1 }}"
+
+
+KEY_BY_HAND_MUTANTS = (
+    ("loan-device", LOAN_SIG, "entries_.find(expert_device_key(members[i].key))",
+     "entries_.find(" + DEVICE_KEY_BY_HAND.format("members[i].key") + ")"),
+    ("loan-host", LOAN_SIG, "entries_.find(expert_host_key(host_id))",
+     "entries_.find(" + HOST_KEY_BY_HAND.format("host_id") + ")"),
+    ("copy-device", REFILL_BODY_SIG, "entries_.find(expert_device_key(key)) != entries_.end()) { refusal = "
+     "\"device entry exists\";",
+     "entries_.find(" + DEVICE_KEY_BY_HAND.format("key") + ") != entries_.end()) { refusal = "
+     "\"device entry exists\";"),
+    ("copy-host", REFILL_BODY_SIG, "const unified_cache_key host_key = expert_host_key(id);",
+     "const unified_cache_key host_key = " + HOST_KEY_BY_HAND.format("id") + ";"),
+    ("source-host", SOURCE_SIG, "entries_.find(to_device ? expert_host_key(key) : expert_device_key(key))",
+     "entries_.find(to_device ? " + HOST_KEY_BY_HAND.format("key") + " : expert_device_key(key))"),
+    ("source-device", SOURCE_SIG, "entries_.find(to_device ? expert_host_key(key) : expert_device_key(key))",
+     "entries_.find(to_device ? expert_host_key(key) : " + DEVICE_KEY_BY_HAND.format("key") + ")"),
+)
+
+
+def test_mutant_a_key_spelled_by_hand_fails():
+    for name, signature, old, new in KEY_BY_HAND_MUTANTS:
+        assert not claim_the_loan_names_its_keys_through_the_helpers(_once_in(CACHE, signature, old, new)), name
+
+
+def test_mutant_hand_over_moves_whatever_the_id_names_fails():
+    """The id handed over from an entry it no longer names would point a reader at the host key of a stale copy."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, HAND_OVER_SIG, " && mapped->second == device_key", ""))
+
+
+def test_mutant_device_key_names_another_layout_fails():
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, "static unified_cache_key expert_device_key(", "GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA"))
+
+
+def test_mutant_failed_registration_drops_the_moved_id_fails():
+    """A registration whose mirror fails erases the id its copy took, and the rollback has no mapping to hand back."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, REGISTER_BODY_SIG, REGISTER_HAND_BACK,
+                 "if (id != id_to_key_.end() && id->second == cache_key) { id_to_key_.erase(id); }"))
+
+
+def test_mutant_remap_walks_uncounted_fails():
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(_once_in(CACHE, REMAP_SIG, REMAP_WALK_COUNT, ""))
+
+
+# A rollback that finds the id mapping gone still puts the device entry back under its id. Something can erase the
+# mapping while the locks are released between step 3 and the rollback (an id-wide retire of the copy this loan
+# registered under the id finds no live entry to hand it to), and the restore re-inserts only a node its own retire
+# took out, which the hand-over left behind. So the loan mints a spare mapping node for each id it hands over, in the
+# check loop, where minting may still throw and nothing has changed, and the rollback inserts it when the id maps to
+# nothing: no node is built in the rollback.
+SPARE_DECL = "id_map::node_type spare_mapping[3];"
+SPARE_MINT = "spare_mapping[i] = expert_spare_mapping(id_to_key_, members[i].key, device_key);"
+SPARE_INSERT = "ids.insert(std::move(spare));"
+
+
+def claim_a_rollback_restores_a_lost_id(cache: str) -> bool:
+    loan = body(norm(cache), LOAN_SIG)
+    at = loan.find("if (failed) {")
+    rollback = loan[at:loan.find(REGISTRATION_REFUSED, at)] if at >= 0 else ""
+    hand_back = body(norm(cache), HAND_BACK_SIG)
+    return (loan.count(SPARE_DECL) == 1 and loan.count(SPARE_MINT) == 1
+            and body(norm(cache), SPARE_SIG).count(SPARE_BODY) == 1 and hand_back.count(SPARE_INSERT) == 1
+            and ordered(loan, SPARE_DECL, HOLD, SPARE_MINT, LOAN_REPOINT)
+            and ordered(rollback, LOAN_HAND_BACK, HOST_WITHDRAW, RESTORE_CALL)
+            and bool(rollback) and not any(x in rollback for x in NODE_BUILDERS)
+            and not any(x in hand_back for x in NODE_BUILDERS))
+
+
+def test_a_rollback_restores_a_lost_id():
+    assert claim_a_rollback_restores_a_lost_id(CACHE)
+
+
+def test_mutant_rollback_leaves_a_lost_id_lost_fails():
+    """The device entry goes back with no id mapping: every reader that resolves the expert through its id misses."""
+    assert not claim_a_rollback_restores_a_lost_id(_once_in(CACHE, HAND_BACK_SIG, SPARE_INSERT, ""))
+
+
+def test_mutant_rollback_builds_the_mapping_fails():
+    """Emplaced in the rollback, the mapping allocates where nothing may throw."""
+    assert not claim_a_rollback_restores_a_lost_id(
+        _once_in(CACHE, HAND_BACK_SIG, SPARE_INSERT, "ids.emplace(id, device_key);"))
+
+
+def test_mutant_spare_minted_after_the_hand_over_fails():
+    """Minted once the ids are handed over, a throw would leave the entries changed."""
+    moved = _once_in(CACHE, LOAN_SIG, SPARE_MINT, "")
+    assert not claim_a_rollback_restores_a_lost_id(
+        _once_in(moved, LOAN_SIG, LOAN_REPOINT, LOAN_REPOINT + " " + SPARE_MINT))
 
 
 def test_loan_never_waits():
@@ -1875,8 +2163,8 @@ def test_mutant_copy_not_behind_the_fill_fails():
 def test_mutant_host_copy_published_ready_fails():
     """The host entry published READY while its copy is still in flight: a reader could see stale bytes."""
     assert not claim_device_free_gated_on_the_copy(
-        _once(CACHE, REGISTER, REGISTER.replace(", m.owner, &out.copy_events[i], false)",
-                                                ", m.owner, nullptr, false)")), SYCL)
+        _once(CACHE, REGISTER, REGISTER.replace(", m.owner, &out.copy_events[i], false,",
+                                                ", m.owner, nullptr, false,")), SYCL)
 
 
 def test_mutant_loan_uses_the_id_wide_retire_fails():
@@ -1922,7 +2210,7 @@ def test_mutant_existing_host_entry_unchecked_fails():
 def test_mutant_idle_host_entry_let_through_fails():
     """Refusing only a retired or leased host entry lets an idle one through to be replaced, storage and all, by a
     registration the loan could not undo."""
-    busy_only = ("const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }); "
+    busy_only = ("const auto host = entries_.find(expert_host_key(host_id)); "
                  "if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) { "
                  'refusal = host->second.retired ? "host entry retiring" : "host entry exists"; break; }')
     assert not claim_existing_host_entry_never_replaced(_once(CACHE, HOST_EXISTS, busy_only), SYCL)
@@ -1938,7 +2226,7 @@ def test_mutant_retiring_host_entry_named_as_live_fails():
 
 def test_mutant_loan_registration_may_replace_fails():
     assert not claim_existing_host_entry_never_replaced(
-        _once(CACHE, REGISTER, REGISTER.replace("&out.copy_events[i], false)", "&out.copy_events[i], true)")), SYCL)
+        _once(CACHE, REGISTER, REGISTER.replace("&out.copy_events[i], false,", "&out.copy_events[i], true,")), SYCL)
 
 
 def test_mutant_registration_ignores_replace_existing_fails():
@@ -1948,7 +2236,7 @@ def test_mutant_registration_ignores_replace_existing_fails():
 
 def test_mutant_typed_registration_drops_replace_existing_fails():
     owned = body(norm(CACHE), OWNED_SIG)
-    dropped = owned.replace(FORWARD, "ready_event);")
+    dropped = owned.replace(FORWARD, "ready_event, moved_from);")
     assert not claim_existing_host_entry_never_replaced(norm(CACHE).replace(owned, dropped, 1), SYCL)
 
 
@@ -2464,8 +2752,7 @@ def test_mutant_refill_mints_after_the_swap_fails():
 
 
 def test_mutant_refill_builds_a_mapping_node_after_the_swap_fails():
-    mutant = _once(CACHE, REMAP_ID, "id_to_key_[key] = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, "
-                                    "GGML_LAYOUT_AOS);")
+    mutant = _once(CACHE, REMAP_ID, "id_to_key_[key] = expert_device_key(key);")
     assert not claim_refill_allocates_before_it_changes_anything(mutant)
 
 
@@ -2903,14 +3190,37 @@ def test_mutant_loan_copy_sized_from_dst_size_fails():
 
 
 def test_mutant_refill_storage_sized_from_dst_size_fails():
-    mutant = _once_in(SYCL, PREP_SIG, DEVICE_ALLOC, DEVICE_ALLOC.replace("(device, staged)", "(device, e->dst_size)"))
+    mutant = _once_in(SYCL, PREP_SIG, DEVICE_ALLOC,
+                      DEVICE_ALLOC.replace("(device, member_bytes)", "(device, e->dst_size)"))
     assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
+
+
+def test_mutant_device_member_minted_at_its_own_staged_size_fails():
+    """Each member minted at its own staged size even when its triplet has a slot: an admitted down projection, a few
+    grains longer than a gate, splits the block an evicted gate gave back and leaves a hole no member fits."""
+    mutant = _once_in(SYCL, PREP_SIG, DEVICE_ALLOC,
+                      DEVICE_ALLOC.replace("(device, member_bytes)", "(device, staged[r])"))
+    assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
+
+
+def test_mutant_mint_takes_the_slot_even_with_none_fails():
+    """The mint asks the slot alone: a triplet with no slot (mixed quant types) would mint 0 bytes."""
+    mutant = _once_in(SYCL, PREP_SIG, DEVICE_MEMBER,
+                      "const size_t member_bytes = ggml_sycl::expert_triplet_slot_bytes(staged);")
+    assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
+
+
+def test_mutant_cache_accepts_a_member_at_its_own_staged_size_fails():
+    """The cache's check against each member's own staged size: a device copy minted short of the slot published."""
+    mutant = _once_in(CACHE, REFILL_BODY_SIG, "if (device_size[i] != member_bytes ||",
+                      "if (device_size[i] != staged[i] ||")
+    assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
 
 
 def test_mutant_refill_device_bytes_from_the_host_copy_fails():
     """The device size taken from the host copy's bytes rather than staged from them: the padded tail the kernels
     read past an expert's own bytes is missing."""
-    mutant = _once_in(SYCL, PREP_SIG, DEVICE_BYTES, "const size_t staged = target.logical_bytes;")
+    mutant = _once_in(SYCL, PREP_SIG, DEVICE_BYTES, "staged[r] = target.logical_bytes;")
     assert not claim_copies_are_sized_from_the_tensor(CACHE, mutant)
 
 
@@ -2941,7 +3251,7 @@ def test_mutant_source_query_finds_a_retired_entry_fails():
 
 def test_mutant_source_query_reads_one_side_fails():
     """Both directions looking up the same key: a refill would ask for the device entry, a loan for the host's."""
-    mutant = _once_in(CACHE, SOURCE_SIG, "to_device ? unified_cache_key{", "!to_device ? unified_cache_key{")
+    mutant = _once_in(CACHE, SOURCE_SIG, "to_device ? expert_host_key(key)", "!to_device ? expert_host_key(key)")
     assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
 
 
@@ -3436,6 +3746,924 @@ def test_mutant_between_contexts_line_reads_as_the_exit_report_fails():
     mutant = _once_in(SYCL, BETWEEN_SIG, "(the context that lent them ended)",
                       "(the context that lent them ended) [MOE-EXEC] refill device 0: 0/0 triplets re-admitted")
     assert not claim_debt_lines_score_as_the_gate_reads_them(mutant, GATE)
+
+
+# --- a moved copy belongs to its source's models: mutants -----------------------------------------------------------
+
+def test_a_moved_copy_belongs_to_its_sources_models():
+    assert claim_a_moved_copy_belongs_to_its_sources_models(CACHE)
+
+
+def test_mutant_helper_drops_the_tag_fails():
+    """Owners copied without the tag: a copy whose owners all die reads as never attributed and is kept forever."""
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, "dst.owner_tagged = dst.owner_tagged || src.owner_tagged; ", ""))
+
+
+def test_mutant_admit_publishes_untagged_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(CACHE, ADMIT_INHERIT + " ", ""))
+
+
+def test_mutant_admit_tags_after_the_insert_fails():
+    """The inserted entry is a copy of device_entry[i]: tagging the local after the insert tags nothing. The call is
+    moved, not dropped, so only the ordering clause (inside the second lock, before the insert) catches it."""
+    moved = _once(CACHE, ADMIT_INHERIT + " ", "")
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(moved, EMPLACE, EMPLACE + " " + ADMIT_INHERIT))
+
+
+def test_mutant_admit_mirror_keeps_the_stamp_fails():
+    """A mirror whose pending load differs from its entry's survives that load's abort, naming a retired entry."""
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(CACHE, " " + ADMIT_MIRROR, ""))
+
+
+def test_mutant_registration_ignores_the_source_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(_once(CACHE, REGISTER_INHERIT, ""))
+
+
+def test_mutant_registration_tags_after_the_insert_fails():
+    moved = _once(CACHE, REGISTER_INHERIT, "")
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once_in(moved, REGISTER_BODY_SIG, REGISTER_INSERT, REGISTER_INSERT + " " + REGISTER_INHERIT))
+
+
+def test_mutant_registration_mirror_keeps_the_stamp_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, REGISTER_MIRROR_TXN, "entry.pending_load_txn_id = load_effect_guard.load_txn_id();"))
+
+
+def test_mutant_owned_registration_drops_the_source_fails():
+    """The typed overload forwards to the body without the source: every loan's host copy is published untagged."""
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, "allocation_owner, ready_event, replace_existing, moved_from);",
+              "allocation_owner, ready_event, replace_existing);"))
+
+
+def test_mutant_loan_names_no_source_fails():
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once(CACHE, REGISTER, REGISTER.replace(", &out.device_keys[i])", ", nullptr)")))
+
+
+def test_mutant_loan_names_its_source_after_the_registration_fails():
+    """The registration reads the key it is handed as the source: a key set only after the call names no entry."""
+    moved = _once_in(CACHE, LOAN_SIG, " " + LOAN_DEVICE_KEY, "")
+    assert not claim_a_moved_copy_belongs_to_its_sources_models(
+        _once_in(moved, LOAN_SIG, REGISTER + ";", REGISTER + "; " + LOAN_DEVICE_KEY))
+
+
+# --- a missing source refuses before the insert -----------------------------------------------------------------------
+
+def test_a_missing_source_refuses_before_the_insert():
+    assert claim_a_missing_source_refuses_before_the_insert(CACHE)
+
+
+def test_mutant_missing_source_publishes_untagged_fails():
+    """The WARN without the refusal: the copy is inserted and mirrored owned by nobody, and outlives its model."""
+    assert not claim_a_missing_source_refuses_before_the_insert(
+        _once_in(CACHE, REGISTER_BODY_SIG, REGISTER_SOURCE_REFUSE, "} else { source = &found->second; } }"))
+
+
+def test_mutant_missing_source_looked_up_before_the_locks_fails():
+    """The source looked up before the locks are taken: another thread can erase it between the lookup and the
+    insert, and the copy inherits from an entry that is gone."""
+    unlocked = _once_in(CACHE, REGISTER_BODY_SIG, " std::lock(direct_lock, cache_lock);", "")
+    assert not claim_a_missing_source_refuses_before_the_insert(
+        _once_in(unlocked, REGISTER_BODY_SIG, REGISTER_SOURCE_REFUSE,
+                 REGISTER_SOURCE_REFUSE + " std::lock(direct_lock, cache_lock);"))
+
+
+
+# --- a member's ids come from an index, not a scan of the expert table ----------------------------------------------
+
+# A move resolves every member's canonical ids, and the table those come from has a row per expert per tensor (73728 on
+# Qwen), so a scan per member cost as much as the transaction's copies. The index is built from the table wherever the
+# table is replaced, in the same allocation epoch and swapped in under the same locks, so the two never disagree, and
+# the lookups walk only the rows of one tensor name and expert, in table order.
+GET_KEYS_SIG = "static std::vector<ggml_sycl_cache_id> ggml_sycl_get_canonical_moe_expert_keys("
+MATERIALIZE_SIG = "static bool ggml_sycl_materialize_planned_expert_layout("
+META_SCAN = "for (const auto & m : g_moe_expert_meta)"
+KEYS_LOOKUP = ("for (uint32_t r = moe_expert_meta_first_row_locked(src0->name, expert_id); r != UINT32_MAX; "
+               "r = g_moe_expert_meta_index.next_row[r]) {")
+MATERIALIZE_LOOKUP = "const uint32_t r = moe_expert_meta_first_row_locked(src0->name, expert_id);"
+INDEX_BUILT = "new_expert_meta_index = moe_expert_meta_index_build(new_expert_meta);"
+PUBLISH_LOCK = "std::scoped_lock lock(g_moe_expert_meta_mutex, g_expert_groups_mutex);"
+PUBLISH_TABLE = "g_moe_expert_meta.swap(new_expert_meta);"
+PUBLISH_INDEX = "g_moe_expert_meta_index.swap(new_expert_meta_index);"
+SEED_ROW = "g_moe_expert_meta.push_back({});"
+SEED_INDEX = "g_moe_expert_meta_index = moe_expert_meta_index_build(g_moe_expert_meta);"
+
+
+def claim_member_ids_come_from_the_meta_index(sycl: str) -> bool:
+    s = norm(sycl)
+    keys = body(s, GET_KEYS_SIG)
+    mat = body(s, MATERIALIZE_SIG)
+    return (bool(keys) and bool(mat) and META_SCAN not in keys and META_SCAN not in mat
+            and keys.count(KEYS_LOOKUP) == 1 and mat.count(MATERIALIZE_LOOKUP) == 1
+            and s.count("moe_expert_meta_index_build(") == 3 and s.count(INDEX_BUILT) == 1
+            and s.count(PUBLISH_INDEX) == 1 and ordered(s, INDEX_BUILT, PUBLISH_LOCK, PUBLISH_TABLE, PUBLISH_INDEX)
+            and s.count(SEED_INDEX) == 1 and ordered(s, SEED_ROW, SEED_INDEX))
+
+
+def test_member_ids_come_from_the_meta_index():
+    assert claim_member_ids_come_from_the_meta_index(SYCL)
+
+
+def test_mutant_member_ids_scan_the_table_fails():
+    """The scan per member back: every member of a move compares its name against every row of the table."""
+    assert not claim_member_ids_come_from_the_meta_index(
+        _once_in(SYCL, GET_KEYS_SIG, KEYS_LOOKUP, META_SCAN + " { const uint32_t r = 0; (void) r;"))
+
+
+def test_mutant_index_left_stale_by_a_new_table_fails():
+    """A new table published without its index: the lookups answer with the previous model's rows."""
+    assert not claim_member_ids_come_from_the_meta_index(_once(SYCL, PUBLISH_INDEX, ""))
+
+
+def test_mutant_seeded_row_leaves_the_index_behind_fails():
+    """A test row seeded without its index: the lookups cannot see the row the test placed."""
+    assert not claim_member_ids_come_from_the_meta_index(_once(SYCL, SEED_INDEX, ""))
+
+
+
+# --- an expert move's retires leave the eviction latch alone, while its publication covers them ---------------------
+
+# has_evictions_ turns off graph replay and persistent TG for the whole process until the next model load, so a decode
+# run that evicted once ran every later graph by direct dispatch. An expert move's retires do not need it: its
+# publication bumps the exec-graph epoch, which drops every exec graph that may bake a moved copy's pointer, and
+# persistent TG never takes a graph with a MUL_MAT_ID. So (b) the cache marks the retires the move makes that the latch
+# would otherwise count, the loan's device entries (a host copy is host-resident, which the latch never counts, so the
+# copy to the device marks nothing), finalize leaves only marked entries out of the latch, and a restore clears the
+# mark; any other retire of the same entry still latches. And (c) the exemption holds only once the
+# epoch has moved: the transaction arms a guard before each cache move, disarms it again for a move the cache refused
+# whole, and dismisses it only after the epoch bump in the won swap; on every other exit (a lost swap, a throw) its
+# destructor sets the latch through the cache's one public setter.
+CACHE_HPP = read("ggml/src/ggml-sycl/unified-cache.hpp")
+FINALIZE_SIG = "size_t unified_cache::finalize_retired_entries_locked() {"
+FINALIZE_LATCH = re.compile(r"if \(([^{]*)\) \{ has_evictions_\.store\(true")
+MOVE_MARK_FIELD = "!entry.retired_by_expert_move"
+LOAN_MARK = "device_entry[i]->retired_by_expert_move = true;"
+RESTORE_CLEAR = "it->second.retired_by_expert_move = false;"
+HOST_RETIRE_CALL = "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);"
+LATCH_SETTER = "void latch_evictions() noexcept { has_evictions_.store(true, std::memory_order_release); }"
+GUARD_DTOR = "~ggml_sycl_expert_move_latch_guard() { if (armed && cache) { cache->latch_evictions(); } }"
+GUARD_DECL = "ggml_sycl_expert_move_latch_guard latch{ cache };"
+GUARD_ARM = "const bool armed_before = latch.armed; latch.armed = true;"
+GUARD_REFUSED = "if (!loaned) { latch.armed = armed_before; }"
+GUARD_DISMISS = "ggml_sycl_optional_layouts_retired(); latch.armed = false; }"
+SWAP_WON = "if (swapped) {"
+
+
+def claim_a_move_marks_its_retires_and_only_they_skip_the_latch(cache: str, hpp: str) -> bool:
+    c = norm(cache)
+    latch = FINALIZE_LATCH.search(body(c, FINALIZE_SIG))
+    loan = body(c, LOAN_SIG)
+    copy = body(c, REFILL_BODY_SIG)
+    return (latch is not None and MOVE_MARK_FIELD in latch.group(1) and "!entry.optional_layout" in latch.group(1)
+            and c.count("retired_by_expert_move = true;") == 1
+            and loan.count(LOAN_MARK) == 1 and ordered(loan, LOAN_MARK, DEVICE_RETIRE)
+            and "retired_by_expert_move" not in copy
+            and body(c, RESTORE_SIG).count(RESTORE_CLEAR) == 1
+            and "bool retired_by_expert_move = false;" in norm(hpp))
+
+
+def test_a_move_marks_its_retires_and_only_they_skip_the_latch():
+    assert claim_a_move_marks_its_retires_and_only_they_skip_the_latch(CACHE, CACHE_HPP)
+
+
+def test_mutant_finalize_latches_a_moves_retire_fails():
+    """The exemption gone: a decode run's first evict turns off graph replay until the next load."""
+    n = norm(CACHE)
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(
+        _once_in(n, FINALIZE_SIG, " && " + MOVE_MARK_FIELD, ""), CACHE_HPP)
+
+
+def test_mutant_loan_retire_left_unmarked_fails():
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(_once_in(CACHE, LOAN_SIG, LOAN_MARK, ""),
+                                                                           CACHE_HPP)
+
+
+def test_mutant_admit_marks_its_host_retire_fails():
+    """A host copy is host-resident, so the latch never counted it: the mark there is dead code that reads as a rule."""
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(
+        _once_in(CACHE, REFILL_BODY_SIG, HOST_RETIRE_CALL,
+                 "host->second.retired_by_expert_move = true; " + HOST_RETIRE_CALL),
+        CACHE_HPP)
+
+
+def test_mutant_restore_keeps_the_mark_fails():
+    """A restored entry kept the mark: a later pressure eviction or drop of it would skip the latch."""
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(
+        _once_in(CACHE, RESTORE_SIG, RESTORE_CLEAR, ""), CACHE_HPP)
+
+
+def claim_an_unpublished_move_sets_the_latch(sycl: str, hpp: str) -> bool:
+    s = norm(sycl)
+    txn = body(s, TXN_SIG)
+    return (LATCH_SETTER in norm(hpp) and s.count(GUARD_DTOR) == 1
+            and txn.count(GUARD_DECL) == 1 and txn.count(GUARD_ARM) == 1 and txn.count(GUARD_REFUSED) == 1
+            and txn.count("latch.armed = false;") == 1 and txn.count(GUARD_DISMISS) == 1
+            and ordered(txn, GUARD_DECL, GUARD_ARM, MOVE_CALL, GUARD_REFUSED, SWAP_WON, PUBLISH, GUARD_DISMISS))
+
+
+def test_an_unpublished_move_sets_the_latch():
+    assert claim_an_unpublished_move_sets_the_latch(SYCL, CACHE_HPP)
+
+
+def test_mutant_guard_dismissed_before_the_swap_fails():
+    """Dismissed as the cache moves: a lost swap leaves retires no epoch covers out of the latch."""
+    n = norm(SYCL)
+    moved = _once_in(n, TXN_SIG, GUARD_DISMISS, "ggml_sycl_optional_layouts_retired(); }")
+    assert not claim_an_unpublished_move_sets_the_latch(
+        _once_in(moved, TXN_SIG, GUARD_REFUSED, GUARD_REFUSED + " latch.armed = false;"), CACHE_HPP)
+
+
+def test_mutant_guard_sets_nothing_fails():
+    assert not claim_an_unpublished_move_sets_the_latch(
+        _once(SYCL, GUARD_DTOR, "~ggml_sycl_expert_move_latch_guard() {}"), CACHE_HPP)
+
+
+def test_mutant_guard_never_armed_fails():
+    assert not claim_an_unpublished_move_sets_the_latch(_once_in(SYCL, TXN_SIG, GUARD_ARM, ""), CACHE_HPP)
+
+
+# (d) The retires stay unreapable until the latch question is settled. A retired device entry is reaped by the
+# deferred-free pass once its last lease goes, and the mark leaves that reap out of the latch, so a lease must hold
+# each entry until the publication has bumped the epoch, or until the guard has latched on an exit that did not
+# publish. The loan hands the leases that held its retires in place to the transaction (expert_move_record::
+# retired_leases) instead of dropping them; the transaction moves them into one vector, reserved before the first move
+# so taking them cannot throw, and declared before the guard, so the guard's destructor runs first on every exit. The
+# vector is never released by hand: it goes as the call returns, after the bump or after the latch.
+RECORD_LEASES = "std::shared_ptr<mem_handle> retired_leases[3];"
+LEASES_DECL = "std::vector<std::shared_ptr<ggml_sycl::mem_handle>> move_leases;"
+LEASES_RESERVE = "move_leases.reserve(3 * prepared.size());"
+LEASES_TAKEN = ("for (std::shared_ptr<ggml_sycl::mem_handle> & lease : record.retired_leases) { if (lease) { "
+                "move_leases.push_back(std::move(lease)); } }")
+
+
+def claim_a_moves_retires_stay_leased_until_published(cache: str, hpp: str, sycl: str) -> bool:
+    loan = body(norm(cache), LOAN_SIG)
+    txn = body(norm(sycl), TXN_SIG)
+    return (RECORD_LEASES in norm(hpp) and loan.count(HAND_HELD) == 1 and loan.count(DROP_HELD) == 1
+            and ordered(loan, "if (failed) {", DROP_HELD, "return false; }", HAND_HELD, "out.accepted = true;")
+            and txn.count("move_leases") == 3 and txn.count(LEASES_TAKEN) == 1
+            and ordered(txn, LEASES_DECL, LEASES_RESERVE, GUARD_DECL, MOVE_CALL, LEASES_TAKEN, GUARD_REFUSED))
+
+
+def test_a_moves_retires_stay_leased_until_published():
+    assert claim_a_moves_retires_stay_leased_until_published(CACHE, CACHE_HPP, SYCL)
+
+
+def test_mutant_loan_drops_its_retires_leases_fails():
+    """The loan dropped them as before: the deferred-free pass can reap a marked entry before any epoch moves."""
+    assert not claim_a_moves_retires_stay_leased_until_published(_once_in(CACHE, LOAN_SIG, HAND_HELD, DROP_HELD),
+                                                                 CACHE_HPP, SYCL)
+
+
+def test_mutant_txn_leaves_the_leases_on_the_record_fails():
+    """Left on the per-triplet record, each lease goes at the end of its loop iteration, before the publication."""
+    assert not claim_a_moves_retires_stay_leased_until_published(CACHE, CACHE_HPP,
+                                                                 _once_in(SYCL, TXN_SIG, LEASES_TAKEN, ""))
+
+
+def test_mutant_leases_outlived_by_the_guard_fails():
+    """Declared after the guard, the leases go before its destructor latches: a reap in between skips the latch."""
+    moved = _once_in(SYCL, TXN_SIG, LEASES_DECL + " " + LEASES_RESERVE, "")
+    assert not claim_a_moves_retires_stay_leased_until_published(
+        CACHE, CACHE_HPP, _once_in(moved, TXN_SIG, GUARD_DECL, GUARD_DECL + " " + LEASES_DECL + " " + LEASES_RESERVE))
+
+
+def test_mutant_leases_released_before_the_bump_fails():
+    assert not claim_a_moves_retires_stay_leased_until_published(
+        CACHE, CACHE_HPP, _once_in(SYCL, TXN_SIG, PUBLISH, "move_leases.clear(); " + PUBLISH))
+
+
+# The hooks the move cases read the latch and the id map through exist only in the testing build: a production caller
+# of test_reset_evictions_latch could clear the latch outside a reclaim and turn graph replay back on over a retire no
+# epoch covers.
+TEST_ONLY_HOOKS = ("test_id_remap_walks()", "test_id_mapping(ggml_sycl_cache_id id", "test_reset_evictions_latch()")
+PRIVATE_TESTING_IF = "#if defined(GGML_SYCL_PRIVATE_TESTING)"
+
+
+def _in_private_testing(text: str, needle: str) -> bool:
+    """Whether every occurrence of `needle` sits in the true branch of a GGML_SYCL_PRIVATE_TESTING conditional."""
+    lines = strip_comments(text).split("\n")
+    stack: list[bool] = []
+    seen = False
+    for line in lines:
+        directive = line.strip()
+        if directive.startswith("#if"):
+            stack.append(directive == PRIVATE_TESTING_IF)
+        elif directive.startswith("#el"):
+            stack[-1] = False
+        elif directive.startswith("#endif"):
+            stack.pop()
+        elif needle in line:
+            seen = True
+            if not any(stack):
+                return False
+    return seen
+
+
+def _raw_once(text: str, old: str, new: str) -> str:
+    """`text` with the one occurrence of `old` replaced on the raw text, for a mutant whose anchor is a line break."""
+    assert text.count(old) == 1, f"mutant anchor must match exactly once: {old!r} x{text.count(old)}"
+    return text.replace(old, new, 1)
+
+
+def claim_the_move_test_hooks_are_test_only(hpp: str, cache: str) -> bool:
+    return all(_in_private_testing(hpp, hook) and _in_private_testing(cache, "unified_cache::" + hook)
+               for hook in TEST_ONLY_HOOKS)
+
+
+def test_the_move_test_hooks_are_test_only():
+    assert claim_the_move_test_hooks_are_test_only(CACHE_HPP, CACHE)
+
+
+def test_mutant_latch_reset_in_production_fails():
+    """The declaration moved out of the guard: production code could clear the latch."""
+    hpp = _raw_once(CACHE_HPP, "    void     test_reset_evictions_latch() noexcept;\n", "")
+    hpp = _raw_once(hpp, PRIVATE_TESTING_IF + "\n    // Test-only",
+                "    void     test_reset_evictions_latch() noexcept;\n" + PRIVATE_TESTING_IF + "\n    // Test-only")
+    assert not claim_the_move_test_hooks_are_test_only(hpp, CACHE)
+
+
+def test_mutant_definitions_in_production_fail():
+    cache = _raw_once(CACHE, PRIVATE_TESTING_IF + "\nvoid unified_cache::test_reset_evictions_latch()",
+                  "void unified_cache::test_reset_evictions_latch()")
+    cache = _raw_once(cache, "    return true;\n}\n#endif\n\nuint64_t unified_cache::test_entry_pending_load_txn(",
+                  "    return true;\n}\n\nuint64_t unified_cache::test_entry_pending_load_txn(")
+    assert not claim_the_move_test_hooks_are_test_only(CACHE_HPP, cache)
+
+# --- one WEIGHT-zone slot per triplet: every member mint, load and swap alike, takes it -----------------------------
+
+# A triplet's members need not stage alike (an AOS down projection whose row width is not a multiple of
+# MATRIX_ROW_PADDING carries a tail its gate and up do not). Minted each at its own size, a swap's admitted member
+# splits a block another member size gave back and leaves a hole no member fits. So one function gives a triplet's
+# slot (expert_triplet_slot_bytes, the largest of the members' staged sizes rounded to the zone's grain, and 0 when that
+# would pad the triplet by more than 1/128 of its members' own blocks), one gives each member's size from it
+# (expert_triplet_member_bytes, the slot or else the member's own staged size), and every mint of a member asks them:
+# the load's per-expert staging through ggml_sycl_expert_stage_bytes, the swap's and the refill's preparation, and the
+# cache's check of the storage it is handed; the planner charges each member of a slotted triplet the slot, and each
+# AOS member of a complete triplet with none its own staged size, at each plan build and again after each pass that
+# re-lays out experts (the single-device PP gate/up preparation, the pack, the I8 upgrades and the multi-device layout
+# passes), moving the totals of the device each changed entry is on, found by its target device, by the change, and
+# warning when that is past the device's room. The load's bulk staging, one stride for every expert, declines a tensor
+# whose triplets' slots exceed that stride, and the opt-in DPAS rollback restores an AOS base at its triplet's slot by
+# the load's own plain copy. The logical bytes stay the member's own: every copy moves them and no more.
+SLOT_HPP = read("ggml/src/ggml-sycl/expert-slot.hpp")
+SLOT_SIG = "inline size_t expert_triplet_slot_bytes(const size_t (&staged)[3])"
+SLOT_ROUND = "const size_t rounded = tlsf_allocator::round_request(bytes, tlsf_allocator::block_grain);"
+SLOT_MAX = "slot = rounded > slot ? rounded : slot;"
+SLOT_DIVISOR = "inline constexpr size_t expert_triplet_slot_padding_divisor = 128;"
+SLOT_PAD = ("const size_t padding = 3 * slot - own; "
+            "return padding <= own / expert_triplet_slot_padding_divisor ? slot : 0;")
+MEMBER_SIG = "inline size_t expert_triplet_member_bytes(const size_t (&staged)[3], int role)"
+MEMBER_BODY = "const size_t slot = expert_triplet_slot_bytes(staged); return slot != 0 ? slot : staged[role];"
+RECHARGE_SIG = ("static inline std::vector<placement_charge_change> placement_entries_recharge_expert_slots("
+                "std::vector<placement_entry> & entries)")
+RECHARGE_CHARGES = "placement_entries_charge_expert_slots(entries);"
+RECHARGE_ON_SIG = ("static inline size_t placement_entries_recharge_expert_slots_on("
+                   "std::vector<placement_entry> & entries,")
+RECHARGE_ON_READ = "placement_entries_recharge_expert_slots(entries)"
+RECHARGE_ON_HOST = "if (!e.on_device) { continue; }"
+RECHARGE_ON_KEY = "if (d.device_id != e.target_device || !d.remaining) { continue; }"
+RECHARGE_ON_MOVE = ("over += placement_charge_move(c.old_charge, c.new_charge, *d.remaining, "
+                    "d.device_vram ? *d.device_vram : untracked, weight_vram, vram);")
+PLANNER_RECHARGE_SIG = "static size_t planner_recharge_expert_slots(placement_plan & plan,"
+PLANNER_RECHARGE_CALL = ("const size_t over = placement_entries_recharge_expert_slots_on(plan.entries, devices, "
+                         "plan.weight_vram_bytes, plan.vram_bytes);")
+PLANNER_RECHARGE_WARN = 'if (over > 0) { GGML_LOG_WARN("[PLACEMENT-MOE] %s: expert slots re-charged %.1f MB past the '
+ROOM_ONE_SIG = "static std::vector<placement_recharge_device> planner_recharge_device(int device_id,"
+ROOM_ONE_BODY = ("std::vector<placement_recharge_device> devices; "
+                 "devices.push_back({ device_id, &remaining, device_vram }); return devices;")
+ROOM_ALL_SIG = "static std::vector<placement_recharge_device> planner_recharge_devices_of(placement_plan & plan,"
+ROOM_ALL_BODY = ("std::vector<placement_recharge_device> devices; "
+                 "for (size_t d = 0; d < budgets.size() && d < remaining.size(); ++d) { "
+                 "size_t * device_vram = d < plan.per_device_vram.size() ? &plan.per_device_vram[d] : nullptr; "
+                 "devices.push_back({ budgets[d].device_id, &remaining[d], device_vram }); } return devices;")
+MULTI_LAYOUTS_SIG = "static void apply_multi_moe_per_target_layouts(placement_plan & plan,"
+MULTI_UPGRADE_SIG = "static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,"
+MULTI_RECHARGE = "planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),"
+MULTI_LAYOUT_SET = "entry.dst_size = new_size;"
+UPGRADE_RECHARGE = ("planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining, "
+                    "&plan.per_device_vram[device_index]),")
+SINGLE_RECHARGE = "planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining),"
+PACK_PREPARE = ("prepare_single_moe_pp_gate_up_primary_layouts_for_pack(plan, device_id, kv_info, envelope); } "
+                "placement_entries_charge_expert_slots(plan.entries); auto moe_groups = build_moe_triplet_groups(")
+PACK_RECHARGE = SINGLE_RECHARGE + ' "triplet pack");'
+PACK_HOST_SET = "entry.dst_size = entry.src_size;"
+DOWN_I8_RECHARGE = SINGLE_RECHARGE + ' "I8 down layout upgrades");'
+GATE_UP_I8_CALL = "maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);"
+GATE_UP_I8_RECHARGE = SINGLE_RECHARGE + ' "I8 gate/up layout upgrades");'
+MULTI_DOWN_I8_RECHARGE = MULTI_RECHARGE + ' "I8 down layout upgrades");'
+# Each I8 down re-charge comes right after the upgrades it follows: the single-device one after both arms of the
+# down upgrade and the PP alternates, each multi-device one right after its primary's down upgrade is charged.
+SINGLE_PP_ALTERNATES = "add_single_moe_pp_executable_alternates(plan, remaining, device_id, kv_info, envelope, nullptr"
+SINGLE_DOWN_I8_CALL = "maybe_upgrade_moe_down_layouts_to_i8(plan, remaining, device_id, n_experts);"
+SINGLE_DOWN_I8_ARMS = ("if (!planner_moe_prompt_down_specialized_layouts_enabled()) { " + SINGLE_PP_ALTERNATES
+                       + ", false); " + SINGLE_DOWN_I8_CALL + " } else { " + SINGLE_DOWN_I8_CALL + " "
+                       + SINGLE_PP_ALTERNATES + "); }")
+SINGLE_DOWN_I8_SITE = SINGLE_DOWN_I8_ARMS + " " + DOWN_I8_RECHARGE
+PRIMARY_DOWN_I8_UPGRADE = ("maybe_upgrade_moe_down_layouts_to_i8(plan, remaining[0], device_budgets[0].device_id, "
+                           "n_experts, false); if (!plan.per_device_vram.empty()) { "
+                           "plan.per_device_vram[0] += primary_down_charged; }")
+PRIMARY_DOWN_I8_SITE = PRIMARY_DOWN_I8_UPGRADE + " " + MULTI_DOWN_I8_RECHARGE
+# The second multi-device site is anchored on the end of both arms of its down upgrade, as the single-device one is,
+# so neither the re-charge nor the re-charge with the charge bookkeeping can move ahead of the arms.
+BRANCH_PP_ALTERNATES = "add_multi_moe_pp_executable_alternates(plan, remaining, device_budgets, kv_info, envelope);"
+BRANCH_DOWN_I8_CALL = ("primary_down_charged = maybe_upgrade_moe_down_layouts_to_i8(plan, remaining[0], "
+                       "device_budgets[0].device_id, n_experts, multi_static_i8_executor_supported);")
+BRANCH_DOWN_I8_ARMS = ("if (!planner_moe_prompt_down_specialized_layouts_enabled()) { " + BRANCH_PP_ALTERNATES + " "
+                       + BRANCH_DOWN_I8_CALL + " } else { " + BRANCH_DOWN_I8_CALL + " " + BRANCH_PP_ALTERNATES + " }")
+BRANCH_DOWN_I8_TOTAL = "plan.per_device_vram[0] += primary_down_charged;"
+BRANCH_DOWN_I8_SITE = BRANCH_DOWN_I8_ARMS + " " + BRANCH_DOWN_I8_TOTAL + " " + MULTI_DOWN_I8_RECHARGE
+# A repeat of a triplet role in another layout or on another device is charged on its own while the load stages it as
+# its member: the planner says so at WARN, naming the repeat, and a duplicated role raises the summary line to WARN.
+DIAG_SIG = "static void log_moe_placement_diagnostics(const char * tag, const placement_plan & plan, int n_experts)"
+DIAG_SUMMARY = ('ggml_log_internal(summary.duplicates != 0 ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO, '
+                '"[%s] expected=%zu planned=%zu unclassified=%zu duplicates=%zu missing=%zu\\n",')
+DIAG_OFF_LOOP = ("for (const placement_repeat_off_member & off : "
+                 "placement_entries_repeats_off_their_member(plan.entries)) {")
+DIAG_OFF_WARN = ('GGML_LOG_WARN("[%s] layer %d expert %d %s: a repeated entry (%s on %s) differs from its member '
+                 '(%s on %s); the load stages it as its member, so the repeat\'s charge does not follow the slot the '
+                 'load stages it at\\n", tag, off.repeat->layer_id, off.repeat->expert_id, '
+                 'expert_tensor_role_name(off.repeat->expert_role),')
+OFF_SIG = "static inline std::vector<placement_repeat_off_member> placement_entries_repeats_off_their_member("
+OFF_TEST = "} else if (e.layout != member->layout || e.target_device != member->target_device) {"
+PLAN_SLOT_SIG = "static inline size_t moe_expert_triplet_slot_bytes(const placement_entry * const (&t)[3])"
+PLAN_SLOT_CALL = "return expert_triplet_slot_bytes(staged);"
+PLAN_ENTRY_STAGED = "return staged_expert_bytes(e.layout, e.type, e.ne[0], e.src_size);"
+CHARGE_SIG = "static inline size_t placement_entries_charge_expert_slots(std::vector<placement_entry> & entries)"
+# The charge resolves a triplet as the plan's index does (first entry of each role, no entry with no layer), so the
+# load's lookup of the slot and the charge agree, and charges every entry that stages as AOS what the load stages it at.
+CHARGE_INDEXED = ("if (e.expert_id < 0 || e.layer_id < 0 || !detail::moe_expert_role_is_triplet(e.expert_role)) { "
+                  "continue; }")
+CHARGE_FIRST = "if (member) { t.repeats.push_back(&e); } else { member = &e; }"
+CHARGE_COMPLETE = "if (!members[0] || !members[1] || !members[2]) { continue; }"
+CHARGE_SET = "e->vram_charge_size = placement_vram_charge_bytes(std::max(slot_bytes, staged));"
+CHARGE_STAGED = ("const size_t staged = moe_expert_entry_staged_bytes(*e); if (staged != 0) { " + CHARGE_SET + " }")
+CHARGE_EACH = ("for (placement_entry * e : t.members) { charge(e); } "
+               "for (placement_entry * e : t.repeats) { charge(e); }")
+# The loan's bulk answer mirrors the load's decline of an AOS tensor whose triplets' slot passes its one stride, in the
+# layout the load stages: the primary's, or the alternate's for a tensor staged through its alternates.
+BULK_MIRROR_SIG = ("static inline bool moe_loan_tensor_bulk_staged(const placement_plan & plan, "
+                   "const std::string & name, int device)")
+BULK_MIRROR_ALT = "++n_alt; staged_layout = alt.layout;"
+BULK_MIRROR = ("if (staged_layout == GGML_LAYOUT_AOS) { const size_t stride = staged_expert_bytes(GGML_LAYOUT_AOS, "
+               "e.type, e.ne[0], e.src_size); if (moe_expert_triplet_slot_bytes(plan, e.layer_id, e.expert_id) > "
+               "stride) { return false; } }")
+# The materialization reorder runs after the last charge and is the plan order the index reads: it keeps entries that
+# share a role in the order the charge saw, so the index's first entry of a role is the one charged as the member.
+REORDER_SIG = "static void reorder_plan_entries_for_moe_materialization(placement_plan & plan,"
+REORDER_SORT = ("std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) { return "
+                "moe_materialization_role_order(plan.entries[a].expert_role) < "
+                "moe_materialization_role_order(plan.entries[b].expert_role); });")
+STAGE_BYTES_SIG = "static size_t ggml_sycl_expert_stage_bytes(const ggml_sycl::placement_plan & plan,"
+STAGE_BYTES_BODY = ("if (layout != GGML_LAYOUT_AOS) { return staged; } const size_t slot = "
+                    "ggml_sycl::moe_expert_triplet_slot_bytes(plan, layer, expert); return slot >= staged ? slot : "
+                    "staged; }")
+# The preload reads the cache's plan once per tensor, for the bulk decline and each expert's slot sizing, and a DPAS
+# rollback once for its restore: an owner fetch costs an atomic load and a shared_ptr copy.
+PRELOAD_OWNER = ("const auto plan_owner = ggml_sycl_cache_plan_owner(cache); "
+                 "auto try_bulk_stage_moe_tensor = [&]() -> bool {")
+DPAS_OWNER = ("restore_keys.reserve(local_experts.size()); const auto plan_owner = ggml_sycl_cache_plan_owner(cache); "
+              "for (int e : local_experts) {")
+PRELOAD_SLOT = ("expert_preload_bytes = ggml_sycl_expert_stage_bytes(*plan_owner, expert_slot_layer, "
+                "static_cast<int>(e), expert_preload_layout, expert_preload_bytes);")
+PRELOAD_STAGE = ("ggml_sycl::unified_cache_direct_stage_expert(device, key, expert_aos, expert_size, "
+                 "expert_preload_bytes, expert_preload_layout,")
+PRELOAD_STAGE_END = PRELOAD_STAGE + " expert_fill_fn, expert_fill_ctx, moe_preload_q, &handle);"
+# Layer 0 is a layer: the sizing runs for every planned layer, and only an expert the plan does not place on this
+# device (layer -1) stages at its own size.
+PRELOAD_GUARD = "if (expert_slot_layer >= 0) { " + PRELOAD_SLOT + " }"
+PRELOAD_LAYER = "expert_slot_layer = placement.layer_id;"
+BULK_LAYER = "bulk_layers.push_back(placement.layer_id);"
+BULK_SLOT = ("if (bulk_layout == GGML_LAYOUT_AOS) { for (size_t e = 0; e < bulk_layers.size(); ++e) { "
+             "if (ggml_sycl_expert_stage_bytes(*plan_owner, bulk_layers[e], static_cast<int>(e), bulk_layout, "
+             "bulk_expert_bytes) != bulk_expert_bytes) { return false; } } }")
+BULK_STAGE = "auto bulk_result = ggml_sycl::unified_cache_direct_stage_expert_tensor("
+DPAS_AOS_FILL = ("if (base_layout == GGML_LAYOUT_AOS) { restore_fill_fn = nullptr; restore_fill = nullptr; "
+                 "if (have_plan) {")
+DPAS_SLOT = ("restore_bytes = ggml_sycl_expert_stage_bytes(*plan_owner, placement.layer_id, e, base_layout, "
+             "expert_base_bytes);")
+DPAS_STAGE = ("auto rollback = ggml_sycl::unified_cache_direct_stage_expert(device, key, expert_aos, tensor->nb[2], "
+              "restore_bytes, base_layout, restore_fill_fn, restore_fill, s1_preload_q, &rollback_handle);")
+PLANNER_CHARGES = "placement_entries_charge_expert_slots(plan.entries);"
+TESTING_IF_RE = re.compile(r"#\s*if\s+defined\s*\(\s*GGML_SYCL_PRIVATE_TESTING\s*\)")
+CONDITIONAL_RE = re.compile(r"#\s*(if|ifdef|ifndef|endif)\b")
+FIXTURE_SLOT_RE = re.compile(r"\bexpert_triplet_slot_bytes\(")
+
+
+def conditional_end(text: str, after: int) -> int:
+    """Where the conditional opened just before `after` closes: the end of its matching #endif, found by counting
+    the conditionals nested in it. -1 when it never closes."""
+    depth = 1
+    for m in CONDITIONAL_RE.finditer(text, after):
+        depth += -1 if m.group(1) == "endif" else 1
+        if depth == 0:
+            return m.end()
+    return -1
+
+
+def production(text: str) -> str:
+    """`text` without each GGML_SYCL_PRIVATE_TESTING block that computes a slot of its own (the device fixtures,
+    which size their own entries). The block is found by balancing its conditionals, not by the comment on its
+    #endif, so raw and normalized text (which has no comments) lose the same block. Unchanged when there is none."""
+    out = []
+    pos = 0
+    for m in TESTING_IF_RE.finditer(text):
+        if m.start() < pos:
+            continue
+        end = conditional_end(text, m.end())
+        if end >= 0 and FIXTURE_SLOT_RE.search(text, m.end(), end):
+            out.append(text[pos:m.start()])
+            pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def claim_every_member_mint_takes_the_triplet_slot(sycl: str, cache: str, plan_hpp: str, slot_hpp: str) -> bool:
+    """One function gives the slot, from the largest of the members' staged sizes rounded to the zone's grain, and
+    none past 1/128 of padding; one gives each member's size from it, and the plan header asks it in one place only.
+    The plan asks the slot of a triplet's three entries, the preparation and the cache ask each member's size of the
+    three members they are handed; the load's per-expert staging mints at the plan's slot, through one helper, for
+    every planned layer from 0, its bulk staging declines a tensor a slot would not fit (and the loan's bulk answer
+    mirrors that decline, in the layout the load stages), and the DPAS rollback restores an AOS base at the slot by
+    the plain copy. The planner resolves a triplet as the plan's index does (each role's first entry, no entry with no
+    layer) and charges each of its entries that stages as AOS what the load stages it at: the slot when the triplet
+    has one, its own staged size when it has none. It charges at each of its two plan builds (single-device and
+    multi-device) and after the single-device PP preparation, and re-charges with accounting after the pack, right
+    after each I8 upgrade and after each multi-device layout pass: the change of each entry on a device moves the
+    totals of the device in the pass's list whose id is its target device (each list's device and room taken from the
+    pass's own, index by index), and a charge past the room warns. Nothing else computes a slot."""
+    s = norm(production(sycl))
+    c = norm(production(cache))
+    p = norm(plan_hpp)
+    h = norm(slot_hpp)
+    slot_body = body(h, SLOT_SIG)
+    charge = body(p, CHARGE_SIG)
+    recharge_on = body(p, RECHARGE_ON_SIG)
+    planner_recharge = body(c, PLANNER_RECHARGE_SIG)
+    multi_layouts = body(c, MULTI_LAYOUTS_SIG)
+    multi_upgrade = body(c, MULTI_UPGRADE_SIG)
+    return (slot_body.count(SLOT_ROUND) == 1 and slot_body.count(SLOT_MAX) == 1 and h.count(SLOT_DIVISOR) == 1
+            and slot_body.rstrip().endswith(SLOT_PAD + " }")
+            and body(h, MEMBER_SIG).strip() == "{ " + MEMBER_BODY + " }"
+            and body(p, RECHARGE_SIG).count(RECHARGE_CHARGES) == 1
+            and recharge_on.count(RECHARGE_ON_READ) == 1 and recharge_on.count(RECHARGE_ON_MOVE) == 1
+            and ordered(recharge_on, RECHARGE_ON_READ, RECHARGE_ON_HOST, RECHARGE_ON_KEY, RECHARGE_ON_MOVE)
+            and planner_recharge.count(PLANNER_RECHARGE_CALL) == 1
+            and ordered(planner_recharge, PLANNER_RECHARGE_CALL, PLANNER_RECHARGE_WARN)
+            and planner_recharge.count("GGML_LOG") == 1
+            and body(c, ROOM_ONE_SIG).strip() == "{ " + ROOM_ONE_BODY + " }"
+            and body(c, ROOM_ALL_SIG).strip() == "{ " + ROOM_ALL_BODY + " }"
+            and multi_layouts.count(MULTI_RECHARGE) == 1 and ordered(multi_layouts, MULTI_LAYOUT_SET, MULTI_RECHARGE)
+            and multi_upgrade.count(UPGRADE_RECHARGE) == 1
+            and ordered(multi_upgrade, MULTI_LAYOUT_SET, UPGRADE_RECHARGE)
+            and c.count(PACK_PREPARE) == 1 and ordered(c, PACK_PREPARE, PACK_HOST_SET, PACK_RECHARGE)
+            and ordered(c, PACK_RECHARGE, DOWN_I8_RECHARGE, GATE_UP_I8_CALL, GATE_UP_I8_RECHARGE)
+            and c.count(SINGLE_DOWN_I8_SITE) == 1
+            and c.count(SINGLE_RECHARGE) == 3 and c.count(MULTI_DOWN_I8_RECHARGE) == 2
+            and c.count(PRIMARY_DOWN_I8_SITE) == 1 and c.count(BRANCH_DOWN_I8_SITE) == 1
+            and len(re.findall(r"\bplanner_recharge_expert_slots\(", c)) == 8
+            and body(p, PLAN_SLOT_SIG).count(PLAN_SLOT_CALL) == 1
+            and len(re.findall(r"\bexpert_triplet_slot_bytes\(", p)) == 1
+            and PLAN_ENTRY_STAGED in p and p.count(CHARGE_SET) == 1 and ordered(p, CHARGE_SIG, CHARGE_SET)
+            and ordered(charge, CHARGE_INDEXED, CHARGE_FIRST, CHARGE_COMPLETE, CHARGE_STAGED, CHARGE_EACH)
+            and ordered(body(p, BULK_MIRROR_SIG), BULK_MIRROR_ALT, BULK_MIRROR)
+            and body(c, REORDER_SIG).count(REORDER_SORT) == 1 and "std::sort(" not in body(c, REORDER_SIG)
+            and body(s, STAGE_BYTES_SIG).rstrip().endswith(STAGE_BYTES_BODY)
+            and s.count(PRELOAD_LAYER) == 1 and s.count(PRELOAD_SLOT) == 1 and s.count(PRELOAD_GUARD) == 1
+            and s.count(PRELOAD_STAGE_END) == 1 and ordered(s, PRELOAD_LAYER, PRELOAD_GUARD, PRELOAD_STAGE_END)
+            and s.count(BULK_SLOT) == 1 and ordered(s, BULK_LAYER, BULK_SLOT, BULK_STAGE)
+            and s.count(DPAS_SLOT) == 1 and ordered(s, DPAS_AOS_FILL, DPAS_SLOT, DPAS_STAGE)
+            and s.count(PRELOAD_OWNER) == 1 and ordered(s, PRELOAD_OWNER, BULK_SLOT, PRELOAD_GUARD)
+            and s.count(DPAS_OWNER) == 1 and ordered(s, DPAS_OWNER, DPAS_SLOT)
+            and len(re.findall(r"\bggml_sycl_expert_stage_bytes\(", s)) == 4
+            and len(re.findall(r"\bexpert_triplet_slot_bytes\(", s)) == 0
+            and len(re.findall(r"\bexpert_triplet_slot_bytes\(", c)) == 0
+            and len(re.findall(r"\bexpert_triplet_member_bytes\(", s)) == 1
+            and len(re.findall(r"\bexpert_triplet_member_bytes\(", c)) == 1
+            and c.count(PLANNER_CHARGES) == 3)
+
+
+def test_every_member_mint_takes_the_triplet_slot():
+    assert claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_every_member_mint_takes_the_triplet_slot_on_normalized_sources():
+    """The mutants hand the claim normalized text, which has no comments: unchanged, it must pass as the raw text
+    does, or every mutant is caught whatever it changes."""
+    assert claim_every_member_mint_takes_the_triplet_slot(norm(SYCL), norm(CACHE), norm(PLAN_HPP), norm(SLOT_HPP))
+
+
+def test_production_drops_the_fixtures_from_raw_and_normalized_text_alike():
+    """Both forms lose every fixture's own slot and keep the load's sizing."""
+    for text in (SYCL, norm(SYCL)):
+        kept = production(text)
+        assert len(FIXTURE_SLOT_RE.findall(text)) > 0 and len(FIXTURE_SLOT_RE.findall(kept)) == 0
+        assert norm(kept).count(PRELOAD_SLOT) == 1
+
+
+def test_mutant_slot_from_the_first_member_fails():
+    mutant = _once_in(SLOT_HPP, SLOT_SIG, SLOT_MAX, "slot = slot == 0 ? rounded : slot;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, PLAN_HPP, mutant)
+
+
+def test_mutant_slot_unrounded_fails():
+    mutant = _once_in(SLOT_HPP, SLOT_SIG, SLOT_ROUND, "const size_t rounded = bytes;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, PLAN_HPP, mutant)
+
+
+def test_mutant_load_stages_a_member_at_its_own_size_fails():
+    mutant = _once(SYCL, PRELOAD_SLOT, "")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_load_slot_after_the_stage_fails():
+    """The sizing runs once the stage has minted the member at its own size: too late to give it the slot."""
+    mutant = _once(_once(SYCL, PRELOAD_GUARD, ""), PRELOAD_STAGE_END, PRELOAD_STAGE_END + " " + PRELOAD_GUARD)
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_load_slot_skips_layer_zero_fails():
+    """Layer 0's experts stage at their own sizes while the plan charges them the slot."""
+    mutant = _once(SYCL, "if (expert_slot_layer >= 0) {", "if (expert_slot_layer > 0) {")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_load_slot_never_has_a_layer_fails():
+    mutant = _once(SYCL, PRELOAD_LAYER, "")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_stage_helper_ignores_the_slot_fails():
+    mutant = _once_in(SYCL, STAGE_BYTES_SIG, "return slot >= staged ? slot : staged;", "return staged;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_a_second_slot_source_fails():
+    """A second place computing a slot from the members' staged sizes, which could disagree with the first."""
+    mutant = _once(SYCL, PRELOAD_SLOT, PRELOAD_SLOT + " (void) ggml_sycl::expert_triplet_slot_bytes({ 1, 2, 3 });")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_planner_charges_one_member_alone_fails():
+    mutant = _once(PLAN_HPP, CHARGE_SET, "(void) e;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_planner_misses_a_build_fails():
+    n = norm(CACHE)
+    mutant = n.replace(PLANNER_CHARGES, "", 1)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_slot_with_no_padding_bound_fails():
+    """Every triplet takes the largest member's size: a Q4_K gate and up beside a Q5_K down pad by 14%."""
+    mutant = _once_in(SLOT_HPP, SLOT_SIG, SLOT_PAD, "return slot;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, PLAN_HPP, mutant)
+
+
+def test_mutant_member_takes_the_slot_even_with_none_fails():
+    mutant = _once_in(SLOT_HPP, MEMBER_SIG, "return slot != 0 ? slot : staged[role];", "return slot;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, PLAN_HPP, mutant)
+
+
+def test_mutant_multi_layouts_skip_the_recharge_fails():
+    """The per-target layout pass charges a member it moved into AOS its own size, and nothing charges the slot back:
+    the plan under-charges what the load stages, an OOM at load."""
+    mutant = _once_in(CACHE, MULTI_LAYOUTS_SIG, MULTI_RECHARGE, "skip_recharge(plan, planner_recharge_devices_of(plan, "
+                      "device_budgets, remaining),")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_multi_upgrade_skips_the_recharge_fails():
+    mutant = _once_in(CACHE, MULTI_UPGRADE_SIG, UPGRADE_RECHARGE, "skip_recharge(plan, planner_recharge_device("
+                      "device_id, remaining, &plan.per_device_vram[device_index]),")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_recharge_moves_no_total_fails():
+    """The re-charge sets the slot on the entries and leaves every device total where the pass put it."""
+    mutant = _once_in(PLAN_HPP, RECHARGE_ON_SIG, RECHARGE_ON_MOVE, "(void) c;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_recharge_charges_nothing_fails():
+    mutant = _once_in(PLAN_HPP, RECHARGE_SIG, RECHARGE_CHARGES, "")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_a_second_slot_call_in_the_plan_header_fails():
+    """A second place in the plan header asking the slot of staged sizes, which could disagree with the plan's own."""
+    mutant = _once_in(PLAN_HPP, CHARGE_SIG, CHARGE_SET, CHARGE_SET + " (void) expert_triplet_slot_bytes({ 1, 2, 3 });")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_lost_slot_keeps_its_charge_fails():
+    """A triplet that lost its slot keeps charging its AOS members the slot: the plan over-charges forever."""
+    mutant = _once_in(PLAN_HPP, CHARGE_SIG, "if (staged != 0) {", "if (staged != 0 && slot_bytes != 0) {")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_charge_takes_a_roles_last_entry_fails():
+    """The load's lookup keeps a role's first entry: charged from the last, a duplicated role is charged another
+    triplet's slot than the one it stages at."""
+    mutant = _once_in(PLAN_HPP, CHARGE_SIG, CHARGE_FIRST, "member = &e;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_charge_leaves_a_repeated_role_uncharged_fails():
+    mutant = _once_in(PLAN_HPP, CHARGE_SIG, "for (placement_entry * e : t.repeats) { charge(e); }", "")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_charge_counts_an_entry_with_no_layer_fails():
+    """The index leaves an entry with no layer out of every triplet; the charge would make it a member."""
+    mutant = _once_in(PLAN_HPP, CHARGE_SIG, "e.expert_id < 0 || e.layer_id < 0 ||", "e.expert_id < 0 ||")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_loan_reads_a_slotted_aos_tensor_as_bulk_fails():
+    """The load stages such a tensor expert by expert; read as bulk, none of its experts is ever lent."""
+    mutant = _once_in(PLAN_HPP, BULK_MIRROR_SIG, BULK_MIRROR, "")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_loan_bulk_mirror_reads_the_primarys_layout_for_an_alternate_fails():
+    """An alternate-staged tensor stages in the alternate's layout, not its primary's."""
+    mutant = _once_in(PLAN_HPP, BULK_MIRROR_SIG, BULK_MIRROR_ALT, "++n_alt;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_materialization_reorder_sorts_unstably_fails():
+    """An unstable sort may swap two entries of one role after the charge: the index then reads as the member an entry
+    the charge took as a repeat, and the load stages the triplet at a slot the plan did not charge."""
+    mutant = _once_in(CACHE, REORDER_SIG, "std::stable_sort(indices.begin()", "std::sort(indices.begin()")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_materialization_reorder_breaks_a_role_tie_by_priority_fails():
+    """Stable or not, a priority tie-break moves a later entry of a role ahead of the first when its priority is
+    lower."""
+    mutant = _once_in(CACHE, REORDER_SIG, "moe_materialization_role_order(plan.entries[b].expert_role); });",
+                      "moe_materialization_role_order(plan.entries[b].expert_role) || "
+                      "static_cast<uint8_t>(plan.entries[a].priority) < "
+                      "static_cast<uint8_t>(plan.entries[b].priority); });")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_recharge_ignores_the_target_device_fails():
+    """Every change moves the first device's room, whatever device the entry is on."""
+    mutant = _once_in(PLAN_HPP, RECHARGE_ON_SIG, RECHARGE_ON_KEY, "if (!d.remaining) { continue; }")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, CACHE, mutant, SLOT_HPP)
+
+
+def test_mutant_multi_room_list_is_empty_fails():
+    """The multi-device list names no device, so no change moves any room."""
+    mutant = _once_in(CACHE, ROOM_ALL_SIG, "devices.push_back({ budgets[d].device_id, &remaining[d], device_vram });",
+                      "(void) device_vram;")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_multi_room_keys_every_room_to_the_first_device_fails():
+    mutant = _once_in(CACHE, ROOM_ALL_SIG, "{ budgets[d].device_id, &remaining[d],", "{ budgets[0].device_id, "
+                      "&remaining[d],")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_multi_room_reads_another_devices_room_fails():
+    mutant = _once_in(CACHE, ROOM_ALL_SIG, "&remaining[d], device_vram", "&remaining[0], device_vram")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_single_room_ignores_its_device_fails():
+    mutant = _once_in(CACHE, ROOM_ONE_SIG, "{ device_id, &remaining, device_vram }", "{ -1, &remaining, device_vram }")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_single_room_reads_no_room_fails():
+    mutant = _once_in(CACHE, ROOM_ONE_SIG, "{ device_id, &remaining, device_vram }",
+                      "{ device_id, nullptr, device_vram }")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_recharge_overflow_demoted_to_debug_fails():
+    mutant = _once_in(CACHE, PLANNER_RECHARGE_SIG, 'GGML_LOG_WARN("[PLACEMENT-MOE] %s: expert slots re-charged',
+                      'GGML_LOG_DEBUG("[PLACEMENT-MOE] %s: expert slots re-charged')
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_recharge_overflow_prefix_changed_fails():
+    mutant = _once_in(CACHE, PLANNER_RECHARGE_SIG, '"[PLACEMENT-MOE] %s: expert slots re-charged',
+                      '"[PLACEMENT-MOE-MULTI] %s: expert slots re-charged')
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_prepare_leaves_the_lost_slot_charged_fails():
+    """The single-device PP preparation moves a gate or up to SOA and the pack reads the stale slot charge."""
+    mutant = _once(CACHE, PACK_PREPARE, PACK_PREPARE.replace("placement_entries_charge_expert_slots(plan.entries); ",
+                                                             ""))
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_single_i8_down_skips_the_recharge_fails():
+    mutant = _once(CACHE, DOWN_I8_RECHARGE, "")
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_single_i8_recharge_before_the_gate_up_upgrade_fails():
+    mutant = _once(_once(CACHE, GATE_UP_I8_RECHARGE, ""), GATE_UP_I8_CALL, GATE_UP_I8_RECHARGE + " " + GATE_UP_I8_CALL)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_multi_i8_down_skips_the_recharge_fails():
+    n = norm(CACHE)
+    mutant = n.replace(MULTI_DOWN_I8_RECHARGE, "", 1)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_single_i8_down_recharge_before_the_upgrade_fails():
+    """The re-charge runs before the down upgrade moves members out of AOS: the slots they lose stay charged."""
+    mutant = _once(CACHE, SINGLE_DOWN_I8_SITE, DOWN_I8_RECHARGE + " " + SINGLE_DOWN_I8_ARMS)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_multi_primary_i8_down_recharge_before_the_upgrade_fails():
+    mutant = _once(CACHE, PRIMARY_DOWN_I8_SITE, MULTI_DOWN_I8_RECHARGE + " " + PRIMARY_DOWN_I8_UPGRADE)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_multi_branch_i8_down_recharge_before_the_upgrade_fails():
+    """The re-charge runs ahead of both arms of the down upgrade: the slots the upgrade takes stay charged."""
+    mutant = _once(CACHE, BRANCH_DOWN_I8_SITE,
+                   MULTI_DOWN_I8_RECHARGE + " " + BRANCH_DOWN_I8_ARMS + " " + BRANCH_DOWN_I8_TOTAL)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_multi_branch_i8_down_total_and_recharge_before_the_upgrade_fails():
+    """The charge bookkeeping and the re-charge move together ahead of the arms: still before the upgrade."""
+    mutant = _once(CACHE, BRANCH_DOWN_I8_SITE,
+                   BRANCH_DOWN_I8_TOTAL + " " + MULTI_DOWN_I8_RECHARGE + " " + BRANCH_DOWN_I8_ARMS)
+    assert not claim_every_member_mint_takes_the_triplet_slot(SYCL, mutant, PLAN_HPP, SLOT_HPP)
+
+
+def claim_a_repeat_off_its_member_warns(cache: str, plan_hpp: str) -> bool:
+    """The planner names, at WARN, each repeat of a triplet role whose layout or device differs from its member's,
+    and raises the placement summary to WARN when a role is duplicated."""
+    diag = body(norm(cache), DIAG_SIG)
+    off = body(norm(plan_hpp), OFF_SIG)
+    return (diag.count(DIAG_SUMMARY) == 1 and diag.count(DIAG_OFF_LOOP) == 1 and diag.count(DIAG_OFF_WARN) == 1
+            and ordered(diag, DIAG_SUMMARY, DIAG_OFF_LOOP, DIAG_OFF_WARN) and off.count(OFF_TEST) == 1)
+
+
+def test_a_repeat_off_its_member_warns():
+    assert claim_a_repeat_off_its_member_warns(CACHE, PLAN_HPP)
+
+
+def test_mutant_duplicate_summary_demoted_to_info_fails():
+    mutant = _once_in(CACHE, DIAG_SIG, "summary.duplicates != 0 ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO",
+                      "GGML_LOG_LEVEL_INFO")
+    assert not claim_a_repeat_off_its_member_warns(mutant, PLAN_HPP)
+
+
+def test_mutant_repeat_off_its_member_demoted_to_info_fails():
+    mutant = _once_in(CACHE, DIAG_SIG, 'GGML_LOG_WARN("[%s] layer %d expert', 'GGML_LOG_INFO("[%s] layer %d expert')
+    assert not claim_a_repeat_off_its_member_warns(mutant, PLAN_HPP)
+
+
+def test_mutant_repeat_off_its_member_ignores_the_device_fails():
+    mutant = _once_in(PLAN_HPP, OFF_SIG, " || e.target_device != member->target_device", "")
+    assert not claim_a_repeat_off_its_member_warns(CACHE, mutant)
+
+
+def test_mutant_preload_sizes_from_the_global_plan_fails():
+    """The global snapshot is not the cache's plan: the load would size a slot from another plan than it stages by."""
+    mutant = _once(SYCL, PRELOAD_OWNER,
+                   PRELOAD_OWNER.replace("ggml_sycl_cache_plan_owner(cache)", "preload_plan_owner"))
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_dpas_restore_sizes_from_the_global_plan_fails():
+    mutant = _once(SYCL, DPAS_OWNER, DPAS_OWNER.replace("ggml_sycl_cache_plan_owner(cache)", "preload_plan_owner"))
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_bulk_stages_past_the_slot_fails():
+    """The bulk copy stages a slotted triplet's members at their own stride while the plan charges the slot."""
+    mutant = _once(SYCL, BULK_SLOT, "")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_dpas_restores_at_the_base_size_fails():
+    mutant = _once(SYCL, DPAS_STAGE, DPAS_STAGE.replace("restore_bytes, base_layout", "expert_base_bytes, base_layout"))
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+def test_mutant_dpas_restores_aos_by_the_reorder_fill_fails():
+    """The reorder fill writes its whole destination, so at the slot it would copy past the expert's bytes."""
+    mutant = _once(SYCL, DPAS_AOS_FILL, "if (base_layout == GGML_LAYOUT_AOS) { if (have_plan) {")
+    assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
 
 
 if __name__ == "__main__":

@@ -106,7 +106,7 @@ with gate('fattn-owner-first'):
     )
     owner_first(
         region(FATTN, "static bool ggml_sycl_fattn_alloc_device_owner", "template <typename T>"),
-        "owner = new ggml_sycl::mem_handle",
+        "owner = std::move(handle)",
     )
     owner_first(
         region(FATTN, "bool ggml_sycl_fattn_xmx_materialize_packed_k", "static void ggml_sycl_fattn_xmx_v2_free"),
@@ -190,8 +190,9 @@ NAMED_OWNER_FIRST_SITES = (
     ("ggml_sycl_host_expert_alloc",
      "llama.cpp-36j0: S1-PRELOAD's pinned-pool storage for one host-planned expert (role WEIGHT), replacing a legacy "
      "unified_alloc; the expert registers with this typed owner so its leases report HOST_PINNED/WEIGHT through "
-     "owner_metadata() and the prefill ring copies from it directly; refuses on failure, handed over via "
-     "from_owned_alloc"),
+     "owner_metadata() and the prefill ring copies from it directly; with grow_zone false (a named evict's host copy, "
+     "through ggml_sycl_host_expert_alloc_no_growth, which calls it) the request forbids host-zone growth and keeps "
+     "its miss out of the error log; refuses on failure, handed over via from_owned_alloc"),
     ("ggml_sycl_mul_mat_id_nvfp4_resident_decode",
      "the NVFP4 resident decode route's per-node Q8_1 input slice (must_device, SCRATCH zone, spill forbidden), held "
      "in the node's retention until the kernel's event, which drains the stream first on any exit that did not "

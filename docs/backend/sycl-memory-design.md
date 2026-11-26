@@ -365,6 +365,29 @@ returns their room to the WEIGHT zone. So an admit in the same call never gets
 an evict's room: in a full zone the admit is BUSY "WEIGHT zone full" beside the
 evict that moved, and moves at a later boundary, after the pass.
 
+**An expert move's retires stay out of the eviction latch.** The cache's latch (`has_evictions_`) is set by the reap
+of an entry the cache evicts, and it turns off graph replay and persistent TG until the next model load, to guard
+pointers that nothing then replays. Two retires are left out of it. A named evict's device entries carry
+`retired_by_expert_move`, which the loan body sets on each as it retires them and a restore clears; their reap leaves
+the latch alone. A host copy never needed the mark: the latch is set only for a device entry that is not host
+resident. The exemption is sound for four reasons, and it holds only while all four do:
+- Every recording that may bake a moved expert's pointer is dropped before it replays. The move publishes its plan
+  through the swap, and that publication bumps the exec-graph epoch. Each context compares the epoch at its next graph
+  compute (`optional_layout_epoch`) and, when it differs, drops its whole-graph recording (`exec_graph`), its valid
+  MoE segments and its block graphs. Those are the recordings that can name an expert's address.
+- The keyed decode slots survive that bump, and they hold no expert's address. A keyed split records every
+  `MUL_MAT_ID` as a direct boundary, outside its recorded segments, and that node resolves its experts at each call.
+  "Every recording that may bake a pointer is dropped" is true only because of this: the slots the check leaves
+  alone cannot bake one.
+- Persistent TG never holds an expert's pointer. It refuses every graph with a `MUL_MAT_ID`, so it re-resolves nothing
+  of an expert's between tokens.
+- The reap does not run before the bump. The retired entries' leases go to the transaction, which drops them only
+  after the publication that won its swap, so the deferred-free pass cannot erase an entry a recorded graph still
+  names. A move whose publication does not run (a lost swap, an exception) sets the latch itself
+  (`ggml_sycl_expert_move_latch_guard`), so the exemption is never unearned.
+The mark is per retire, not per kind of entry: a pressure eviction, a drop or an async evict of an expert's device
+entry outside a move still latches, which `test_expert_moves_leave_the_eviction_latch_clear` holds as its control.
+
 A move to the device needs a card the published plan uses. A publication gives a
 card's cache the plan only while the plan places something there (an entry, a
 layer, the KV or a layer block) and leaves every other card's cache without one,
@@ -377,33 +400,67 @@ plan with its last evict, and no admit could bring those experts back.
 An expert's size is a fact of its tensor, never of a cache entry: the
 transaction reads the tensor's bytes per expert (`nb[2]`), its type and its
 width, and hands the three to the cache. The device copy is minted from the
-WEIGHT zone through `ggml_sycl_device_expert_alloc` at `staged_expert_bytes()`,
-the size direct staging gives the expert, never at the host copy's size. For
-AOS that is `aos_staged_weight_bytes(type, ncols, nb[2])`: a quantized weight
-gets a tail that completes its last row to a multiple of `MATRIX_ROW_PADDING`
-columns, which the quantized kernels may read. The size is asked of the
-layout, so a layout that stages another way adds its own case in one place. A
-host copy may be longer than the expert when another writer padded it; a loan
-or an evict copies only the expert's bytes, so the host copies they make hold
-exactly `nb[2]` and a padded device entry's tail stays on the card. The copy
-moves exactly `nb[2]` bytes from the host copy's offset 0 and never reads past
-them, so an expert that goes to the host and back does not grow. A host copy
-shorter than `nb[2]` is refused "host copy size", REFUSED. The cache requires
-the device size to equal the staged size and to be at least `nb[2]`. The tail
-is zero-filled behind the copy on the same queue, the device entry is published
-behind the fill, and the extra's record covers
-`nb[2]` bytes, as direct staging's does, while the entry holds the staged size.
-The admit gives back the whole host entry, all of its zone bytes. A Q4_0
-expert 640 columns wide gains 216 bytes. The first graph after the publish
-serves the admitted expert from the card. The selected-ids pointer table
-(`ggml_sycl_update_moe_ptr_table`) is built only outside graph recording: each
-of its callers checks the flag or runs before a recording starts. It orders
-its upload behind the entry's ready event on the context's in-order stream, so
-nothing waits on the host, and that graph queues behind at most the admitted
-triplets' copy and fill. The decode direct route
-(`ggml_sycl_moe_decode_direct_table`) keeps its decision per storage
-generation, and the admit's device records bump the tensor's generation, so
-the route decides again and serves a block the admit completed from its
+WEIGHT zone through `ggml_sycl_device_expert_alloc` at the size direct
+staging gives the member, `expert_triplet_member_bytes()`, never at the host
+copy's size. A member's staged size is `staged_expert_bytes()`, for AOS
+`aos_staged_weight_bytes(type, ncols, nb[2])`: a quantized weight gets a tail
+that completes its last row to a multiple of `MATRIX_ROW_PADDING` columns,
+which the quantized kernels may read. The size is asked of the layout, so a
+layout that stages another way adds its own case in one place. The slot is
+`expert_triplet_slot_bytes()` (`expert-slot.hpp`): the largest of the three
+members' staged sizes, rounded to the TLSF grain. Every member of a triplet
+that has a slot takes it, at the load, at a refill and at an admit, and the
+planner charges it for each member. Members of one triplet need not stage
+alike (a 640-column AOS down projection carries a tail its gate and up do
+not), and the load stages each tensor's experts as one run, so a swap that
+minted each member at its own size would split freed runs of the other size
+and leave holes a few grains short of any member; at one size per triplet any
+freed member's block holds any member. A triplet has a slot only where it is
+nearly free: the padding, three slots less the members' grain-rounded sizes,
+is at most 1/128 of those sizes. A triplet whose members differ by quant type
+(a Q4_K gate and up beside a Q5_K down) would pad by 14% or more, so each of
+its members keeps its own staged size everywhere, and the swap can still
+fragment such a zone (a gate split from a freed down-sized block). Every
+planner pass that re-lays out experts re-charges the triplets after it (the
+single-device PP gate/up preparation, the triplet pack, the I8 down and gate/up
+upgrades of a single-device plan, the I8 down upgrade of a multi-device plan,
+and the multi-device layout passes; `placement_entries_recharge_expert_slots_on`): a
+member moved into AOS is charged the slot its triplet now has, a triplet that
+lost its slot charges its AOS members their own staged sizes again, and the
+device totals move by each change. The charge resolves a triplet as the plan's
+index does, each role's first entry, so a role planned twice is charged the slot
+the load looks up. The load resolves the later entry by name too and stages it
+as its member: a repeat with its member's layout and device is charged what the
+load stages, and one in another layout or on another device is a known gap the
+planner warns for (`placement_entries_repeats_off_their_member`). The
+materialization reorder that follows the last charge keeps entries of one role
+in plan order (a stable sort on the role alone), so the index's first entry is
+still the one charged. The load stages each member at that size: a tensor whose
+experts' triplets have a slot past their staged bytes is not bulk-staged, since
+the bulk copy has one stride, and is staged expert by expert, so the loan's
+selection reads it as not bulk and its experts can be lent
+(`moe_loan_tensor_bulk_staged`); a DPAS promotion that rolls back restores an
+AOS base at its triplet's slot. A host copy may be longer than the expert when
+another writer padded it; a loan or an evict copies only the expert's bytes, so
+the host copies they make hold exactly `nb[2]` and a padded device entry's tail
+stays on the card. The copy moves exactly `nb[2]` bytes from the host copy's
+offset 0 and never reads past them, so an expert that goes to the host and back
+does not grow. A host copy shorter than `nb[2]` is refused "host copy size",
+REFUSED. The cache requires the device size to equal
+`expert_triplet_member_bytes()` and to be at least `nb[2]`. The tail is
+zero-filled behind the copy on the same queue, the device entry is published
+behind the fill, and the extra's record covers `nb[2]` bytes, as direct
+staging's does, while the entry holds its whole allocation. The admit gives back
+the whole host entry, all of its zone bytes. A Q4_0 expert 640 columns wide
+gains 216 bytes. The first graph after the publish serves the admitted expert
+from the card. The selected-ids pointer table (`ggml_sycl_update_moe_ptr_table`)
+is built only outside graph recording: each of its callers checks the flag or
+runs before a recording starts. It orders its upload behind the entry's ready
+event on the context's in-order stream, so nothing waits on the host, and that
+graph queues behind at most the admitted triplets' copy and fill. The decode
+direct route (`ggml_sycl_moe_decode_direct_table`) keeps its decision per
+storage generation, and the admit's device records bump the tensor's generation,
+so the route decides again and serves a block the admit completed from its
 full-coverage table. Outside recording, that table's upload
 (`ggml_sycl_upload_moe_transient_ptr_table`) chains each slot's ready event in
 the same way. The publish bumps the exec-graph epoch, so the first graph after
@@ -413,8 +470,11 @@ event; it asks each slot's event for its status and refuses the table while a
 slot's copy is still in flight.
 
 The named move bounds memory as follows. An evict mints its pinned host copy
-before it retires the device copy, so a boundary evicts only as many triplets as
-the pinned pool has room for; the rest are BUSY "host pinned pool exhausted".
+before it retires the device copy, and mints it without growing the pinned host
+WEIGHT zone (`ggml_sycl_host_expert_alloc_no_growth`): a decode boundary must not
+take host memory the plan did not size. So a boundary evicts only as many
+triplets as the zone has free room for; the rest are BUSY "host pinned pool
+exhausted". A loan's host copy keeps the growing mint.
 The admit returns each admitted triplet's pinned
 host copy once that copy's last lease drains, so the experts' host pinned use
 stays within the triplets not on the card times the triplet size. It mints its
@@ -423,9 +483,62 @@ triplets as the WEIGHT zone has room for. A triplet the zone cannot hold is
 refused "WEIGHT zone full", BUSY, after giving back what its other members
 minted, and the plan the transaction publishes leaves it on the host; when no
 triplet fits, nothing is published. The caller retries at a later boundary.
-Planned headroom in the zone is the planner's job, not the transaction's. Only
-the private fixtures call the named move for now; the boundary driver that
-will name triplets is not yet written.
+Planned headroom in the zone is the planner's job, not the transaction's.
+
+Every copy a move publishes belongs to the models that owned the entry it
+replaces. A model load's end tags what the load staged with its owners
+(`owner_mask`, `owner_tagged`), and a moved copy is tagged by inheriting its
+source's owners and tag. A model teardown never reclaims an untagged entry, so a
+copy published after the load would otherwise outlive its model in the WEIGHT
+zone or the pinned host zone. One helper, `inherit_entry_ownership`, copies the
+owners and the tag, and copies the source's pending load only when the copy's
+own stamp left none: a copy made outside any load takes the pending load, so
+that load's end tags it, while a mover inside a load keeps that load's stamp,
+since that load published the copy. An admit's or a refill's device entry
+takes them from the host copy it withdraws, under the locks that re-check that
+copy; a loan's or an evict's host copy takes them from the device entry the
+loan retired, which the loan holds in place until its registrations return
+(`register_host_expert_owned`'s `moved_from`). A registration whose
+`moved_from` entry is gone refuses, with one WARN naming the key, before it
+changes anything, so the loan's rollback puts the device entries back rather
+than publish a copy no model owns.
+
+**The swap driver** (`GGML_SYCL_MOE_SWAP=1`, opt-in) is the named move's one
+production caller. At each synchronize after a graph, behind the refill, it asks
+the swap policy (`moe-swap-policy.hpp`) which resident triplet of a block leaves
+for which host triplet, from the route counters, and sends the answer through the
+named move (`moe-swap-driver.hpp` holds the rules, as a pure function of what the
+caller reads). One boundary sends one transaction at most: the evicts, and at the
+next boundary their admits, since an evict's device room comes back only when a
+deferred-free pass reaps the entries it retired. The evict batch is trimmed to
+the room the host zone can hand out without growing
+(`unified_cache::host_zone_no_growth_room`, read without a wait), the same figure
+the evict's mint is refused past. The driver waits for nothing and holds no lock
+across the policy step. On entry it checks once that no graph computes on any
+device and none is in flight; the named move checks again only on its own entry.
+Once two graph computes have overlapped, a latch nothing clears
+(`g_sycl_graph_multithreaded`) turns every later boundary off. Its state is one
+instance per device, keyed on the route table it reads, since that table is one
+per device and shared by every context on the card. A transaction that throws
+leaves its batch unsettled in that state, and the next boundary with no loans
+outstanding settles each move from the plan the move published before it
+rethrew; a loan's publication shows lent triplets off the card, so a boundary
+with loans outstanding settles nothing.
+
+A round is not free. Each accepted transaction publishes a plan, and a published
+plan bumps the exec-graph epoch. A context reads the epoch at its next graph
+compute and clears what it recorded only while it holds a whole-graph recording,
+valid one-slot segments (a prompt records those) or block graphs. That clear also
+retires the keyed decode slots, and each keyed split then runs direct once and
+records once before it replays again. A keyed decode sets none of the three
+again, so the first transaction after a prompt can cost that re-record, and the
+later transactions of the same decode clear nothing: their keyed slots keep
+replaying. That is sound because a keyed split keeps every `MUL_MAT_ID` out of
+its recorded segments, and the direct node resolves its experts at each call.
+That is the mechanism read from the code; no measured figure exists yet. The
+second `[MOE-SWAP]` summary line puts the accepted transactions, evicts and
+admits apart, beside the decode graphs they ran among, and the policy's margin
+and decay are what keep rounds rare once the routing settles.
 
 **Gates.** Three gates keep the rule enforceable.
 
@@ -563,8 +676,9 @@ it back to three:
    version of this allocator gated every `free()` (and every `alloc()`'s
    opportunistic drain) on `event.get_info<command_execution_status>()`. That
    call **blocks** rather than polls on a profiling-enabled queue (every
-   backend compute queue is one; see `get_dma_queue()`'s comment in
-   `unified-cache.hpp`) — and the event this allocator receives always comes
+   backend compute queue is one when the queues carry profiling:
+   `GGML_SYCL_QUEUE_PROFILING=1` or a requested profiling diagnostic; see
+   `get_dma_queue()`'s comment in `unified-cache.hpp`) — and the event this allocator receives always comes
    from that same compute queue. The result was that every `free()` became a
    synchronous wait for that op's device completion, undoing most of the
    host-time win the allocator existed to deliver (measured: attention host
@@ -990,9 +1104,11 @@ ticket reproduced on:
   device marker kernel, not a direct SYCL event query, and not a
   host_task either (llama.cpp-c6ah).** `event_complete()`'s bare
   `command_execution_status` query BLOCKS rather than polls on any
-  profiling-enabled queue, and every backend stream — including the one
-  oneDNN's free callback supplies `release_event` on — is
-  profiling-enabled (see that function's own comment). Querying
+  profiling-enabled queue, and, when the queues carry profiling
+  (`GGML_SYCL_QUEUE_PROFILING=1` or a requested profiling diagnostic), every
+  backend stream — including the one oneDNN's free callback supplies
+  `release_event` on — is profiling-enabled (see that function's own
+  comment). Querying
   `release_event` directly from the reuse pool therefore WAITS for an
   in-flight SDPA kernel to finish instead of skipping it, defeating the
   "park and skip in-flight entries" design; this bare-query block remains
@@ -1057,7 +1173,8 @@ ticket reproduced on:
   device-kernel event on a non-profiling queue, both measured a few ms or
   less either way. Every real pool release event in production is
   device-kernel-produced (oneDNN's own free callback), matching the case
-  that actually blocks.
+  that blocks when the queue carries profiling (`GGML_SYCL_QUEUE_PROFILING=1`
+  or a requested profiling diagnostic).
 - **Without TP, a parked entry is reused while its release is still in
   flight (llama.cpp-jwjz).** Every Graph-scratch consumer submits on the
   cache's own in-order queue when TP is inactive. That is the fact the
@@ -4092,7 +4209,16 @@ allocation.
 but nothing in it stays sized for a model once no model is live. The model
 release hook, when it drops the last model, and a failed load's abort, when no
 model is live, run one step last (`ggml_sycl_release_last_model_effects()`),
-after each has dropped and put back what its model published. The step asks the
+after each has dropped and put back what its model published. The hook retires
+the model's MoE mmid workspaces just before the step
+(`unified_cache_retire_moe_mmid_workspaces()`): once no lease holds a workspace
+pool, the registry's reference is what keeps its blob in the RUNTIME zone, so a
+retire after the step left that blob to be read as a holder of an arena no model
+uses. The hook runs only past the teardown's fail-closed gates, so a teardown
+they refuse keeps its model's workspaces. A teardown the registry then fails to
+finalize (`finalize_teardown()` not OK after the effects ran) has already
+released the model's slot, weights and workspaces; the quarantine reaper retries
+it, and the retry's retire finds nothing left. The step asks the
 cache of each device the scheduler sees
 (`ggml_backend_sycl_get_device_count()`). Each cache it asks gives back what it
 sized for a model (`unified_cache::release_for_no_live_model()`): it waits once

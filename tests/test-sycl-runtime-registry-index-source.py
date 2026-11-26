@@ -26,10 +26,11 @@ What this file enforces:
     - the address of `second.handle`, `second.handle.ptr` or `second.handle.size` taken anywhere in the file, whatever
       the pointer's declared type (`size_t * s = &it->second.handle.size;`, `*(&it->second.handle.size) = 0;`);
     - a whole-row assignment (`it->second = rec;`, `registry.find(p)->second = rec;`) anywhere in the file, except the
-      entries of ROW_WRITE_ALLOWLIST: three non-registry sites and the one row move in runtime_registry_assign_locked,
-      which resizes or re-keys the index before it moves a row over the old. Entries are keyed by (enclosing function,
-      line text) with an exact occurrence count, so a second assignment in an allowed function, a copy of an allowed
-      line in another function, and an entry that stops matching all fail;
+      entries of ROW_WRITE_ALLOWLIST: the non-registry sites (the offload stats and five id_to_key_ writes) and the
+      one row move in runtime_registry_assign_locked, which resizes or re-keys the index before it moves a row over the
+      old. Entries are keyed by (enclosing function, line text) with an exact occurrence count, so a second
+      assignment in an allowed function, a copy of an allowed line in another function, and an entry that stops
+      matching all fail;
     - in a function that touches the registry (names it, or takes a runtime_registry_iterator or the map's own iterator
       type): a non-const reference or pointer bound to a whole row or to `second.handle[.ptr|.size]`
       (`auto & r = it->second;`, `auto q = &it->second;`, `auto * q = &it->second.handle;`, `decltype(auto) r = ...;`),
@@ -181,9 +182,22 @@ ROW_WRITE_RE = re.compile(r"(?:->|\.)\s*second\s*\)*\s*" + _ASSIGN)
 # (enclosing function, stripped source line) with the exact number of times that line appears in that function: a second
 # copy in the same function, the same line in another function, and an entry that no longer matches all fail.
 ROW_WRITE_ALLOWLIST = {
-    ("lifecycle_replace_placement_plan", "current->second = replacement;"): (1, "the MoE mmid plan registry's entry"),
     ("offload_stats_note_host_alloc", "entry.second += bytes;"): (1, "offload host-alloc stats, keyed by tag"),
-    ("remap_or_erase_id_mapping_locked", "mapped->second = replacement;"): (1, "the id_to_key_ map"),
+    ("remap_or_extract_id_mapping_locked", "mapped->second = replacement;"): (1, "the id_to_key_ map"),
+    # An expert move points each id at the copy that now holds the expert: id_to_key_ map writes, not registry rows.
+    ("expert_id_hand_over", "mapped->second = host_key;"): (1, "id_to_key_: the loan hands the id to its host copy"),
+    ("expert_id_hand_back", "mapped->second = device_key;"): (
+        1,
+        "id_to_key_: the loan's rollback hands the id back to the restored device entry",
+    ),
+    ("copy_host_triplet_to_device", "id_to_key_.find(key)->second = expert_device_key(key);"): (
+        1,
+        "id_to_key_: the copy to the device hands the id to the new device entry",
+    ),
+    ("register_host_expert", "id->second = *moved_from;"): (
+        1,
+        "id_to_key_: a failed moved-copy registration hands the id back to the entry it was to replace",
+    ),
     ("runtime_registry_assign_locked", "it->second = std::move(fresh);"): (
         1,
         "the registry's own row move, after the index was resized or re-keyed to the new geometry",
@@ -765,6 +779,50 @@ def mutate(code: str, old: str, new: str) -> str:
     return code.replace(old, new)
 
 
+# The two allowlist entries above are keyed by the helper's name, so any other function that called a helper would
+# inherit the permission to rewrite an id_to_key_ row. The helpers have one caller each, the loan, and nothing else
+# may name them (a call, a pointer to one, a second definition).
+HAND_OVER_USERS = {
+    ("expert_id_hand_over", "loan_expert_triplet"): 1,
+    ("expert_id_hand_back", "loan_expert_triplet"): 1,
+}
+
+
+def id_hand_users(code: str):
+    users = {}
+    for m in re.finditer(r"\bexpert_id_hand_(?:over|back)\b", code):
+        if re.search(r"\bvoid\s+$", code[: m.start()]):
+            continue  # the helper's own definition
+        key = (m.group(0), enclosing_function(code, m.start()))
+        users[key] = users.get(key, 0) + 1
+    return users
+
+
+def test_the_id_hand_helpers_have_only_the_loan_as_a_caller():
+    assert id_hand_users(CODE) == HAND_OVER_USERS
+
+
+def test_the_caller_pin_sees_a_second_call_in_the_loan():
+    call = "expert_id_hand_over(id_to_key_, members[i].key, device_key, host_key);"
+    assert id_hand_users(mutate(CODE, call, call + "\n            " + call)) != HAND_OVER_USERS
+
+
+@pytest.mark.parametrize(
+    "helper",
+    ["expert_id_hand_over", "expert_id_hand_back"],
+)
+def test_the_caller_pin_sees_a_call_planted_in_another_function(helper):
+    planted = CODE + f"\nvoid planted_other_caller(Map & ids) {{\n    {helper}(ids, k, a, b);\n}}\n"
+    users = id_hand_users(planted)
+    assert users != HAND_OVER_USERS
+    assert users.get((helper, "planted_other_caller")) == 1
+
+
+def test_the_caller_pin_sees_a_pointer_to_a_helper():
+    planted = CODE + "\nvoid planted_pointer() {\n    auto f = &expert_id_hand_back<Map>;\n}\n"
+    assert id_hand_users(planted) != HAND_OVER_USERS
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -777,7 +835,7 @@ def mutate(code: str, old: str, new: str) -> str:
         "void f() {\n    it->second++;\n}",
         "void f(std::pair<void *, runtime_alloc_record> & kv) {\n    kv.second = rec;\n}",
         # an allowed line copied into a function that is not the allowed one
-        "void f() {\n    current->second = replacement;\n}",
+        "void f() {\n    mapped->second = replacement;\n}",
         "void f() {\n    it->second = std::move(fresh);\n}",
         # parenthesised row access
         "void f() {\n    (it->second) = rec;\n}",

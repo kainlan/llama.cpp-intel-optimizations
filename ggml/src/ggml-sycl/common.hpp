@@ -36,6 +36,7 @@
 #include "orchestrator.hpp"
 #include "presets.hpp"
 #include "q8-dense-layout-rule.hpp"
+#include "queue-profiling.hpp"
 #include "soa-reorder-types.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl_hw.hpp"
@@ -6688,6 +6689,64 @@ struct ggml_backend_sycl_context {
     // in the destructor.
     void * fattn_xmx_v2_cache = nullptr;
 
+    // FlashAttention's device buffers that live from one op to the next (fattn.cpp fills and grows them). They are
+    // members so they end with the context: a llama_context frees its backends before its model is freed, so nothing
+    // here is still allocated when the last model's release asks whether the arena is empty. A holder with a thread's
+    // lifetime would outlive every model on an inference thread that never exits. The destructor releases them through
+    // ggml_sycl_fattn_release_context_buffers once its queues are drained. Each raw pointer is a cached ABI view of the
+    // handle beside it and is valid only while that handle is; `alloc_queue` is the stream a group was allocated on,
+    // and a group is released and allocated again when the context's stream is no longer that one.
+
+    // The identity block table, the sequence lengths and the partition scratch of auto-V2 (GGML_SYCL_PAGED_V2).
+    struct fattn_v2_auto_buffers {
+        int32_t *             block_table          = nullptr;  // [num_seqs, max_blocks]
+        int32_t *             seq_lens             = nullptr;  // [num_seqs]
+        size_t                block_table_capacity = 0;        // elements
+        size_t                seq_lens_capacity    = 0;        // elements
+        ggml_sycl::mem_handle block_table_owner;
+        ggml_sycl::mem_handle seq_lens_owner;
+        void *                temp_buf          = nullptr;  // [exp_sums | max_logits | tmp_out]
+        size_t                temp_buf_capacity = 0;        // bytes
+        ggml_sycl::mem_handle temp_buf_owner;
+        sycl::queue *         alloc_queue = nullptr;
+    };
+
+    // Device copies of a multi-sequence batch's sequence ids and sequence boundary offsets.
+    struct fattn_seq_id_buffers {
+        int32_t *             q_seq_ids_dev        = nullptr;
+        int32_t *             kv_seq_ids_dev       = nullptr;
+        size_t                q_seq_ids_size       = 0;  // bytes
+        size_t                kv_seq_ids_size      = 0;  // bytes
+        int32_t *             seq_q_offsets_dev    = nullptr;
+        int32_t *             seq_kv_offsets_dev   = nullptr;
+        size_t                seq_offsets_capacity = 0;  // bytes, of each offsets buffer
+        ggml_sycl::mem_handle q_seq_ids_owner;
+        ggml_sycl::mem_handle kv_seq_ids_owner;
+        ggml_sycl::mem_handle seq_q_offsets_owner;
+        ggml_sycl::mem_handle seq_kv_offsets_owner;
+        sycl::queue *         alloc_queue = nullptr;
+    };
+
+    // Device copies of the operands that resolve to memory that is not device USM: the sinks, and a mask that is not a
+    // staged graph input. One slot per operand, reused by every FlashAttention op of the context.
+    struct fattn_operand_stage {
+        struct slot {
+            void *                dev      = nullptr;
+            size_t                capacity = 0;  // bytes
+            ggml_sycl::mem_handle owner;
+        };
+
+        slot          sinks;
+        slot          mask;
+        sycl::queue * alloc_queue = nullptr;
+    };
+
+    struct fattn_context_buffers {
+        fattn_v2_auto_buffers v2_auto;
+        fattn_seq_id_buffers  seq_ids;
+        fattn_operand_stage   operand_stage;
+    } fattn_buffers;
+
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
     // The asynchronous-failure counts when this context was created. Once either moves, this context's graph boundaries
@@ -7050,6 +7109,14 @@ struct ggml_backend_sycl_context {
     // GGML_SYCL_MOE_REFILL_PER_GRAPH triplets however often the context synchronizes (llama.cpp-sif1).
     std::atomic<uint64_t> decode_graph_count{ 0 };
     std::atomic<uint64_t> refill_decode_graph{ 0 };
+
+    // The expert swap driver's marks (GGML_SYCL_MOE_SWAP=1), read and written only by this context's synchronize:
+    // graph_compute_seq at the last boundary it counted, run or not, and decode_graph_count and graph_compute_seq
+    // when it last ran, so a boundary stands for every graph since then and a graph that was not a decode one says a
+    // prompt pass ran.
+    uint64_t swap_seen_seq     = 0;
+    uint64_t swap_decode_graph = 0;
+    uint64_t swap_graph_seq    = 0;
 
     uint64_t test_graph_replay_count  = 0;
 
@@ -8813,10 +8880,17 @@ void ggml_sycl_watchdog_non_graph_begin();
 void ggml_sycl_watchdog_non_graph_end();
 
 // Standard property list for all directly-created GPU in-order queues.
-// Includes enable_profiling to activate counter-based events on L0 (~15% TG speedup).
+// Includes enable_profiling only when ggml_sycl_queue_profiling_enabled() answers on: GGML_SYCL_QUEUE_PROFILING=1, or
+// the knob unset while a profiling diagnostic is requested (queue-profiling.hpp). On the Level Zero v2 adapter a
+// profiling queue reads a device timestamp for every command it submits, and only the diagnostics read the result;
+// without the property GPT-OSS 20B decode measured 12 to 26 % faster and a Qwen prefill 34 % faster, nothing slower
+// (driver 26.44, 2026-11-24).
 // Use this for every `new sycl::queue(...)` call that targets a GPU device.
 inline sycl::property_list default_queue_properties() {
-    return sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} };
+    if (ggml_sycl_queue_profiling_enabled()) {
+        return sycl::property_list{ sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} };
+    }
+    return sycl::property_list{ sycl::property::queue::in_order{} };
 }
 
 // Combined pin/unpin skip guard: returns true when per-op pin/unpin should be

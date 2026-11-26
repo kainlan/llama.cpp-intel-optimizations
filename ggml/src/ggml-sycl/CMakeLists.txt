@@ -1477,19 +1477,15 @@ else()
     endif()
 endif()
 
-# SYCL queue profiling (L0 counter-based events) is enabled unconditionally
-# in dpct::device_ext::create_queue_impl() (ggml-sycl/dpct/helper.hpp), not
-# via a compile definition here -- see that function's comment for why
-# (llama.cpp-yke2: a PRIVATE compile definition here used to be read by an
-# `#ifdef` inside those header-only inline functions, which is not
-# interposition-safe across translation units).
+# SYCL queue profiling is not set through a compile definition here. The enable_profiling queue property is added by
+# default_queue_properties() (ggml-sycl/common.hpp) and by the dpct create_queue_impl() overloads
+# (ggml-sycl/dpct/helper.hpp), and only when the resolver in queue-profiling.hpp answers on:
+# GGML_SYCL_QUEUE_PROFILING=1, or a requested profiling diagnostic with the knob unset. A compile definition read by an
+# `#ifdef` inside those header-only inline functions would not be interposition-safe across translation units, which is
+# why the decision is an out-of-line function in common.cpp.
 #
-# The enable_profiling queue property is the SYCL API-correct way to request
-# profiling-capable event pools.  On the L0 backend this triggers counter-based
-# events (ZE_experimental_event_pool_counter_based) which use GPU hardware
-# counters instead of signal-based synchronization, eliminating CPU busy-wait
-# in oneDNN's after_exec_hook.  Result: ~15% TG improvement on Arc B580.
-# Users can also set UR_L0_USE_DRIVER_COUNTER_BASED_EVENTS=1 before launch.
+# On the Level Zero v2 adapter a profiling queue reads a device timestamp for every command, so the default is off:
+# turning it off measured GPT-OSS 20B decode 12 to 26 % faster and a Qwen prefill 34 % faster, nothing slower.
 
 target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_DNNL=${GGML_SYCL_DNNL})
 target_compile_definitions(ggml-sycl PRIVATE GGML_SYCL_MKL_FALLBACK=${GGML_SYCL_MKL_FALLBACK_ENABLED})
@@ -2684,6 +2680,22 @@ target_link_libraries(test-kv-region-registry PRIVATE Threads::Threads)
 add_test(NAME sycl-kv-region-registry COMMAND test-kv-region-registry)
 set_tests_properties(sycl-kv-region-registry PROPERTIES
     LABELS "sycl;kv;hostonly"
+    TIMEOUT 60
+)
+
+# The chunk lease holder table (chunk-lease-holders.hpp), which GGML_SYCL_LEASE_HOLDERS=1 uses to name the code that
+# holds each VRAM arena chunk lease: header-only and SYCL-free, so it needs neither SYCL_LINK_ONLY_TEST_OPTIONS nor
+# ggml-base. One case claims from eight threads, hence Threads.
+add_executable(test-chunk-lease-holders
+    tests/test-chunk-lease-holders.cpp
+)
+target_include_directories(test-chunk-lease-holders PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(test-chunk-lease-holders PRIVATE Threads::Threads)
+add_test(NAME sycl-chunk-lease-holders COMMAND test-chunk-lease-holders)
+set_tests_properties(sycl-chunk-lease-holders PROPERTIES
+    LABELS "sycl;hostonly"
     TIMEOUT 60
 )
 
@@ -4430,6 +4442,40 @@ if (IntelSYCL_FOUND)
 endif()
 add_test(NAME test-sycl-arena-accessors COMMAND test-sycl-arena-accessors)
 set_tests_properties(test-sycl-arena-accessors PROPERTIES
+    LABELS "sycl;hostonly;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+    SKIP_RETURN_CODE 77
+)
+
+# Test: the zone-exact owner request (unified_cache_zone_allocate_owner) is
+# served by its zone or refused there: a full zone refuses without a
+# raw-allocation gate reading its figure, and room is served as an exact
+# zone-managed block. The cache is a real unified_cache on the OpenCL CPU
+# device, registered through unified_cache_register_for_queue(), so the selector
+# is pinned to it: no GPU.
+add_executable(test-sycl-zone-exact-alloc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-zone-exact-alloc.cpp
+)
+target_include_directories(test-sycl-zone-exact-alloc PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-zone-exact-alloc PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-zone-exact-alloc PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-zone-exact-alloc PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-zone-exact-alloc PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-zone-exact-alloc PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-zone-exact-alloc COMMAND test-sycl-zone-exact-alloc)
+set_tests_properties(test-sycl-zone-exact-alloc PROPERTIES
     LABELS "sycl;hostonly;tdd"
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 120
@@ -8124,9 +8170,10 @@ set_tests_properties(sycl-host-weight-alias PROPERTIES
 # and compiled against gpu-arch.cpp directly instead of linking libggml-sycl:
 # the backend library would bring in dpct::dev_mgr, whose first use enumerates
 # every SYCL device on the machine. The test supplies its own definitions of
-# the two backend symbols dispatch.hpp's gate needs, and of the async-failure
-# handler dpct::device_ext's emitted code references (see the link-seam comment
-# in the test), so it stays host-only and needs no GPU.
+# the two backend symbols dispatch.hpp's gate needs, and of the two symbols
+# dpct::device_ext's create_queue_impl overloads reference (the async-failure
+# handler and the queue-profiling resolver; see the link-seam comment in the
+# test), so it stays host-only and needs no GPU.
 #
 # ggml-base is linked for one reason: dpct::dev_mgr's constructor references
 # ggml_abort. That code is never executed here — the negative-device-id path
@@ -9949,6 +9996,49 @@ else()
     set_tests_properties(sycl-expert-predictor-guard PROPERTIES
         DISABLED TRUE
         LABELS "sycl;expert-predict;41bs;hostonly;not-built")
+endif()
+
+# The queue-profiling resolver (common.cpp, queue-profiling.hpp). Its pure parts, ggml_sycl_queue_profiling_decide() and
+# ggml_sycl_queue_profiling_requested_diagnostic(), run with plain values and an injected getenv. Its memoised wrapper,
+# ggml_sycl_queue_profiling_enabled() with its WARN lines, runs once per state in a forked child, each of which sets its
+# environment, captures the log and asks twice. No SYCL device is opened, no model is loaded and nothing is allocated,
+# so the test carries the `hostonly` label and none of `model`, `cache` or `mem-handle`, and the sweep may run it. It
+# needs the ordinary libggml-sycl for the out-of-line functions, hence the same `NOT GGML_BACKEND_DL` guard and disabled
+# placeholder as sycl-expert-predictor-guard above. There is no ONEAPI_DEVICE_SELECTOR pin, because there is no device.
+# SKIP_RETURN_CODE 77 is for a platform without fork(), where the forked arms cannot run: the test then exits 77 and
+# ctest reports a skip, not a pass.
+if (NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-queue-profiling-resolver
+        tests/test-sycl-queue-profiling-resolver.cpp
+    )
+    target_include_directories(test-sycl-queue-profiling-resolver PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        ${SYCL_INCLUDE_DIR}
+    )
+    target_compile_options(test-sycl-queue-profiling-resolver PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_link_options(test-sycl-queue-profiling-resolver PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+    target_link_libraries(test-sycl-queue-profiling-resolver PRIVATE ggml-base ggml ggml-sycl Threads::Threads)
+    if (IntelSYCL_FOUND)
+        target_link_libraries(test-sycl-queue-profiling-resolver PRIVATE IntelSYCL::SYCL_CXX)
+    endif()
+    set_target_properties(test-sycl-queue-profiling-resolver PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+    add_test(NAME sycl-queue-profiling-resolver COMMAND test-sycl-queue-profiling-resolver)
+    set_tests_properties(sycl-queue-profiling-resolver PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+        LABELS "sycl;queue-profiling;hostonly"
+        SKIP_RETURN_CODE 77
+        TIMEOUT 30
+    )
+else()
+    add_test(NAME sycl-queue-profiling-resolver
+        COMMAND ${CMAKE_COMMAND} -E echo
+                "not built: needs -DGGML_BACKEND_DL=OFF (test links ggml-sycl directly for the resolver)")
+    set_tests_properties(sycl-queue-profiling-resolver PROPERTIES
+        DISABLED TRUE
+        LABELS "sycl;queue-profiling;hostonly;not-built")
 endif()
 
 # Host zone routing, host-allocation lifetimes, the host SCRATCH demand ledger and the host holder plan

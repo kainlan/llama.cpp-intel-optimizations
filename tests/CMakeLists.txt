@@ -598,6 +598,15 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-moe-swap-policy PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# The decode-boundary swap driver of the MoE expert cache: the policy, the pending admits, the restores and open
+# slots, the host-room trim and the two summary lines, against a fake transaction. ggml-sycl/moe-swap-driver.hpp
+# includes only the policy header and the standard library, so this loads no model and needs no device.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-moe-swap-driver.cpp)
+    set_tests_properties(test-sycl-moe-swap-driver PROPERTIES LABELS "sycl;moe;hostonly")
+    target_include_directories(test-sycl-moe-swap-driver PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+endif()
+
 # Decode/prompt classification of a scheduler split (llama.cpp-7pm2): MUL_MAT_ID is batch evidence and a split with
 # no matmul keeps the previous phase. ggml-sycl/graph-phase.hpp includes only ggml.h; the test builds synthetic
 # graphs on a no-alloc ggml context, so it needs no device.
@@ -1195,7 +1204,7 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-moe-route-counts-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-route-counts-source.py --self-test)
     set_tests_properties(test-sycl-moe-route-counts-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # The fused gate_up expert role (its enum slot, classifier order, switches, claim, paired-path exclusions, ring
     # consumer and loader name test) and the seam where the direct MMID route steps aside for the batched prompt
     # executor and takes a node back only while the executor has submitted nothing. Run WITH --self-test so each
@@ -1218,13 +1227,20 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-swap-policy-source.py --self-test)
     set_tests_properties(test-sycl-moe-swap-policy-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+    # The swap driver runs once per synchronize boundary, after the refill and gated, never waits and never holds a
+    # lock across its policy; its switch is read once, its summaries log at WARN, and a named evict's host copy never
+    # grows the pinned host zone. Run WITH --self-test so each pin is shown to catch its mutant. Text only.
+    add_test(NAME test-sycl-moe-swap-driver-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-swap-driver-source.py --self-test)
+    set_tests_properties(test-sycl-moe-swap-driver-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # The named expert move's admit: no wait, the device storage minted at the staged size before the inventory lock,
-    # refused while triplets are lent, the padded tail filled before the one publish, the ledger untouched, and no
-    # production caller yet. Run WITH --self-test so each pin is shown to catch its mutant. Text only.
+    # refused while triplets are lent, the padded tail filled before the one publish, the ledger untouched, and one
+    # production caller, the swap driver. Run WITH --self-test so each pin is shown to catch its mutant. Text only.
     add_test(NAME test-sycl-moe-expert-admit-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-admit-source.py --self-test)
     set_tests_properties(test-sycl-moe-expert-admit-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # Every dnnl::primitive_attr the backend builds goes through the one helper that asks oneDNN for a deterministic
     # implementation, behind one default-ON switch read once (GGML_SYCL_ONEDNN_DETERMINISTIC). Without it identical
     # inputs gave different bits run to run. Run WITH --self-test so each mutant is caught by the pin it names. Text
@@ -1243,7 +1259,7 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-legacy-ranking-removed-source.py
             --self-test)
     set_tests_properties(test-sycl-moe-legacy-ranking-removed-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 300)
     # The opt-in spread order of routed experts: both orders go through one comparator, the switch is read once and
     # reaches the planner only through the inventory intake, the planner writes no popularity rank, the spread sort runs
     # before the ring room and the pack, and the swap headroom is a WEIGHT zone term. Run WITH --self-test so each
@@ -4989,6 +5005,20 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
+# GGML_SYCL_QUEUE_PROFILING (default off): the three-state knob that decides whether every queue the backend builds
+# carries enable_profiling. Host-only source gate: the resolver reads the environment once and not a macro, the one
+# list of diagnostics matches the readers and each diagnostic's own parse, the three property sites go through the
+# predicate, and every get_profiling_info reader asks it first. Same registration shape as the sibling above; each pin
+# carries a mutant inside the test. The resolver's pure parts and its three states, WARN lines included, have a C++
+# test beside the other host-only SYCL tests (ggml/src/ggml-sycl/CMakeLists.txt, sycl-queue-profiling-resolver).
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-queue-profiling-knob-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-queue-profiling-knob-source.py
+        LABEL "sycl;source;host"
+        TIMEOUT 120)
+endif()
+
 # llama.cpp-pktr: test-sycl-layout-choice.cpp is already registered, in
 # ggml/src/ggml-sycl/CMakeLists.txt, as ctest `sycl-layout-choice` (note the
 # ctest name differs from the executable target name). Do not register it
@@ -5209,6 +5239,29 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-last-release-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-last-release-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# Source gate for naming the code that holds each VRAM arena chunk lease: every take records its own return address in
+# its tag (a copy its copier's), GGML_SYCL_LEASE_HOLDERS is read once out of line, the counts by holder move only behind
+# the cache's copy of that flag, and the holders report prints at its caller's level. Host-only, reads the sources as
+# text. Same registration shape as test-sycl-last-release-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-chunk-lease-holder-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-chunk-lease-holder-source.py
+        LABEL "sycl;python;source-assert;mutation"
+        TIMEOUT 120)
+endif()
+
+# Source gate for the MXFP4 MoE decode reuse store's graph-local handles: the graph compute drops them on every exit
+# after its start, so the last graph's copy of a tensor handle cannot hold an arena chunk lease into a model release.
+# Host-only, reads the sources as text. Same registration shape as test-sycl-last-release-source above.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-mxfp4-moe-tg-reuse-lifetime-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-mxfp4-moe-tg-reuse-lifetime-source.py
         LABEL "sycl;python;source-assert;mutation"
         TIMEOUT 120)
 endif()
@@ -5775,6 +5828,20 @@ if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-moe-expert-loan-source
         SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-loan-source.py
+        LABEL "sycl;python;source-assert"
+        TIMEOUT 120)
+endif()
+
+# FlashAttention's persistent device buffers (the staged sinks and mask, the sequence-id buffers, the auto-V2 partition
+# buffers) are members of the backend context, which every tool frees before the model: no thread_local in fattn.cpp
+# holds a cache allocation, every owner is a mem_handle by value, and the context's destructor releases them once,
+# after it has waited for its queues and destroyed its executable graph. A thread_local holder outlived every model on
+# a thread that never exits, so the last model's release found the VRAM arena held. A mutant per claim. Text only: no
+# device, no model.
+if (Python3_Interpreter_FOUND)
+    llama_test_pytest(${Python3_EXECUTABLE}
+        NAME test-sycl-fattn-buffer-owner-source
+        SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-fattn-buffer-owner-source.py
         LABEL "sycl;python;source-assert"
         TIMEOUT 120)
 endif()

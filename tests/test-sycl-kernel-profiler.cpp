@@ -46,6 +46,10 @@ int main() {
     ggml_sycl_kernel_profile_reset_for_test();
     clear_profile_env();
 
+    // This first read stops at the variable's own flag, so the queue-profiling resolver is not asked and the knob stays
+    // unresolved. The read below sets GGML_SYCL_KERNEL_PROFILE=1 and expects the resolver, asked for the first time
+    // there, to see it and answer on. Were the resolver asked on this first read (the guard ahead of the flag in
+    // ggml_sycl_kernel_profile_config_from_env()), it would resolve off for the whole process and that read would fail.
     const ggml_sycl_kernel_profile_config disabled_env = ggml_sycl_kernel_profile_config_from_env();
     CHECK(!disabled_env.enabled, "unset GGML_SYCL_KERNEL_PROFILE should disable profiler");
 

@@ -13,6 +13,7 @@
 #include "moe-xmx-fused.hpp"
 #include "quantize.hpp"
 #include "quants.hpp"
+#include "queue-profiling.hpp"
 #include "sycl-kernel-profiler.hpp"
 #include "sycl-profiling.hpp"
 #include "unified-cache.hpp"
@@ -191,14 +192,13 @@ static void mmvq_moe_trace(const ggml_tensor * src0,
 }
 
 static bool mmvq_moe_tg_profile_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("GGML_SYCL_MXFP4_TG_PROFILE");
-        return env && std::atoi(env) != 0;
-    }();
+    static const bool enabled = ggml_sycl_profile_env_nonzero(std::getenv("GGML_SYCL_MXFP4_TG_PROFILE"));
     // This diagnostic inserts host waits to time individual MXFP4 MoE kernels.
     // Level Zero command-graph recording forbids queue/event waits, so profiling
-    // must be silent while capture is active.
-    return enabled && !ggml_sycl_graph_recording_active();
+    // must be silent while capture is active. Without queue profiling it has nothing to read: it warns once and every
+    // figure it would print stays off.
+    return enabled && !ggml_sycl_graph_recording_active() &&
+           ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_MXFP4_TG_PROFILE");
 }
 
 static bool mxfp4_moe_tg_profile_launch_enabled() {
@@ -210,13 +210,12 @@ static bool mxfp4_moe_tg_profile_launch_enabled() {
 }
 
 static bool mmvq_moe_pp_profile_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("GGML_SYCL_MXFP4_PP_PROFILE");
-        return env && std::atoi(env) != 0;
-    }();
+    static const bool enabled = ggml_sycl_profile_env_nonzero(std::getenv("GGML_SYCL_MXFP4_PP_PROFILE"));
     // This diagnostic inserts host waits to split prompt MoE latency.  Do not
-    // run it during graph capture.
-    return enabled && !ggml_sycl_graph_recording_active();
+    // run it during graph capture. Without queue profiling it has nothing to read: it warns once and every figure it
+    // would print stays off.
+    return enabled && !ggml_sycl_graph_recording_active() &&
+           ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_MXFP4_PP_PROFILE");
 }
 
 static bool mxfp4_moe_gateup_m2_tg1_index_enabled() {
@@ -1449,17 +1448,19 @@ static int mxfp4_moe_xmx_tiled_output_validate_rows() {
     return rows > 0 ? rows : 256;
 }
 
-// get_profiling_info() BLOCKS the calling host thread until `ev` completes --
-// every backend queue is created with sycl::property::queue::enable_profiling
-// (see default_queue_properties() in common.hpp), so this call always
-// succeeds and always waits; there is no "info unavailable" escape hatch on
-// this backend. Only call this helper when a profiling diagnostic that
-// actually consumes the result is enabled (detail_profile / tg_profile /
-// pp_profile / profile_launch, or the mmvq_moe_{tg,pp}_profile_enabled()
-// checks that feed them) -- i.e. only behind a profile guard, never
-// unconditionally on the dispatch hot path (ruling 6: no host waits in
-// dispatch).
+// get_profiling_info() BLOCKS the calling host thread until `ev` completes.
+// A requested profiling diagnostic puts enable_profiling on every backend
+// queue, so the call succeeds and waits; with GGML_SYCL_QUEUE_PROFILING=0 (or
+// no diagnostic requested) it would throw, so this returns -1.0 ("not
+// available") without making it. Only call it behind a
+// profile guard (detail_profile / tg_profile / pp_profile / profile_launch, or
+// mmvq_moe_{tg,pp}_profile_enabled(), which stay closed then) and never
+// unconditionally on the dispatch hot path (ruling 6: no host waits).
 static double mmvq_sycl_event_duration_us(const sycl::event & ev) {
+    // The callers sit behind the TG and PP gates, which warned and closed when the knob is off; no second WARN here.
+    if (!ggml_sycl_queue_profiling_enabled()) {
+        return -1.0;
+    }
     try {
         const uint64_t start = ev.get_profiling_info<sycl::info::event_profiling::command_start>();
         const uint64_t end   = ev.get_profiling_info<sycl::info::event_profiling::command_end>();
@@ -1961,25 +1962,31 @@ static void mxfp4_moe_tg_reuse_invalidate() {
     g_mxfp4_moe_tg_reuse.ready_event_set = false;
 }
 
-// llama.cpp-2gag: g_mxfp4_moe_tg_reuse's validity check (mxfp4_moe_tg_reuse_can_use)
-// keys on {device, layer, role, shape, src1_handle pointer-identity} -- and a
-// layer's glu_dst tensor sits at the SAME device address every decode token
-// (it's a persistent graph node), so the pointer-identity check is satisfied
-// trivially across tokens and proves nothing about which token's data is in
-// the buffer. Every call site that invalidates this cache is inside the
-// gate/up dispatch's own internal branches (mmvq.cpp); none of them run
-// unconditionally, and no per-graph reset call exists anywhere for this
-// cache (verified by exhaustive search across the file -- unlike the sibling
-// g_moe_precomputed_mmid_skip family, which IS reset every graph via
-// ggml_sycl_moe_precomputed_skip_new_graph()). If some internal branch of
-// the gate/up dispatch neither re-stores nor invalidates the cache for a
-// given token, while the down-projection dispatch for that same layer still
-// finds mxfp4_moe_tg_reuse_can_use() true, the down projection silently
-// consumes a stale, previous-token GLU-Q8 artifact -- plausible-magnitude,
-// systematically wrong output, not garbage. Exposed here so the canonical
-// per-graph cache invalidation point (ggml_backend_sycl_graph_compute_impl)
-// can reset it exactly like its sibling caches.
+// g_mxfp4_moe_tg_reuse's validity check (mxfp4_moe_tg_reuse_can_use) keys on {device, layer, role, shape,
+// src1_handle pointer identity}, and a layer's glu_dst tensor sits at the same device address every decode token (it
+// is a persistent graph node), so the identity check holds across tokens and proves nothing about which token's data
+// is in the buffer. The invalidations inside the gate/up dispatch's own branches do not run on every path, so if one
+// branch neither re-stores nor invalidates the store for a token while the down projection of that layer still finds
+// it usable, the down projection consumes the previous token's GLU-Q8 artifact: plausible-magnitude, systematically
+// wrong output. Two graph-level resets close that. ggml_backend_sycl_graph_compute_impl calls this one at its start,
+// like the sibling per-graph caches. The scope in ggml_backend_sycl_graph_compute_unchecked calls
+// ggml_sycl_mxfp4_moe_tg_reuse_end_graph() below when every call ends, including the segmented record and replay
+// calls, which never pass through compute_impl.
 void ggml_sycl_mxfp4_moe_tg_reuse_new_graph() {
+    mxfp4_moe_tg_reuse_invalidate();
+}
+
+// The graph-local half is a copy of a tensor's mem_handle, and that copy holds a VRAM arena chunk lease of its own.
+// Left for the next graph's start to drop, the last decode token's copy outlives the model and the last model
+// release finds the arena still leased. The graph compute call drops it when it ends instead, on the thread that
+// stored it. That comes before the model release: a llama_context holds a reference to its model, so llama.cpp frees a
+// model's contexts before the model (common_init_result declares the model first, so it is destroyed last), and no
+// graph call is in flight when the slot release runs; ggml_sycl_release_model_slot_resources WARNs if one is at the
+// last live model's release. The release is no place for the drop: it runs on whichever thread calls
+// llama_model_free, which the bundled tools make the thread that decoded but the API does not require, and a
+// thread_local of another thread is out of its reach. The Q8 staging buffers the store owns are untouched, so the next
+// graph reuses them without allocating.
+void ggml_sycl_mxfp4_moe_tg_reuse_end_graph() {
     mxfp4_moe_tg_reuse_invalidate();
 }
 

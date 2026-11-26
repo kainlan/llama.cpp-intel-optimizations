@@ -301,12 +301,17 @@ These are in a test function `xmx_test_kernel` called at startup to verify XMX c
 |---|------|------|----------|-------|---------|-------------|------------------|----------------------|------------|
 | 70 | `fattn.cpp` | 171 | block table alloc (seq_id_buffer pool) | graph_compute | Flash-attn block table per stream | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
 | 71 | `fattn.cpp` | 301 | fattn weight staging slot | graph_compute | Per-weight staging slot for fattn | `ggml_sycl_malloc_device` | `unified_allocate(..., STAGING zone)` | migrate | `llama.cpp-32dg8.6` |
-| 72 | `fattn.cpp` | 455 | `g_v2_auto.block_table` | context_init | Pre-alloc block table for V2 auto | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
-| 73 | `fattn.cpp` | 466 | `g_v2_auto.seq_lens` | context_init | Pre-alloc seq lens for V2 auto | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
-| 74 | `fattn.cpp` | 476 | `g_v2_auto.temp_buf` | context_init | Pre-alloc temp buf for V2 auto | `ggml_sycl_malloc_device_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
-| 75 | `fattn.cpp` | 1660 | `g_v2_auto.block_table` (lazy) | graph_compute | Lazy block table realloc | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
-| 76 | `fattn.cpp` | 1667 | `g_v2_auto.seq_lens` (lazy) | graph_compute | Lazy seq lens realloc | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
-| 77 | `fattn.cpp` | 1708 | `g_v2_auto.temp_buf` (lazy) | graph_compute | Lazy temp buf realloc | `ggml_sycl_malloc_device_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 72 | `fattn.cpp` | 455 | `fattn_buffers.v2_auto.block_table` | context_init | Pre-alloc block table for V2 auto | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 73 | `fattn.cpp` | 466 | `fattn_buffers.v2_auto.seq_lens` | context_init | Pre-alloc seq lens for V2 auto | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 74 | `fattn.cpp` | 476 | `fattn_buffers.v2_auto.temp_buf` | context_init | Pre-alloc temp buf for V2 auto | `ggml_sycl_malloc_device_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+| 75 | `fattn.cpp` | 1660 | `fattn_buffers.v2_auto.block_table` (lazy) | graph_compute | Lazy block table realloc | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 76 | `fattn.cpp` | 1667 | `fattn_buffers.v2_auto.seq_lens` (lazy) | graph_compute | Lazy seq lens realloc | `ggml_sycl_malloc_device_t` | `unified_allocate(..., RUNTIME zone)` | migrate | `llama.cpp-32dg8.6` |
+| 77 | `fattn.cpp` | 1708 | `fattn_buffers.v2_auto.temp_buf` (lazy) | graph_compute | Lazy temp buf realloc | `ggml_sycl_malloc_device_t` | `unified_allocate(..., SCRATCH zone)` | migrate | `llama.cpp-32dg8.6` |
+
+The line numbers and the "Current API" column of this group are those of the 2026-04-27 audit. Rows 70 to 77 have
+since become members of the backend context (`ggml_backend_sycl_context::fattn_buffers`: `seq_ids`, `operand_stage` and
+`v2_auto`), allocated through `unified_allocate_owner()` and released by the context's destructor
+(llama.cpp-cvq4).
 
 ---
 

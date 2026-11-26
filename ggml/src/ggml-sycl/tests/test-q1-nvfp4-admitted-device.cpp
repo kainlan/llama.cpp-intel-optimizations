@@ -584,7 +584,10 @@ struct lifecycle_fixture {
     // grown zone has left, is refused by the no-growth bound, by name, and the zone does not grow for it. It allocates
     // nothing. A zone with no bound at all would miss on the contiguous block instead, and one that grew would serve
     // it. The bound is the zone's, whatever sent the request there: the host pool reaches WEIGHT as a persistent
-    // owner, a flag whose setters are a census of two, so the probe reaches it by role, as a host weight does.
+    // owner, a flag whose setters are a census of two, so the probe reaches it by role, as a host weight does. It
+    // leaves its failure log on, as a host weight does: the zone's refusal warning skips a request that suppresses
+    // its failure log and is no persistent owner, and this request is neither. The cache's allocation-failed error
+    // prints as well, to stderr only: the capture above keeps the refusal line alone.
     static void require_no_growth_request_refused_at_capacity(int device) {
         auto * cache = ggml_sycl::get_unified_cache_for_device(device);
         require(cache != nullptr, "the primary device has no unified cache");
@@ -597,7 +600,6 @@ struct lifecycle_fixture {
         request.device                                     = device;
         request.size                                       = before.capacity - before.used + 1;
         request.alignment                                  = 64;
-        request.suppress_failure_log                       = true;
         request.host_zone_miss                             = &miss;
         request.intent.role                                = ggml_sycl::alloc_role::WEIGHT;
         request.intent.category                            = ggml_sycl::runtime_category::HOST_COMPUTE;

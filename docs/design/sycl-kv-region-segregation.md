@@ -6080,8 +6080,10 @@ records; the only record moua produces is the recurrent state's.
   23mk's function at once (r17 m-6; rulings §M41 m-6). Every beni demand is computed by a
   visitor in zhcn's measure walker, before KV admission, and travels in zhcn's tenant section.
   The llama.cpp-cxgg sidecar fix is folded into beni.
-- **llama.cpp-jzvq:** the fattn thread-local device workspaces (`fattn.cpp:747` and its callers,
-  the `:1800` XMX split workspace) and the **MXFP4 MoE token-generation caches**
+- **llama.cpp-jzvq:** the fattn device workspaces (`ggml_sycl_fattn_alloc_device_owner()` at
+  `fattn.cpp:765` and its callers, whose buffers are members of the backend context,
+  `ggml_backend_sycl_context::fattn_buffers`, since llama.cpp-cvq4; and the XMX split workspace
+  at `:1858`) and the **MXFP4 MoE token-generation caches**
   (`g_mxfp4_moe_tg_reuse`, `mmvq.cpp:1744`, and `g_mxfp4_stored_gemm_ksplit_scratch`,
   `mxfp4-stored-gemm.cpp:242`; ticket comment c-jv0r). The latter are on the **default GPT-OSS
   decode path** (four raw `role=6` EXT-ALLOC lines on the B50 master baseline), so without jzvq

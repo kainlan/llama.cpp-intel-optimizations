@@ -113,7 +113,8 @@
 //       the cache under TP). The reuse pool's completion checks must not
 //       BLOCK a calling thread on a pooled entry's release_event --
 //       event_complete()'s bare command_execution_status query does exactly
-//       that on any profiling-enabled queue, which every backend stream is.
+//       that on any profiling-enabled queue, which every backend stream is
+//       when the queues carry profiling (main() asks for it below).
 //       Parking an entry with a slow, unwaited release event and
 //       immediately re-requesting the identical size must return a fresh
 //       allocation (miss, not hit) in well under the release delay, leaving
@@ -366,8 +367,9 @@ constexpr int kSlowReleaseMs = 1500;
 // of this file's own release events are deliberately still pending at
 // their own "elapsed=" print site; this helper is for the OTHER prints,
 // after an explicit wait()). Requires the queue the event was submitted on
-// to be profiling-enabled (every real backend stream in this codebase is,
-// via default_queue_properties()) -- returns -1 if the query itself
+// to be profiling-enabled (main() sets GGML_SYCL_QUEUE_PROFILING=1 before the
+// backend starts, so every backend stream is, via default_queue_properties())
+// -- returns -1 if the query itself
 // throws, so a caller can print "n/a" rather than propagate the exception
 // into an unrelated check. Defined here, ahead of
 // ensure_slow_release_calibrated() below, because that function also uses
@@ -1215,8 +1217,10 @@ void test_oversized_request_skips_wait_loop(unified_cache * cache, int device) {
 //
 // BACKGROUND. unified_cache::event_complete()'s bare
 // command_execution_status query BLOCKS rather than polls on any
-// profiling-enabled queue, and every backend stream -- including the one
-// oneDNN's free callback supplies release_event on -- is profiling-enabled.
+// profiling-enabled queue, and, when the queues carry profiling
+// (GGML_SYCL_QUEUE_PROFILING=1 or a requested profiling diagnostic), every
+// backend stream -- including the one oneDNN's free callback supplies
+// release_event on -- is profiling-enabled.
 // The DIRECT reuse pool's completion checks
 // (onednn_graph_scratch_entry_usable_locked(),
 // onednn_graph_scratch_evict_pool_until_fits_locked(),
@@ -2244,6 +2248,11 @@ int main(int, char ** argv) {
     // direct run of this specific binary should ever set this, never a
     // production process.
     setenv("GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS", "1", 1);
+    // The ordering checks read command_start/command_end of events on the cache's queue (actual_kernel_duration_ms(),
+    // and the write-order check after the early-exit re-park). The backend's queues carry profiling only when asked
+    // (GGML_SYCL_QUEUE_PROFILING=1, or a profiling diagnostic), and the answer is resolved once at the first query, so
+    // it is set here, before ggml_backend_sycl_init.
+    setenv("GGML_SYCL_QUEUE_PROFILING", "1", 1);
 
     const int device = 0;  // in-process index after selector filtering
 

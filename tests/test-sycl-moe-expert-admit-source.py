@@ -26,12 +26,14 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
       live-update lease, and again under the inventory lock while the ledger holds a lent triplet;
   A4  an expert's size is its tensor's, never a cache entry's, in every direction: the resolver reads the tensor's
       bytes per expert (nb[2]) with its type and width, and the preparation hands all three to the cache. A move to
-      the device mints its storage at the padded staged size of those bytes, asked of the layout
-      (staged_expert_bytes), and a move to the host mints pinned storage for exactly those bytes; the preparation
-      sizes by the kind's direction alone, and the transaction sizes nothing. Never the host copy's size and never
-      computed for one type: the cache refuses a host copy shorter than the expert ("host copy size", a refusal a
-      later boundary meets again) and storage that is not exactly the staged size or is smaller than the expert, for
-      a refill as for an admit, and the device entry takes the storage's size;
+      the device mints every member's storage at what the load gives it (expert_triplet_member_bytes): its triplet's
+      slot, the largest of the padded staged sizes of the three members' bytes, asked of the layout
+      (staged_expert_bytes), when that pads the triplet by at most 1/128, else the member's own staged size; a move to
+      the host mints pinned storage for exactly those bytes; the preparation sizes by the kind's direction alone, and
+      the transaction sizes nothing. Never the host copy's size and never computed for one type: the cache refuses a
+      host copy shorter than the expert ("host copy size", a refusal a later boundary meets again) and storage that is
+      not exactly the member's size or is smaller than the expert, for a refill as for an admit, and the device entry
+      takes the storage's size;
   A5  the copy moves exactly the expert's bytes from offset 0 of the host copy, the padded tail is zero-filled on the
       copy's queue behind the copy, and the device entry is published behind the fill (its ready event and last
       write), as the record the transaction remembers is, whose logical bytes are the tensor's bytes per expert in
@@ -46,8 +48,9 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
       strict ("not lent", "not a lent copy"), admit_host_triplet passes true, and an admit's host copy must be pinned
       storage it owns whole, its owner exactly the entry's base and size, and a host-zone slice ("host copy not
       pinned" otherwise), while a refill's owner need only hold the entry, as the loan that lent it requires;
-  A9  a named move WARNs nothing (its refusals skip the loan's WARN, its result line is DEBUG), and nothing but the
-      private test fixtures calls the entry;
+  A9  a named move WARNs no refusal (its refusals skip the loan's WARN; its caller reads each answer from the
+      outcomes), and outside the private test fixtures the entry has exactly one caller, the decode-boundary swap driver
+      (ggml_sycl_run_expert_swap_claimed, which the boundary and the private tests' hook call), which calls it once;
   A10 the named selection takes the published plan's verdict (moe_expert_move_validate) and moves only the triplets it
       lets through;
   A11 every refusal either cache body assigns, the copy to the device and the loan's copy to the host, is classed
@@ -74,7 +77,19 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
       moves; it never ends the list;
   E5  each moved outcome records the device storage it took or gives back; the body sums the bytes once per
       direction, as each triplet moves, writes them once the plan is published and names both directions in its
-      DEBUG line, and the entry takes those sums, counts each outcome in its direction and returns it in its own list.
+      result line, and the entry takes those sums, counts each outcome in its direction and returns it in its own list;
+  M2  an admit's retires of its host copies carry no latch mark: the cache's eviction latch already leaves a
+      host-resident entry out, so retired_by_expert_move is set only on the device entries an evict retires, and the
+      copy to the device never names it;
+  M1  a named move's one result line is a DEBUG line with no timings; what the move cost the boundary thread is the
+      answer's instead, written to the body's answer on every exit by the guard that also writes the room figure (a
+      transaction that threw is neither reported, since the entry rethrows before it copies the answer, nor counted
+      by the swap driver): the
+      microseconds the cache spent in each move's copy step and in its id handover and retire, the transaction in the
+      members' metadata lookups. The call's whole time is the entry's, taken on every exit that returns (a refusal
+      before any preparation included, whose three parts stay 0). Each cache body, the loan's and
+      the copy to the device, records its two times in the move record, the preparation times its resolver call, and
+      the body sums all three as each call returns, into counters declared before the guard.
 
 Checks run on comment-stripped, whitespace-normalized text. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it and is reported if it survives, if another pin
@@ -88,6 +103,7 @@ served from its old table and that an evict's room comes back only after the rea
 
 from __future__ import annotations
 
+import functools
 import re
 import sys
 from pathlib import Path
@@ -99,6 +115,7 @@ FILES = {
     "pad": ROOT / "ggml/src/ggml-sycl/weight-row-padding.hpp",
     "common": ROOT / "ggml/src/ggml-sycl/common.hpp",
     "hostpath": ROOT / "ggml/src/ggml-sycl/moe-decode-hostpath.hpp",
+    "plan": ROOT / "ggml/src/ggml-sycl/moe-stream-plan.hpp",
 }
 
 _LEXEME_RE = re.compile(r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'", re.DOTALL)
@@ -113,6 +130,27 @@ class MutantNotApplied(Exception):
     pass
 
 
+# The self-test runs the gate on a mutant of each source in turn. The unmutated sources, and what is cut from them,
+# stay cached because every mutant reads them; a mutated text is used for its one check and evicted. The caches are
+# small on purpose: a key holds a whole 7 MB source, so a large cache would keep hundreds of dead mutants in memory. A
+# cache hit returns what the same text gave before, so each mutant is still judged on its own text.
+_WHOLE_SOURCE = 1 << 20  # a text this long is a whole source or a whole stripped copy of one, not a body cut from it
+
+
+def content_cache(fn):
+    """Cache `fn` by its text argument in two tiers: the few whole-source texts stay hot, and the many short texts cut
+    from them are held in a larger cache whose keys are each under a megabyte."""
+    short = functools.lru_cache(maxsize=256)(fn)
+    whole = functools.lru_cache(maxsize=8)(fn)
+
+    @functools.wraps(fn)
+    def cached(text):
+        return (whole if len(text) >= _WHOLE_SOURCE else short)(text)
+
+    return cached
+
+
+@functools.lru_cache(maxsize=8)
 def strip_comments(src: str) -> str:
     """Comments blanked to their newlines, literals kept."""
 
@@ -125,6 +163,7 @@ def strip_comments(src: str) -> str:
     return _LEXEME_RE.sub(repl, src)
 
 
+@content_cache
 def norm(text: str) -> str:
     """Comment-stripped, whitespace-canonical text with adjacent string literals joined, and every guard on
     g_tensor_inventory_mutex in its deduced spelling, so a clang-format re-wrap cannot turn a pin red."""
@@ -259,9 +298,10 @@ LEASE = "registry.acquire_live_update(current_token)"
 LEDGER_LOCKED = "ggml_sycl_expert_lent_ledger & ledger = ggml_sycl_expert_lent_ledger_locked(device, *current);"
 
 PREP_DIRECTION = "const bool to_device = ggml_sycl_expert_move_to_device(out.kind);"
-STAGED_SIZE = ("const size_t staged = "
+STAGED_SIZE = ("staged[r] = "
                "ggml_sycl::staged_expert_bytes(e->layout, target.type, target.ncols, target.logical_bytes);")
-MINT = "storage = ggml_sycl_device_expert_alloc(device, staged);"
+MEMBER = "const size_t member_bytes = ggml_sycl::expert_triplet_member_bytes(staged, r);"
+MINT = "storage = ggml_sycl_device_expert_alloc(device, member_bytes);"
 HOST_MINT = "storage = ggml_sycl_host_expert_alloc(device, target.logical_bytes);"
 MEMBER_TYPE = "m.type = target.type;"
 MEMBER_NCOLS = "m.ncols = target.ncols;"
@@ -273,8 +313,10 @@ STAGED_GUARD = "if (layout != GGML_LAYOUT_AOS ||"
 STAGED_AOS = "return aos_staged_weight_bytes(type, ncols, expert_bytes);"
 CACHE_LOGICAL = "const size_t logical = members[i].logical_bytes;"
 HOST_SIZE_GUARD = 'if (e.size < logical) { refusal = "host copy size"; break; }'
-CACHE_STAGED = "const size_t staged = staged_expert_bytes(e.layout, members[i].type, members[i].ncols, logical);"
-SIZE_GUARD = 'if (device_size[i] != staged || staged < logical) { refusal = "device storage size"; break; }'
+CACHE_STAGED = ("staged[i] = staged_expert_bytes(GGML_LAYOUT_AOS, members[i].type, members[i].ncols, "
+                "members[i].logical_bytes);")
+SIZE_GUARD = ('const size_t member_bytes = expert_triplet_member_bytes(staged, i); if (device_size[i] != member_bytes '
+              '|| member_bytes < logical) { refusal = "device storage size"; break; }')
 COPY_BYTES = "bytes[i] = logical;"
 FINAL_SIG = "static bool ggml_sycl_expert_move_refusal_is_final("
 ENTRY_SIZE = "entry.size = device_size[i];"
@@ -292,7 +334,7 @@ REMEMBER = ("(void) triplet.extras[r]->remember_moe_storage_handle(triplet.membe
 
 PUBLISH = "ggml_sycl_publish_prepared_plan_locked(prepared_publication);"
 SWAP_PUBLISH = ("if (swapped) { ggml_sycl_publish_prepared_plan_locked(prepared_publication); "
-                "ggml_sycl_optional_layouts_retired(); }")
+                "ggml_sycl_optional_layouts_retired(); latch.armed = false; }")
 RETHROW = "std::rethrow_exception(escaped);"
 RETHROW_LAST = "if (escaped) { std::rethrow_exception(escaped); } return finish(ggml_sycl_txn_result::ACCEPTED, reason);"
 NAMED_CALL = ("const ggml_sycl_txn_result code = ggml_sycl_expert_txn_run(ggml_sycl_expert_txn_direction::NAMED, "
@@ -328,9 +370,11 @@ PINNED_CHECK = ("if (e.location != cache_location::HOST_PINNED || !e.host_reside
                 '{ refusal = admit ? "host copy not pinned" : "not a lent copy"; break; }')
 
 REFUSE_GATE = "if (!probe_mode && !refill && !named && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {"
-NAMED_DEBUG = ('GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) '
-               '(%s)\\n"')
+NAMED_FORMAT = ('"[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s)\\n"')
+NAMED_LINE = "GGML_LOG_DEBUG(" + NAMED_FORMAT
 ENTRY_NAME = "ggml_sycl_expert_move_transaction_run("
+# The entry's one production caller: the swap driver's claimed body, which the synchronize boundary runs.
+DRIVER_SIG = "static void ggml_sycl_run_expert_swap_claimed("
 
 VALIDATE = ("const ggml_sycl::moe_expert_move_check check = ggml_sycl::moe_expert_move_validate(plan, device, evict, "
             "admit);")
@@ -359,6 +403,18 @@ SUCCESS_REASON = "OK"
 _REASON_ASSIGN_RE = re.compile(r"\b(?:refusal|out\.reason) = ([^;]*);")
 _LITERAL_RE = re.compile(r'"((?:\\.|[^"\\])*)"')
 _FINAL_LIST_RE = re.compile(r"final_reasons\[\] = \{([^}]*)\}")
+# A refusal the cache gives and the transaction classifies by a named constant: its one spelling is in the plan header.
+_NAMED_REASON_DEF_RE = re.compile(r"constexpr const char (MOE_EXPERT_MOVE_\w+)\[\] = (\"(?:\\.|[^\"\\])*\");")
+
+
+def resolve_named_reasons(plan: str, *texts: str) -> list[str]:
+    """Each named refusal constant in `texts` replaced by the literal the plan header defines it as, so A11 reads the
+    reason a body assigns or lists whether it is spelled as a literal or by its name."""
+    out = list(texts)
+    for name, literal in _NAMED_REASON_DEF_RE.findall(plan):
+        use = re.compile(r"(?:\bggml_sycl::)?\b" + name + r"\b(?!\[)")
+        out = [use.sub(lambda _m: literal, t) for t in out]
+    return out
 # Each named triplet takes its own list's verdict: the plan judged the evicts and the admits in two lists.
 VERDICT = ("const char * verdict = moves[i].to_device ? check.admit[n_admit++] : check.evict[n_evict++]; "
            "if (verdict) { moves[i].code = ggml_sycl_txn_result::REFUSED; moves[i].reason = verdict; continue; }")
@@ -399,13 +455,23 @@ STAMP_COMPARES = "s.expert_storage_generation == expert_storage_generation"
 BODY_SUM = "++lent; (to_device ? taken : freed) += record.device_bytes;"
 BODY_RESULT = "result.bytes_freed = freed; result.bytes_readmitted = taken;"
 BODY_COUNT = "if (!m.to_device) { ++n_evicted; }"
-NAMED_DEBUG_ARGS = "device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason);"
+NAMED_LINE_ARGS = "device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason);"
+# M1: what the body sums into the line, and where each figure is measured.
+SUM_META = "meta_us += triplet.resolve_us;"
+COST_GUARD = ("ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, meta_us, "
+              "copy_us, remap_us };")
+COST_COUNTERS = "uint64_t meta_us = 0; uint64_t copy_us = 0; uint64_t remap_us = 0;"
+COST_WRITE = "answer->meta_us = meta_us; answer->copy_us = copy_us; answer->remap_us = remap_us;"
+SUM_CACHE = "copy_us += record.copy_us; remap_us += record.remap_us;"
+CACHE_TIMES = ("out.copy_us = copy_took;", "out.remap_us = remap_took;")
+PREP_TIMED = "const bool resolved = resolver(*e, target); out.resolve_us += ggml_sycl::expert_move_us_since(resolve_from);"
 ENTRY_BYTES = "r.bytes_evicted = answer.bytes_freed; r.bytes_admitted = answer.bytes_readmitted;"
 ENTRY_SPLIT = ("for (ggml_sycl_expert_move_outcome & m : moves) { if (m.moved) { "
                "++(m.to_device ? r.n_admitted : r.n_evicted); } (m.to_device ? r.admitted : r.evicted).push_back(m); }")
 
 
-def _private_testing_lines(raw: str) -> list[bool]:
+@functools.lru_cache(maxsize=8)
+def _private_testing_lines(raw: str) -> tuple[bool, ...]:
     """Per line of comment-stripped `raw`, whether it sits inside a `#if defined(GGML_SYCL_PRIVATE_TESTING)` block
     (not its #else). Nested conditionals keep the outer block's answer."""
     stack: list[bool] = []
@@ -419,12 +485,14 @@ def _private_testing_lines(raw: str) -> list[bool]:
         elif re.match(r"#\s*endif", s) and stack:
             stack.pop()
         out.append(any(stack))
-    return out
+    return tuple(out)
 
 
 def check(raw: dict[str, str]) -> None:
-    sycl = norm(raw["sycl"])
-    cache = norm(raw["cache"])
+    plan = norm(raw["plan"])
+    if not _NAMED_REASON_DEF_RE.search(plan):
+        fail("A11", "the plan header defines no named refusal (MOE_EXPERT_MOVE_SHARED_STORAGE) this pin can resolve")
+    sycl, cache = resolve_named_reasons(plan, norm(raw["sycl"]), norm(raw["cache"]))
     pad = norm(raw["pad"])
     txn = body(sycl, TXN_SIG)
     entry = body(sycl, ENTRY_SIG)
@@ -483,9 +551,11 @@ def check(raw: dict[str, str]) -> None:
                    "before the admit")
 
     # A4 ---------------------------------------------------------------------------------------------------------------
-    if not (prep.count(PREP_DIRECTION) == 1 and prep.count(STAGED_SIZE) == 1 and prep.count(MINT) == 1
-            and ordered(prep, PREP_DIRECTION, STAGED_SIZE, MINT)):
-        fail("A4", "a move to the device is not minted at the staged size, decided by the kind's direction")
+    if not (prep.count(PREP_DIRECTION) == 1 and prep.count(STAGED_SIZE) == 1 and prep.count(MEMBER) == 1
+            and prep.count(MINT) == 1 and prep.count("ggml_sycl_device_expert_alloc(") == 1
+            and ordered(prep, PREP_DIRECTION, STAGED_SIZE, MEMBER, MINT)):
+        fail("A4", "a move to the device is not minted at what the load gives the member (its triplet's slot, else "
+                   "its own staged size), decided by the kind's direction")
     if prep.count(HOST_MINT) != 1 or "staged_expert_bytes(" in txn:
         fail("A4", "a move to the host is not minted at the tensor's bytes, or the transaction sizes a copy itself")
     if not (prep.count(MEMBER_TYPE) == 1 and prep.count(MEMBER_NCOLS) == 1 and RESOLVED_TYPE in resolve
@@ -494,12 +564,12 @@ def check(raw: dict[str, str]) -> None:
     if not (prep.count(MEMBER_LOGICAL) == 1 and RESOLVED_LOGICAL in resolve):
         fail("A4", "the expert's bytes every move sizes, copies and records are not its tensor's nb[2]")
     if not (copy.count(CACHE_LOGICAL) == 1 and copy.count(HOST_SIZE_GUARD) == 1
-            and ordered(copy, CACHE_LOGICAL, HOST_SIZE_GUARD, CACHE_STAGED) and '"host copy size"' in final):
+            and ordered(copy, CACHE_LOGICAL, HOST_SIZE_GUARD, SIZE_GUARD) and '"host copy size"' in final):
         fail("A4", "the cache does not refuse, as final, a host copy shorter than the expert's tensor bytes")
     if not (STAGED_GUARD in staged and staged.count(STAGED_AOS) == 1):
         fail("A4", "staged_expert_bytes does not ask the layout, or does not give AOS the padded size")
     if not (copy.count(CACHE_STAGED) == 1 and copy.count(SIZE_GUARD) == 1 and ordered(copy, CACHE_STAGED, SIZE_GUARD)):
-        fail("A4", "the cache does not refuse admit storage that is not exactly the staged size")
+        fail("A4", "the cache does not refuse admit storage that is not exactly what the load gives the member")
     if not (copy.count(ENTRY_SIZE) == 1 and copy.count(MIRROR_SIZE) == 1):
         fail("A4", "the device entry is not sized as its storage")
     for name, text in (("transaction body", txn), ("triplet preparation", prep), ("cache shared body", copy),
@@ -548,14 +618,23 @@ def check(raw: dict[str, str]) -> None:
                    "refill's owner bound is not the loan's")
 
     # A9 ---------------------------------------------------------------------------------------------------------------
-    if txn.count(REFUSE_GATE) != 1 or txn.count(NAMED_DEBUG) != 1:
-        fail("A9", "a named move's refusal or result is logged above DEBUG")
+    if txn.count(REFUSE_GATE) != 1:
+        fail("A9", "a named move's refusal is logged")
     private = _private_testing_lines(raw["sycl"])
-    lines = strip_comments(raw["sycl"]).split("\n")
+    stripped = strip_comments(raw["sycl"])
+    lines = stripped.split("\n")
+    d_start, d_end = body_span(stripped, DRIVER_SIG)
+    d_first = stripped.count("\n", 0, d_start) if d_start >= 0 else -1
+    d_last = stripped.count("\n", 0, d_end) if d_start >= 0 else -1
+    production = []
     for k, line in enumerate(lines):
-        if ENTRY_NAME in line and ENTRY_SIG.rstrip("(") not in re.sub(r"\s+", " ", line):
-            if not private[k]:
-                fail("A9", f"line {k + 1} calls the named move outside the private test fixtures")
+        if ENTRY_NAME in line and ENTRY_SIG.rstrip("(") not in re.sub(r"\s+", " ", line) and not private[k]:
+            production.append(k)
+    for k in production:
+        if not d_first <= k <= d_last:
+            fail("A9", f"line {k + 1} calls the named move outside the swap driver and the private test fixtures")
+    if len(production) != 1:
+        fail("A9", f"the swap driver calls the named move {len(production)} times, not once")
 
     # A10 --------------------------------------------------------------------------------------------------------------
     if select.count(VALIDATE) != 1 or select.count(VERDICT) != 1 or txn.count(SELECT_CALL) != 1:
@@ -620,13 +699,36 @@ def check(raw: dict[str, str]) -> None:
 
     # E5 ---------------------------------------------------------------------------------------------------------------
     if (txn.count(BODY_SUM) != 1 or txn.count(BODY_RESULT) != 1 or txn.count(BODY_COUNT) != 1
-            or txn.count(NAMED_DEBUG_ARGS) != 1 or "+= m.device_bytes" in txn
-            or not ordered(txn, BODY_SUM, BODY_RESULT, BODY_COUNT, NAMED_DEBUG, NAMED_DEBUG_ARGS)):
-        fail("E5", "the body does not sum each direction's bytes once, as each triplet moves, or its DEBUG line does "
+            or txn.count(NAMED_LINE_ARGS) != 1 or "+= m.device_bytes" in txn
+            or not ordered(txn, BODY_SUM, BODY_RESULT, BODY_COUNT, NAMED_FORMAT, NAMED_LINE_ARGS)):
+        fail("E5", "the body does not sum each direction's bytes once, as each triplet moves, or its result line does "
                    "not name both directions")
     if entry.count(ENTRY_BYTES) != 1 or entry.count(ENTRY_SPLIT) != 1 or "device_bytes" in entry:
         fail("E5", "the entry does not take the body's bytes, or does not count each outcome in its direction and "
                    "return it in its own list")
+
+    # M2 ---------------------------------------------------------------------------------------------------------------
+    if "retired_by_expert_move" in copy:
+        fail("M2", "the copy to the device marks a host copy's retire as an expert move's, which the eviction latch "
+                   "never reads for a host-resident entry")
+
+    # M1 ---------------------------------------------------------------------------------------------------------------
+    if (txn.count(NAMED_LINE) != 1 or txn.count(SUM_META) != 1 or txn.count(SUM_CACHE) != 1
+            or not ordered(txn, "stop = ggml_sycl_expert_prepare_triplet(", SUM_META, "std::unique_lock lock(")
+            or not ordered(txn, "loaned = cache->refill_lent_triplet(triplet.members, record); break; }", SUM_CACHE,
+                           "if (!loaned && (admit || evict)) {")
+            or not ordered(txn, SUM_CACHE, NAMED_LINE)
+            or "GGML_LOG_WARN(\"[MOE-EXEC] named move" in txn):
+        fail("M1", "the named move's result line is not one DEBUG line, or the batch's copy submission, id remap and "
+                   "meta lookup times are not each summed as its call returns")
+    if (txn.count(COST_GUARD) != 1 or txn.count(COST_COUNTERS) != 1 or not ordered(txn, COST_COUNTERS, COST_GUARD)
+            or sycl.count(COST_WRITE) != 1):
+        fail("M1", "the named move's cost is not written to its answer by the guard that writes the room figure, on "
+                   "every exit, from counters declared before it")
+    if (not all(loan.count(t) == 1 and copy.count(t) == 1 for t in CACHE_TIMES) or prep.count(PREP_TIMED) != 1
+            or "resolver(*e, target)" in prep.replace(PREP_TIMED, "")):
+        fail("M1", "a cache body does not record its copy and handover times, or the preparation does not time its "
+                   "resolver call")
 
 
 def mutate(raw: dict[str, str], edits: list[tuple[str, str, str, str]]) -> dict[str, str]:
@@ -673,8 +775,29 @@ def self_test(raw: dict[str, str]) -> int:
         failures.append(name)
         print(f"  self-test: {name}: SURVIVED (pin {pin} did not catch it)")
 
-    expect_fail("entry-renamed", "A0", [("sycl", "", "ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(\n",
-                                         "ggml_sycl_txn_result ggml_sycl_expert_move_run(\n")])
+    expect_fail("admit-marks-the-host-copy", "M2",
+                [("cache", COPY_SIG, "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);",
+                  "host->second.retired_by_expert_move = true;\n"
+                  "                        (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);")])
+    expect_fail("named-line-warns", "M1", [("sycl", TXN_SIG, 'GGML_LOG_DEBUG("[MOE-EXEC] named move',
+                                            'GGML_LOG_WARN("[MOE-EXEC] named move')])
+    expect_fail("named-line-carries-timings", "E5", [("sycl", TXN_SIG, "taken / (1024 * 1024), reason);",
+                                                      "taken / (1024 * 1024), reason, (unsigned long long) copy_us);")])
+    expect_fail("cost-not-written", "M1", [("sycl", "", "answer->remap_us        = remap_us;", "")])
+    PAD = " " * 27
+    expect_fail("cost-guard-before-its-counters", "M1",
+                [("sycl", TXN_SIG,
+                  "    uint64_t%s meta_us  = 0;\n    uint64_t%s copy_us  = 0;\n    uint64_t%s remap_us = 0;\n"
+                  % (PAD, PAD, PAD), ""),
+                 ("sycl", TXN_SIG, "    const char * stop      = nullptr;\n",
+                  "    const char * stop      = nullptr;\n    uint64_t meta_us = 0;\n    uint64_t copy_us = 0;\n"
+                  "    uint64_t remap_us = 0;\n")])
+    expect_fail("meta-lookup-unsummed", "M1", [("sycl", TXN_SIG, "meta_us += triplet.resolve_us;", "")])
+    expect_fail("copy-cost-not-written", "M1", [("sycl", "", "answer->copy_us         = copy_us;", "")])
+    expect_fail("meta-cost-not-written", "M1", [("sycl", "", "answer->meta_us         = meta_us;", "")])
+    expect_fail("loan-copy-untimed", "M1", [("cache", LOAN_SIG, "out.copy_us  = copy_took;", "")])
+    expect_fail("entry-renamed", "A0", [("sycl", "", "ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int ",
+                                         "ggml_sycl_txn_result ggml_sycl_expert_move_run(int ")])
     expect_fail("fill-waited", "A1", [("cache", COPY_SIG, "bq,\n                                                    "
                                        "{ out.copy_events[i] });",
                                        "bq,\n                                                    "
@@ -685,13 +808,15 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("evict-view-drop-waits", "A1", [("sycl", DROP_SIG, "++w.moe_expert_storage_generation;",
                                                  "++w.moe_expert_storage_generation;\n"
                                                  "        dpct::get_in_order_queue().wait();")])
-    expect_fail("evict-cache-loan-reaps", "A1", [("cache", LOAN_SIG, 'refusal = "shared storage";',
+    expect_fail("evict-cache-loan-reaps", "A1", [("cache", LOAN_SIG, "refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;",
                                                   "(void) finalize_retired_entries_locked();\n"
-                                                  '                refusal = "shared storage";')])
+                                                  "                refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;")])
     expect_fail("lock-before-mint", "A2", [("sycl", PREP_SIG,
-                                            "            storage = ggml_sycl_device_expert_alloc(device, staged);",
+                                            "            storage                   = "
+                                            "ggml_sycl_device_expert_alloc(device, member_bytes);",
                                             "            std::lock_guard early(g_tensor_inventory_mutex);\n"
-                                            "            storage = ggml_sycl_device_expert_alloc(device, staged);")])
+                                            "            storage = "
+                                            "ggml_sycl_device_expert_alloc(device, member_bytes);")])
     expect_fail("lock-before-prepare", "A2", [("sycl", TXN_SIG, "        stop = ggml_sycl_expert_prepare_triplet(",
                                                "        std::lock_guard early(g_tensor_inventory_mutex);\n"
                                                "        stop = ggml_sycl_expert_prepare_triplet(")])
@@ -709,8 +834,14 @@ def self_test(raw: dict[str, str]) -> int:
                                                     "outstanding\");\n    }\n    if (!refill && !named) {",
                                                     "        return refuse(ggml_sycl_txn_result::REFUSED, \"loans "
                                                     "outstanding\");\n    }\n    if (!refill && !named) {")])
-    expect_fail("minted-at-host-size", "A4", [("sycl", PREP_SIG, "ggml_sycl_device_expert_alloc(device, staged)",
+    expect_fail("minted-at-host-size", "A4", [("sycl", PREP_SIG, "ggml_sycl_device_expert_alloc(device, member_bytes)",
                                                "ggml_sycl_device_expert_alloc(device, target.logical_bytes)")])
+    expect_fail("minted-at-own-staged-size", "A4", [("sycl", PREP_SIG,
+                                                     "ggml_sycl_device_expert_alloc(device, member_bytes)",
+                                                     "ggml_sycl_device_expert_alloc(device, staged[r])")])
+    expect_fail("member-takes-the-slot-alone", "A4", [("sycl", PREP_SIG,
+                                                       "ggml_sycl::expert_triplet_member_bytes(staged, r)",
+                                                       "ggml_sycl::expert_triplet_slot_bytes(staged)")])
     expect_fail("host-copy-at-entry-size", "A4",
                 [("sycl", PREP_SIG, "ggml_sycl_host_expert_alloc(device, target.logical_bytes)",
                   "ggml_sycl_host_expert_alloc(device, cache.loan_copy_bytes(target.key))")])
@@ -718,14 +849,15 @@ def self_test(raw: dict[str, str]) -> int:
                                                     "        triplet.named = named ? named_place[t] : 0;\n        (void) "
                                                     "staged_expert_bytes(GGML_LAYOUT_AOS, GGML_TYPE_COUNT, 0, 0);")])
     expect_fail("cache-checks-host-size", "A4", [("cache", COPY_SIG,
-                                                  "staged_expert_bytes(e.layout, members[i].type, members[i].ncols, "
-                                                  "logical)",
-                                                  "e.size")])
+                                                  "if (device_size[i] != member_bytes || member_bytes < logical)",
+                                                  "if (device_size[i] != e.size || e.size < logical)")])
     expect_fail("refill-staged-at-host-copy-size", "A4", [("cache", COPY_SIG,
-                                                           "staged_expert_bytes(e.layout, members[i].type, "
-                                                           "members[i].ncols, logical)",
-                                                           "(admit ? staged_expert_bytes(e.layout, members[i].type, "
-                                                           "members[i].ncols, logical) : e.size)")])
+                                                           "if (device_size[i] != member_bytes || "
+                                                           "member_bytes < logical)",
+                                                           "if (device_size[i] != (admit ? member_bytes : e.size) || "
+                                                           "member_bytes < logical)")])
+    expect_fail("cache-checks-own-staged-size", "A4", [("cache", COPY_SIG, "if (device_size[i] != member_bytes ||",
+                                                        "if (device_size[i] != staged[i] ||")])
     expect_fail("refill-copies-the-host-copy-whole", "A4", [("cache", COPY_SIG,
                                                              "const size_t logical = members[i].logical_bytes;",
                                                              "const size_t logical = admit ? members[i].logical_bytes "
@@ -735,7 +867,7 @@ def self_test(raw: dict[str, str]) -> int:
                                                  "target.ncols, e->dst_size)")])
     expect_fail("logical-not-handed-to-cache", "A4",
                 [("sycl", PREP_SIG, "        m.logical_bytes                   = target.logical_bytes;\n", "")])
-    expect_fail("cache-stages-host-copy-size", "A4", [("cache", COPY_SIG, "members[i].ncols, logical)",
+    expect_fail("cache-stages-host-copy-size", "A4", [("cache", COPY_SIG, "members[i].ncols, members[i].logical_bytes)",
                                                        "members[i].ncols, e.size)")])
     expect_fail("shorter-host-copy-admitted", "A4", [("cache", COPY_SIG, "if (e.size < logical) {", "if (false) {")])
     expect_fail("host-copy-size-retried", "A4", [("sycl", FINAL_SIG, '"host copy size",', "")])
@@ -806,6 +938,10 @@ def self_test(raw: dict[str, str]) -> int:
                                              "static void ggml_sycl_admit_everything(int d) {\n"
                                              "    (void) ggml_sycl_expert_move_transaction_run(d, {}, nullptr, nullptr);"
                                              "\n}\n\n" + ENTRY_SIG)])
+    driver_call = "ggml_sycl_expert_move_transaction_run(device, request, resolver, &result)"
+    expect_fail("driver-calls-twice", "A9", [("sycl", DRIVER_SIG, driver_call + ";",
+                                              driver_call + ";\n        (void) " + driver_call + ";")])
+    expect_fail("driver-drops-its-call", "A9", [("sycl", DRIVER_SIG, driver_call, "ggml_sycl_txn_result::BUSY")])
     expect_fail("verdict-ignored", "A10", [("sycl", SELECT_SIG, "if (verdict) {", "if (false) {")])
     expect_fail("final-refusal-misspelled-in-cache", "A11", [("cache", COPY_SIG, 'refusal = "device storage not owned";',
                                                               'refusal = "device storage not own";')])
@@ -815,11 +951,12 @@ def self_test(raw: dict[str, str]) -> int:
                                                          'out.reason = "copy submit faild";')])
     expect_fail("transient-refusal-made-final", "A11", [("sycl", FINAL_SIG, '"invalid arguments",',
                                                          '"invalid arguments", "entry changed",')])
-    expect_fail("loan-refusal-unclassified", "A11", [("cache", LOAN_SIG, 'refusal = "shared storage";',
+    expect_fail("loan-refusal-unclassified", "A11", [("cache", LOAN_SIG, "refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;",
                                                       'refusal = "shared storage held";')])
     expect_fail("loan-transient-made-final", "A11", [("sycl", FINAL_SIG, '"invalid arguments",',
                                                       '"invalid arguments", "storage still referenced",')])
-    expect_fail("loan-final-dropped-from-the-list", "A11", [("sycl", FINAL_SIG, '"shared storage",', "")])
+    expect_fail("loan-final-dropped-from-the-list", "A11",
+                [("sycl", FINAL_SIG, "ggml_sycl::MOE_EXPERT_MOVE_SHARED_STORAGE,", "")])
     expect_fail("live-host-entry-unclassified", "A11", [("sycl", FINAL_SIG, '"host entry exists"',
                                                          '"host entry exist"')])
     expect_fail("retiring-host-entry-made-final", "A11", [("sycl", FINAL_SIG, '"invalid arguments",',
@@ -868,8 +1005,9 @@ def self_test(raw: dict[str, str]) -> int:
                                                     "s.expert_storage_generation == expert_storage_generation && ", "")])
     expect_fail("evict-refusal-ends-the-list", "E4", [("sycl", TXN_SIG, "if (!loaned && (admit || evict)) {",
                                                        "if (!loaned && admit) {")])
-    expect_fail("evict-bytes-counted-as-admitted", "E5", [("sycl", ENTRY_SIG, "r.bytes_evicted  = answer.bytes_freed;",
-                                                           "r.bytes_evicted  = answer.bytes_readmitted;")])
+    expect_fail("evict-bytes-counted-as-admitted", "E5",
+                [("sycl", ENTRY_SIG, "r.bytes_evicted   = answer.bytes_freed;",
+                  "r.bytes_evicted   = answer.bytes_readmitted;")])
     expect_fail("body-sums-both-directions", "E5", [("sycl", TXN_SIG,
                                                      "(to_device ? taken : freed) += record.device_bytes;",
                                                      "freed += record.device_bytes;")])

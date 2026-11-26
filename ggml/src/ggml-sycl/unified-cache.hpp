@@ -35,6 +35,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -3615,8 +3616,8 @@ bool ggml_sycl_test_onednn_graph_scratch_abort_triggered();
 // flag_slot == -1 fallback runs its query against a genuinely UNWATCHED
 // event -- which behaves like the real pre-fix code path: it blocks for
 // real (a bare command_execution_status query on an unwatched
-// device-kernel event blocks on a profiling-enabled queue, confirmed on
-// hardware, both cards; see event_complete()'s own comment). An earlier
+// device-kernel event blocks on a queue that carries profiling, confirmed
+// on hardware, both cards; see event_complete()'s own comment). An earlier
 // version of this hook instead short-circuited the completion CHECK to
 // query release_event directly regardless of whether a flag had been
 // armed; that design was abandoned because it queried a WATCHED event,
@@ -4211,7 +4212,9 @@ inline bool expert_retire_succeeded(expert_retire_status status) {
 // expert under, key first; the lease on key's entry is the one returned. owner is the destination storage, minted
 // owner-first by the caller before it took any listed lock, so no allocation for the bytes runs under one: pinned host
 // storage that holds logical_bytes for a move to the host, and WEIGHT zone storage on the device for a move to the
-// device, exactly staged_expert_bytes() of the host copy's layout and this member's type, ncols and logical_bytes.
+// device, exactly expert_triplet_member_bytes() of the three members' staged_expert_bytes() as AOS (from their type,
+// ncols and logical_bytes): the triplet's slot when it has one, so every member of such a triplet takes one WEIGHT-zone
+// size, else the member's own staged bytes.
 // type, ncols and logical_bytes are the weight's type, row width and bytes per expert (nb[2]), which the caller
 // resolves from its tensor. An expert's size is a fact of its tensor, never of a cache entry, whose storage may be
 // padded: each direction copies logical_bytes from offset 0 of its source, so a padded device entry's tail never
@@ -4236,7 +4239,13 @@ struct expert_move_member {
 // the entry's leases are gone and behind the copy, which is the entry's last write, and in device_keys[i] the key the
 // device entry was retired under: the caller drops every view it holds on the entry by that key, since a retired
 // entry refuses the resolve a view would otherwise be matched by once the cache generation moves. A move to the
-// device leaves both at their defaults.
+// device leaves both at their defaults. An accepted move also reports the host time it spent, in microseconds, in its
+// copy step (the submissions; a synchronous staged branch would show here as a wait) and in its handover (each id
+// handed to the new copy and the old one retired, under the cache locks), for the move's summary line. An accepted move
+// to the host hands the caller, in retired_leases[i], the lease that held each retired device entry in place: the
+// entry's retire is left out of the eviction latch because the caller's publication bumps the exec-graph epoch, so the
+// caller keeps the lease, and the deferred-free pass cannot reap the entry, until that bump has run or the caller has
+// set the latch instead. A move to the device leaves them empty.
 struct expert_move_record {
     bool                 accepted     = false;
     const char *         reason       = "none";
@@ -4246,7 +4255,18 @@ struct expert_move_record {
     expert_retire_status retire_status[3] = { expert_retire_status::INVALID, expert_retire_status::INVALID,
                                               expert_retire_status::INVALID };
     unified_cache_key    device_keys[3]   = {};
+    uint64_t             copy_us          = 0;
+    uint64_t             remap_us         = 0;
+
+    // The lease on each device entry a move to the host retired, for the caller to hold (above).
+    std::shared_ptr<mem_handle> retired_leases[3];
 };
+
+// Whole microseconds since `since`, for the expert move's timings.
+inline uint64_t expert_move_us_since(std::chrono::steady_clock::time_point since) {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - since).count());
+}
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 // Deterministic publication/lifecycle controls exist only in private fixtures.
@@ -4493,6 +4513,8 @@ struct unified_cache_entry {
     // decisions actually need.  owner_tagged distinguishes "no owner left"
     // (reclaimable) from "never attributed to any model" (e.g. materialized at
     // runtime, outside a load) -- the latter is kept while any model is live.
+    // A model load's end sets both; a copy an expert move publishes after it
+    // takes them from the entry it replaces (inherit_entry_ownership).
     uint32_t              owner_mask            = 0;
     bool                  owner_tagged          = false;
     uint64_t              pending_load_txn_id   = 0;
@@ -4503,6 +4525,12 @@ struct unified_cache_entry {
     // yield_optional_layouts_begin() acts on it, and only while no one but the
     // cache's own direct-stage mirror holds a lease. Never set on a primary.
     bool                  optional_layout       = false;
+
+    // Retired by an expert move: loan_expert_triplet() sets it on the device entries it retires, and nowhere else; a
+    // restore clears it. The move's publication bumps the exec-graph epoch, so its reap need not set has_evictions_
+    // (see there). Any other retire of the same entry leaves it false, and its reap latches. A host copy needs no
+    // mark, because the latch skips host-resident entries.
+    bool                  retired_by_expert_move = false;
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
     // entry -- a distinct string literal stamped at each of the ~16 sites that
     // bump in_use_count, whether directly or through acquire_entry_lease().
@@ -4786,8 +4814,10 @@ class unified_cache {
 
     // --- DMA queue for cache operations (separate from compute) ---
     // tests/test-unified-cache-unpin-event.cpp depends on this queue staying
-    // NON-profiling: every backend stream is created with both `in_order` and
-    // `enable_profiling` via default_queue_properties(), and on a profiling-enabled
+    // NON-profiling: every backend stream is created with `in_order`, and with
+    // `enable_profiling` too when the queue-profiling resolver (queue-profiling.hpp) answers on, via
+    // default_queue_properties() (it answers off unless a profiling diagnostic is requested or
+    // GGML_SYCL_QUEUE_PROFILING=1; off removes this hazard), and on a profiling-enabled
     // queue the bare command_execution_status query in event_complete() BLOCKS
     // instead of polling -- confirmed on hardware
     // (tests/test-sycl-event-status-blocking-probe.cpp) to hold specifically
@@ -5002,12 +5032,14 @@ class unified_cache {
     // ("device entry size" otherwise) and its owner must hold them too ("host storage too small"). Otherwise the
     // three D2H copies go on the DMA queue, each moving the member's logical_bytes from offset 0 of its device entry,
     // so a padded entry's tail stays behind, and each retaining its two owners until it completes; each device
-    // entry's last write becomes its copy, so its storage is freed behind the copy; each device entry is retired
-    // exactly; then each host copy is registered at logical_bytes with register_host_expert_owned carrying its copy as
-    // the ready event. A registration that fails anyway puts the device entries back. out.device_bytes is the device
+    // entry's last write becomes its copy, so its storage is freed behind the copy; each member's id is handed to its
+    // host copy's key and then its device entry is retired exactly, so no retire walks the cache for an entry to hand
+    // the id to; then each host copy is registered at logical_bytes with register_host_expert_owned carrying its copy
+    // as the ready event. A registration that fails anyway puts the device entries back. out.device_bytes is the device
     // entries' whole size, which the deferred-free pass gives back once each entry is reaped. Nothing here waits and
     // nothing asks an event's status. The caller holds the inventory mutex, forgets its own record of the device
-    // lease, and flips the plan.
+    // lease, and flips the plan; it holds out.retired_leases until its publication bumps the exec-graph epoch or it
+    // sets the eviction latch instead.
     bool loan_expert_triplet(const expert_move_member members[3], expert_move_record & out);
 
     // Whether the cache holds the entry a move copies from, not retired: for a move to the host, the AOS device entry
@@ -5023,8 +5055,9 @@ class unified_cache {
     // storage, which the direct mirror and the id mapping both name, with no device entry under the member's
     // direct-stage key (a withdrawn one the deferred-free pass has not reclaimed yet refuses as "device entry exists",
     // so a later boundary retries). A missing host copy refuses as "not lent", and one holding fewer than the member's
-    // logical_bytes as "host copy size". Each member's owner must be exactly staged_expert_bytes() of the host copy's
-    // layout and the member's type, ncols and logical_bytes, never less than logical_bytes ("device storage size").
+    // logical_bytes as "host copy size". Each member's owner must be exactly expert_triplet_member_bytes() of the
+    // three members' staged_expert_bytes() as AOS (the triplet's slot when it has one, else the member's own staged
+    // bytes), never less than logical_bytes ("device storage size").
     // One member that fails refuses the triplet with a reason and leaves no state behind. Otherwise the three H2D
     // copies go on the BCS queue behind the host copy's writes, each moving logical_bytes from offset 0 of the host
     // copy and retaining its two owners until it completes, so the pinned storage outlives the read whatever happens to
@@ -5115,14 +5148,20 @@ class unified_cache {
     // replace_existing = false refuses when the key already has an entry, of
     // any state, instead of replacing an idle one with its storage: a loan
     // must be able to undo every registration it made (c-mwmr-3).
-    bool register_host_expert_owned(ggml_sycl_cache_id  key,
-                                    void *              ptr,
-                                    size_t              size,
-                                    ggml_layout_mode    layout,
-                                    mem_handle *        out_handle,
-                                    const mem_handle &  allocation_owner,
-                                    const sycl::event * ready_event      = nullptr,
-                                    bool                replace_existing = true);
+    // A non-null moved_from names the entry a move publishes this copy in
+    // place of: a new entry takes that entry's model ownership, read under the
+    // registration's locks, since the copy holds the same weight. The caller
+    // keeps that entry in place until the registration returns; when it is
+    // gone, the registration refuses with one WARN before anything changes.
+    bool register_host_expert_owned(ggml_sycl_cache_id        key,
+                                    void *                    ptr,
+                                    size_t                    size,
+                                    ggml_layout_mode          layout,
+                                    mem_handle *              out_handle,
+                                    const mem_handle &        allocation_owner,
+                                    const sycl::event *       ready_event      = nullptr,
+                                    bool                      replace_existing = true,
+                                    const unified_cache_key * moved_from       = nullptr);
 
     // Register a host-arena pointer directly as a HOST_PINNED dense weight entry.
     // ptr must be host-pinned memory (typically from host_zone_alloc(WEIGHT)).
@@ -5280,9 +5319,15 @@ class unified_cache {
     // Check if budget is exceeded (used > budget after eviction)
     bool is_budget_exceeded() const { return budget_exceeded_; }
 
-    // Returns true if any weight has been evicted from device memory.
-    // Once true, never resets. Used to disable graph replay with stale baked pointers.
+    // Returns true if any weight has been evicted from device memory since the last
+    // reclaim_weight_entries(); see has_evictions_ for what sets and clears it.
+    // Used to disable graph replay and persistent TG with stale baked pointers.
     bool has_evictions() const { return has_evictions_.load(std::memory_order_acquire); }
+
+    // Set the latch for device storage the cache released without setting it itself: an expert move's retires,
+    // which finalize leaves out because the move's publication bumps the exec-graph epoch, when that publication
+    // did not run (a lost plan swap, an exception). Without it those retired pointers would stay replayable.
+    void latch_evictions() noexcept { has_evictions_.store(true, std::memory_order_release); }
 
     // Available memory
     size_t available() const {
@@ -5610,6 +5655,19 @@ class unified_cache {
                              size_t &     used,
                              size_t &     available,
                              size_t &     largest_free);
+    // The size of every free block of the allocators `zone` draws on, read under its allocator group's mutex, in no
+    // order: the free space zone_largest_free reports the top of, block by block. WEIGHT in single-chunk mode is the
+    // KV allocator's blocks, so free KV room reads as WEIGHT room, as it is. Diagnostic: it walks every block, so a
+    // caller asks it once, never per allocation. Takes the group mutex, so a caller already inside the group must not
+    // call it. False, with `sizes` empty, when no arena is active.
+    bool             zone_free_block_sizes(vram_zone_id zone, std::vector<size_t> & sizes);
+    // A count that moves each time `zone` could have gained room: a block went back to an allocator it draws on, or
+    // those allocators were made or reset. It never moves for an allocation or a refusal, so a request the zone
+    // refused under one value is refused again while the value stands. It is kept per allocator group, the unit room
+    // is shared in (KV and WEIGHT are one group), and not per cache: RUNTIME and SCRATCH give blocks back at every
+    // graph, so a cache-wide count would move at every boundary and say nothing about WEIGHT. It starts at 0 with the
+    // cache. Takes no lock.
+    uint64_t         zone_room_epoch(vram_zone_id zone) const noexcept;
     void   dump_live_zone_allocations(vram_zone_id zone, const char * where, size_t max_entries = 32) const;
 
     const vram_zone & get_zone(vram_zone_id zone) const { return arena_zones_[static_cast<int>(zone)]; }
@@ -5634,12 +5692,22 @@ class unified_cache {
     // arena rebuild refused for leases can say who holds them. The count is one
     // relaxed atomic add on each side and takes no lock: the lease paths are
     // per-resolve hot paths and the count is read only for a diagnostic.
+    // With GGML_SYCL_LEASE_HOLDERS=1 the tagged acquire also files the take's
+    // call stack in the holder table, writes the holder slot into `tag` and
+    // counts the lease there; the caller keeps that tag for the release. With
+    // the knob off the tag is left as it came. The untagged acquire is for a
+    // caller that keeps no tag: its lease counts as untagged, in holder slot 0.
     int      arena_find_chunk(const void * ptr) const;
-    int      arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag tag = chunk_lease_tag());
-    void     arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag = chunk_lease_tag());
+    int      arena_acquire_chunk_lease(const void * ptr);
+    int      arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag & tag);
+    // A mem_handle move hands its lease to a new keeper. With the knob on and the lease counted in a named slot, the
+    // lease is counted again under the stack of the move whose address `tag.pc` recorded, keeping the take it came
+    // from, and `tag.holder` is updated; otherwise nothing changes. Never throws.
+    void     arena_move_chunk_lease_holder(chunk_lease_tag & tag) noexcept;
+    void     arena_release_chunk_lease(int chunk_idx, const chunk_lease_tag & tag = chunk_lease_tag());
     bool     arena_chunk_has_leases(int chunk_idx) const;
     uint32_t arena_chunk_lease_count(int chunk_idx) const;
-    uint32_t arena_chunk_lease_count_at(chunk_lease_tag tag) const;
+    uint32_t arena_chunk_lease_count_at(const chunk_lease_tag & tag) const;
     // The leases by site, each site apart from the copies of its handles, written into `out` (`size` bytes, always
     // NUL-terminated when `size` is not 0) as " site=N" for every count that is not zero, and empty when all are.
     // Returns the counts' sum. It writes only into the caller's buffer and allocates nothing, so a teardown can call it
@@ -5744,6 +5812,15 @@ class unified_cache {
     // as a retained handle the context plan knows nothing of: what a yield
     // finds still referencing a copy after its reap.
     bool     test_retain_owner_until_event(ggml_sycl_cache_id key, ggml_layout_mode layout, sycl::event event);
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+    // Test-only: the last clears the eviction latch, which production code must never do outside a reclaim.
+    // The walks of entries_ the id remap has made over the cache's life (id_remap_walks_).
+    uint64_t test_id_remap_walks() const noexcept;
+    // The key `id` maps to, in *out; false when the id maps to nothing.
+    bool     test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const;
+    // Clear has_evictions_, as reclaim_weight_entries() does, so a case starts from a clean latch.
+    void     test_reset_evictions_latch() noexcept;
+#endif
     size_t   retired_pending_count_for_test() const noexcept {
         return retired_pending_count_.load(std::memory_order_acquire);
     }
@@ -6350,6 +6427,10 @@ class unified_cache {
     size_t host_zone_used(host_zone_id zone) const;
     size_t host_zone_capacity(host_zone_id zone) const;
     size_t host_zone_reserved_capacity(host_zone_id zone) const;
+    // The bytes `zone` can still hand out without growing: host_zone_no_growth_bound() less what it holds, or the
+    // capacity less what it holds for a zone with no bound, never below zero. A request that forbids host-zone growth
+    // is refused past it.
+    size_t host_zone_no_growth_room(host_zone_id zone) const;
     // Largest single-chunk contiguous free block in `zone`. Used by callers
     // that must hand out a contiguous pointer (the SYCL host buffer type)
     // and therefore cannot consume a fragmented multi-segment allocation.
@@ -6601,7 +6682,7 @@ class unified_cache {
                                      const std::vector<sycl::event> & deps,
                                      sycl::queue *                    override_q = nullptr);
     // See this function's own comment at its definition in unified-cache.cpp
-    // for the full BLOCKS-not-polls hazard on a profiling-enabled queue,
+    // for the full BLOCKS-not-polls hazard on a queue that carries profiling,
     // and (llama.cpp-c6ah) a related but SEPARATE hazard in anything that
     // submits a host_task depending on one of these events:
     // that submit call itself blocks its calling thread until the event
@@ -6821,6 +6902,12 @@ class unified_cache {
     // Cache storage: (identity, type, layer/expert) -> entry
     entry_map entries_;
     id_map    id_to_key_;
+    // How often remap_or_extract_id_mapping_locked() walked entries_ for an entry to hand an id to: a retire whose
+    // id still named it. Each walk visits every entry under both locks, so a move hands its ids over before it
+    // retires and makes none; the device tests read the count across one. The count is kept in every build, not only
+    // under GGML_SYCL_PRIVATE_TESTING: one relaxed add costs nothing beside the walk it counts, and a member that one
+    // build variant has and another lacks would give the class two layouts.
+    std::atomic<uint64_t> id_remap_walks_{ 0 };
 
     // Slots held by llama_model objects that are still alive (llama.cpp-0qlw).
     // Guarded by rw_mutex_ like entries_, so a reclaim decision and the liveness
@@ -6879,10 +6966,24 @@ class unified_cache {
 
     // The cell a lease of `tag` moves. A site out of range counts as UNTAGGED, so a corrupt tag cannot index past the
     // array.
-    std::atomic<uint32_t> & arena_chunk_leases_of(chunk_lease_tag tag) const {
+    std::atomic<uint32_t> & arena_chunk_leases_of(const chunk_lease_tag & tag) const {
         const size_t site = static_cast<size_t>(tag.site);
         return arena_chunk_leases_by_site_[site < static_cast<size_t>(chunk_lease_site::COUNT) ? site : 0]
                                           [tag.copy ? 1 : 0];
+    }
+
+    // GGML_SYCL_LEASE_HOLDERS, resolved once per process and kept here so a lease's take and release read a member.
+    const bool                                     chunk_lease_holders_enabled_ = chunk_lease_holders_enabled();
+    // The leases on all chunks by holder-table slot, moved only when chunk_lease_holders_enabled_ is set, beside the
+    // counts by site. Slots 0 and 1 count the leases taken with no address and those whose holder found the table
+    // full. Allocated (zeroed) only when the knob is on, so a run without it carries no 16 KB of counters in the cache.
+    const std::unique_ptr<std::atomic<uint32_t>[]> arena_chunk_leases_by_holder_ =
+        chunk_lease_holders_enabled_ ? std::make_unique<std::atomic<uint32_t>[]>(CHUNK_LEASE_HOLDER_SLOTS) : nullptr;
+
+    // The cell a lease of `tag` moves by holder. A slot out of range counts in slot 0, as a lease with no address.
+    // Called only behind chunk_lease_holders_enabled_, which is when the counters exist.
+    std::atomic<uint32_t> & arena_chunk_lease_holder_of(const chunk_lease_tag & tag) const {
+        return arena_chunk_leases_by_holder_[tag.holder < CHUNK_LEASE_HOLDER_SLOTS ? tag.holder : 0];
     }
 
     // Adds the cache's scratch buffers to `holders`: those whose pointer the arena owns, which keep it from a
@@ -6899,8 +7000,10 @@ class unified_cache {
 
     // Names who holds the arena on `dev_id`, from the figures arena_read_holders() read: one line at `level` with each
     // zone's live bytes, the queued frees those zones still count, the device's releases waiting for a retry, the
-    // retired entries not yet finalized and the evictions in flight, which it also fills into `holders`; one WARN
-    // line with the chunk leases by site; then each zone with live bytes lists its live allocations under `site`.
+    // retired entries not yet finalized and the evictions in flight, which it also fills into `holders`; one line at
+    // `level` with the chunk leases by site, then either a line per holder (GGML_SYCL_LEASE_HOLDERS=1) or, when a
+    // lease is held, a line that names that knob; then each zone with live bytes lists its live allocations under
+    // `site`.
     // `level` is ERROR where a holder refuses what the caller needs (a rebuild, a model's release) and WARN at a
     // load's start, where the holder may still be the failed model's buffers. It only reads: it drains, frees,
     // evicts, resets and allocates nothing.
@@ -6909,6 +7012,10 @@ class unified_cache {
                               zone_arena_holders & holders,
                               const char *         site,
                               ggml_log_level       level);
+    // One line at `level` per holder-table slot that holds a lease on this cache's chunks: the count, the site, and
+    // the call stack that took it as module+offset frames, innermost first; then their sum beside `chunk_leases`,
+    // the per-chunk total the caller read.
+    void arena_report_chunk_lease_holders(int dev_id, ggml_log_level level, uint32_t chunk_leases) const;
 
     // The oneDNN scratchpad pair's release for the last model. False, with nothing released, while a reservation holds
     // the pair. The fields are emptied under onednn_scratch_mutex_ and the blocks freed after it is released, so no
@@ -7022,6 +7129,8 @@ class unified_cache {
         uint64_t                                           lifecycle_epoch = 0;
         std::vector<std::shared_ptr<arena_authority>>       draining_authorities;
         std::unordered_map<void *, allocator_group_record> allocations;
+        // Counts the times this group's allocators gained room (zone_room_epoch). Atomic: it is read with no lock.
+        std::atomic<uint64_t>                               room_epoch{ 0 };
     };
     static constexpr size_t ARENA_ALLOCATOR_GROUP_COUNT = 4;
     std::array<allocator_group, ARENA_ALLOCATOR_GROUP_COUNT> arena_allocator_groups_{};
@@ -7032,7 +7141,22 @@ class unified_cache {
 
     std::mutex arena_destroy_mutex_;  // serializes retryable explicit destroy transactions
     static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
+
+    // Allocator group `group` gained room: a block went back to one of its allocators, or they were made or reset.
+    // The caller holds the group's mutex, or builds the arena before any other thread can allocate from it.
+    void arena_note_room_grew(size_t group) noexcept;
+    // arena_reserve() made every group's allocators.
+    void arena_note_allocators_made() noexcept;
+
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
+    // Calls visit(allocator) for each allocator `zone` draws on, the one place that choice is made: WEIGHT in
+    // single-chunk mode the KV allocator, WEIGHT and KV in chunked mode the per-chunk allocators (KV its own tail
+    // allocator first), any other zone its own. True when the zone is served that way, even with no allocator made
+    // yet; false for a zone with no allocator outside those modes, whose room only its counters give. Takes no lock:
+    // the caller holds the group's mutex, or reads the figures bare as zone_largest_free does. Defined in, and used
+    // only by, unified-cache.cpp.
+    template <typename F> bool arena_visit_zone_allocators(vram_zone_id zone, F && visit) const;
+
     // Written by arena_destroy() under arena_destroy_mutex_ on each refusal and cleared when a teardown completes; read
     // without that lock.
     std::atomic<zone_arena_teardown_refusal> arena_teardown_refusal_{ zone_arena_teardown_refusal::NONE };
@@ -7285,10 +7409,12 @@ class unified_cache {
         // DEVICE MARKER KERNEL (not a host_task -- see this struct's own
         // history below for why) submitted on get_event_watch_queue() at
         // park time, depending on release_event, once release_event
-        // completes. release_event lives on a profiling-enabled backend
-        // stream, and event_complete()'s own comment documents that the
-        // bare command_execution_status query BLOCKS rather than polls on
-        // such a queue -- so querying release_event directly here would
+        // completes. When the backend streams carry profiling
+        // (GGML_SYCL_QUEUE_PROFILING=1 or a requested profiling diagnostic),
+        // release_event lives on a profiling-enabled stream, and
+        // event_complete()'s own comment documents that the bare
+        // command_execution_status query BLOCKS rather than polls on such a
+        // queue -- so querying release_event directly here would
         // turn "skip an in-flight entry" into "wait for it", exactly the
         // bug this ticket closes. Pool lookups must go through
         // pool_entry_release_complete() rather than event_complete()
@@ -7395,9 +7521,11 @@ class unified_cache {
     // host-visible flag at entry.flag_slot (written by a device marker
     // kernel armed at park time -- see onednn_graph_scratch_pool_entry::flag_slot's
     // own comment for the full mechanism and history) over querying
-    // entry.release_event directly, because release_event lives on a
-    // profiling-enabled backend stream and event_complete()'s own comment
-    // documents that a bare query BLOCKS instead of polling there for an
+    // entry.release_event directly, because, when the backend streams carry
+    // profiling (GGML_SYCL_QUEUE_PROFILING=1 or a requested profiling
+    // diagnostic), release_event lives on a profiling-enabled stream and
+    // event_complete()'s own comment documents that a bare query BLOCKS
+    // instead of polling there for an
     // UNWATCHED device-kernel event -- so entry.flag_slot, once armed
     // (>= 0), is the predicate this entry's completion is actually checked
     // through; this function only falls through to
@@ -7508,7 +7636,8 @@ class unified_cache {
     // performs the one completion query (via
     // onednn_graph_scratch_pool_entry_release_complete(), llama.cpp-c6ah --
     // NOT a direct event_complete() query, which blocks rather than polls
-    // on the profiling-enabled queues every backend stream uses) and, if
+    // on a queue that carries profiling: GGML_SYCL_QUEUE_PROFILING=1 or a
+    // requested profiling diagnostic) and, if
     // that passes, the one resolve() query this entry needs for this
     // request -- a caller must NOT query completion on the same entry
     // itself first; doubling the query here would double that cost per
@@ -7854,6 +7983,18 @@ class unified_cache {
     // to host, drop, or async evict.  Used by graph replay / persistent TG to know
     // that baked pointers may reference freed device memory.
     //
+    // Two releases leave it alone, each because something else already drops
+    // every recorded pointer to the storage (finalize_retired_entries_locked):
+    //   - an optional layout copy (a WOQ copy): only yield_optional_layouts_begin()
+    //     releases one, and that transaction bumps the exec-graph epoch, and
+    //     persistent TG never reads a WOQ copy;
+    //   - an expert move's retire (retired_by_expert_move): the move's publication
+    //     bumps the exec-graph epoch, so each context drops the exec graphs it
+    //     recorded before its next replay, and persistent TG refuses any graph
+    //     with a MUL_MAT_ID, so it holds no expert pointer. A move whose
+    //     publication did not run sets the latch through latch_evictions().
+    // A pressure eviction, a drop or an async evict of the same entry latches.
+    //
     // It is a latch, but NOT a process-lifetime one: reclaim_weight_entries()
     // clears it, so the flag is scoped to the current weight population rather
     // than to the cache object.  That clear is sound because every reclaim mode is
@@ -7928,15 +8069,18 @@ class unified_cache {
     // the entry's direct_alloc_owner. A non-null ready_event publishes the
     // entry IN_PROGRESS behind that event (the copy still filling it).
     // replace_existing = false refuses any key that already has an entry.
-    bool register_host_expert(ggml_sycl_cache_id    key,
-                              void *                ptr,
-                              size_t                size,
-                              ggml_layout_mode      layout,
-                              mem_handle *          out_handle,
-                              std::shared_ptr<void> storage_owner,
-                              const mem_handle &    typed_owner,
-                              const sycl::event *   ready_event      = nullptr,
-                              bool                  replace_existing = true);
+    // A non-null moved_from gives a new entry that entry's model ownership,
+    // and refuses the registration when that entry is gone.
+    bool register_host_expert(ggml_sycl_cache_id        key,
+                              void *                    ptr,
+                              size_t                    size,
+                              ggml_layout_mode          layout,
+                              mem_handle *              out_handle,
+                              std::shared_ptr<void>     storage_owner,
+                              const mem_handle &        typed_owner,
+                              const sycl::event *       ready_event      = nullptr,
+                              bool                      replace_existing = true,
+                              const unified_cache_key * moved_from       = nullptr);
 
     // What retire_expert_entry_at_locked() takes out of the lookup maps, kept as the maps' own nodes, so that
     // restore_expert_entry_at_locked() puts them back without building new ones and a loan's rollback allocates no
@@ -10689,6 +10833,10 @@ bool unified_cache_test_arena_destroy_closing_reached();
 bool unified_cache_test_cache_exists(int device);
 // Sets the device total the raw-allocation gates read for `device`; 0 reads the driver's figure again.
 void unified_cache_test_set_raw_gate_device_total(int device, size_t bytes);
+
+// How often a raw-allocation gate read its figure for `device`, which walks the runtime registry each time; 0 for a
+// device out of range.
+uint64_t unified_cache_test_raw_gate_reads(int device);
 // Called from cache destruction once arena_destroy() has returned, with the
 // members the cache still holds then. Pass nullptr to remove it.
 using unified_cache_test_destroy_observer = void (*)(int device, ggml_sycl_arena_backing_type backing,

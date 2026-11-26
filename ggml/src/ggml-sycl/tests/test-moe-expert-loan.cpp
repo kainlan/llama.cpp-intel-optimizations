@@ -228,6 +228,70 @@
 //                           The control: once an admit completes the block, the decode direct route serves each tensor
 //                           from AOS. The evict of expert 0 moves each tensor's storage generation, and the route then
 //                           refuses the block rather than serve its old table.
+//   evict_without_host_room_is_busy_and_keeps_the_zone
+//                           The control: fillers that never grow the host WEIGHT zone fill it. The evict of expert 0 is
+//                           then BUSY "host pinned pool exhausted", moves nothing and leaves the zone's capacity as it
+//                           was; once the fillers go, the same evict moves, still without growing the zone.
+//   evict_walks_no_entry_to_hand_over_its_id
+//                           The control: before the evict each of expert 0's ids names its device entry. The evict and
+//                           the reaping of its device entries leave the id remap's walk count where it was, and each
+//                           id then names its host copy.
+//   loan_rollback_hands_the_id_back_to_the_device_entry
+//                           The control: expert 0 resolves on the device through its id. A loan of it whose first host
+//                           registration fails is refused "host registration failed" and leaves no host copy; each id
+//                           names its device entry again, each member resolves on the device, and the walk count is
+//                           where it was.
+//   moves_leave_the_eviction_latch_clear
+//                           The control: a drop of expert 1's device entries outside any move sets the cache's eviction
+//                           latch on their reap. A named evict of expert 0, the reap of its device entries, its admit
+//                           back and the reap of its host copies, before it, leave the latch clear.
+//   move_whose_swap_lost_sets_the_eviction_latch
+//                           The control: the latch is clear after its reset. The plan is published as a model's
+//                           lifecycle row, which the publication hook erases during the evict's host registration, so
+//                           the evict's plan swap loses: it is REFUSED and the latch is set.
+//   failed_moved_copy_hands_its_id_back
+//                           The control: the same registration without the failure succeeds and maps the id to its host
+//                           copy. With expert 0's device entry retired exactly (its id mapping gone, the extra's record
+//                           keeping it), a host copy registered in its place whose mirror allocation fails is refused,
+//                           leaves no host copy, and leaves the id naming the device entry.
+//   swap_boundary_maps_an_evict_then_an_admit
+//                           The swap driver's boundary (ggml_sycl_run_expert_swap_claimed) on this fixture, through its
+//                           resolver. The first boundary reaches the policy's period and evicts the coldest resident
+//                           expert for the hottest host one; the driver's figures show the moved evict and its bytes,
+//                           its admit pending, and the triplet on the host in the plan. The call says it is not settled
+//                           while the evicted entries wait for the deferred-free pass and while a triplet is lent, and
+//                           settled once the pass ran. The next boundary admits it; a boundary after a prompt (more
+//                           graphs than decode graphs) is counted as one, seeds the policy and moves nothing.
+//   swap_boundary_carries_or_drops_what_is_in_flight
+//                           A route table replaced with the same shape hands the pending admit to the new driver,
+//                           which sends it. One of another shape cannot take a later pending admit: the replaced
+//                           driver counts it as an open slot and prints its summary with it.
+//
+// Who owns a moved copy. Each case claims some triplets for a model as a load claims what it staged, moves one, then
+// releases the model as its teardown does, its tensors' records first; they run last, since a release scans the whole
+// device cache. A case that fails after its claim leaves the slot to the fixture, which releases it, so the next case
+// does not find it live:
+//
+//   admit_belongs_to_the_host_copys_model
+//                           A model claims expert 1's host copies and expert 0's device entries. After the admit of
+//                           expert 1 and the release, expert 1's device entries and expert 0's are gone and the WEIGHT
+//                           zone has the admitted triplet's room back. Expert 1's host copies go too, but as retired
+//                           entries the deferred-free pass removes whatever their tags. The control: expert 2, never
+//                           claimed, keeps its device entries, since a release keeps an entry it cannot attribute.
+//   evict_host_copy_belongs_to_the_device_entrys_model
+//                           A model claims experts 0 and 1. After the evict of expert 0 and the reaping of its device
+//                           entries, the release reclaims expert 0's host copies, with their room in the host WEIGHT
+//                           zone, and expert 1's device entries. The control: expert 2, never claimed, stays.
+//   evict_host_copy_takes_the_sources_pending_load
+//                           A load marks expert 0's device entries and has not ended when expert 0 is evicted. Once
+//                           the withdrawn device entries are reaped, each host copy is pending under that load; the
+//                           load's end tags exactly the three copies, and the release reclaims them with their room in
+//                           the host WEIGHT zone. The control: experts 1 and 2, never claimed, stay.
+//   refill_belongs_to_the_lending_model
+//                           A model claims experts 0 and 1, the only ones on the device; one is lent and refilled.
+//                           The release reclaims both triplets' device entries. The refilled triplet's host copies go
+//                           too, but as retired entries the deferred-free pass removes whatever their tags. No
+//                           unclaimed control: the loan picks its own triplet, which must be a claimed one.
 //
 // The fixture configures the device's host zones, as a model load does before anything runs, so each lent copy is a
 // slice of the WEIGHT host zone: the provenance the copy path reads as host USM, and so the one a refill can copy from
@@ -255,9 +319,15 @@
 
 static bool run_case(const char * name, std::string (*body)()) {
     fprintf(stderr, "[TEST] %s ... ", name);
-    const std::string failure = body();
+    const std::string failure   = body();
+    // The fixture's teardown ran inside body(): a drain that timed out there fails the case it ended.
+    const int         torn_down = ggml_sycl::test_expert_loan_take_teardown_failures();
     if (!failure.empty()) {
         fprintf(stderr, "FAILED: %s\n", failure.c_str());
+        return false;
+    }
+    if (torn_down != 0) {
+        fprintf(stderr, "FAILED: the fixture's teardown did not settle (%d drain timeout(s))\n", torn_down);
         return false;
     }
     fprintf(stderr, "PASSED\n");
@@ -333,6 +403,28 @@ int main() {
                    ggml_sycl::test_expert_evict_room_is_not_an_admit_in_the_same_call);
     ok &= run_case("evict_takes_a_block_off_the_direct_route",
                    ggml_sycl::test_expert_evict_takes_a_block_off_the_direct_route);
+    ok &= run_case("evict_without_host_room_is_busy_and_keeps_the_zone",
+                   ggml_sycl::test_expert_evict_without_host_room_is_busy_and_keeps_the_zone);
+    ok &= run_case("evict_walks_no_entry_to_hand_over_its_id",
+                   ggml_sycl::test_expert_evict_walks_no_entry_to_hand_over_its_id);
+    ok &= run_case("loan_rollback_hands_the_id_back_to_the_device_entry",
+                   ggml_sycl::test_expert_loan_rollback_hands_the_id_back_to_the_device_entry);
+    ok &= run_case("moves_leave_the_eviction_latch_clear", ggml_sycl::test_expert_moves_leave_the_eviction_latch_clear);
+    ok &= run_case("move_whose_swap_lost_sets_the_eviction_latch",
+                   ggml_sycl::test_expert_move_whose_swap_lost_sets_the_eviction_latch);
+    ok &= run_case("failed_moved_copy_hands_its_id_back", ggml_sycl::test_expert_failed_moved_copy_hands_its_id_back);
+    ok &= run_case("swap_boundary_maps_an_evict_then_an_admit",
+                   ggml_sycl::test_expert_swap_boundary_maps_an_evict_then_an_admit);
+    ok &= run_case("swap_boundary_carries_or_drops_what_is_in_flight",
+                   ggml_sycl::test_expert_swap_boundary_carries_or_drops_what_is_in_flight);
+    // Last: each releases a model slot, a teardown scan of the whole device cache.
+    ok &=
+        run_case("admit_belongs_to_the_host_copys_model", ggml_sycl::test_expert_admit_belongs_to_the_host_copys_model);
+    ok &= run_case("evict_host_copy_belongs_to_the_device_entrys_model",
+                   ggml_sycl::test_expert_evict_host_copy_belongs_to_the_device_entrys_model);
+    ok &= run_case("evict_host_copy_takes_the_sources_pending_load",
+                   ggml_sycl::test_expert_evict_host_copy_takes_the_sources_pending_load);
+    ok &= run_case("refill_belongs_to_the_lending_model", ggml_sycl::test_expert_refill_belongs_to_the_lending_model);
 
     fprintf(stderr, "%s\n", ok ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     return ok ? 0 : 1;

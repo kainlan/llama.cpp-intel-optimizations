@@ -736,7 +736,9 @@ INTERNAL_WRAPPER_SITES = {
         "const auto plan = ggml_sycl_cache_plan_owner(cache);": 2,
         "const auto plan_hybrid_owner = ggml_sycl_cache_plan_owner(plan_cache_hybrid);": 1,
         "const auto plan_owner = cache ? ggml_sycl_cache_plan_owner(cache) : nullptr;": 1,
-        "const auto plan_owner = ggml_sycl_cache_plan_owner(cache);": 12,
+        # Two of these are the preload's: one per tensor for the bulk decline and each expert's slot sizing, and one
+        # for a DPAS rollback's restore, each fetched once for the tensor's experts rather than once per expert.
+        "const auto plan_owner = ggml_sycl_cache_plan_owner(cache);": 14,
         "const auto plan_owner = ggml_sycl_cache_plan_owner(plan_cache);": 4,
         "const auto plan_owner = ggml_sycl_cache_plan_owner(route_cache);": 1,
         "const auto plan_ref_owner = ggml_sycl_cache_plan_owner(plan_cache);": 1,
@@ -825,7 +827,8 @@ INTERNAL_WRAPPER_SITES = {
         # must leave in place.
         # 21 -> 25: the evict cases read the publication a call starts from: the one-evict and shared-storage cases
         # show an accepted call replaced it, and the just-admitted and lent cases show a BUSY evict left it in place.
-        "const auto published = ::ggml_sycl_global_plan_snapshot();": 25,
+        # 25 -> 26: the evict into a host zone without room reads the publication its BUSY refusal must leave in place.
+        "const auto published = ::ggml_sycl_global_plan_snapshot();": 26,
         # llama.cpp-sif1: the unpreparable-triplet case reads the publication a refill into a full WEIGHT zone must
         # leave in place, and shows it does.
         "const auto before_full = ::ggml_sycl_global_plan_snapshot();": 1,
@@ -846,9 +849,12 @@ INTERNAL_WRAPPER_SITES = {
         # triplet shows the publication changed.
         "if (::ggml_sycl_global_plan_snapshot().get() == published.get()) {": 1,
         # The evict a loan made BUSY published nothing, kept the triplet's device entries and left the ledger alone,
-        # in one condition.
+        # in one condition. 1 -> 2: the evict into a host zone without room, BUSY, shows the same in one condition.
         ("if (::ggml_sycl_global_plan_snapshot().get() != published.get() || "
-         "test_evict_device_entries(fx, 0, 0) != 3 ||"): 1,
+         "test_evict_device_entries(fx, 0, 0) != 3 ||"): 2,
+        # The expert swap driver's boundary reads the published plan once, to rebuild its view of the plan when a
+        # publication it was not built from appears: the snapshot the named move publishes, so no new reader kind.
+        "const std::shared_ptr<const ggml_sycl::lifecycle_plan_snapshot> snap = ggml_sycl_global_plan_snapshot();": 1,
         # llama.cpp-pu8v: test_expert_loan_and_refill_stop_on_a_missing_entry checks, in one condition each, that the
         # refused loan and the refill that dropped a triplet published nothing and left the request and the ledger
         # as they must be.
@@ -1892,6 +1898,7 @@ wrapper_text = (root / "tests/test-sycl-lifecycle-runtime-wrapper.cpp").read_tex
 nodelete_mutants = (
     ("NODELETE MoE state reset: swap republish removed",
      "        g_moe_expert_meta.swap(new_expert_meta);\n"
+     "        g_moe_expert_meta_index.swap(new_expert_meta_index);\n"
      "        g_expert_groups.swap(new_expert_groups);\n",
      "        // NODELETE-MUTANT: swap republish removed\n"),
     ("NODELETE MoE state reset: install_fresh() removed from reset function",

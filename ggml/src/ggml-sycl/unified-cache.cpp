@@ -12,6 +12,7 @@
 #include "cpu-traits-support.hpp"
 #include "e2e-profile.hpp"
 #include "expert-prefetch.hpp"
+#include "expert-slot.hpp"
 #include "ggml-impl.h"
 #include "ggml-sycl-test.hpp"
 #include "ggml-sycl.h"
@@ -33,6 +34,7 @@
 #include "range-index.hpp"
 #include "scratch-test-mutant.hpp"
 #include "sycl-timeline.hpp"
+#include "tlsf-allocator.hpp"
 #include "unified-types.hpp"
 #include "vram-headroom.hpp"
 #include "weight-row-padding.hpp"
@@ -40,6 +42,7 @@
 #include "zone-used-count.hpp"
 
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <level_zero/ze_api.h>
 
 #include <algorithm>
@@ -151,6 +154,22 @@ cache_load_effect acquire_bound_load_effect() noexcept {
 void stamp_pending_owner(unified_cache_entry & entry, const cache_load_effect & effect) noexcept {
     if (const uint64_t txn = effect.load_txn_id()) {
         entry.pending_load_txn_id = txn;
+    }
+}
+
+// A copy a move publishes (an admit's or a refill's device entry, a loan's or an evict's host copy) holds the same
+// weight as the entry it replaces, so it belongs to the same models: it takes that entry's owners and tag. A model
+// load's end tags what the load staged; a moved copy is tagged by this inheritance too. A model teardown never
+// reclaims an untagged entry, so a copy published after the load without it would outlive its model.
+// The pending load follows two rules. A copy whose own stamp is unset (its mover runs outside any load) takes the
+// source's pending load, so that load's end tags the copy as it would have tagged the source. A mover that runs
+// inside a load keeps its own stamp: that load published the copy, so its end must tag the copy and its abort must
+// withdraw it, as for anything else it staged. An entry holds one pending load, and the source keeps its own.
+void inherit_entry_ownership(unified_cache_entry & dst, const unified_cache_entry & src) noexcept {
+    dst.owner_mask |= src.owner_mask;
+    dst.owner_tagged = dst.owner_tagged || src.owner_tagged;
+    if (dst.pending_load_txn_id == 0) {
+        dst.pending_load_txn_id = src.pending_load_txn_id;
     }
 }
 
@@ -9674,6 +9693,60 @@ static unified_cache_key make_direct_stage_key(cache_entry_type           type,
     return key;
 }
 
+// The two keys an expert's id is resolved by as it moves between the card and the host: its device entry's (the AOS
+// layout, which every named move and loan stages) and a host copy's. The loan, with its rollback and the restore,
+// copy_host_triplet_to_device and has_expert_source name them through these.
+static unified_cache_key expert_device_key(const ggml_sycl_cache_id & id) {
+    return make_direct_stage_key(cache_entry_type::MOE_EXPERT, id, GGML_LAYOUT_AOS);
+}
+
+static unified_cache_key expert_host_key(const ggml_sycl_cache_id & id) {
+    return unified_cache_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };
+}
+
+// The loan's id hand-over and its rollback. The id names the device entry when the loan starts; it is handed to the
+// host copy's key before the device entry is retired, so the retire finds the id gone from its entry and walks no
+// entry of the cache looking for another to hand it to. A rollback hands it back, unless another registrant's live
+// entry holds the host key, and an id that was erased while the locks were released takes the spare node minted before
+// anything changed, so nothing is built where nothing may throw.
+template <typename Map>
+static typename Map::node_type expert_spare_mapping(const Map &                ids,
+                                                    const ggml_sycl_cache_id & id,
+                                                    const unified_cache_key &  device_key) {
+    const auto mapped = ids.find(id);
+    if (mapped == ids.end() || !(mapped->second == device_key)) {
+        return {};
+    }
+    Map spare;
+    return spare.extract(spare.emplace(id, device_key).first);
+}
+
+template <typename Map>
+static void expert_id_hand_over(Map &                      ids,
+                                const ggml_sycl_cache_id & id,
+                                const unified_cache_key &  device_key,
+                                const unified_cache_key &  host_key) {
+    const auto mapped = ids.find(id);
+    if (mapped != ids.end() && mapped->second == device_key) {
+        mapped->second = host_key;
+    }
+}
+
+template <typename Map>
+static void expert_id_hand_back(Map &                      ids,
+                                const ggml_sycl_cache_id & id,
+                                const unified_cache_key &  host_key,
+                                const unified_cache_key &  device_key,
+                                bool                       held_by_another,
+                                typename Map::node_type &  spare) {
+    const auto mapped = ids.find(id);
+    if (mapped != ids.end() && mapped->second == host_key && !held_by_another) {
+        mapped->second = device_key;
+    } else if (mapped == ids.end() && !spare.empty()) {
+        ids.insert(std::move(spare));
+    }
+}
+
 static bool can_replace_cache_entry_locked(const unified_cache_key &   key,
                                            const unified_cache_entry & old,
                                            const char *                path) {
@@ -9748,6 +9821,7 @@ void unified_cache::remap_or_extract_id_mapping_locked(const ggml_sycl_cache_id 
         return score;
     };
     int best_score = std::numeric_limits<int>::min();
+    id_remap_walks_.fetch_add(1, std::memory_order_relaxed);
     for (const auto & pair : entries_) {
         const unified_cache_key &   candidate_key = pair.first;
         const unified_cache_entry & candidate     = pair.second;
@@ -11503,8 +11577,9 @@ void unified_cache::restore_expert_entry_at_locked(const unified_cache_key & exa
     if (it == entries_.end() || !it->second.retired) {
         return;
     }
-    it->second.retired    = false;
-    const size_t previous = retired_pending_count_.fetch_sub(1, std::memory_order_acq_rel);
+    it->second.retired                = false;
+    it->second.retired_by_expert_move = false;
+    const size_t previous             = retired_pending_count_.fetch_sub(1, std::memory_order_acq_rel);
     GGML_ASSERT(previous != 0 && "restored entry without a matching retirement count");
     if (!released.mapping.empty() && id_to_key_.find(exact.id) == id_to_key_.end()) {
         id_to_key_.insert(std::move(released.mapping));
@@ -11520,9 +11595,7 @@ bool unified_cache::has_expert_source(ggml_sycl_cache_id key, bool to_device) co
     std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
     std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
     std::lock(direct_lock, cache_lock);
-    const auto it =
-        entries_.find(to_device ? unified_cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 } :
-                                  make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));
+    const auto it = entries_.find(to_device ? expert_host_key(key) : expert_device_key(key));
     return it != entries_.end() && !it->second.retired;
 }
 
@@ -11530,8 +11603,8 @@ bool unified_cache::has_expert_source(ggml_sycl_cache_id key, bool to_device) co
 // reader correct and every byte owned. The copies go first. Each device entry's last write then becomes its copy,
 // which ran behind every earlier write, so release_entry_allocation_locked() queues the storage's free behind the copy
 // that reads it. The device entry is withdrawn exactly, its host copy is published behind the copy event, and only
-// then does the transaction drop the lease that held the withdrawn entry in place. Nothing here waits or asks an
-// event's status.
+// then does the loan hand the lease that held the withdrawn entry in place to its caller, which drops it once its
+// publication has covered the retire. Nothing here waits or asks an event's status.
 bool unified_cache::loan_expert_triplet(const expert_move_member members[3], expert_move_record & out) {
     out = expert_move_record{};
     if (!members) {
@@ -11580,8 +11653,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
         std::lock(direct_lock, cache_lock);
         for (int i = 0; i < 3 && !refusal; ++i) {
-            const auto it =
-                entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS));
+            const auto it = entries_.find(expert_device_key(members[i].key));
             if (it == entries_.end() || it->second.retired || !it->second.device_ptr ||
                 it->second.state == cache_entry_state::EVICTING || it->second.state == cache_entry_state::FAILED) {
                 refusal = "not resident";
@@ -11607,7 +11679,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             alloc_metadata md{};
             if (e.storage_owner || e.pool_allocated || !e.direct_alloc_owner.owner_metadata(&md) ||
                 md.ptr != e.device_ptr || md.size != e.size || md.cache_backing || md.tier != alloc_tier::DEVICE_VRAM) {
-                refusal = "shared storage";
+                refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;
                 break;
             }
             // Held by the entry alone: anything else retaining the owner shares the storage with the loan.
@@ -11632,8 +11704,8 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             // owner's and stays until that owner withdraws it, so "host entry exists" comes back at every retry. The
             // registration below refuses the same, so an entry that appears after this check fails the loan whole
             // instead of being replaced.
-            for (const ggml_sycl_cache_id & host_key : members[i].host_keys) {
-                const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 });
+            for (const ggml_sycl_cache_id & host_id : members[i].host_keys) {
+                const auto host = entries_.find(expert_host_key(host_id));
                 if (host != entries_.end()) {
                     refusal = host->second.retired ? "host entry retiring" : "host entry exists";
                     break;
@@ -11662,6 +11734,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
     // 2. The copies, on the DMA queue behind what wrote each entry. mem_copy_async retains each copy's two owners
     // until it completes, so the device storage outlives the read and the host storage the write, whatever happens
     // to either entry afterwards.
+    const auto copy_from = std::chrono::steady_clock::now();
     try {
         sycl::queue & dq = get_dma_queue();
         for (int i = 0; i < 3; ++i) {
@@ -11674,29 +11747,37 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
         out.reason = "copy submit failed";
         return false;
     }
+    const uint64_t copy_took = expert_move_us_since(copy_from);
 
     // 3. All three or none, under the locks: each device entry is still the one checked. The transaction takes a lease
-    // that holds the entry in place until its host copy is published. Its last write becomes its copy, which ran behind
-    // the fill, so its storage is freed behind the copy, and it is withdrawn exactly, leaving any other entry under its
-    // id alone. DEFERRED is the expected status: that lease alone defers the free. The leases are minted in the check
-    // loop, before any entry changes: minting allocates, so a throw leaves every entry as it was, and the leases
-    // already minted go with the unwinding. What changes the entries after it allocates nothing: each retire moves its
-    // entry's mirror and id mapping out as nodes, into device_nodes, for a rollback to put back. The rollback after
-    // step 4 collects the host copies a failed registration left published into `host_nodes`, sized here, before any
-    // entry changes, so collecting them cannot throw.
+    // that holds the entry in place until its host copy is published, and then hands it to the caller. Its last write
+    // becomes its copy, which ran behind the fill, so its storage is freed behind the copy, and it is withdrawn
+    // exactly, leaving any other entry under its id alone. DEFERRED is the expected status: that lease alone defers the
+    // free. The leases are minted in the check loop, before any entry changes: minting allocates, so a throw leaves
+    // every entry as it was, and the leases already minted go with the unwinding. What changes the entries after it
+    // allocates nothing. Each member's id is handed to its host copy's key before its device entry is retired, as an
+    // admit hands it to the device entry before it retires the host copy: direct staging maps the id to the device
+    // entry, and a retire that finds the id still on its entry walks every entry of the cache for another to hand it
+    // to. Handed over first, the retire walks nothing, nor does the deferred-free pass that erases the entry, and a
+    // reader that resolves the id before the registration below finds no entry under the host key, a miss, never the
+    // retiring device entry. Each retire moves its entry's mirror out as a node, into device_nodes, for a rollback to
+    // put back; the rollback hands the id back. The rollback after step 4 collects the host copies a failed
+    // registration left published into `host_nodes`, sized here, before any entry changes, so collecting them cannot
+    // throw.
     std::shared_ptr<mem_handle>      held[3];
     expert_retire_nodes              device_nodes[3];
+    id_map::node_type                spare_mapping[3];
     std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
                                                 members[2].host_keys.size());
+    uint64_t                         remap_took = 0;
     {
         std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
         std::lock(direct_lock, cache_lock);
         unified_cache_entry * device_entry[3] = { nullptr, nullptr, nullptr };
         for (int i = 0; i < 3 && !refusal; ++i) {
-            const unified_cache_key device_key =
-                make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
-            const auto it = entries_.find(device_key);
+            const unified_cache_key device_key = expert_device_key(members[i].key);
+            const auto              it         = entries_.find(device_key);
             if (it == entries_.end() || it->second.retired ||
                 it->second.direct_alloc_owner.owner_control_id() != src_control[i]) {
                 refusal = "entry changed";
@@ -11704,15 +11785,26 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             }
             device_entry[i] = &it->second;
             held[i]         = make_direct_entry_handle(device_key, cache_device, *device_entry[i], "expert_loan/held");
+            // A spare mapping node for each id handed over below, minted while a throw still changes nothing. While
+            // the locks are released before a rollback, something can erase the id (an id-wide retire of the copy
+            // registered under it finds no live entry to hand it to), and the restore re-inserts only nodes its own
+            // retire took out, which the hand-over leaves in place: the rollback puts the device entry back under its
+            // id through this node, building none.
+            spare_mapping[i] = expert_spare_mapping(id_to_key_, members[i].key, device_key);
         }
+        const auto remap_from = std::chrono::steady_clock::now();
         for (int i = 0; i < 3 && !refusal; ++i) {
-            const unified_cache_key device_key =
-                make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
-            device_entry[i]->last_write_event = out.copy_events[i];
-            device_entry[i]->has_write_event  = true;
-            out.retire_status[i]              = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
-            out.device_keys[i]                = device_key;
+            const unified_cache_key device_key = expert_device_key(members[i].key);
+            device_entry[i]->last_write_event  = out.copy_events[i];
+            device_entry[i]->has_write_event   = true;
+            const unified_cache_key host_key   = expert_host_key(members[i].key);
+            expert_id_hand_over(id_to_key_, members[i].key, device_key, host_key);
+            // The move's publication bumps the exec-graph epoch, so this entry's reap leaves has_evictions_ alone.
+            device_entry[i]->retired_by_expert_move = true;
+            out.retire_status[i]                    = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
+            out.device_keys[i]                      = device_key;
         }
+        remap_took = expert_move_us_since(remap_from);
     }
     if (refusal) {
         out        = expert_move_record{};
@@ -11736,7 +11828,7 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
                 published = host_ptr &&
                             register_host_expert_owned(m.host_keys[k], host_ptr, bytes[i], GGML_LAYOUT_AOS,
                                                        k == 0 ? &out.handles[i] : nullptr, m.owner, &out.copy_events[i],
-                                                       /*replace_existing=*/false);
+                                                       /*replace_existing=*/false, &out.device_keys[i]);
             } catch (const ggml_sycl_fallback_error &) {
                 // G-CATCH requires this clause before catch (...). Nothing in a host registration throws the op
                 // fallback (dispatch control flow), so no loan is stranded by it (llama.cpp-mwmr).
@@ -11760,25 +11852,37 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
         // until they complete. Every host copy is withdrawn before any device entry goes back, so at each restore no
         // lookup map holds more entries than it did before step 3 took the nodes out, and the restores, which re-insert
         // those nodes, allocate nothing unless other registrations filled a map while the locks were released.
+        // First each id goes back to its device entry, where step 3 took it from, so withdrawing a host copy walks no
+        // entry looking for one to hand it to. A registration that failed after naming its copy under the id handed it
+        // back itself (register_host_expert's moved_from). A host key that holds another registrant's live entry keeps
+        // the id: that entry appeared after step 1 and is not this loan's to undo.
         {
             std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
             std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
             std::lock(direct_lock, cache_lock);
+            for (int i = 0; i < 3; ++i) {
+                const unified_cache_key device_key = expert_device_key(members[i].key);
+                const unified_cache_key host_key   = expert_host_key(members[i].key);
+                const auto              host       = entries_.find(host_key);
+                const bool              held_by_another =
+                    host != entries_.end() && !host->second.retired &&
+                    host->second.direct_alloc_owner.owner_control_id() != members[i].owner.owner_control_id();
+                expert_id_hand_back(id_to_key_, members[i].key, host_key, device_key, held_by_another,
+                                    spare_mapping[i]);
+            }
             size_t r = 0;
             for (int i = 0; i < 3; ++i) {
                 const uint64_t host_control = members[i].owner.owner_control_id();
                 for (int k = 0; k < registered[i]; ++k) {
-                    const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].host_keys[k], -1, -1 };
-                    const auto              host = entries_.find(host_key);
+                    const unified_cache_key host_key = expert_host_key(members[i].host_keys[k]);
+                    const auto              host     = entries_.find(host_key);
                     if (host != entries_.end() && host->second.direct_alloc_owner.owner_control_id() == host_control) {
                         (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);
                     }
                 }
             }
             for (int i = 0; i < 3; ++i) {
-                restore_expert_entry_at_locked(
-                    make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS),
-                    device_nodes[i]);
+                restore_expert_entry_at_locked(expert_device_key(members[i].key), device_nodes[i]);
             }
         }
         host_nodes.clear();
@@ -11790,10 +11894,12 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
         return false;
     }
 
-    // 5. Every host copy is published: the leases that held the withdrawn device entries go, with no lock held, and
-    // the deferred-free pass reclaims each entry once the caller's own lease is gone too.
-    for (std::shared_ptr<mem_handle> & lease : held) {
-        lease.reset();
+    // 5. Every host copy is published. The leases that held the withdrawn device entries in place go to the caller,
+    // which drops them once its publication has bumped the exec-graph epoch over the retires, or it has set the
+    // eviction latch instead: the mark above leaves each entry's reap out of the latch, so the deferred-free pass must
+    // not reap one before then.
+    for (int i = 0; i < 3; ++i) {
+        out.retired_leases[i] = std::move(held[i]);
     }
     for (expert_retire_nodes & nodes : device_nodes) {
         if (!nodes.mirror.empty()) {
@@ -11805,6 +11911,8 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
     // pass reaps each entry.
     out.accepted = true;
     out.reason   = "OK";
+    out.copy_us  = copy_took;
+    out.remap_us = remap_took;
     for (int i = 0; i < 3; ++i) {
         out.device_bytes += device_size[i];
     }
@@ -11872,6 +11980,12 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         }
         deps[i].reserve(2);
     }
+    // The storage every member must own: what the WEIGHT zone hands it (expert_triplet_member_bytes, expert-slot.hpp),
+    // from the members' staged bytes as AOS, the one layout this stages (each host copy is checked to be AOS below).
+    size_t staged[3] = { 0, 0, 0 };
+    for (int i = 0; i < 3; ++i) {
+        staged[i] = staged_expert_bytes(GGML_LAYOUT_AOS, members[i].type, members[i].ncols, members[i].logical_bytes);
+    }
 
     // 1. Each member's host copy is one the direction copies from, a loan's for a refill and any whole pinned
     // host-zone copy for an admit, all three members before anything changes.
@@ -11881,7 +11995,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         std::lock(direct_lock, cache_lock);
         for (int i = 0; i < 3 && !refusal; ++i) {
             const ggml_sycl_cache_id & key = members[i].key;
-            const unified_cache_key    host_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+            const unified_cache_key    host_key = expert_host_key(key);
             const auto                 it = entries_.find(host_key);
             if (it == entries_.end() || it->second.retired || !it->second.device_ptr ||
                 it->second.state == cache_entry_state::EVICTING || it->second.state == cache_entry_state::FAILED) {
@@ -11923,8 +12037,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                 refusal = "host copy not published";
                 break;
             }
-            if (entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS)) !=
-                entries_.end()) {
+            if (entries_.find(expert_device_key(key)) != entries_.end()) {
                 refusal = "device entry exists";
                 break;
             }
@@ -11936,11 +12049,12 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                 refusal = "host copy size";
                 break;
             }
-            // The storage is the size direct staging gives the expert, its bytes and the padded tail the copy below
-            // zero-fills, asked of the layout; never less than its bytes. The entry is published at that size, so it
-            // owns its whole allocation, which a loan that later lends it again requires.
-            const size_t staged = staged_expert_bytes(e.layout, members[i].type, members[i].ncols, logical);
-            if (device_size[i] != staged || staged < logical) {
+            // The storage is the size direct staging gives the member, its triplet's slot or else its own staged
+            // bytes: the expert's bytes and a tail the copy below zero-fills (the row padding the kernels may read,
+            // then any slot rounding), never less than its bytes. The entry is published at that size, so it owns its
+            // whole allocation, which a loan that later lends it again requires.
+            const size_t member_bytes = expert_triplet_member_bytes(staged, i);
+            if (device_size[i] != member_bytes || member_bytes < logical) {
                 refusal = "device storage size";
                 break;
             }
@@ -11963,6 +12077,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
     // 2. The copies, on the BCS queue (the copy engine, off the compute engine the decode graph runs on) behind what
     // wrote each host copy: a loan's D2H copy, or the load's. Both endpoints are typed owners, so the copy is a direct
     // DMA, and mem_copy_async retains both until it completes.
+    const auto copy_from = std::chrono::steady_clock::now();
     try {
         sycl::queue & bq = get_bcs_queue();
         for (int i = 0; i < 3; ++i) {
@@ -11983,6 +12098,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         out.reason = "copy submit failed";
         return false;
     }
+    const uint64_t copy_took = expert_move_us_since(copy_from);
 
     // 3. Everything the publication allocates, built before the locks: each device entry and its mirror record, and
     // the nodes the host retires hand back. Under the locks, the device entries' insertion and their lease minting
@@ -12027,7 +12143,8 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
     scoped_planned_materialization   materialization(this, admit ? "expert admit" : "expert refill");
     std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + members[1].host_keys.size() +
                                                 members[2].host_keys.size());
-    int                              inserted = 0;
+    int                              inserted   = 0;
+    uint64_t                         remap_took = 0;
     {
         std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
@@ -12035,7 +12152,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         // Each host copy is still the one checked and still what resolves its id, and no device entry has appeared.
         for (int i = 0; i < 3 && !refusal; ++i) {
             const ggml_sycl_cache_id & key = members[i].key;
-            const unified_cache_key    host_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
+            const unified_cache_key    host_key = expert_host_key(key);
             const auto                 it     = entries_.find(host_key);
             const auto                 mirror = direct_expert_entries_.find(key);
             const auto                 mapped = id_to_key_.find(key);
@@ -12043,9 +12160,13 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                 it->second.direct_alloc_owner.owner_control_id() != src_control[i] ||
                 mirror == direct_expert_entries_.end() || mirror->second.ptr != it->second.device_ptr ||
                 mapped == id_to_key_.end() || !(mapped->second == host_key) ||
-                entries_.find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS)) !=
-                    entries_.end()) {
+                entries_.find(expert_device_key(key)) != entries_.end()) {
                 refusal = "entry changed";
+            } else {
+                // The device entry replaces this host copy, so it belongs to the copy's models as they are now,
+                // under the locks, and its mirror carries the entry's pending load.
+                inherit_entry_ownership(device_entry[i], it->second);
+                device_mirror[i].pending_load_txn_id = device_entry[i].pending_load_txn_id;
             }
         }
         // The allocations: insert each device entry, then mint its mirror's lease and the caller's. A throw withdraws
@@ -12054,15 +12175,13 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         if (!refusal) {
             try {
                 for (int i = 0; i < 3; ++i) {
-                    const unified_cache_key device_key =
-                        make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+                    const unified_cache_key device_key = expert_device_key(members[i].key);
                     device_entry[i].last_access = time_++;
                     entries_.emplace(device_key, device_entry[i]);
                     ++inserted;
                 }
                 for (int i = 0; i < 3; ++i) {
-                    const unified_cache_key device_key =
-                        make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
+                    const unified_cache_key device_key = expert_device_key(members[i].key);
                     unified_cache_entry & stored = entries_.find(device_key)->second;
                     device_mirror[i].handle =
                         make_direct_entry_handle(device_key, cache_device, stored, "expert_refill/mirror");
@@ -12078,10 +12197,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                 throw;
             } catch (...) {
                 for (int i = 0; i < inserted; ++i) {
-                    (void) transition_to_retired_locked(
-                        entries_
-                            .find(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS))
-                            ->second);
+                    (void) transition_to_retired_locked(entries_.find(expert_device_key(members[i].key))->second);
                 }
                 refusal = "publication failed";
             }
@@ -12092,21 +12208,23 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         // key name the device entry by then, so the retire there takes neither; under the loan's other host ids it
         // takes both, into host_nodes.
         if (!refusal) {
-            size_t r = 0;
+            const auto remap_from = std::chrono::steady_clock::now();
+            size_t     r          = 0;
             for (int i = 0; i < 3; ++i) {
                 const ggml_sycl_cache_id & key = members[i].key;
                 std::swap(direct_expert_entries_.find(key)->second, device_mirror[i]);
-                id_to_key_.find(key)->second =
-                    make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);
+                id_to_key_.find(key)->second = expert_device_key(key);
                 for (const ggml_sycl_cache_id & id : members[i].host_keys) {
-                    const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };
+                    const unified_cache_key host_key = expert_host_key(id);
                     const auto              host = entries_.find(host_key);
                     if (host != entries_.end() && !host->second.retired &&
                         host->second.direct_alloc_owner.owner_control_id() == src_control[i]) {
+                        // No latch mark: the latch leaves a host-resident entry out whatever its mark.
                         (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);
                     }
                 }
             }
+            remap_took = expert_move_us_since(remap_from);
         }
     }
 
@@ -12132,6 +12250,8 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
 
     out.accepted = true;
     out.reason   = "OK";
+    out.copy_us  = copy_took;
+    out.remap_us = remap_took;
     for (int i = 0; i < 3; ++i) {
         out.device_bytes += device_size[i];
     }
@@ -12605,34 +12725,36 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
     return register_host_expert(key, ptr, size, layout, out_handle, std::move(allocation_owner), mem_handle{});
 }
 
-bool unified_cache::register_host_expert_owned(ggml_sycl_cache_id  key,
-                                               void *              ptr,
-                                               size_t              size,
-                                               ggml_layout_mode    layout,
-                                               mem_handle *        out_handle,
-                                               const mem_handle &  allocation_owner,
-                                               const sycl::event * ready_event,
-                                               bool                replace_existing) {
+bool unified_cache::register_host_expert_owned(ggml_sycl_cache_id        key,
+                                               void *                    ptr,
+                                               size_t                    size,
+                                               ggml_layout_mode          layout,
+                                               mem_handle *              out_handle,
+                                               const mem_handle &        allocation_owner,
+                                               const sycl::event *       ready_event,
+                                               bool                      replace_existing,
+                                               const unified_cache_key * moved_from) {
     if (!allocation_owner.valid()) {
-        return register_host_expert(key, ptr, size, layout, out_handle, {}, mem_handle{}, ready_event,
-                                    replace_existing);
+        return register_host_expert(key, ptr, size, layout, out_handle, {}, mem_handle{}, ready_event, replace_existing,
+                                    moved_from);
     }
     // The storage owner is a copy of the typed owner, aliased to ptr as the
     // legacy owner wrapper was, so the entry releases exactly as before.
     auto storage_owner = std::make_shared<mem_handle>(allocation_owner);
     return register_host_expert(key, ptr, size, layout, out_handle, std::shared_ptr<void>(storage_owner, ptr),
-                                allocation_owner, ready_event, replace_existing);
+                                allocation_owner, ready_event, replace_existing, moved_from);
 }
 
-bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
-                                         void *                ptr,
-                                         size_t                size,
-                                         ggml_layout_mode      layout,
-                                         mem_handle *          out_handle,
-                                         std::shared_ptr<void> allocation_owner,
-                                         const mem_handle &    typed_owner,
-                                         const sycl::event *   ready_event,
-                                         bool                  replace_existing) {
+bool unified_cache::register_host_expert(ggml_sycl_cache_id        key,
+                                         void *                    ptr,
+                                         size_t                    size,
+                                         ggml_layout_mode          layout,
+                                         mem_handle *              out_handle,
+                                         std::shared_ptr<void>     allocation_owner,
+                                         const mem_handle &        typed_owner,
+                                         const sycl::event *       ready_event,
+                                         bool                      replace_existing,
+                                         const unified_cache_key * moved_from) {
     auto load_effect_guard = acquire_bound_load_effect();
     if (load_effect_guard.failed()) {
         return false;
@@ -12656,11 +12778,28 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
 
     std::shared_ptr<mem_handle> direct_handle;
     std::shared_ptr<mem_handle> replaced_direct_handle;
-    bool                        cache_inserted = false;
+    bool                        cache_inserted     = false;
+    uint64_t                    mirror_pending_txn = load_effect_guard.load_txn_id();
     {
         std::unique_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock);
         std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
         std::lock(direct_lock, cache_lock);
+        // A host copy a move publishes in place of a device entry takes that entry's owners (below). The mover holds
+        // the entry in place until its registrations are done, so one that is gone means the move is not what it was
+        // checked to be. Refused before anything here changes: a copy published without its source's owners would
+        // belong to no model, and no model's teardown would reclaim it.
+        const unified_cache_entry * source = nullptr;
+        if (moved_from) {
+            const auto found = entries_.find(*moved_from);
+            if (found == entries_.end()) {
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] register_host_expert refused model=%llu name_hash=0x%llx: the entry "
+                    "its moved copy replaces is gone\n",
+                    (unsigned long long) key.model_id, (unsigned long long) key.name_hash);
+                return false;
+            }
+            source = &found->second;
+        }
         unified_cache_key   cache_key{ cache_entry_type::MOE_EXPERT, key, -1, -1 };
         unified_cache_entry cache_entry{};
         auto                old = entries_.find(cache_key);
@@ -12726,6 +12865,12 @@ bool unified_cache::register_host_expert(ggml_sycl_cache_id    key,
         cache_entry.non_owning_external_host = !allocation_owner;
         cache_entry.direct_alloc_owner       = typed_owner;
         stamp_pending_owner(cache_entry, load_effect_guard);
+        // The moved copy belongs to its source's models, read under the locks. The source is a device entry, never the
+        // host key registered here, so the erase of an existing entry under this key above left it in place.
+        if (source) {
+            inherit_entry_ownership(cache_entry, *source);
+            mirror_pending_txn = cache_entry.pending_load_txn_id;
+        }
         try {
             if (fail_next_host_registration_insert_.exchange(false)) {
                 throw std::bad_alloc();
@@ -12766,7 +12911,7 @@ publish_host_expert_direct:
         entry.has_ready_event       = ready_event != nullptr;
         entry.ready_event           = ready_event ? *ready_event : sycl::event{};
         entry.handle                = std::move(direct_handle);
-        entry.pending_load_txn_id = load_effect_guard.load_txn_id();
+        entry.pending_load_txn_id   = mirror_pending_txn;
         auto old_direct = direct_expert_entries_.find(key);
         if (old_direct != direct_expert_entries_.end()) {
             replaced_direct_handle = std::move(old_direct->second.handle);
@@ -12785,9 +12930,16 @@ publish_host_expert_direct:
         if (it != entries_.end() && it->second.device_ptr == ptr) {
             erase_entry_locked(it);
         }
+        // A moved copy hands its id back to the entry it was to replace, which its mover puts back (the loan's
+        // rollback): the mover handed the id over before it retired that entry, and a rollback that found the id gone
+        // would have to build a mapping. Any other id the copy took goes with it.
         auto id = id_to_key_.find(key);
         if (id != id_to_key_.end() && id->second == cache_key) {
-            id_to_key_.erase(id);
+            if (moved_from && detail::cache_id_equal(moved_from->id, key)) {
+                id->second = *moved_from;
+            } else {
+                id_to_key_.erase(id);
+            }
         }
         return false;
     }
@@ -14942,9 +15094,14 @@ sycl::event unified_cache::copy_to_device_async(void *                          
     return mem_copy_async(dst_handle, src_handle, size, q, deps);
 }
 
-// NOTE for any NEW caller: this BLOCKS rather than polls on a
-// profiling-enabled queue (see unified-cache.hpp's own get_dma_queue()
-// comment). Callers that hold a lock across this call
+// NOTE for any NEW caller: this BLOCKS rather than polls on a queue that
+// carries profiling (see unified-cache.hpp's own get_dma_queue() comment).
+// A backend queue carries profiling only when the queue-profiling resolver
+// answers on (GGML_SYCL_QUEUE_PROFILING=1 or a requested profiling
+// diagnostic, queue-profiling.hpp); by default none does and the query
+// polls. A caller must still be written for the blocking case, because a
+// profiling run is exactly when it is exercised. Callers that hold a lock
+// across this call
 // serialise the allocation/lookup path behind whatever produced `evt` --
 // that was the exact bug in the oneDNN Graph-scratch DIRECT reuse pool
 // (llama.cpp-c6ah). Pool entries must go through
@@ -16135,8 +16292,8 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
         // flag_slot this pool entry will be checked against
         // (onednn_graph_scratch_pool_entry_release_complete()), instead of
         // leaving pool lookups to query `event` directly (which BLOCKS
-        // rather than polls on the profiling-enabled queue `event` lives
-        // on -- see event_complete()'s comment). A marker kernel with no
+        // rather than polls when the queue `event` lives on carries
+        // profiling -- see event_complete()'s comment). A marker kernel with no
         // dependency but this one release event costs nothing on the
         // allocation path: it runs on get_event_watch_queue(), a dedicated
         // queue nothing else waits on, and (unlike an earlier, host_task-
@@ -16342,8 +16499,9 @@ void unified_cache::onednn_graph_scratch_free(void * ptr, const sycl::event * ev
     // pattern (see get_dma_queue()'s comment above): a dedicated
     // NON-profiling queue whose events CAN be polled via
     // event.get_info<command_execution_status>() without blocking, unlike
-    // every other backend stream (profiling-enabled, where that same query
-    // blocks instead of polling).
+    // every other backend stream when it carries profiling
+    // (GGML_SYCL_QUEUE_PROFILING=1 or a requested profiling diagnostic),
+    // where that same query blocks instead of polling.
     //
     // THE ASSUMPTION IS ALREADY KNOWN TO BREAK UNDER TP: ggml_backend_sycl_context::
     // stream()/ctx.stream() (common.hpp) returns the TP shared-context queue
@@ -16848,15 +17006,26 @@ size_t unified_cache::finalize_retired_entries_locked() {
         }
 
         release_entry_allocation_locked(entry);
-        // An optional layout copy is released only by yield_optional_layouts_begin(),
-        // from a context's KV admission, and that transaction also bumps the
-        // optional-layout epoch (ggml-sycl.cpp): every coexisting context
-        // drops the exec graphs it recorded, which may bake the copy's
-        // pointer, before its next replay. Persistent TG re-resolves weight
-        // pointers every token and never reads a WOQ copy. The latch would
-        // disable graph replay and persistent TG for the whole process to
-        // guard pointers that nothing can replay any more.
-        if (!entry.storage_owner && entry.device_ptr && !entry.host_resident && !entry.optional_layout) {
+        // The latch would disable graph replay and persistent TG for the whole
+        // process, until the next model load, to guard pointers nothing can
+        // replay any more. Two releases are left out of it for that reason:
+        //  - An optional layout copy is released only by
+        //    yield_optional_layouts_begin(), from a context's KV admission, and
+        //    that transaction also bumps the optional-layout epoch
+        //    (ggml-sycl.cpp): every coexisting context drops the exec graphs it
+        //    recorded, which may bake the copy's pointer, before its next
+        //    replay. Persistent TG re-resolves weight pointers every token and
+        //    never reads a WOQ copy.
+        //  - An expert move's retire (retired_by_expert_move, set only where the
+        //    move retires and cleared by a restore): the move's publication bumps
+        //    the same epoch, and persistent TG refuses every graph with a
+        //    MUL_MAT_ID (should_use_persistent_tg's MoE probe counts each one),
+        //    so it never holds an expert's pointer. A move whose publication did
+        //    not run sets the latch itself (latch_evictions()).
+        // The mark is per retire, not per kind of entry: a pressure eviction, a
+        // drop or an async evict of an expert entry still latches.
+        if (!entry.storage_owner && entry.device_ptr && !entry.host_resident && !entry.optional_layout &&
+            !entry.retired_by_expert_move) {
             has_evictions_.store(true, std::memory_order_release);
         }
         const unified_cache_key key = it->first;
@@ -17465,6 +17634,28 @@ bool unified_cache::test_expert_host_entry_state(ggml_sycl_cache_id key,
     }
     return true;
 }
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+void unified_cache::test_reset_evictions_latch() noexcept {
+    has_evictions_.store(false, std::memory_order_release);
+}
+
+uint64_t unified_cache::test_id_remap_walks() const noexcept {
+    return id_remap_walks_.load(std::memory_order_relaxed);
+}
+
+bool unified_cache::test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    const auto                          mapped = id_to_key_.find(id);
+    if (mapped == id_to_key_.end()) {
+        return false;
+    }
+    if (out) {
+        *out = mapped->second;
+    }
+    return true;
+}
+#endif
 
 uint64_t unified_cache::test_entry_pending_load_txn(ggml_sycl_cache_id key, ggml_layout_mode layout) const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
@@ -20499,6 +20690,17 @@ void unified_cache_test_set_raw_gate_device_total(int device, size_t bytes) {
         g_test_raw_gate_device_total[device].store(bytes, std::memory_order_relaxed);
     }
 }
+
+// Per device, how often a raw gate read its figure: each read is one walk of the runtime registry. Only the tests read
+// it, to pin which requests never reach a raw gate.
+static std::array<std::atomic<uint64_t>, GGML_SYCL_MAX_DEVICES> g_test_raw_gate_reads{};
+
+uint64_t unified_cache_test_raw_gate_reads(int device) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_test_raw_gate_reads[device].load(std::memory_order_relaxed);
+}
 #endif
 
 // Locks, one after the other and never two at once: g_cache_rw_mutex (L4), shared, for the cache lookup, released; then
@@ -20512,6 +20714,7 @@ zone_raw_gate_inputs unified_cache_raw_gate_inputs(int device, sycl::queue & que
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     const size_t test_total = g_test_raw_gate_device_total[device].load(std::memory_order_relaxed);
     in.device_total         = test_total != 0 ? test_total : in.device_total;
+    g_test_raw_gate_reads[device].fetch_add(1, std::memory_order_relaxed);
 #endif
     // The reservation is committed whole when the arena is made, on one chunk or N: all of it is taken, however empty
     // its zones are.
@@ -21162,13 +21365,17 @@ bool unified_alloc(const alloc_request & req_in, alloc_handle * out) {
                 }
                 const auto refuse_no_growth = [&](host_zone_alloc_miss miss) -> void * {
                     host_miss = miss;
-                    // Only WEIGHT: its no-growth requests are persistent owners the planner sized the zone for, so a
-                    // refusal there is a planning fault. A STAGING miss is back-pressure its caller retries.
-                    if (zone == host_zone_id::WEIGHT) {
+                    // Only WEIGHT, and only for a request the planner sized the zone for: a persistent owner, or a
+                    // request that leaves its failure to the cache's own log. Its refusal is a planning fault. A
+                    // request that suppresses its failure log and is no persistent owner (the evict's host copy at a
+                    // decode boundary) is back-pressure its caller retries and counts, and a STAGING miss is the same,
+                    // so neither warns once per retry.
+                    if (zone == host_zone_id::WEIGHT &&
+                        (!req.suppress_failure_log || req.intent.constraints.persistent_owner)) {
                         host_zone_no_growth_refusal_warn(miss, zone, req, alloc_size,
-                                                                         ucache->host_zone_reserved_capacity(zone),
-                                                                         ucache->host_zone_capacity(zone), ucache->host_zone_used(zone),
-                                                                         ucache->host_zone_largest_free_block(zone));
+                                                         ucache->host_zone_reserved_capacity(zone),
+                                                         ucache->host_zone_capacity(zone), ucache->host_zone_used(zone),
+                                                         ucache->host_zone_largest_free_block(zone));
                     }
                     return nullptr;
                 };
@@ -26987,6 +27194,21 @@ size_t unified_cache::host_zone_reserved_capacity(host_zone_id zone) const {
     return host_zone_reserved_bytes_[zi];
 }
 
+size_t unified_cache::host_zone_no_growth_room(host_zone_id zone) const {
+    if (!host_arena_ || !host_arena_->zones_configured()) {
+        return 0;
+    }
+    // unified_alloc() refuses a no-growth request once the zone's use plus the request passes
+    // host_zone_no_growth_bound(), so the room is that bound less what the zone holds. A zone with no bound skips that
+    // check and serves the request from the chunks it has, never growing, so what it can hand out is its capacity
+    // less what it holds.
+    const size_t capacity = host_zone_capacity(zone);
+    const size_t bound    = host_zone_no_growth_bound(zone, host_zone_reserved_capacity(zone), capacity);
+    const size_t limit    = bound > 0 ? bound : capacity;
+    const size_t used     = host_zone_used(zone);
+    return limit > used ? limit - used : 0;
+}
+
 size_t unified_cache::host_zone_largest_free_block(host_zone_id zone) const {
     if (!host_arena_ || !host_arena_->zones_configured()) {
         return 0;
@@ -29295,6 +29517,14 @@ allocation_result unified_cache_zone_allocate_owner(
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = zone;
 
+    // Only a block of `zone` is accepted below, so a zone with no room is the answer: a raw block would be made, found
+    // not zone-managed and given back, after its gate walked the whole runtime registry for a figure nobody uses.
+    req.intent.constraints.forbid_vram_zone_spill = true;
+    // That answer is a zone out of room, not a plan that was wrong: every caller takes the refusal and goes on (a later
+    // boundary, its own second request, an eviction, or a load step that reports the failure itself), so it is counted
+    // as a cascade miss.
+    req.intent.constraints.cascade_step           = true;
+
     allocation_result result = unified_allocate_owner(req);
     if (!result) return result;
     const alloc_metadata exact = result.owner.metadata();
@@ -30186,6 +30416,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                     z.allocator = std::make_unique<tlsf_allocator>(z.size);
                 }
             }
+            arena_note_allocators_made();
 
             arena_publish_authorities();
             return true;
@@ -30394,6 +30625,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             z.allocator = std::make_unique<tlsf_allocator>(z.size);
         }
     }
+    arena_note_allocators_made();
 
     arena_publish_authorities();
     return true;
@@ -31019,6 +31251,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
                 }
                 arena_forget_allocation_locked(zone, ptr);
                 zone_used_free(*z.allocator, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
+                arena_note_room_grew(arena_allocator_group_index(zone));
                 if (profile_active) {
                     const size_t idx = static_cast<size_t>(zone);
                     t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31050,6 +31283,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         const auto   p          = reinterpret_cast<uintptr_t>(ptr);
         const size_t chunk_off  = static_cast<size_t>(p - chunk_base);
         zone_used_free(*target->allocator, chunk_off, arena_zones_[static_cast<int>(record_zone)].used);
+        arena_note_room_grew(arena_allocator_group_index(zone));
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31079,6 +31313,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         }
         arena_forget_allocation_locked(zone, ptr);
         zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
+        arena_note_room_grew(arena_allocator_group_index(zone));
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31103,6 +31338,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     }
     arena_forget_allocation_locked(zone, ptr);
     zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
+    arena_note_room_grew(arena_allocator_group_index(zone));
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
         t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31323,36 +31559,37 @@ void unified_cache::dump_live_zone_allocations(vram_zone_id zone, const char * w
     fflush(stderr);
 }
 
-size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
+template <typename F> bool unified_cache::arena_visit_zone_allocators(vram_zone_id zone, F && visit) const {
     const auto & z = arena_zones_[static_cast<int>(zone)];
-
     if (arena_chunks_.size() == 1 && zone == vram_zone_id::WEIGHT) {
-        const auto & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
-        if (kv.allocator) {
-            return kv.allocator->largest_free_block();
+        if (const tlsf_allocator * kv = arena_zones_[static_cast<int>(vram_zone_id::KV)].allocator.get()) {
+            visit(*kv);
         }
-        return 0;
+        return true;
     }
-
-    // N-chunk shared WEIGHT/KV: max across per-chunk allocators (a single alloc cannot
-    // span chunks, so the largest fittable size is the largest single chunk's
-    // largest free block).  KV includes its dedicated tail allocator too.
+    // N-chunk shared WEIGHT/KV: the per-chunk allocators, and KV's dedicated tail allocator too.
     if ((zone == vram_zone_id::WEIGHT || zone == vram_zone_id::KV) && !weight_chunk_allocators_.empty()) {
-        size_t best = 0;
         if (zone == vram_zone_id::KV && z.allocator) {
-            best = z.allocator->largest_free_block();
+            visit(*z.allocator);
         }
         for (const auto & wca : weight_chunk_allocators_) {
-            best = std::max(best, wca.allocator->largest_free_block());
+            visit(*wca.allocator);
         }
-        return best;
+        return true;
     }
-
     if (z.allocator) {
-        return z.allocator->largest_free_block();
+        visit(*z.allocator);
+        return true;
     }
+    return false;
+}
 
-    return zone_available(zone);
+size_t unified_cache::zone_largest_free(vram_zone_id zone) const {
+    // A single allocation cannot span chunks, so the largest fittable size is the largest of the allocators' own.
+    size_t     best   = 0;
+    const bool served = arena_visit_zone_allocators(
+        zone, [&best](const tlsf_allocator & allocator) { best = std::max(best, allocator.largest_free_block()); });
+    return served ? best : zone_available(zone);
 }
 
 bool unified_cache::zone_free_figures(vram_zone_id zone,
@@ -31369,6 +31606,37 @@ bool unified_cache::zone_free_figures(vram_zone_id zone,
     available    = zone_available(zone);
     largest_free = zone_largest_free(zone);
     return true;
+}
+
+bool unified_cache::zone_free_block_sizes(vram_zone_id zone, std::vector<size_t> & sizes) {
+    sizes.clear();
+    if (!arena_active()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(arena_allocator_group_mutex(zone));
+    // The allocators zone_largest_free reads the top of.
+    (void) arena_visit_zone_allocators(zone, [&sizes](const tlsf_allocator & allocator) {
+        for (const tlsf_allocator::extent & e : allocator.block_census()) {
+            if (e.free) {
+                sizes.push_back(e.size);
+            }
+        }
+    });
+    return true;
+}
+
+uint64_t unified_cache::zone_room_epoch(vram_zone_id zone) const noexcept {
+    return arena_allocator_groups_[arena_allocator_group_index(zone)].room_epoch.load(std::memory_order_acquire);
+}
+
+void unified_cache::arena_note_room_grew(size_t group) noexcept {
+    arena_allocator_groups_[group].room_epoch.fetch_add(1, std::memory_order_release);
+}
+
+void unified_cache::arena_note_allocators_made() noexcept {
+    for (size_t group = 0; group < ARENA_ALLOCATOR_GROUP_COUNT; ++group) {
+        arena_note_room_grew(group);
+    }
 }
 
 // The role half of a zone census tag. A role added to the enum after this list reads as its number, never as another
@@ -32087,6 +32355,7 @@ std::shared_ptr<arena_authority> unified_cache::arena_close_authority(vram_zone_
 }
 
 void unified_cache::arena_group_reset_allocators_locked(size_t group) noexcept {
+    arena_note_room_grew(group);  // every block the group's allocators held is room again
     if (group == arena_allocator_group_index(vram_zone_id::KV)) {
         // KV and WEIGHT share the KV allocator and every per-chunk allocator.
         vram_zone & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
@@ -32129,17 +32398,102 @@ int unified_cache::arena_find_chunk(const void * ptr) const {
     return -1;
 }
 
-int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag tag) {
+// The one resolution of GGML_SYCL_LEASE_HOLDERS. A function-local static runs once per process, on the first cache's
+// construction, and each cache keeps the answer in a const member, so no take or release reads the environment.
+bool chunk_lease_holders_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_SYCL_LEASE_HOLDERS");
+        const bool   on    = value != nullptr && std::strcmp(value, "1") == 0;
+        if (on) {
+            // backtrace() loads the unwinder on its first call. Make that call here, once, rather than in a take.
+            void * frame = nullptr;
+            (void) backtrace(&frame, 1);
+            GGML_LOG_WARN(
+                "[VRAM-ARENA] GGML_SYCL_LEASE_HOLDERS=1: every VRAM arena chunk lease's take walks its call stack, and "
+                "a held arena names the code that holds each lease; slower than a run without it\n");
+        } else if (value != nullptr && std::strcmp(value, "0") != 0) {
+            GGML_LOG_WARN("[VRAM-ARENA] GGML_SYCL_LEASE_HOLDERS=%s is neither 0 nor 1; treating it as unset\n", value);
+        }
+        return on;
+    }();
+    return enabled;
+}
+
+// The process's holder table. Constant-initialised and never destroyed early, so a report during teardown reads it.
+static chunk_lease_holder_table & chunk_lease_holder_table_get() {
+    static chunk_lease_holder_table table;
+    return table;
+}
+
+// The holder slot for a lease `tag` describes, from the stack of the take or move that is running (`origin` is the
+// take's slot for a move, 0 for a take). Called only with the knob on. A tag with no address (a caller that keeps no
+// tag) counts in CHUNK_LEASE_HOLDER_NO_ADDRESS without a walk.
+static uint16_t chunk_lease_holder_claim(const chunk_lease_tag & tag, uint16_t origin) {
+    if (tag.pc == nullptr) {
+        return CHUNK_LEASE_HOLDER_NO_ADDRESS;
+    }
+    // Deep enough to reach the take's frame under this helper, the acquire and a copy's bump, plus the holder's own
+    // frames above it.
+    void *    stack[CHUNK_LEASE_HOLDER_FRAMES + 16];
+    const int depth = backtrace(stack, static_cast<int>(sizeof(stack) / sizeof(stack[0])));
+    return chunk_lease_holder_table_get().claim(tag, stack, depth, origin);
+}
+
+// A frame as module+offset, the offset `addr2line -f -C -e <module>` takes. No symbol name: dladdr knows only exported
+// symbols, so for a static function it names the nearest export instead, and a mangled name does not fit a frame's
+// fixed width. A frame is a return address, so the call it names is the instruction before the offset.
+static void chunk_lease_holder_frame_name(const void * pc, char * out, size_t size) {
+    Dl_info info{};
+    if (dladdr(pc, &info) == 0 || info.dli_fname == nullptr) {
+        snprintf(out, size, "%p", pc);
+        return;
+    }
+    const char * slash  = std::strrchr(info.dli_fname, '/');
+    const char * module = slash != nullptr ? slash + 1 : info.dli_fname;
+    const char * base   = static_cast<const char *>(info.dli_fbase);
+    snprintf(out, size, "%s+0x%zx", module, static_cast<size_t>(static_cast<const char *>(pc) - base));
+}
+
+int unified_cache::arena_acquire_chunk_lease(const void * ptr) {
+    chunk_lease_tag tag;
+    return arena_acquire_chunk_lease(ptr, tag);
+}
+
+int unified_cache::arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag & tag) {
     const int idx = arena_find_chunk(ptr);
     if (idx < 0) {
         return -1;
     }
     arena_chunks_[idx].lease_count.fetch_add(1);
     arena_chunk_leases_of(tag).fetch_add(1, std::memory_order_relaxed);
+    // With the knob off this is one load of a const member. With it on the take walks its stack; the slot goes back
+    // into the caller's tag, which the handle keeps for the release.
+    if (chunk_lease_holders_enabled_) {
+        tag.holder = chunk_lease_holder_claim(tag, 0);
+        arena_chunk_lease_holder_of(tag).fetch_add(1, std::memory_order_relaxed);
+    }
     return idx;
 }
 
-void unified_cache::arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag) {
+void unified_cache::arena_move_chunk_lease_holder(chunk_lease_tag & tag) noexcept {
+    // Only a lease counted in a named slot moves: with the knob off the slot is always 0, and a lease in an unnamed
+    // slot (no address, table full) stays where it is counted.
+    if (!chunk_lease_holders_enabled_ || tag.holder < CHUNK_LEASE_HOLDER_FIRST) {
+        return;
+    }
+    // The table's mutex is a leaf lock; nothing here throws short of a failed lock, which ends the process as it would
+    // in any noexcept move.
+    const uint16_t moved = chunk_lease_holder_claim(tag, chunk_lease_holder_table_get().origin_of(tag.holder));
+    // A full table keeps the lease under its old holder rather than losing the name.
+    if (moved < CHUNK_LEASE_HOLDER_FIRST || moved == tag.holder) {
+        return;
+    }
+    arena_chunk_lease_holder_of(tag).fetch_sub(1, std::memory_order_relaxed);
+    tag.holder = moved;
+    arena_chunk_lease_holder_of(tag).fetch_add(1, std::memory_order_relaxed);
+}
+
+void unified_cache::arena_release_chunk_lease(int chunk_idx, const chunk_lease_tag & tag) {
     if (chunk_idx < 0 || chunk_idx >= static_cast<int>(arena_chunks_.size())) {
         return;
     }
@@ -32152,6 +32506,9 @@ void unified_cache::arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag
         return;
     }
     arena_chunk_leases_of(tag).fetch_sub(1, std::memory_order_relaxed);
+    if (chunk_lease_holders_enabled_) {
+        arena_chunk_lease_holder_of(tag).fetch_sub(1, std::memory_order_relaxed);
+    }
 }
 
 bool unified_cache::arena_chunk_has_leases(int chunk_idx) const {
@@ -32168,7 +32525,7 @@ uint32_t unified_cache::arena_chunk_lease_count(int chunk_idx) const {
     return arena_chunks_[chunk_idx].lease_count.load();
 }
 
-uint32_t unified_cache::arena_chunk_lease_count_at(chunk_lease_tag tag) const {
+uint32_t unified_cache::arena_chunk_lease_count_at(const chunk_lease_tag & tag) const {
     return arena_chunk_leases_of(tag).load(std::memory_order_relaxed);
 }
 
@@ -32356,15 +32713,79 @@ void unified_cache::arena_report_holders(int                  dev_id,
     // after the per-chunk total the caller read, so a lease taken or dropped in between can set the two sums one apart.
     // Then each zone with live bytes lists its live allocations, through this cache's own dump, which takes only the
     // runtime registry's lock; that lock ranks after every scratch lock a caller can hold here.
+    // These lines print at the caller's level, the level of the line that called this report, so a tool that shows
+    // only errors shows who holds the leases beside the error that says they are held.
     char           leases_by_site[512];
     const uint32_t site_leases = arena_chunk_lease_census(leases_by_site, sizeof(leases_by_site));
-    GGML_LOG_WARN("[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\n", dev_id,
-                  leases_by_site[0] != '\0' ? leases_by_site : " none", site_leases, holders.chunk_leases);
+    ggml_log_internal(level, "[VRAM-ARENA] chunk leases on device %d by site:%s (sum %u of %u)\n", dev_id,
+                      leases_by_site[0] != '\0' ? leases_by_site : " none", site_leases, holders.chunk_leases);
+    if (chunk_lease_holders_enabled_) {
+        arena_report_chunk_lease_holders(dev_id, level, holders.chunk_leases);
+    } else if (holders.chunk_leases != 0) {
+        ggml_log_internal(level,
+                          "[VRAM-ARENA] set GGML_SYCL_LEASE_HOLDERS=1 to name the code that took each of the %u chunk "
+                          "leases on device %d\n",
+                          holders.chunk_leases, dev_id);
+    }
     for (size_t z = 0; z < static_cast<size_t>(vram_zone_id::COUNT); ++z) {
         if (live_zone_used[z] != 0) {
             dump_live_zone_allocations(static_cast<vram_zone_id>(z), site);
         }
     }
+}
+
+void unified_cache::arena_report_chunk_lease_holders(int dev_id, ggml_log_level level, uint32_t chunk_leases) const {
+    // A holder's frames as module+offset, innermost first, joined into `out`.
+    auto frames_of = [](const chunk_lease_holder & holder, char * out, size_t size) {
+        size_t used = 0;
+        out[0]      = '\0';
+        for (int f = 0; f < holder.n_frames && used < size; ++f) {
+            char frame[96];
+            chunk_lease_holder_frame_name(holder.frames[f], frame, sizeof(frame));
+            const int n = snprintf(out + used, size - used, "%s%s", f == 0 ? "" : " < ", frame);
+            if (n > 0) {
+                used = std::min(size, used + static_cast<size_t>(n));
+            }
+        }
+    };
+    uint32_t sum = 0;
+    for (size_t slot = 0; slot < CHUNK_LEASE_HOLDER_SLOTS; ++slot) {
+        const uint32_t held = arena_chunk_leases_by_holder_[slot].load(std::memory_order_relaxed);
+        sum += held;
+        if (held == 0) {
+            continue;
+        }
+        chunk_lease_holder holder;
+        char               taken_at[CHUNK_LEASE_HOLDER_FRAMES * 96 * 2 + 32];
+        const char *       site = "unknown";
+        const char *       copy = "";
+        if (slot == CHUNK_LEASE_HOLDER_NO_ADDRESS) {
+            snprintf(taken_at, sizeof(taken_at), "a take that recorded no address");
+        } else if (slot == CHUNK_LEASE_HOLDER_FULL) {
+            snprintf(taken_at, sizeof(taken_at), "a take or move that found the holder table full (%zu slots)",
+                     CHUNK_LEASE_HOLDER_SLOTS);
+        } else if (!chunk_lease_holder_table_get().read(static_cast<uint16_t>(slot), holder)) {
+            snprintf(taken_at, sizeof(taken_at), "an unreadable holder slot %zu", slot);
+        } else {
+            site = chunk_lease_site_name(holder.site);
+            copy = holder.copy ? "(copy)" : "";
+            char last[CHUNK_LEASE_HOLDER_FRAMES * 96];
+            frames_of(holder, last, sizeof(last));
+            chunk_lease_holder origin;
+            if (holder.origin != 0 && chunk_lease_holder_table_get().read(holder.origin, origin)) {
+                // A moved lease: the code that keeps it now, then the take it came from.
+                char first[CHUNK_LEASE_HOLDER_FRAMES * 96];
+                frames_of(origin, first, sizeof(first));
+                snprintf(taken_at, sizeof(taken_at), "%s; moved there from a take at %s", last, first);
+            } else {
+                snprintf(taken_at, sizeof(taken_at), "%s", last);
+            }
+        }
+        ggml_log_internal(level, "[VRAM-ARENA] chunk lease holder on device %d: %u held, site %s%s, taken at %s\n",
+                          dev_id, held, site, copy, taken_at);
+    }
+    ggml_log_internal(level, "[VRAM-ARENA] chunk leases on device %d by holder: sum %u of %u\n", dev_id, sum,
+                      chunk_leases);
 }
 
 void unified_cache::compute_arena_bind() {
@@ -32920,16 +33341,14 @@ static void reorder_plan_entries_for_moe_materialization(placement_plan &       
     }
 
     for (const moe_triplet_group & group : moe_groups) {
+        // A group's indices are in plan order, and this runs after the last slot charge. Entries that share a role
+        // keep that order (a stable sort keyed on the role alone): the first entry of each role is the one the slot
+        // charge (placement_entries_charge_expert_slots) and the index's find_expert_entry both read, so the slot the
+        // load looks up is the slot the plan charged.
         std::vector<size_t> indices = group.indices;
-        std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
-            const placement_entry & ea     = plan.entries[a];
-            const placement_entry & eb     = plan.entries[b];
-            const int               role_a = moe_materialization_role_order(ea.expert_role);
-            const int               role_b = moe_materialization_role_order(eb.expert_role);
-            if (role_a != role_b) {
-                return role_a < role_b;
-            }
-            return static_cast<uint8_t>(ea.priority) < static_cast<uint8_t>(eb.priority);
+        std::stable_sort(indices.begin(), indices.end(), [&](size_t a, size_t b) {
+            return moe_materialization_role_order(plan.entries[a].expert_role) <
+                   moe_materialization_role_order(plan.entries[b].expert_role);
         });
 
         for (size_t idx : indices) {
@@ -33095,8 +33514,23 @@ static void log_moe_placement_diagnostics(const char * tag, const placement_plan
     }
 
     const auto summary = plan.summarize_expert_placements(observed_layers, n_experts);
-    GGML_LOG_INFO("[%s] expected=%zu planned=%zu unclassified=%zu duplicates=%zu missing=%zu\n", tag, summary.expected,
-                  summary.planned, summary.unclassified, summary.duplicates, summary.missing);
+    // A duplicated role reaches a default-verbosity log: the load stages a repeat as its member, so a repeat planned
+    // in another layout or on another device is charged what the load does not stage.
+    ggml_log_internal(summary.duplicates != 0 ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO,
+                      "[%s] expected=%zu planned=%zu unclassified=%zu duplicates=%zu missing=%zu\n", tag,
+                      summary.expected, summary.planned, summary.unclassified, summary.duplicates, summary.missing);
+    for (const placement_repeat_off_member & off : placement_entries_repeats_off_their_member(plan.entries)) {
+        char member_buf[32];
+        char repeat_buf[32];
+        GGML_LOG_WARN(
+            "[%s] layer %d expert %d %s: a repeated entry (%s on %s) differs from its member (%s on %s); the load "
+            "stages it as its member, so the repeat's charge does not follow the slot the load stages it at\n",
+            tag, off.repeat->layer_id, off.repeat->expert_id, expert_tensor_role_name(off.repeat->expert_role),
+            scratch_layout_name(off.repeat->layout),
+            placement_target_name(off.repeat->target_device, repeat_buf, sizeof(repeat_buf)),
+            scratch_layout_name(off.member->layout),
+            placement_target_name(off.member->target_device, member_buf, sizeof(member_buf)));
+    }
     GGML_LOG_INFO("[%s] roles: gate=%zu up=%zu down=%zu gate_up=%zu unknown=%zu\n", tag,
                   summary.role_counts[static_cast<size_t>(expert_tensor_role::GATE)],
                   summary.role_counts[static_cast<size_t>(expert_tensor_role::UP)],
@@ -33648,7 +34082,8 @@ static ggml_layout_mode planner_multi_device_moe_common_layout(const placement_t
 // What a routed expert in `layout` costs the WEIGHT zone when it is on a device: its staged bytes, rounded as the zone
 // rounds them. A host-placed expert carries the same charge, because a later move to a device charges what the entry
 // says. An AOS quantized expert is staged with its row-padding tail, which dst_size leaves out because loans and
-// refills size their copies from the entry.
+// refills size their copies from the entry. This is one member alone: once its triplet's three entries exist,
+// placement_entries_charge_expert_slots() charges each member of a triplet that has a slot the slot's bytes instead.
 static size_t planner_expert_vram_charge_bytes(ggml_type type, int64_t ncols, ggml_layout_mode layout, size_t bytes) {
     return placement_vram_charge_bytes(layout == GGML_LAYOUT_AOS ? aos_staged_weight_bytes(type, ncols, bytes) : bytes);
 }
@@ -34497,6 +34932,48 @@ static void add_multi_moe_decode_secondary_alternates(placement_plan &          
     }
 }
 
+// After a pass that re-laid out expert entries, charging each the size it now stages alone: charge every member of a
+// triplet with a slot the slot again, as the load stages it, give a triplet that lost its slot its members' own
+// charges back, and move the totals of the device each changed entry is on by its change
+// (placement_entries_recharge_expert_slots_on). An entry on a device `devices` does not name moves no total, as the
+// pass that changed it accounts only those devices. A device short of the difference is still charged it, since the
+// load stages the slot whatever the plan says, and the plan warns how far past its budget that put the devices.
+// Returns the bytes charged past every device's remaining room.
+static size_t planner_recharge_expert_slots(placement_plan &                               plan,
+                                            const std::vector<placement_recharge_device> & devices,
+                                            const char *                                   pass) {
+    const size_t over =
+        placement_entries_recharge_expert_slots_on(plan.entries, devices, plan.weight_vram_bytes, plan.vram_bytes);
+    if (over > 0) {
+        GGML_LOG_WARN("[PLACEMENT-MOE] %s: expert slots re-charged %.1f MB past the devices' remaining room\n", pass,
+                      over / (1024.0 * 1024.0));
+    }
+    return over;
+}
+
+// The one device a single-device pass accounts, for planner_recharge_expert_slots: `device_id` with its remaining room
+// and its per-device total, which a single-device plan does not keep (null).
+static std::vector<placement_recharge_device> planner_recharge_device(int      device_id,
+                                                                      size_t & remaining,
+                                                                      size_t * device_vram = nullptr) {
+    std::vector<placement_recharge_device> devices;
+    devices.push_back({ device_id, &remaining, device_vram });
+    return devices;
+}
+
+// The devices a multi-device pass accounts, for planner_recharge_expert_slots: device_budgets[d] with remaining[d] and
+// the plan's per-device total d.
+static std::vector<placement_recharge_device> planner_recharge_devices_of(placement_plan &                   plan,
+                                                                          const std::vector<device_budget> & budgets,
+                                                                          std::vector<size_t> & remaining) {
+    std::vector<placement_recharge_device> devices;
+    for (size_t d = 0; d < budgets.size() && d < remaining.size(); ++d) {
+        size_t * device_vram = d < plan.per_device_vram.size() ? &plan.per_device_vram[d] : nullptr;
+        devices.push_back({ budgets[d].device_id, &remaining[d], device_vram });
+    }
+    return devices;
+}
+
 static void apply_multi_moe_per_target_layouts(placement_plan &                   plan,
                                                std::vector<size_t> &              remaining,
                                                const std::vector<device_budget> & device_budgets,
@@ -34568,26 +35045,14 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
                 entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
             const size_t new_charge =
                 planner_expert_vram_charge_bytes(entry.type, entry.ne[0], target_layout, new_size);
-            if (new_charge > old_charge) {
-                const size_t extra = new_charge - old_charge;
-                if (remaining[dev_index] < extra) {
-                    skipped_capacity++;
-                    continue;
-                }
-                remaining[dev_index] -= extra;
-                plan.weight_vram_bytes += extra;
-                plan.vram_bytes += extra;
-                plan.per_device_vram[dev_index] += extra;
-                charged_delta += static_cast<int64_t>(extra);
-            } else if (old_charge > new_charge) {
-                const size_t freed = old_charge - new_charge;
-                remaining[dev_index] += freed;
-                plan.weight_vram_bytes = plan.weight_vram_bytes > freed ? plan.weight_vram_bytes - freed : 0;
-                plan.vram_bytes        = plan.vram_bytes > freed ? plan.vram_bytes - freed : 0;
-                plan.per_device_vram[dev_index] =
-                    plan.per_device_vram[dev_index] > freed ? plan.per_device_vram[dev_index] - freed : 0;
-                charged_delta -= static_cast<int64_t>(freed);
+            // A layout that needs more room than the device has left is skipped: the move would charge past it.
+            if (new_charge > old_charge && remaining[dev_index] < new_charge - old_charge) {
+                skipped_capacity++;
+                continue;
             }
+            (void) placement_charge_move(old_charge, new_charge, remaining[dev_index], plan.per_device_vram[dev_index],
+                                         plan.weight_vram_bytes, plan.vram_bytes);
+            charged_delta += static_cast<int64_t>(new_charge) - static_cast<int64_t>(old_charge);
             entry.vram_charge_size = new_charge;
             device_changed++;
         } else {
@@ -34626,6 +35091,12 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
                 break;
         }
     }
+
+    // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot. A member moved
+    // out of AOS can leave its triplet with no slot, and the re-charge then gives the slot back: each AOS member of
+    // that triplet goes back to its own staged size.
+    planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
+                                  "per-target layouts");
 
     GGML_LOG_INFO(
         "[PLACEMENT-MOE-MULTI] per-target layouts: device_changed=%zu host_changed=%zu xmx_tiled=%zu "
@@ -34692,24 +35163,17 @@ static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
             entry.vram_charge_size != 0 ? entry.vram_charge_size : placement_vram_charge_bytes(entry.dst_size);
         const size_t new_charge = planner_expert_vram_charge_bytes(entry.type, entry.ne[0], target_layout, new_size);
         if (new_charge > old_charge) {
+            // An upgrade that would leave the device less than the guard is skipped: the move would charge into it.
             const size_t extra = new_charge - old_charge;
             if (remaining <= k_layout_upgrade_guard || extra > remaining - k_layout_upgrade_guard) {
                 continue;
             }
-            remaining -= extra;
-            plan.weight_vram_bytes += extra;
-            plan.vram_bytes += extra;
-            plan.per_device_vram[device_index] += extra;
             charged_bytes += extra;
-        } else if (old_charge > new_charge) {
-            const size_t freed = old_charge - new_charge;
-            remaining += freed;
-            plan.weight_vram_bytes = plan.weight_vram_bytes > freed ? plan.weight_vram_bytes - freed : 0;
-            plan.vram_bytes        = plan.vram_bytes > freed ? plan.vram_bytes - freed : 0;
-            plan.per_device_vram[device_index] =
-                plan.per_device_vram[device_index] > freed ? plan.per_device_vram[device_index] - freed : 0;
-            released_bytes += freed;
+        } else {
+            released_bytes += old_charge - new_charge;
         }
+        (void) placement_charge_move(old_charge, new_charge, remaining, plan.per_device_vram[device_index],
+                                     plan.weight_vram_bytes, plan.vram_bytes);
 
         entry.layout           = target_layout;
         entry.dst_size         = new_size;
@@ -34721,6 +35185,12 @@ static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
             soa_entries++;
         }
     }
+    // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot. A member moved
+    // out of AOS can leave its triplet with no slot, and the re-charge then gives the slot back: each AOS member of
+    // that triplet goes back to its own staged size. Only this device's entries changed, so only its totals move.
+    planner_recharge_expert_slots(plan,
+                                  planner_recharge_device(device_id, remaining, &plan.per_device_vram[device_index]),
+                                  "primary executor layout upgrades");
 
     if (upgraded_entries > 0) {
         GGML_LOG_INFO(
@@ -38652,6 +39122,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             placement_host_backing_when_host(plan, kv_info, /*routed_expert=*/false, tensor.get_rows_only);
         plan.entries.push_back(std::move(entry));
     }
+    // Every member of a triplet takes its slot in the WEIGHT zone (expert-slot.hpp), so each is charged the slot's
+    // bytes before anything is packed against the zone.
+    placement_entries_charge_expert_slots(plan.entries);
 
     // Sort by (priority ASC, layer_id ASC, dst_size DESC).
     // This ensures highest-priority weights fill VRAM first, earlier layers
@@ -38892,6 +39365,9 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
         if (!planner_xmx_moe_forced()) {
             prepare_single_moe_pp_gate_up_primary_layouts_for_pack(plan, device_id, kv_info, envelope);
         }
+        // A gate or up moved to SOA above leaves its triplet without a slot, and its AOS members keep the slot's charge
+        // until charged again. No expert is placed yet, so no total moves; the pack reads these charges.
+        placement_entries_charge_expert_slots(plan.entries);
         auto   moe_groups             = build_moe_triplet_groups(plan, moe_indices, &hotness_source);
         size_t pp_alt_groups          = 0;
         size_t pp_alt_entries         = 0;
@@ -39009,6 +39485,10 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
                 }
             }
         }
+        // A host expert now stages as AOS, so its triplet may have a slot it lacked in another layout, and the charge a
+        // later move to the device reads is the slot's. The pack charged each device triplet as charged above, so a
+        // device entry's charge does not change here; were it to, its change moves the totals.
+        planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining), "triplet pack");
         room.expert_bytes  = stats.device_bytes;
         room.expert_groups = stats.device_groups;
 
@@ -39030,7 +39510,12 @@ placement_plan compute_placement_plan(const std::vector<placement_tensor_info> &
             maybe_upgrade_moe_down_layouts_to_i8(plan, remaining, device_id, n_experts);
             add_single_moe_pp_executable_alternates(plan, remaining, device_id, kv_info, envelope, nullptr);
         }
+        // An I8 member leaves AOS, so its triplet loses its slot and the AOS members give it back before the gate/up
+        // upgrade reads the room. A single-device plan keeps no per-device total.
+        planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining), "I8 down layout upgrades");
         maybe_upgrade_moe_gate_up_layouts_to_i8(plan, remaining, device_id, n_experts);
+        planner_recharge_expert_slots(plan, planner_recharge_device(device_id, remaining),
+                                      "I8 gate/up layout upgrades");
         log_moe_triplet_pack_stats("PLACEMENT-MOE", stats, remaining);
         record_moe_block_device_slots(plan, moe_groups);
         log_moe_spread_placement("PLACEMENT-MOE", plan, kv_info, stats.hotness, "every routed expert fits");
@@ -40227,6 +40712,9 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
 
         plan.entries.push_back(std::move(entry));
     }
+    // Every member of a triplet takes its slot in a WEIGHT zone (expert-slot.hpp), so each is charged the slot's bytes
+    // before anything is packed against a device.
+    placement_entries_charge_expert_slots(plan.entries);
 
     // Step 3: Sort by (priority ASC, layer_id ASC, dst_size DESC, expert_id ASC).
     std::sort(plan.entries.begin(), plan.entries.end(), [](const placement_entry & a, const placement_entry & b) {
@@ -40626,6 +41114,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
             if (!plan.per_device_vram.empty()) {
                 plan.per_device_vram[0] += primary_down_charged;
             }
+            planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
+                                          "I8 down layout upgrades");
         }
         if (device_budgets.size() > 1) {
             std::vector<double> moe_device_scores(device_budgets.size(), 1.0);
@@ -41095,6 +41585,8 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
                     add_multi_moe_pp_executable_alternates(plan, remaining, device_budgets, kv_info, envelope);
                 }
                 plan.per_device_vram[0] += primary_down_charged;
+                planner_recharge_expert_slots(plan, planner_recharge_devices_of(plan, device_budgets, remaining),
+                                              "I8 down layout upgrades");
                 GGML_LOG_INFO(
                     "[PLACEMENT-MOE-MULTI] secondary executor layout is selected per planned route; current secondary "
                     "capability remains SOA until grouped secondary XMX dispatch is implemented\n");

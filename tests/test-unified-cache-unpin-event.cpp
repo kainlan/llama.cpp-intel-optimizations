@@ -264,7 +264,8 @@ static bool check_event_source_policy() {
 // `unified_cache::event_complete()` is a bare
 // `event::get_info<sycl::info::event::command_execution_status>()`.  On a queue
 // created with `sycl::property::queue::enable_profiling` -- which is every backend
-// stream, see `default_queue_properties()` in common.hpp -- that query does not poll:
+// stream when the queues carry profiling (GGML_SYCL_QUEUE_PROFILING=1 or a requested
+// profiling diagnostic), see `default_queue_properties()` in common.hpp -- that query does not poll:
 // it BLOCKS until the command finishes and then answers `complete`.  Measured on the
 // Arc Pro B50 with an 825 ms kernel, four queue configurations:
 //
