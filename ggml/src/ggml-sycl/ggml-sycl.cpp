@@ -29134,10 +29134,10 @@ std::string test_expert_loan_rollback_hands_the_id_back_to_the_device_entry() {
 std::string test_expert_moves_leave_the_eviction_latch_clear() {
     // The cache's eviction latch turns off graph replay and persistent TG until the next model load. An expert move's
     // retires stay out of it, since the move's publication bumps the exec-graph epoch, so a named evict and the reap of
-    // its device entries leave it clear, and so do an admit and the reap of its host copies. The control: another
-    // retire of an expert's device entry, here a drop of expert 1's entries outside any move, latches on its reap, so
-    // the exemption is the move's mark, not the entry's kind. The case reads this device's cache, which no other case
-    // shares the latch of while it runs.
+    // its device entries leave it clear. An admit's host copies never latch, mark or none (the latch leaves a host-
+    // resident entry out), so the admit is not asserted here. The control: another retire of an expert's device entry,
+    // here a drop of expert 1's entries outside any move, latches on its reap, so the exemption is the move's mark, not
+    // the entry's kind. The case reads this device's cache, which no other case shares the latch of while it runs.
     test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637412ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
@@ -29169,18 +29169,6 @@ std::string test_expert_moves_leave_the_eviction_latch_clear() {
     }
     if (fx.cache->has_evictions()) {
         return "the reap of the evicted triplet's device entries set the eviction latch";
-    }
-
-    ::ggml_sycl_expert_move_result admitted;
-    code = test_named_move(fx, test_no_triplet, { 0, 0 }, admitted);
-    if (code != ::ggml_sycl_txn_result::ACCEPTED || admitted.n_admitted != 1) {
-        return "the admit answered " + test_admit_answer(code, admitted);
-    }
-    if (!fx.reclaim_until([&] { return test_evict_host_entries(fx, 0, 0) == 0; })) {
-        return test_loan_fail("2 s after the admit %d of its host copies remain", test_evict_host_entries(fx, 0, 0));
-    }
-    if (fx.cache->has_evictions()) {
-        return "the admit or the reap of its host copies set the eviction latch";
     }
 
     // The control: expert 1's device entries dropped outside any move, each extra's record of them first, so the

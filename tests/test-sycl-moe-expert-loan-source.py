@@ -916,8 +916,7 @@ SWAP_MIRROR = "std::swap(direct_expert_entries_.find(key)->second, device_mirror
 REMAP_ID = "id_to_key_.find(key)->second = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);"
 HOST_RETIRE = ("if (host != entries_.end() && !host->second.retired && "
                "host->second.direct_alloc_owner.owner_control_id() == src_control[i]) "
-               "{ host->second.retired_by_expert_move = true; "
-               "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
+               "{ (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
 PUBLICATION_FAILED = 'refusal = "publication failed";'
 WITHDRAW_INSERTED = "for (int i = 0; i < inserted; ++i) { (void) transition_to_retired_locked("
 REFILL_CATCH = "} catch (const ggml_sycl_fallback_error &) { throw; } catch (...) { " + WITHDRAW_INSERTED
@@ -3762,9 +3761,10 @@ def test_mutant_seeded_row_leaves_the_index_behind_fails():
 # has_evictions_ turns off graph replay and persistent TG for the whole process until the next model load, so a decode
 # run that evicted once ran every later graph by direct dispatch. An expert move's retires do not need it: its
 # publication bumps the exec-graph epoch, which drops every exec graph that may bake a moved copy's pointer, and
-# persistent TG never takes a graph with a MUL_MAT_ID. So (b) the cache marks the retires the move makes, the loan's
-# device entries and the copy to the device's host copies, finalize leaves only marked entries out of the latch, and a
-# restore clears the mark; any other retire of the same entry still latches. And (c) the exemption holds only once the
+# persistent TG never takes a graph with a MUL_MAT_ID. So (b) the cache marks the retires the move makes that the latch
+# would otherwise count, the loan's device entries (a host copy is host-resident, which the latch never counts, so the
+# copy to the device marks nothing), finalize leaves only marked entries out of the latch, and a restore clears the
+# mark; any other retire of the same entry still latches. And (c) the exemption holds only once the
 # epoch has moved: the transaction arms a guard before each cache move, disarms it again for a move the cache refused
 # whole, and dismisses it only after the epoch bump in the won swap; on every other exit (a lost swap, a throw) its
 # destructor sets the latch through the cache's one public setter.
@@ -3773,9 +3773,8 @@ FINALIZE_SIG = "size_t unified_cache::finalize_retired_entries_locked() {"
 FINALIZE_LATCH = re.compile(r"if \(([^{]*)\) \{ has_evictions_\.store\(true")
 MOVE_MARK_FIELD = "!entry.retired_by_expert_move"
 LOAN_MARK = "device_entry[i]->retired_by_expert_move = true;"
-ADMIT_MARK = "host->second.retired_by_expert_move = true;"
-ADMIT_RETIRE = "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);"
 RESTORE_CLEAR = "it->second.retired_by_expert_move = false;"
+HOST_RETIRE_CALL = "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);"
 LATCH_SETTER = "void latch_evictions() noexcept { has_evictions_.store(true, std::memory_order_release); }"
 GUARD_DTOR = "~ggml_sycl_expert_move_latch_guard() { if (armed && cache) { cache->latch_evictions(); } }"
 GUARD_DECL = "ggml_sycl_expert_move_latch_guard latch{ cache };"
@@ -3791,9 +3790,9 @@ def claim_a_move_marks_its_retires_and_only_they_skip_the_latch(cache: str, hpp:
     loan = body(c, LOAN_SIG)
     copy = body(c, REFILL_BODY_SIG)
     return (latch is not None and MOVE_MARK_FIELD in latch.group(1) and "!entry.optional_layout" in latch.group(1)
-            and c.count("retired_by_expert_move = true;") == 2
+            and c.count("retired_by_expert_move = true;") == 1
             and loan.count(LOAN_MARK) == 1 and ordered(loan, LOAN_MARK, DEVICE_RETIRE)
-            and copy.count(ADMIT_MARK) == 1 and ordered(copy, ADMIT_MARK, ADMIT_RETIRE)
+            and "retired_by_expert_move" not in copy
             and body(c, RESTORE_SIG).count(RESTORE_CLEAR) == 1
             and "bool retired_by_expert_move = false;" in norm(hpp))
 
@@ -3812,6 +3811,13 @@ def test_mutant_finalize_latches_a_moves_retire_fails():
 def test_mutant_loan_retire_left_unmarked_fails():
     assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(_once_in(CACHE, LOAN_SIG, LOAN_MARK, ""),
                                                                            CACHE_HPP)
+
+
+def test_mutant_admit_marks_its_host_retire_fails():
+    """A host copy is host-resident, so the latch never counted it: the mark there is dead code that reads as a rule."""
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(
+        _once_in(CACHE, REFILL_BODY_SIG, HOST_RETIRE_CALL, "host->second.retired_by_expert_move = true; " + HOST_RETIRE_CALL),
+        CACHE_HPP)
 
 
 def test_mutant_restore_keeps_the_mark_fails():

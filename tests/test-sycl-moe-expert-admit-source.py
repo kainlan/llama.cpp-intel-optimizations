@@ -76,6 +76,9 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
   E5  each moved outcome records the device storage it took or gives back; the body sums the bytes once per
       direction, as each triplet moves, writes them once the plan is published and names both directions in its
       result line, and the entry takes those sums, counts each outcome in its direction and returns it in its own list;
+  M2  an admit's retires of its host copies carry no latch mark: the cache's eviction latch already leaves a
+      host-resident entry out, so retired_by_expert_move is set only on the device entries an evict retires, and the
+      copy to the device never names it;
   M1  a named move's one result line is a DEBUG line with no timings; what the move cost the boundary thread is the
       answer's instead, written on every exit, a throw included, by the guard that also writes the room figure: the
       microseconds the cache spent in each move's copy step and in its id handover and retire, the transaction in the
@@ -673,6 +676,11 @@ def check(raw: dict[str, str]) -> None:
         fail("E5", "the entry does not take the body's bytes, or does not count each outcome in its direction and "
                    "return it in its own list")
 
+    # M2 ---------------------------------------------------------------------------------------------------------------
+    if "retired_by_expert_move" in copy:
+        fail("M2", "the copy to the device marks a host copy's retire as an expert move's, which the eviction latch "
+                   "never reads for a host-resident entry")
+
     # M1 ---------------------------------------------------------------------------------------------------------------
     if (txn.count(NAMED_LINE) != 1 or txn.count(SUM_META) != 1 or txn.count(SUM_CACHE) != 1
             or not ordered(txn, "stop = ggml_sycl_expert_prepare_triplet(", SUM_META, "std::unique_lock lock(")
@@ -738,6 +746,10 @@ def self_test(raw: dict[str, str]) -> int:
         failures.append(name)
         print(f"  self-test: {name}: SURVIVED (pin {pin} did not catch it)")
 
+    expect_fail("admit-marks-the-host-copy", "M2",
+                [("cache", COPY_SIG, "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);",
+                  "host->second.retired_by_expert_move = true;\n"
+                  "                        (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);")])
     expect_fail("named-line-warns", "M1", [("sycl", TXN_SIG, 'GGML_LOG_DEBUG("[MOE-EXEC] named move',
                                             'GGML_LOG_WARN("[MOE-EXEC] named move')])
     expect_fail("named-line-carries-timings", "E5", [("sycl", TXN_SIG, "taken / (1024 * 1024), reason);",

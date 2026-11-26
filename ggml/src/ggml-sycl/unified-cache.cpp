@@ -12137,8 +12137,7 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                     const auto              host = entries_.find(host_key);
                     if (host != entries_.end() && !host->second.retired &&
                         host->second.direct_alloc_owner.owner_control_id() == src_control[i]) {
-                        // As the loan marks its device entries: the move's publication covers this retire.
-                        host->second.retired_by_expert_move = true;
+                        // No latch mark: the latch leaves a host-resident entry out whatever its mark.
                         (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);
                     }
                 }
