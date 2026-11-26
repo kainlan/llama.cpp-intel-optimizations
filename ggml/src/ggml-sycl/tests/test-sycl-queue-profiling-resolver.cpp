@@ -94,8 +94,9 @@ struct resolver_arm {
     // a part of each WARN the resolution prints, in order
     std::vector<const char *> want_warns;
     // After the resolution the arm asks the refusing reader's WARN twice for one diagnostic and once for another: one
-    // line per diagnostic, and the text names this cause. Null: the arm does not ask.
-    const char *              want_unavailable;
+    // line per diagnostic, and each line holds every one of these parts (the cause, and the way out). Empty: the arm
+    // does not ask.
+    std::vector<const char *> want_unavailable;
 };
 
 // Runs one arm in the current process, which is a fresh child. Returns the number of failed checks.
@@ -133,7 +134,7 @@ int run_resolver_arm(const resolver_arm & arm) {
     CHECK(g_warns.size() == arm.want_warns.size(), "%s: %zu WARN lines after setenv, want %zu", arm.name,
           g_warns.size(), arm.want_warns.size());
 
-    if (arm.want_unavailable != nullptr) {
+    if (!arm.want_unavailable.empty()) {
         const size_t before = g_warns.size();
         ggml_sycl_queue_profiling_warn_unavailable("GGML_SYCL_KERNEL_PROFILE");
         ggml_sycl_queue_profiling_warn_unavailable("GGML_SYCL_KERNEL_PROFILE");
@@ -141,8 +142,10 @@ int run_resolver_arm(const resolver_arm & arm) {
         CHECK(g_warns.size() == before + 2, "%s: %zu refusal WARN lines, want one per diagnostic (2)", arm.name,
               g_warns.size() - before);
         for (size_t i = before; i < g_warns.size(); ++i) {
-            CHECK(g_warns[i].find(arm.want_unavailable) != std::string::npos,
-                  "%s: refusal WARN `%s` does not hold `%s`", arm.name, g_warns[i].c_str(), arm.want_unavailable);
+            for (const char * part : arm.want_unavailable) {
+                CHECK(g_warns[i].find(part) != std::string::npos, "%s: refusal WARN `%s` does not hold `%s`", arm.name,
+                      g_warns[i].c_str(), part);
+            }
         }
         if (g_warns.size() >= before + 2) {
             CHECK(g_warns[before].find("GGML_SYCL_KERNEL_PROFILE ") == 7 &&
@@ -154,43 +157,49 @@ int run_resolver_arm(const resolver_arm & arm) {
 }
 
 // Forks one child per arm, so each resolves the knob fresh in its own process. The parent never asks the memoised
-// wrapper.
-void check_resolver_arms() {
+// wrapper. Returns true: the arms ran.
+bool check_resolver_arms() {
     const char * const bad_value_warn = "GGML_SYCL_QUEUE_PROFILING=yes is neither 0 nor 1; treating it as unset";
     const char * const kernel_warn = "GGML_SYCL_KERNEL_PROFILE is set, so the backend's queues carry event profiling";
     const char * const mxfp4_warn  = "GGML_SYCL_MXFP4_TG_PROFILE is set, so the backend's queues carry event profiling";
 
     std::vector<resolver_arm> arms;
-    // a diagnostic set after the answer was fixed is refused, and no variable names that cause for a test hook
-    arms.push_back({ "default off", {}, false, reason::DEFAULT_OFF, {}, "resolved off before" });
+    // Default off, then a diagnostic asked for afterwards: it gets the late refusal WARN (the knob did not resolve off
+    // by its own value), not the knob-0 one.
+    arms.push_back({
+        "default off", {},
+         false, reason::DEFAULT_OFF, {},
+         { "resolved off before", "GGML_SYCL_QUEUE_PROFILING=1" }
+    });
     arms.push_back({ "diagnostic turns it on",
                      { { "GGML_SYCL_KERNEL_PROFILE", "1" } },
                      true,
                      reason::DIAGNOSTIC,
                      { kernel_warn },
-                     nullptr });
-    arms.push_back({ "knob 1", { { KNOB, "1" } }, true, reason::KNOB_ON, {}, nullptr });
+                     {} });
+    // a requested diagnostic under knob 1 is not what turned profiling on: no "turned on" WARN
+    arms.push_back({
+        "knob 1", { { KNOB, "1" }, { "GGML_SYCL_KERNEL_PROFILE", "1" } },
+         true, reason::KNOB_ON, {},
+         {}
+    });
     arms.push_back({
         "knob 0 refuses a requested diagnostic",
         { { KNOB, "0" }, { "GGML_SYCL_KERNEL_PROFILE", "1" } },
         false,
         reason::KNOB_OFF,
         {},
-        "GGML_SYCL_QUEUE_PROFILING=0"
+        { "GGML_SYCL_QUEUE_PROFILING=0", "GGML_SYCL_QUEUE_PROFILING=1" }
     });
-    arms.push_back({ "bad value, nothing requested",
-                     { { KNOB, "yes" } },
-                     false,
-                     reason::BAD_VALUE_OFF,
-                     { bad_value_warn },
-                     nullptr });
+    arms.push_back(
+        { "bad value, nothing requested", { { KNOB, "yes" } }, false, reason::BAD_VALUE_OFF, { bad_value_warn }, {} });
     arms.push_back({
         "bad value, diagnostic requested",
         { { KNOB, "yes" }, { "GGML_SYCL_MXFP4_TG_PROFILE", "1" } },
         true,
         reason::BAD_VALUE_DIAGNOSTIC,
-        { bad_value_warn,  mxfp4_warn                            },
-        nullptr
+        { bad_value_warn, mxfp4_warn },
+        {}
     });
     for (const resolver_arm & arm : arms) {
         std::fflush(stdout);
@@ -210,12 +219,14 @@ void check_resolver_arms() {
         CHECK(waitpid(pid, &status, 0) == pid, "%s: waitpid failed", arm.name);
         CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "%s: the child failed (status %d)", arm.name, status);
     }
+    return true;
 }
 
 #else
 
-void check_resolver_arms() {
-    std::printf("SKIP the forked resolver arms: no fork on this platform\n");
+// No fork on this platform: the arms cannot run, and main reports the run as skipped, not passed.
+bool check_resolver_arms() {
+    return false;
 }
 
 #endif
@@ -307,12 +318,16 @@ int main() {
           "an unset variable is the default of its parse");
 
     // the memoised wrapper, one forked child per state
-    check_resolver_arms();
+    const bool arms_ran = check_resolver_arms();
 
-    if (g_failures == 0) {
-        std::printf("PASS test-sycl-queue-profiling-resolver\n");
-        return 0;
+    if (g_failures != 0) {
+        std::fprintf(stderr, "%d failure(s)\n", g_failures);
+        return 1;
     }
-    std::fprintf(stderr, "%d failure(s)\n", g_failures);
-    return 1;
+    if (!arms_ran) {
+        std::printf("SKIP test-sycl-queue-profiling-resolver: the forked arms need fork(); the pure checks passed\n");
+        return 77;  // ctest's SKIP_RETURN_CODE: a skip that shows as a skip
+    }
+    std::printf("PASS test-sycl-queue-profiling-resolver\n");
+    return 0;
 }

@@ -9823,13 +9823,15 @@ else()
         LABELS "sycl;expert-predict;41bs;hostonly;not-built")
 endif()
 
-# The queue-profiling resolver's pure parts: ggml_sycl_queue_profiling_decide() and
-# ggml_sycl_queue_profiling_requested_diagnostic() (common.cpp), plus the parse helpers of queue-profiling.hpp. The test
-# calls them with plain values and an injected getenv: it opens no SYCL device, loads no model and allocates nothing, so
-# it carries the `hostonly` label and none of `model`, `cache` or `mem-handle`, and the sweep may run it. It needs the
-# ordinary libggml-sycl for the two out-of-line functions, hence the same `NOT GGML_BACKEND_DL` guard and disabled
-# placeholder as sycl-expert-predictor-guard above. No ONEAPI_DEVICE_SELECTOR pin and no SKIP_RETURN_CODE: there is no
-# "no device" case.
+# The queue-profiling resolver (common.cpp, queue-profiling.hpp). Its pure parts, ggml_sycl_queue_profiling_decide() and
+# ggml_sycl_queue_profiling_requested_diagnostic(), run with plain values and an injected getenv. Its memoised wrapper,
+# ggml_sycl_queue_profiling_enabled() with its WARN lines, runs once per state in a forked child, each of which sets its
+# environment, captures the log and asks twice. No SYCL device is opened, no model is loaded and nothing is allocated,
+# so the test carries the `hostonly` label and none of `model`, `cache` or `mem-handle`, and the sweep may run it. It
+# needs the ordinary libggml-sycl for the out-of-line functions, hence the same `NOT GGML_BACKEND_DL` guard and disabled
+# placeholder as sycl-expert-predictor-guard above. There is no ONEAPI_DEVICE_SELECTOR pin, because there is no device.
+# SKIP_RETURN_CODE 77 is for a platform without fork(), where the forked arms cannot run: the test then exits 77 and
+# ctest reports a skip, not a pass.
 if (NOT GGML_BACKEND_DL)
     add_executable(test-sycl-queue-profiling-resolver
         tests/test-sycl-queue-profiling-resolver.cpp
@@ -9852,6 +9854,7 @@ if (NOT GGML_BACKEND_DL)
     set_tests_properties(sycl-queue-profiling-resolver PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
         LABELS "sycl;queue-profiling;hostonly"
+        SKIP_RETURN_CODE 77
         TIMEOUT 30
     )
 else()

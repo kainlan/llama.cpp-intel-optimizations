@@ -187,7 +187,8 @@ def check_predicate(src: dict[str, str]) -> list[str]:
     if not re.search(r"#[ \t]*include\s+\"\.\./queue-profiling\.hpp\"", mask_comments(helper)):
         bad.append(f"{HELPER} does not include queue-profiling.hpp, so common.hpp and the dpct queues cannot share one "
                    "predicate")
-    # the reader's guard asks the predicate and warns once; the warning is a WARN that names the knob
+    # the reader's guard asks the predicate and warns; the C++ arms of test-sycl-queue-profiling-resolver pin that the
+    # warning is a WARN, how often it prints and what it says
     body = body_of(code, r"inline\s+bool\s+%s\s*\([^)]*\)" % READABLE)
     if body is None:
         bad.append(f"{PREDICATE_HEADER} defines no `inline bool {READABLE}(...)` for the readers")
