@@ -18,7 +18,10 @@
 //      sycl::reduce_over_group(sg, _, maximum/plus<float>{}).
 //      No SLM batch_max_shared, no SLM sum_shared.
 //   3. One group_barrier per SLM phase transition. No barrier on aliased regions
-//      (there are none).
+//      (there are none). Its scope is the set of sub-groups that consume what
+//      it guards: the work-group where other sub-groups read the region, the
+//      sub-group where only the producing sub-group does (the f32_sv leaf's
+//      tile_S rows, before its S@V).
 //   4. Zero overlap between producer/consumer SLM regions.
 //   5. No lane-order-dependent computation beyond XMX/sub-group guarantees.
 //      QK extracted via joint_matrix_apply (canary-5 pattern), NOT via
@@ -969,7 +972,22 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
             // Online softmax may rescale VKQ when a later KV tile raises the
             // row max, so the current tile's probabilities must be consumed
             // before the next tile can update KQ_max.
-            sycl::group_barrier(item.get_group());  // Rule 3
+            //
+            // The barrier makes this sub-group's Phase 4 stores to tile_S
+            // visible to its own S@V below. In the f32_sv leaf a sub-group
+            // barrier does that: between the K/V copy barrier and the barrier
+            // at the end of the batch, the only SLM a sub-group writes is its
+            // own TM rows of tile_S (sg_q_base .. sg_q_base + TM - 1, in this
+            // kv_tile's columns), the only tile_S it reads is those rows, and
+            // tile_Q, tile_K and tile_V are only read. The other leaves keep
+            // the work-group barrier: nobody has measured them with a
+            // sub-group one, and the TM=16 leaf is a hang reproducer whose
+            // code should not move.
+            if constexpr (f32_sv) {
+                sycl::group_barrier(sg);                // Rule 3, sub-group scope
+            } else {
+                sycl::group_barrier(item.get_group());  // Rule 3
+            }
 
             if constexpr (f32_sv) {
                 // The (TM x TK) half P tile times the (TK x TN) V tile, into a
@@ -1080,6 +1098,8 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
             }
         }  // end kv_tile loop
 
+        // A work-group barrier on every leaf: the next batch's Phase 1
+        // overwrites tile_K and tile_V, which every sub-group has just read.
         sycl::group_barrier(item.get_group());  // Rule 3
 
     }  // end kv_start loop

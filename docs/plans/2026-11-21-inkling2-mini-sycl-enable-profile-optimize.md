@@ -6924,6 +6924,13 @@ hang it reproduces. Derived, not measured: 26 KB of SLM per work-group at D=128,
 float one gives the same), only at D=64. Each K/V batch now serves 32 query rows, which halves the kernel's global K/V
 reads and its copy messages per query row; the number of threads launched does not change.
 
+**S2b (2026-11-26).** In the f32_sv leaf the barrier between the softmax (P into tile_S) and S·V is a sub-group
+barrier. It is one statement in the kv_tile loop, run twice per 32-key batch (the "two barriers" of the ruling), and
+it guards only the sub-group's own tile_S rows: between the K/V copy barrier and the end-of-batch barrier a sub-group
+writes and reads only its own eight tile_S rows and only reads tile_Q, tile_K and tile_V. The copy barrier and the
+end-of-batch barrier (the next copy overwrites tile_K and tile_V) stay work-group barriers on every leaf, and the
+other leaves keep their in-loop work-group barrier. No name change and no new hang path, so no dispatch suffix.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
