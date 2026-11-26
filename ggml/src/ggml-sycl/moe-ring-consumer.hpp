@@ -248,19 +248,8 @@ inline int64_t moe_pp_ring_experts_worth(const moe_pp_ring_weight * weights, siz
 // open at a time: the lifecycle registry refuses a second begin while one is open (LOAD_BUSY, Registry::begin_outer),
 // so a second load is refused, never interleaved, and no mark of an open load is overwritten.
 struct moe_pp_ring_drop_marks {
-    uint64_t load_txn[GGML_SYCL_MAX_DEVICES] = {};
-
-    static bool device_in_range(int device) { return device >= 0 && device < GGML_SYCL_MAX_DEVICES; }
-
-    // Records that load `txn` dropped `device`'s ring. Nothing for txn 0 or a device out of range.
-    void mark(int device, uint64_t txn) {
-        if (txn != 0 && device_in_range(device)) {
-            load_txn[device] = txn;
-        }
-    }
-
     // Records what a pass of load `txn` decided on `device`'s ring: a drop marks the device, a keep marks nothing. The
-    // load stage calls it with every decision it makes.
+    // load stage calls it with every decision it makes; it is the only way to mark a device.
     void record(int device, uint64_t txn, moe_pp_ring_decision decision) {
         if (decision == moe_pp_ring_decision::DROP) {
             mark(device, txn);
@@ -270,6 +259,18 @@ struct moe_pp_ring_drop_marks {
     // Whether load `txn` dropped `device`'s ring at an earlier pass. Never for txn 0.
     bool dropped(int device, uint64_t txn) const {
         return txn != 0 && device_in_range(device) && load_txn[device] == txn;
+    }
+
+  private:
+    uint64_t load_txn[GGML_SYCL_MAX_DEVICES] = {};
+
+    static bool device_in_range(int device) { return device >= 0 && device < GGML_SYCL_MAX_DEVICES; }
+
+    // Records that load `txn` dropped `device`'s ring, for record() alone. Nothing for txn 0 or a device out of range.
+    void mark(int device, uint64_t txn) {
+        if (txn != 0 && device_in_range(device)) {
+            load_txn[device] = txn;
+        }
     }
 };
 
