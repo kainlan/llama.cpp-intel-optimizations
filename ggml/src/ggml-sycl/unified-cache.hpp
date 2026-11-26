@@ -5649,6 +5649,13 @@ class unified_cache {
                              size_t &     used,
                              size_t &     available,
                              size_t &     largest_free);
+    // A count that moves each time `zone` could have gained room: a block went back to an allocator it draws on, or
+    // those allocators were made or reset. It never moves for an allocation or a refusal, so a request the zone
+    // refused under one value is refused again while the value stands. It is kept per allocator group, the unit room
+    // is shared in (KV and WEIGHT are one group), and not per cache: RUNTIME and SCRATCH give blocks back at every
+    // graph, so a cache-wide count would move at every boundary and say nothing about WEIGHT. It starts at 0 with the
+    // cache. Takes no lock.
+    uint64_t         zone_room_epoch(vram_zone_id zone) const noexcept;
     void   dump_live_zone_allocations(vram_zone_id zone, const char * where, size_t max_entries = 32) const;
 
     const vram_zone & get_zone(vram_zone_id zone) const { return arena_zones_[static_cast<int>(zone)]; }
@@ -7078,6 +7085,8 @@ class unified_cache {
         uint64_t                                           lifecycle_epoch = 0;
         std::vector<std::shared_ptr<arena_authority>>       draining_authorities;
         std::unordered_map<void *, allocator_group_record> allocations;
+        // Counts the times this group's allocators gained room (zone_room_epoch). Atomic: it is read with no lock.
+        std::atomic<uint64_t>                               room_epoch{ 0 };
     };
     static constexpr size_t ARENA_ALLOCATOR_GROUP_COUNT = 4;
     std::array<allocator_group, ARENA_ALLOCATOR_GROUP_COUNT> arena_allocator_groups_{};
@@ -7088,6 +7097,13 @@ class unified_cache {
 
     std::mutex arena_destroy_mutex_;  // serializes retryable explicit destroy transactions
     static size_t arena_allocator_group_index(vram_zone_id zone) noexcept;
+
+    // Allocator group `group` gained room: a block went back to one of its allocators, or they were made or reset.
+    // The caller holds the group's mutex, or builds the arena before any other thread can allocate from it.
+    void arena_note_room_grew(size_t group) noexcept;
+    // arena_reserve() made every group's allocators.
+    void arena_note_allocators_made() noexcept;
+
     std::mutex & arena_allocator_group_mutex(vram_zone_id zone) noexcept;
     // Written by arena_destroy() under arena_destroy_mutex_ on each refusal and cleared when a teardown completes; read
     // without that lock.
@@ -10760,6 +10776,10 @@ bool unified_cache_test_arena_destroy_closing_reached();
 bool unified_cache_test_cache_exists(int device);
 // Sets the device total the raw-allocation gates read for `device`; 0 reads the driver's figure again.
 void unified_cache_test_set_raw_gate_device_total(int device, size_t bytes);
+
+// How often a raw-allocation gate read its figure for `device`, which walks the runtime registry each time; 0 for a
+// device out of range.
+uint64_t unified_cache_test_raw_gate_reads(int device);
 // Called from cache destruction once arena_destroy() has returned, with the
 // members the cache still holds then. Pass nullptr to remove it.
 using unified_cache_test_destroy_observer = void (*)(int device, ggml_sycl_arena_backing_type backing,

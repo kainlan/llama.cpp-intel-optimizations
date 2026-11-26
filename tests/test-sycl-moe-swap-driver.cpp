@@ -74,16 +74,22 @@ static bool contains(const std::string & text, const char * part) {
 // answers the test scripts. A rule answers the moves it matches, first match first, `times` times (forever when < 0),
 // and may mark a final evict refusal as one that latches the block; a move no rule matches moves, 3 bytes. Each pair
 // costs 3 bytes of host room unless a test says otherwise. `throw_after` >= 0 makes the next transaction answer that
-// many moves, publish what they moved, and throw, as the named move does when a submit throws part way.
+// many moves, publish what they moved, and throw, as the named move does when a submit throws part way. `room_epoch`
+// is the device zone's room epoch every boundary is handed: a test moves it to say the zone could have gained room.
+// answer_zone_full() scripts the BUSY answer of an admit the zone had no room for, with the cause the move gives it.
+// Each transaction that returns moves the epoch by `txn_self_moves`, which it reports as its own give-backs, and by
+// `txn_outside_moves`, room from elsewhere while it ran, which it does not report and which is spent by one
+// transaction.
 struct rig {
     struct rule {
-        moe_swap_move_kind    kind;
-        int                   block;
-        int                   expert;
-        moe_swap_move_outcome outcome;
-        const char *          reason;
-        int                   times;
-        bool                  latch;
+        moe_swap_move_kind             kind;
+        int                            block;
+        int                            expert;
+        moe_swap_move_outcome          outcome;
+        const char *                   reason;
+        int                            times;
+        bool                           latch;
+        ggml_sycl::moe_swap_busy_cause cause;
     };
 
     int                                     nb;
@@ -94,12 +100,15 @@ struct rig {
     size_t                                  room = static_cast<size_t>(-1);
     std::vector<rule>                       rules;
     std::vector<std::vector<moe_swap_move>> calls;  // every batch the transaction got, with its answers
-    int                                     counts_reads     = 0;
-    int                                     room_reads       = 0;
-    int                                     throw_after      = -1;
-    int                                     throws           = 0;
-    const uint64_t *                        counts_decode_at = nullptr;  // the arrays the counts callback was handed
-    const uint64_t *                        counts_prompt_at = nullptr;
+    int                                     counts_reads      = 0;
+    int                                     room_reads        = 0;
+    int                                     throw_after       = -1;
+    int                                     throws            = 0;
+    uint64_t                                room_epoch        = 0;
+    uint64_t                                txn_self_moves    = 0;
+    uint64_t                                txn_outside_moves = 0;
+    const uint64_t *                        counts_decode_at  = nullptr;  // the arrays the counts callback was handed
+    const uint64_t *                        counts_prompt_at  = nullptr;
     moe_swap_driver_state                   d;
 
     rig(int n_blocks, int n_experts, int resident_per_block, const moe_swap_params & p = moe_swap_params{}) :
@@ -144,7 +153,13 @@ struct rig {
                 const char *          reason,
                 int                   times = -1,
                 bool                  latch = false) {
-        rules.push_back({ kind, block, expert, outcome, reason, times, latch });
+        rules.push_back(
+            { kind, block, expert, outcome, reason, times, latch, ggml_sycl::MOE_SWAP_BUSY_CAUSE_TRANSIENT });
+    }
+
+    void answer_zone_full(int block, int expert, int times = -1) {
+        rules.push_back({ MOE_SWAP_MOVE_ADMIT, block, expert, MOE_SWAP_MOVE_BUSY, "WEIGHT zone full", times, false,
+                          ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM });
     }
 
     void reply(moe_swap_move & m) {
@@ -159,6 +174,7 @@ struct rig {
             m.reason        = r.reason;
             m.bytes         = 0;
             m.latches_block = r.latch;
+            m.busy_cause    = r.cause;
             return;
         }
         m.outcome = MOE_SWAP_MOVE_MOVED;
@@ -191,6 +207,7 @@ struct rig {
         c.loans_outstanding = loans;
         c.cache_settled     = settled;
         c.prompt_gate       = gate;
+        c.room_epoch        = room_epoch;
 
         const size_t           before = calls.size();
         moe_swap_driver_status st     = MOE_SWAP_DRIVER_SENT;
@@ -219,6 +236,9 @@ struct rig {
                         throw_after = -1;
                         throw std::runtime_error("submit failed");
                     }
+                    room_epoch += txn_self_moves + txn_outside_moves;
+                    txn_outside_moves = 0;
+                    return ggml_sycl::moe_swap_txn_room{ room_epoch, txn_self_moves };
                 });
         } catch (const std::runtime_error &) {
             ++throws;  // the step rethrew; what the moves answered before it is published below, as the move does
@@ -245,6 +265,17 @@ struct rig {
         for (const std::vector<moe_swap_move> & batch : calls) {
             for (const moe_swap_move & m : batch) {
                 n += m.kind == kind ? 1 : 0;
+            }
+        }
+        return n;
+    }
+
+    // How many times a move of `kind` for this triplet was sent, over every batch.
+    size_t count_of(moe_swap_move_kind kind, int block, int expert) const {
+        size_t n = 0;
+        for (const std::vector<moe_swap_move> & batch : calls) {
+            for (const moe_swap_move & m : batch) {
+                n += m.kind == kind && m.block == block && m.expert == expert ? 1 : 0;
             }
         }
         return n;
@@ -288,7 +319,7 @@ static void test_pending_admits_go_first_and_hold_the_policy_in_flight() {
     r.to_period();
     CHECK(r.count(MOE_SWAP_MOVE_EVICT) == 1);
 
-    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 5, MOE_SWAP_MOVE_BUSY, "WEIGHT zone full", 4);
+    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 5, MOE_SWAP_MOVE_BUSY, "graph active", 4);
     r.decode[r.index(0, 6)] = 50;  // a pair the policy would take, were it not in flight
     for (int i = 0; i < 4; ++i) {
         CHECK(r.boundary(1, false, 0.0, false, /*settled=*/false) == MOE_SWAP_DRIVER_SENT);
@@ -298,7 +329,7 @@ static void test_pending_admits_go_first_and_hold_the_policy_in_flight() {
     CHECK(r.d.policy.tokens == 8);
     CHECK(r.count(MOE_SWAP_MOVE_EVICT) == 1);     // the period boundary at token 8 moved nothing
     CHECK(r.d.policy.usage_of(0, 6) == 0.0);      // and absorbed nothing
-    CHECK(reasons(r.d.stats.busy, "WEIGHT zone full") == 4);
+    CHECK(reasons(r.d.stats.busy, "graph active") == 4);
     CHECK(r.d.pending.size() == 1);               // unsettled boundaries never drop a pending admit
 
     CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // token 9: the admit lands
@@ -416,8 +447,8 @@ static void test_a_finally_refused_admit_sends_a_restore() {
 static void test_a_dropped_restore_is_one_open_slot() {
     rig r(2, 8, 4);
     r.decode[r.index(0, 5)] = 10;
-    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 5, MOE_SWAP_MOVE_BUSY, "WEIGHT zone full");
-    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 0, MOE_SWAP_MOVE_BUSY, "WEIGHT zone full");
+    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 5, MOE_SWAP_MOVE_BUSY, "graph active");
+    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 0, MOE_SWAP_MOVE_BUSY, "graph active");
     r.to_period();     // token 4: evicts 0
     for (int i = 0; i < ggml_sycl::MOE_SWAP_PENDING_DROP_STREAK; ++i) {
         r.boundary();  // tokens 5 to 8: the admit busy at four settled boundaries
@@ -426,12 +457,12 @@ static void test_a_dropped_restore_is_one_open_slot() {
     if (r.d.pending.size() == 1) {
         CHECK(r.d.pending[0].restore);
     }
-    CHECK(reasons(r.d.stats.dropped, "WEIGHT zone full") == 1);
+    CHECK(reasons(r.d.stats.dropped, "graph active") == 1);
     for (int i = 0; i < ggml_sycl::MOE_SWAP_PENDING_DROP_STREAK; ++i) {
         r.boundary();  // tokens 9 to 12: the restore busy at four more
     }
     CHECK(r.d.pending.empty());
-    CHECK(reasons(r.d.stats.dropped, "WEIGHT zone full") == 2);
+    CHECK(reasons(r.d.stats.dropped, "graph active") == 2);
     CHECK(r.d.stats.open_slots == 1);
     CHECK(r.d.open_slots[0] == 1);
 
@@ -449,7 +480,7 @@ static void test_a_dropped_restore_is_one_open_slot() {
 static void test_the_drop_streak_counts_settled_boundaries_with_one_reason() {
     rig r(1, 8, 4);
     r.decode[r.index(0, 5)] = 10;
-    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 5, MOE_SWAP_MOVE_BUSY, "WEIGHT zone full", 3);
+    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 5, MOE_SWAP_MOVE_BUSY, "graph active", 3);
     r.to_period();
     for (int i = 0; i < 3; ++i) {
         r.boundary();  // three settled
@@ -652,7 +683,7 @@ static void test_the_summary_lines_name_every_figure() {
     rig r(1, 8, 4);
     r.decode[r.index(0, 5)] = 10;
     r.answer(MOE_SWAP_MOVE_ADMIT, 0, 5, MOE_SWAP_MOVE_REFUSED, "host copy not pinned");
-    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 0, MOE_SWAP_MOVE_BUSY, "WEIGHT zone full");
+    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 0, MOE_SWAP_MOVE_BUSY, "graph active");
     r.to_period();
     r.boundary();      // the admit refused finally: a restore
     for (int i = 0; i < ggml_sycl::MOE_SWAP_PENDING_DROP_STREAK; ++i) {
@@ -675,10 +706,11 @@ static void test_the_summary_lines_name_every_figure() {
     CHECK(contains(faults, "accepted transactions 1 (evict 1, admit 0) over 9 decode graphs"));
     CHECK(contains(faults, "open slots 1"));
     CHECK(contains(faults, "deferred for host room 0"));
+    CHECK(contains(faults, "held for device room 0"));
     CHECK(contains(faults, "off: none"));
     CHECK(contains(faults, "refused: host copy not pinned x1"));
-    CHECK(contains(faults, "busy: WEIGHT zone full x4"));
-    CHECK(contains(faults, "dropped pending: WEIGHT zone full x1"));
+    CHECK(contains(faults, "busy: graph active x4"));
+    CHECK(contains(faults, "dropped pending: graph active x1"));
     CHECK(contains(faults,
                    "settled from the plan after a throw: 0 batches (0 moves moved); unsettled at report: 0 moves"));
     CHECK(!contains(faults, "no single-row decode graph"));
@@ -964,6 +996,256 @@ static void test_the_summary_names_a_run_with_no_single_row_decode_graph() {
     CHECK(!contains(ggml_sycl::moe_swap_driver_summary_faults(r.d.stats, 0), "no single-row decode graph"));
 }
 
+// A BUSY answer for device zone room is not sent again while the zone's room epoch is what it was at that answer: the
+// admit is held, counted as held, its drop streak stands still and nothing is dropped, and the policy stays in flight.
+// A boundary that only holds allocates nothing. A changed epoch sends it once more, and a zone still full holds it
+// under the new epoch.
+static void test_a_zone_full_admit_is_held_while_the_room_epoch_is_unchanged() {
+    rig r(1, 8, 4);
+    r.decode[r.index(0, 5)] = 10;
+    r.to_period();                                // token 4: evicts 0
+    r.answer_zone_full(0, 5);
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // token 5: the admit meets a full zone
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 1);
+    r.decode[r.index(0, 6)] = 50;                 // a pair the policy would take, were it not in flight
+    const size_t allocs     = g_allocs;
+    for (int i = 0; i < 4; ++i) {
+        CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);    // tokens 6 to 9: settled, the epoch unchanged, nothing sent
+    }
+    CHECK(g_allocs == allocs);                          // a boundary that only holds allocates nothing
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 1);  // exactly one admit for that expert in every batch sent
+    CHECK(r.calls.size() == 2);                         // the evict and that admit: token 8's period proposed nothing
+    CHECK(r.d.policy.usage_of(0, 6) == 0.0);            // and absorbed nothing
+    CHECK(r.d.stats.dropped.empty());
+    CHECK(reasons(r.d.stats.busy, "WEIGHT zone full") == 1);
+    CHECK(r.d.stats.admits_room_held == 4);
+    CHECK(r.d.pending.size() == 1);
+    if (r.d.pending.size() == 1) {
+        CHECK(!r.d.pending[0].restore && r.d.pending[0].busy_streak == 1 && r.d.pending[0].held_streak == 4);
+    }
+    CHECK(contains(ggml_sycl::moe_swap_driver_summary_faults(r.d.stats, 0), "held for device room 4"));
+
+    r.room_epoch = 1;                             // a block went back to the zone
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // token 10: sent once more
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 2);
+    CHECK(reasons(r.d.stats.busy, "WEIGHT zone full") == 2);
+    CHECK(r.d.pending.size() == 1);
+    if (r.d.pending.size() == 1) {
+        CHECK(r.d.pending[0].busy_streak == 2 && r.d.pending[0].held_streak == 0);
+    }
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);  // token 11: held under the new epoch
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 2);
+    CHECK(r.d.stats.dropped.empty());
+}
+
+// A held admit is given up at the MOE_SWAP_PENDING_HOLD_BOUND-th settled boundary at which no outside room arrived
+// (the epoch moved by no more than the boundary's own give-backs): it becomes a restore, which goes at that boundary.
+// The restore meets the full zone too, is held the same way and sent only that once, and leaves its slot open; the
+// policy then proposes again. An unsettled boundary holds without counting.
+static void test_a_held_admit_is_given_up_at_the_hold_bound() {
+    const int bound = ggml_sycl::MOE_SWAP_PENDING_HOLD_BOUND;
+    rig       r(2, 8, 4);
+    r.decode[r.index(0, 5)] = 10;
+    r.answer_zone_full(0, 5);
+    r.answer_zone_full(0, 0);
+    r.to_period();                                // evicts 0 of block 0
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // the admit of 5 meets a full zone
+    CHECK(r.boundary(1, false, 0.0, false, /*settled=*/false) == MOE_SWAP_DRIVER_IDLE);  // held, and not counted
+    for (int i = 0; i < bound - 1; ++i) {
+        CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);
+    }
+    CHECK(r.calls.size() == 2 && r.d.stats.dropped.empty());  // one short of the bound: still held
+    CHECK(r.d.pending.size() == 1);
+    if (r.d.pending.size() == 1) {
+        CHECK(!r.d.pending[0].restore && r.d.pending[0].held_streak == bound - 1);
+    }
+
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // the bound: given up, and its restore goes at this boundary
+    CHECK(r.calls.size() == 3 && r.last().size() == 1);
+    if (r.calls.size() == 3 && r.last().size() == 1) {
+        CHECK(r.last()[0].kind == MOE_SWAP_MOVE_ADMIT && r.last()[0].block == 0 && r.last()[0].expert == 0);
+    }
+    CHECK(reasons(r.d.stats.dropped, "WEIGHT zone full") == 1);
+    CHECK(r.d.pending.size() == 1);
+    if (r.d.pending.size() == 1) {
+        CHECK(r.d.pending[0].restore && r.d.pending[0].room_held && r.d.pending[0].held_streak == 0);
+    }
+    for (int i = 0; i < bound - 1; ++i) {
+        CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);
+    }
+    CHECK(r.calls.size() == 3 && r.d.pending.size() == 1);  // the restore was sent once, and is still held
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);            // the bound again: the restore is given up, nothing sent
+    CHECK(r.calls.size() == 3);
+    CHECK(r.d.pending.empty());
+    CHECK(reasons(r.d.stats.dropped, "WEIGHT zone full") == 2);
+    CHECK(reasons(r.d.stats.busy, "WEIGHT zone full") == 2);  // one answer each: no retry
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 1 && r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 0) == 1);
+    CHECK(r.d.stats.open_slots == 1 && r.d.open_slots[0] == 1);
+    CHECK(r.d.stats.admits_room_held == 2u * static_cast<unsigned>(bound - 1) + 1u);
+
+    // Nothing is pending, so the policy is out of flight: block 1's hot host expert is proposed at the next period.
+    r.decode[r.index(1, 6)] = 30;
+    CHECK(r.to_period() == MOE_SWAP_DRIVER_SENT);
+    CHECK(r.last().size() == 1);
+    if (!r.last().empty()) {
+        CHECK(r.last()[0].kind == MOE_SWAP_MOVE_EVICT && r.last()[0].block == 1);
+    }
+}
+
+// A change of the room epoch before the bound sends the held admit again instead of giving it up, and a zone still
+// full holds it under the new epoch with the count started over.
+static void test_a_room_epoch_change_before_the_bound_sends_the_held_admit_again() {
+    const int bound = ggml_sycl::MOE_SWAP_PENDING_HOLD_BOUND;
+    rig       r(1, 8, 4);
+    r.decode[r.index(0, 5)] = 10;
+    r.answer_zone_full(0, 5, 2);
+    r.to_period();  // evicts 0
+    r.boundary();   // the admit of 5 meets a full zone
+    for (int i = 0; i < bound - 1; ++i) {
+        CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);
+    }
+    r.room_epoch = 7;
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // the bound's boundary, but the epoch changed: sent, not given up
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 2);
+    CHECK(r.d.stats.dropped.empty());
+    CHECK(r.d.pending.size() == 1);
+    if (r.d.pending.size() == 1) {
+        CHECK(!r.d.pending[0].restore && r.d.pending[0].held_streak == 0 && r.d.pending[0].busy_streak == 2);
+    }
+    for (int i = 0; i < bound - 1; ++i) {
+        CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);  // held under the new epoch, counted from nothing
+    }
+    CHECK(r.d.stats.dropped.empty() && r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 2);
+    r.room_epoch = 8;
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // room at last: the admit lands
+    CHECK(r.d.pending.empty() && r.d.stats.admits == 1 && r.d.stats.open_slots == 0);
+}
+
+// A zone-full answer that is sent counts toward the drop streak like any BUSY answer: with the epoch changing before
+// every boundary nothing is held, and the fourth settled answer in a row drops the admit.
+static void test_a_zone_full_admit_sent_at_every_boundary_follows_the_drop_streak() {
+    rig r(1, 8, 4);
+    r.decode[r.index(0, 5)] = 10;
+    r.answer_zone_full(0, 5);
+    r.to_period();  // evicts 0
+    for (int i = 0; i < ggml_sycl::MOE_SWAP_PENDING_DROP_STREAK; ++i) {
+        r.room_epoch += 1;
+        CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);
+    }
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == static_cast<size_t>(ggml_sycl::MOE_SWAP_PENDING_DROP_STREAK));
+    CHECK(reasons(r.d.stats.dropped, "WEIGHT zone full") == 1);
+    CHECK(r.d.stats.admits_room_held == 0);
+    CHECK(r.d.pending.size() == 1);
+    if (r.d.pending.size() == 1) {
+        CHECK(r.d.pending[0].restore && !r.d.pending[0].room_held);
+    }
+}
+
+// A transaction moves the room epoch itself when it gives back the members it minted before the zone refused a later
+// one: room the zone had before, not room it gained. An admit refused in such a transaction is still held, under the
+// epoch the transaction left. Room from outside while a transaction runs moves the epoch past what the transaction
+// gave back, so that answer holds nothing and the admit is sent again.
+static void test_a_transaction_that_moves_the_epoch_itself_still_holds_the_admit() {
+    rig r(1, 8, 4);
+    r.decode[r.index(0, 5)] = 10;
+    r.to_period();                                // token 4: evicts 0
+    r.answer_zone_full(0, 5);
+    r.txn_self_moves = 2;                         // each transaction gives back two members it minted
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // token 5: refused for room, the epoch moved by its own give-backs
+    CHECK(r.room_epoch == 2);
+    for (int i = 0; i < 3; ++i) {
+        CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);  // held: nothing but the transaction moved the epoch
+    }
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 1);
+    CHECK(r.d.stats.admits_room_held == 3);
+    CHECK(reasons(r.d.stats.busy, "WEIGHT zone full") == 1);
+    CHECK(r.d.pending.size() == 1);
+    if (r.d.pending.size() == 1) {
+        CHECK(r.d.pending[0].room_held && r.d.pending[0].room_epoch == 2 && r.d.pending[0].held_streak == 3);
+    }
+
+    r.room_epoch += 1;                            // a block went back between boundaries: the admit is sent
+    r.txn_outside_moves = 1;                      // and another goes back while that transaction runs
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // refused again, but the epoch moved by more than its own give-backs
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 2);
+    CHECK(r.d.pending.size() == 1);
+    if (r.d.pending.size() == 1) {
+        CHECK(!r.d.pending[0].room_held);
+    }
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // so it is sent at the next boundary: its own give-backs alone
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);  // and held again
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 5) == 3);
+    CHECK(r.d.stats.dropped.empty());
+    CHECK(r.d.stats.admits_room_held == 4);
+}
+
+// A held admit is not in the batch another pending admit is sent in. When that transaction moves the epoch by its own
+// give-backs alone, the held admit stays held under the epoch it left; when room from outside arrives while it runs,
+// the held admit is sent at the next boundary.
+static void test_a_held_admit_follows_the_epoch_past_another_admits_transaction() {
+    rig r(1, 16, 8);
+    r.decode[r.index(0, 8)] = 40;
+    r.decode[r.index(0, 9)] = 30;
+    r.to_period();  // two evicts
+    CHECK(r.d.pending.size() == 2);
+    r.answer_zone_full(0, 8);
+    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 9, MOE_SWAP_MOVE_BUSY, "graph active", 2);
+    r.txn_self_moves = 3;
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // both admits: 8 meets a full zone, 9 a transient
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // 9 alone, and its transaction moves the epoch by its give-backs
+    CHECK(r.last().size() == 1);
+    if (!r.last().empty()) {
+        CHECK(r.last()[0].kind == MOE_SWAP_MOVE_ADMIT && r.last()[0].expert == 9);
+    }
+    r.txn_outside_moves = 1;
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // 9 alone again, 8 still held; room from outside while it runs
+    CHECK(r.last().size() == 1);
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 8) == 1);
+    CHECK(r.d.stats.admits == 1);                 // 9 landed
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // the outside room sends 8 again
+    CHECK(r.count_of(MOE_SWAP_MOVE_ADMIT, 0, 8) == 2);
+    CHECK(r.last().size() == 1);
+    if (!r.last().empty()) {
+        CHECK(r.last()[0].expert == 8);
+    }
+    CHECK(r.d.stats.dropped.empty());
+}
+
+// A transaction that throws takes only the admits it was sent: a held admit was not in the batch, so it stays pending
+// and held, and the sent one waits unsettled.
+static void test_a_throw_leaves_a_held_admit_pending() {
+    rig r(1, 16, 8);
+    r.decode[r.index(0, 8)] = 40;
+    r.decode[r.index(0, 9)] = 30;
+    r.to_period();  // two evicts
+    CHECK(r.d.pending.size() == 2);
+    r.answer_zone_full(0, 8);
+    r.answer(MOE_SWAP_MOVE_ADMIT, 0, 9, MOE_SWAP_MOVE_BUSY, "graph active", 1);
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);  // both admits: 8 meets a full zone, 9 a transient
+    r.throw_after = 0;
+    r.boundary();                                 // only the admit of 9 is sent, and the transaction throws
+    CHECK(r.throws == 1);
+    CHECK(r.last().size() == 1);
+    if (!r.last().empty()) {
+        CHECK(r.last()[0].kind == MOE_SWAP_MOVE_ADMIT && r.last()[0].expert == 9);
+    }
+    CHECK(r.d.pending.size() == 1 && r.d.unsettled.size() == 1 && r.d.stats.unsettled_moves == 1);
+    if (r.d.pending.size() == 1 && r.d.unsettled.size() == 1) {
+        CHECK(r.d.pending[0].admit_expert == 8 && r.d.pending[0].room_held);
+        CHECK(r.d.unsettled[0].pair.admit_expert == 9 && !r.d.unsettled[0].pair.room_held);
+    }
+    CHECK(reasons(r.d.stats.busy, ggml_sycl::MOE_SWAP_UNSETTLED_REASON) == 1);
+}
+
+// The zone-refusal line names its five figures, the sizes in bytes, under the driver's prefix.
+static void test_the_zone_refusal_line_names_its_figures() {
+    const std::string line = ggml_sycl::moe_swap_zone_refusal_line(1, 276, 300, 3145728, 1048576, 524288);
+    CHECK(line ==
+          "[MOE-SWAP] device 1: WEIGHT zone refused 276 of 300 admits for room: largest member asked 3145728 "
+          "bytes, zone_available 1048576 bytes, zone_largest_free 524288 bytes");
+    std::printf("  zone-refusal line: %s\n", line.c_str());
+}
+
 int main() {
     test_a_period_boundary_sends_its_evicts_alone();
     test_pending_admits_go_first_and_hold_the_policy_in_flight();
@@ -993,6 +1275,14 @@ int main() {
     test_a_prompt_batch_with_room_for_no_pair_spends_the_prompt_boundary();
     test_the_boundary_reads_each_blocks_admissible_count();
     test_the_summary_names_a_run_with_no_single_row_decode_graph();
+    test_a_zone_full_admit_is_held_while_the_room_epoch_is_unchanged();
+    test_a_held_admit_is_given_up_at_the_hold_bound();
+    test_a_room_epoch_change_before_the_bound_sends_the_held_admit_again();
+    test_a_transaction_that_moves_the_epoch_itself_still_holds_the_admit();
+    test_a_held_admit_follows_the_epoch_past_another_admits_transaction();
+    test_a_zone_full_admit_sent_at_every_boundary_follows_the_drop_streak();
+    test_a_throw_leaves_a_held_admit_pending();
+    test_the_zone_refusal_line_names_its_figures();
 
     if (g_failed != 0) {
         std::printf("test-sycl-moe-swap-driver: %d check(s) failed\n", g_failed);

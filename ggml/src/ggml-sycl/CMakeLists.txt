@@ -4436,6 +4436,40 @@ set_tests_properties(test-sycl-arena-accessors PROPERTIES
     SKIP_RETURN_CODE 77
 )
 
+# Test: the zone-exact owner request (unified_cache_zone_allocate_owner) is
+# served by its zone or refused there: a full zone refuses without a
+# raw-allocation gate reading its figure, and room is served as an exact
+# zone-managed block. The cache is a real unified_cache on the OpenCL CPU
+# device, registered through unified_cache_register_for_queue(), so the selector
+# is pinned to it: no GPU.
+add_executable(test-sycl-zone-exact-alloc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-zone-exact-alloc.cpp
+)
+target_include_directories(test-sycl-zone-exact-alloc PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-zone-exact-alloc PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_link_options(test-sycl-zone-exact-alloc PRIVATE ${MEM_HANDLE_CONCURRENCY_TEST_SYCL_OPTIONS})
+target_compile_definitions(test-sycl-zone-exact-alloc PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+    GGML_SYCL_PRIVATE_TESTING=1
+)
+target_link_libraries(test-sycl-zone-exact-alloc PRIVATE ggml-sycl-private-fixtures Threads::Threads)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-zone-exact-alloc PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME test-sycl-zone-exact-alloc COMMAND test-sycl-zone-exact-alloc)
+set_tests_properties(test-sycl-zone-exact-alloc PROPERTIES
+    LABELS "sycl;hostonly;tdd"
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=opencl:cpu;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+    SKIP_RETURN_CODE 77
+)
+
 # Test: retain_handles_until_event() must route a handle by THIS thread's
 # recording state (llama.cpp-oze0).  Its guard was
 # ggml_sycl_graph_recording_active(), true whenever ANY thread records, while

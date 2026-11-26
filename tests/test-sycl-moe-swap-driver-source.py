@@ -60,7 +60,37 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       transaction twice (admits, evicts), and before each call it reserves the unsettled list, and the busy reasons
       when the guard counts one, each past its size (size() + n, never a bare count), then declares a guard whose
       body sets the unsettled count; the line right after the call dismisses that guard. The guard's body runs while
-      a throw unwinds, where a throw ends the process, so the reserves are what make its pushes safe.
+      a throw unwinds, where a throw ends the process, so the reserves are what make its pushes safe;
+  D18 the hold of an admit refused for device room has its two inputs: the caller hands the step the device WEIGHT
+      zone's room epoch (unified_cache::zone_room_epoch), read before the step; and the refusal's cause reaches the
+      move typed, not as text: the preparation leaves the size of a refused device mint on the prepared triplet,
+      right where the mint fails; the transaction marks the named triplet's outcome when that refusal is transient
+      (the "WEIGHT zone full" answer, and no other); and the callback gives the move MOE_SWAP_BUSY_CAUSE_ZONE_ROOM
+      from the outcome. Without either the driver holds nothing, sends a refused admit again at every boundary, and
+      no unit test sees it;
+  D19 a boundary whose transaction refused admits for device room says so in one WARN line: the callback counts the
+      answers that carry a refused size and keeps the largest, and after its loop over the batch, on that count alone
+      (so a batch that moved nothing prints it too, and no admit prints its own), calls
+      ggml_sycl_moe_swap_warn_zone_refusal once with the admits it sent; the helper reads the WEIGHT zone's free
+      figures together (unified_cache::zone_free_figures) and logs moe_swap_zone_refusal_line at WARN;
+  D20 the hold takes the transaction's own give-backs out of the epoch's move. A transaction that gives back storage
+      it took moves the room epoch with no room gained, so an unmeasured give-back sends the refused admit again at
+      every boundary. The meter (ggml_sycl_expert_room_meter) reads the WEIGHT zone's epoch right before and right
+      after a give-back and sums the moves; the named move measures both of its give-backs with it: a refused
+      triplet's minted members, in the named-refusal branch, and the prepared list, in a guard declared before the
+      first triplet is prepared, which is the one writer of the answer's room_self_delta; the entry carries the sum;
+      the callback reads the epoch right after the transaction returns and returns it with the sum; and the step
+      holds a refused admit, and lets a held one follow the epoch, only when moe_swap_room_stood says the epoch's
+      move since the boundary's read is that sum, under the epoch the transaction left. No host test runs the
+      transaction's side of this, so the text is its only gate here;
+  D21 the room epoch moves wherever the zone's allocators gain room. The hold waits for that move, so a site that
+      stops making it holds admits silently to the bound, and no error says so. unified_cache::zone_free gives a block
+      back in four arms (in the N-chunk mode the KV zone's own allocator and a chunk's, then the allocator WEIGHT
+      shares with KV, then a zone's own), and each calls arena_note_room_grew for the zone's group right after its
+      zone_used_free; arena_group_reset_allocators_locked calls it first; arena_note_allocators_made calls it for
+      every group, and arena_reserve calls that at both places it makes the allocators; and arena_note_room_grew adds
+      one to the group's epoch. zone_alloc's own zone_used_free calls undo an allocation that could not be recorded:
+      no room is gained there, and none is pinned.
 
 Checks run on comment-stripped text, string literals kept. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
@@ -102,6 +132,8 @@ STEP_SIG = "moe_swap_driver_status moe_swap_driver_step("
 WARN_SIG = "static void ggml_sycl_moe_swap_warn_refusal("
 LATCH_SIG = "static bool ggml_sycl_moe_swap_refusal_latches_block("
 REPORT_SIG = "static void ggml_sycl_moe_swap_report("
+TXN_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_txn_run("
+ZONE_WARN_SIG = "static void ggml_sycl_moe_swap_warn_zone_refusal("
 ROOM_SIG = "static size_t ggml_sycl_moe_swap_host_room("
 LOAN_SIG = "bool unified_cache::loan_expert_triplet("
 NO_GROWTH_ROOM_SIG = "size_t unified_cache::host_zone_no_growth_room("
@@ -166,6 +198,56 @@ MINT_CAP = "if (bound > 0 && ucache->host_zone_used(zone) + alloc_size > bound) 
 ROOM_BOUND = "host_zone_no_growth_bound(zone, host_zone_reserved_capacity(zone), capacity)"
 NO_GROWTH_ROOM_FIELDS = (f"const size_t bound = {ROOM_BOUND};", "const size_t limit = bound > 0 ? bound : capacity;",
                          "return limit > used ? limit - used : 0;")
+ROOM_EPOCH_READ = "call.room_epoch = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;"
+BUSY_CAUSE_SET = ("m.busy_cause = o.zone_room_bytes != 0 ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM : "
+                  "ggml_sycl::MOE_SWAP_BUSY_CAUSE_TRANSIENT;")
+ZONE_ROOM_MINT = ("storage = ggml_sycl_device_expert_alloc(device, staged); if (!storage.valid()) { "
+                  "out.mint_refused_bytes = staged;")
+ZONE_ROOM_OUTCOME = "(*named_moves)[triplet.named].zone_room_bytes = transient ? triplet.mint_refused_bytes : 0;"
+ZONE_REFUSED_COUNT = ("if (o.zone_room_bytes != 0) { ++zone_refused; "
+                      "zone_refused_max = std::max(zone_refused_max, o.zone_room_bytes); }")
+# The loop over the batch ends on the refusal WARN's call; the zone-refusal line comes right after it, on the count.
+ZONE_WARN_AFTER_LOOP = (WARN_CALL + " } if (zone_refused != 0) { ggml_sycl_moe_swap_warn_zone_refusal(cache, device, "
+                        "zone_refused, request.admit.size(), zone_refused_max); }")
+ZONE_WARN_FIELDS = ("(void) cache->zone_free_figures(ggml_sycl::vram_zone_id::WEIGHT, capacity, used, available, "
+                    "largest_free);",
+                    'GGML_LOG_WARN("%s\\n", ggml_sycl::moe_swap_zone_refusal_line(device, refused, admits, asked, '
+                    "available, largest_free).c_str());")
+METER_SIG = "struct ggml_sycl_expert_room_meter {"
+GIVE_BACK_SIG = "struct ggml_sycl_expert_prepared_give_back {"
+ENTRY_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run("
+ROOM_STOOD_SIG = "inline bool moe_swap_room_stood("
+METER_MEASURE = ("const uint64_t before = cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT); release(); "
+                 "moved += cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) - before;")
+GIVE_BACK_FIELDS = ("meter.give_back([this] { prepared.clear(); });", "answer->room_self_delta = meter.moved;")
+GIVE_BACK_DECL = ("ggml_sycl_expert_room_meter room_meter{ named ? cache : nullptr }; "
+                  "ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr };")
+PREPARE_CALL = "stop = ggml_sycl_expert_prepare_triplet("
+REFUSED_GIVE_BACK = ("room_meter.give_back([&triplet] { for (ggml_sycl::expert_move_member & m : triplet.members) { "
+                     "m.owner = ggml_sycl::mem_handle{}; } });")
+REFILL_BRANCH = "} else if (refill && !transient) {"
+ENTRY_SELF_DELTA = "r.room_self_delta = answer.room_self_delta;"
+# The read comes right after the transaction's call, with nothing between them.
+EPOCH_AFTER_READ = ("ggml_sycl_expert_move_transaction_run(device, request, nullptr, &result); "
+                    "const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;")
+TXN_ROOM_RETURN = "return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta };"
+ROOM_STOOD_BODY = "return room.epoch_after - before == room.self_delta;"
+ADMIT_TXN = "const moe_swap_txn_room room = txn(d.batch);"
+ROOM_STOOD_USE = "const bool room_stood = moe_swap_detail::moe_swap_room_stood(c.room_epoch, room);"
+HELD_FOLLOWS = "p.room_epoch = room_stood ? room.epoch_after : p.room_epoch;"
+HOLD_SET = ("p.room_held = m.busy_cause == MOE_SWAP_BUSY_CAUSE_ZONE_ROOM && room_stood; "
+            "p.room_epoch = room.epoch_after;")
+ZONE_FREE_SIG = "bool unified_cache::zone_free("
+RESET_SIG = "void unified_cache::arena_group_reset_allocators_locked("
+ROOM_GREW_SIG = "void unified_cache::arena_note_room_grew("
+ALLOCATORS_MADE_SIG = "void unified_cache::arena_note_allocators_made("
+ZONE_FREE_GIVES_BACK = re.compile(r"\bzone_used_free\([^;]*;")
+ZONE_FREE_BUMP = "arena_note_room_grew(arena_allocator_group_index(zone));"
+RESET_BUMP = "{ arena_note_room_grew(group);"
+ROOM_GREW_BODY = "arena_allocator_groups_[group].room_epoch.fetch_add(1, std::memory_order_release);"
+ALLOCATORS_MADE_BODY = ("for (size_t group = 0; group < ARENA_ALLOCATOR_GROUP_COUNT; ++group) { "
+                        "arena_note_room_grew(group); }")
+ALLOCATORS_MADE_CALL = "arena_note_allocators_made();"
 
 WAITS = re.compile(
     r"(?:\.|->)\s*wait\s*\(|\bwait_and_throw\b|\bdrain_retained_handles\b|\bwait_all\b|\bcommand_execution_status\b|"
@@ -542,6 +624,82 @@ def check(raw: dict[str, str]) -> None:
             fail("D17", f"guard `{guard.group(1)}` is not dismissed on the line right after the transaction returns")
         prev = at + len(TXN_CALL)
 
+    # D18 --------------------------------------------------------------------------------------------------------------
+    if norm(caller[:step_at]).count(ROOM_EPOCH_READ) != 1 or "call.room_epoch" in callback:
+        fail("D18", "the caller does not hand the step the WEIGHT zone's room epoch, read once before the step and "
+                    "left as read by the callback")
+    if norm(callback).count(BUSY_CAUSE_SET) != 1 or sycl.count("busy_cause") != 1:
+        fail("D18", "the transaction callback does not give each answered move its busy cause from the outcome's "
+                    "zone_room, in one place")
+    if norm(prep).count(ZONE_ROOM_MINT) != 1 or len(re.findall(r"\bmint_refused_bytes\s*=(?!=)", sycl)) != 2:
+        fail("D18", "the preparation does not leave the size of a refused device mint on the prepared triplet, set "
+                    "where the device mint fails and nowhere else")
+    if (norm(body(sycl, TXN_SIG)).count(ZONE_ROOM_OUTCOME) != 1
+            or len(re.findall(r"\bzone_room_bytes\s*=(?!=)", sycl)) != 2):
+        fail("D18", "the transaction does not mark the named triplet's outcome exactly when a device mint was refused "
+                    "transiently")
+
+    # D19 --------------------------------------------------------------------------------------------------------------
+    zone_warn = norm(body(sycl, ZONE_WARN_SIG))
+    if norm(callback).count(ZONE_REFUSED_COUNT) != 1 or len(re.findall(r"\bzone_refused\b\s*(?:=(?!=)|\+=)", caller)) != 1:
+        fail("D19", "the transaction callback does not count the answers refused for device room, with the largest "
+                    "size, in one place")
+    if norm(callback).count(ZONE_WARN_AFTER_LOOP) != 1 or sycl.count("ggml_sycl_moe_swap_warn_zone_refusal(") != 2:
+        fail("D19", "the zone-refusal line is not printed once per boundary, after the loop over the batch, whenever "
+                    "an admit was refused for device room")
+    if not zone_warn or not all(f in zone_warn for f in ZONE_WARN_FIELDS) or "GGML_LOG" in zone_warn.replace(
+            ZONE_WARN_FIELDS[1], ""):
+        fail("D19", "ggml_sycl_moe_swap_warn_zone_refusal does not log moe_swap_zone_refusal_line at WARN with the "
+                    "WEIGHT zone's free figures read together")
+
+    # D20 --------------------------------------------------------------------------------------------------------------
+    txn = norm(body(sycl, TXN_SIG))
+    give_back = norm(body(sycl, GIVE_BACK_SIG))
+    if norm(body(sycl, METER_SIG)).count(METER_MEASURE) != 1:
+        fail("D20", "the room meter does not read the WEIGHT zone's room epoch right before and right after a "
+                    "give-back and sum the move")
+    if (not all(give_back.count(f) == 1 for f in GIVE_BACK_FIELDS)
+            or len(re.findall(r"\broom_self_delta\s*=(?!=)", sycl)) != 4):
+        fail("D20", "the prepared list is not given back measured by a guard that then writes the answer's "
+                    "room_self_delta, the one place it is written besides the entry's copy")
+    if txn.count(GIVE_BACK_DECL) != 1 or not ordered(txn, "prepared.reserve(n_selected);", GIVE_BACK_DECL, PREPARE_CALL):
+        fail("D20", "the named move does not declare its meter and its give-back guard before the first triplet is "
+                    "prepared, so an exit could give minted storage back unmeasured")
+    if (txn.count(REFUSED_GIVE_BACK) != 1 or not ordered(txn, ZONE_ROOM_OUTCOME, REFUSED_GIVE_BACK, REFILL_BRANCH)
+            or sycl.count(".give_back(") != 2):
+        fail("D20", "a refused named triplet's minted members are not given back measured, in the named-refusal "
+                    "branch")
+    if norm(body(sycl, ENTRY_SIG)).count(ENTRY_SELF_DELTA) != 1:
+        fail("D20", "the named move's entry does not carry the measured sum to its caller")
+    if (norm(callback).count(EPOCH_AFTER_READ) != 1 or norm(callback).count(TXN_ROOM_RETURN) != 1
+            or sycl.count("moe_swap_txn_room{") != 1):
+        fail("D20", "the transaction callback does not read the room epoch right after the transaction returns and "
+                    "return it with the transaction's own sum")
+    if norm(body(driver, ROOM_STOOD_SIG)).count(ROOM_STOOD_BODY) != 1:
+        fail("D20", "moe_swap_room_stood does not compare the epoch's move since the boundary's read with the "
+                    "transaction's own sum")
+    if (not ordered(step, ADMIT_TXN, ROOM_STOOD_USE, HELD_FOLLOWS, HOLD_SET) or step.count(HOLD_SET) != 1
+            or step.count(HELD_FOLLOWS) != 1 or re.search(r"\broom_epoch\s*=\s*c\.room_epoch\b", step)):
+        fail("D20", "the step does not hold a refused admit, and let a held one follow the epoch, only when the room "
+                    "stood, under the epoch the transaction left")
+
+    # D21 --------------------------------------------------------------------------------------------------------------
+    zone_free = norm(body(cache, ZONE_FREE_SIG))
+    given_back = [m.end() for m in ZONE_FREE_GIVES_BACK.finditer(zone_free)]
+    if (len(given_back) != 4 or zone_free.count(ZONE_FREE_BUMP) != 4
+            or not all(zone_free[at:].startswith(" " + ZONE_FREE_BUMP) for at in given_back)):
+        fail("D21", "unified_cache::zone_free does not move the group's room epoch right after each of its four "
+                    "zone_used_free calls, so a block can go back to the zone with the epoch standing")
+    if not norm(body(cache, RESET_SIG)).startswith(RESET_BUMP):
+        fail("D21", "arena_group_reset_allocators_locked does not move the group's room epoch before it resets the "
+                    "allocators")
+    if (norm(body(cache, ALLOCATORS_MADE_SIG)).count(ALLOCATORS_MADE_BODY) != 1
+            or cache.count(ALLOCATORS_MADE_CALL) != 2):
+        fail("D21", "arena_note_allocators_made does not move every group's room epoch, or is not called at both "
+                    "places the arena's allocators are made")
+    if norm(body(cache, ROOM_GREW_SIG)).count(ROOM_GREW_BODY) != 1:
+        fail("D21", "arena_note_room_grew does not add one to the group's room epoch")
+
 
 def _helper_body(sycl: str, name: str) -> str:
     for m in HELPER_DEF.finditer(sycl):
@@ -653,8 +811,8 @@ def self_test(raw: dict[str, str]) -> int:
                 [("driver", FAULTS_SIG, "(ull) st.settled_moved, (ull) st.unsettled_moves)",
                   "(ull) st.settled_moved, 0ull)")])
     expect_fail("admit-throw-leaves-the-count", "D7",
-                [("driver", STEP_SIG, "d.pending.clear();\n            st.unsettled_moves = d.unsettled.size();",
-                  "d.pending.clear();")])
+                [("driver", STEP_SIG, "d.pending.resize(kept);\n            st.unsettled_moves = d.unsettled.size();",
+                  "d.pending.resize(kept);")])
     expect_fail("evict-throw-leaves-the-count", "D7",
                 [("driver", STEP_SIG, "d.unsettled.push_back(u);\n        }\n        st.unsettled_moves = "
                   "d.unsettled.size();", "d.unsettled.push_back(u);\n        }")])
@@ -749,6 +907,90 @@ def self_test(raw: dict[str, str]) -> int:
                 [("cache", NO_GROWTH_ROOM_SIG, ROOM_BOUND, "host_zone_reserved_capacity(zone)")])
     expect_fail("no-growth-room-unbounded-zone-is-zero", "D15",
                 [("cache", NO_GROWTH_ROOM_SIG, "bound > 0 ? bound : capacity", "bound")])
+    expect_fail("room-epoch-not-read", "D18",
+                [("sycl", CALLER_SIG,
+                  "call.room_epoch        = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;",
+                  "call.room_epoch        = 0;")])
+    expect_fail("room-epoch-read-in-the-callback", "D18",
+                [("sycl", CALLER_SIG, "ggml_sycl_expert_move_request request;",
+                  "call.room_epoch = 0;\n            ggml_sycl_expert_move_request request;")])
+    expect_fail("busy-cause-not-mapped", "D18",
+                [("sycl", CALLER_SIG, "o.zone_room_bytes != 0 ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM",
+                  "false ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM")])
+    expect_fail("refused-mint-not-recorded", "D18",
+                [("sycl", PREP_SIG, "out.mint_refused_bytes = staged;", "")])
+    expect_fail("host-mint-recorded-as-a-device-one", "D18",
+                [("sycl", PREP_SIG, "*transient = out.kind == ggml_sycl_expert_move_kind::EVICT;",
+                  "out.mint_refused_bytes = target.logical_bytes;\n                "
+                  "*transient = out.kind == ggml_sycl_expert_move_kind::EVICT;")])
+    expect_fail("zone-room-for-any-transient-refusal", "D18",
+                [("sycl", TXN_SIG, "zone_room_bytes = transient ? triplet.mint_refused_bytes : 0;",
+                  "zone_room_bytes = triplet.mint_refused_bytes;")])
+    expect_fail("zone-room-not-on-the-outcome", "D18",
+                [("sycl", TXN_SIG, "(*named_moves)[triplet.named].zone_room_bytes = transient ? "
+                  "triplet.mint_refused_bytes : 0;", "")])
+    after_loop = ("ggml_sycl_moe_swap_warn_refusal(inst, device, m);\n            }\n")
+    expect_fail("zone-refusal-line-per-admit", "D19",
+                [("sycl", CALLER_SIG, after_loop,
+                  "ggml_sycl_moe_swap_warn_refusal(inst, device, m);\n                if (zone_refused != 0) {\n"
+                  "                    ggml_sycl_moe_swap_warn_zone_refusal(cache, device, zone_refused, "
+                  "request.admit.size(), zone_refused_max);\n                }\n            }\n")])
+    expect_fail("zone-refusal-line-only-when-accepted", "D19",
+                [("sycl", CALLER_SIG, "if (zone_refused != 0) {", "if (zone_refused != 0 && result.accepted) {")])
+    expect_fail("zone-refusal-line-dropped", "D19",
+                [("sycl", CALLER_SIG, "if (zone_refused != 0) {", "if (false) {")])
+    expect_fail("zone-refusals-not-counted", "D19", [("sycl", CALLER_SIG, "++zone_refused;", "")])
+    expect_fail("zone-refusal-line-at-info", "D19", [("sycl", ZONE_WARN_SIG, "GGML_LOG_WARN(", "GGML_LOG_INFO(")])
+    expect_fail("zone-refusal-figures-of-another-zone", "D19",
+                [("sycl", ZONE_WARN_SIG, "ggml_sycl::vram_zone_id::WEIGHT", "ggml_sycl::vram_zone_id::KV")])
+    expect_fail("zone-refusal-figures-not-read", "D19", [("sycl", ZONE_WARN_SIG, "(void) cache->zone_free_figures(",
+                                                         "(void) sizeof(")])
+    expect_fail("self-delta-dropped-from-the-comparison", "D20",
+                [("driver", ROOM_STOOD_SIG, "room.epoch_after - before == room.self_delta", "room.epoch_after == before")])
+    expect_fail("refused-admit-held-though-room-arrived", "D20", [("driver", STEP_SIG, " && room_stood;", ";")])
+    expect_fail("refused-admit-held-under-the-epoch-read-before", "D20",
+                [("driver", STEP_SIG, "p.room_epoch  = room.epoch_after;", "p.room_epoch  = c.room_epoch;")])
+    expect_fail("held-admit-does-not-follow-the-epoch", "D20",
+                [("driver", STEP_SIG, "room_stood ? room.epoch_after : p.room_epoch;", "p.room_epoch;")])
+    expect_fail("meter-does-not-sum-the-move", "D20",
+                [("sycl", METER_SIG, "moved += cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) - before;", "")])
+    expect_fail("meter-off-for-the-named-move", "D20",
+                [("sycl", TXN_SIG, "room_meter{ named ? cache : nullptr };", "room_meter{ nullptr };")])
+    expect_fail("refused-members-given-back-unmeasured", "D20",
+                [("sycl", TXN_SIG, "room_meter.give_back([&triplet] {", "std::invoke([&triplet] {")])
+    expect_fail("prepared-list-given-back-unmeasured", "D20",
+                [("sycl", GIVE_BACK_SIG, "meter.give_back([this] { prepared.clear(); });", "prepared.clear();")])
+    guard_decl = "    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr };\n"
+    after_preparation = "    if (named && prepared.empty()) {\n"
+    expect_fail("give-back-guard-declared-after-the-preparation", "D20",
+                [("sycl", TXN_SIG, guard_decl, ""), ("sycl", TXN_SIG, after_preparation, guard_decl + after_preparation)])
+    expect_fail("self-delta-not-written-to-the-answer", "D20",
+                [("sycl", GIVE_BACK_SIG, "answer->room_self_delta = meter.moved;", "(void) answer;")])
+    expect_fail("self-delta-not-carried-by-the-entry", "D20",
+                [("sycl", ENTRY_SIG, "r.room_self_delta = answer.room_self_delta;", "")])
+    expect_fail("epoch-after-not-read", "D20",
+                [("sycl", CALLER_SIG,
+                  "const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;",
+                  "const uint64_t epoch_after = 0;")])
+    expect_fail("self-delta-not-returned", "D20",
+                [("sycl", CALLER_SIG, "{ epoch_after, result.room_self_delta }", "{ epoch_after, 0 }")])
+    used = "arena_zones_[static_cast<int>(record_zone)].used);\n"
+    bump = "arena_note_room_grew(arena_allocator_group_index(zone));\n"
+    for name, call, indent in (("kv-zone-arm", "zone_used_free(*z.allocator, zone_offset, ", " " * 16),
+                               ("chunk-arm", "zone_used_free(*target->allocator, chunk_off, ", " " * 8),
+                               ("shared-allocator-arm", "zone_used_free(*alloc, zone_offset, ", " " * 8),
+                               ("own-allocator-arm", "zone_used_free(*alloc, zone_offset, ", " " * 4)):
+        expect_fail(f"zone-free-{name}-does-not-move-the-epoch", "D21",
+                    [("cache", ZONE_FREE_SIG, call + used + indent + bump, call + used)])
+    expect_fail("allocator-reset-does-not-move-the-epoch", "D21",
+                [("cache", RESET_SIG, "arena_note_room_grew(group);", "")])
+    expect_fail("allocators-made-moves-no-epoch", "D21",
+                [("cache", ALLOCATORS_MADE_SIG, "arena_note_room_grew(group);", "")])
+    expect_fail("allocators-made-not-noted", "D21",
+                [("cache", "", "\n    arena_note_allocators_made();\n", "\n")])
+    expect_fail("room-grew-moves-nothing", "D21",
+                [("cache", ROOM_GREW_SIG, "room_epoch.fetch_add(1, std::memory_order_release);",
+                  "room_epoch.load(std::memory_order_acquire);")])
 
     try:
         mutate(raw, [("sycl", "", "this anchor is in no source", "x")])
@@ -785,7 +1027,9 @@ def main(argv: list[str]) -> int:
         print(e)
         return 1
     print("PASS: the swap driver runs once per synchronize boundary after the refill, gated, without a wait or a lock "
-          "across its policy, its evict copies never grow the host zone, and its refusals, latch and room are named")
+          "across its policy, its evict copies never grow the host zone, its refusals, latch and room are named, and "
+          "its hold reads the zone's room epoch and a typed refusal, less what the transaction's own give-backs moved "
+          "the epoch by, and every site that gives the zone room moves that epoch")
     return 0
 
 

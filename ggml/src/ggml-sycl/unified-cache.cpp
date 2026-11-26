@@ -20603,6 +20603,17 @@ void unified_cache_test_set_raw_gate_device_total(int device, size_t bytes) {
         g_test_raw_gate_device_total[device].store(bytes, std::memory_order_relaxed);
     }
 }
+
+// Per device, how often a raw gate read its figure: each read is one walk of the runtime registry. Only the tests read
+// it, to pin which requests never reach a raw gate.
+static std::array<std::atomic<uint64_t>, GGML_SYCL_MAX_DEVICES> g_test_raw_gate_reads{};
+
+uint64_t unified_cache_test_raw_gate_reads(int device) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return 0;
+    }
+    return g_test_raw_gate_reads[device].load(std::memory_order_relaxed);
+}
 #endif
 
 // Locks, one after the other and never two at once: g_cache_rw_mutex (L4), shared, for the cache lookup, released; then
@@ -20616,6 +20627,7 @@ zone_raw_gate_inputs unified_cache_raw_gate_inputs(int device, sycl::queue & que
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     const size_t test_total = g_test_raw_gate_device_total[device].load(std::memory_order_relaxed);
     in.device_total         = test_total != 0 ? test_total : in.device_total;
+    g_test_raw_gate_reads[device].fetch_add(1, std::memory_order_relaxed);
 #endif
     // The reservation is committed whole when the arena is made, on one chunk or N: all of it is taken, however empty
     // its zones are.
@@ -29418,6 +29430,14 @@ allocation_result unified_cache_zone_allocate_owner(
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = zone;
 
+    // Only a block of `zone` is accepted below, so a zone with no room is the answer: a raw block would be made, found
+    // not zone-managed and given back, after its gate walked the whole runtime registry for a figure nobody uses.
+    req.intent.constraints.forbid_vram_zone_spill = true;
+    // That answer is a zone out of room, not a plan that was wrong: every caller takes the refusal and goes on (a later
+    // boundary, its own second request, an eviction, or a load step that reports the failure itself), so it is counted
+    // as a cascade miss.
+    req.intent.constraints.cascade_step           = true;
+
     allocation_result result = unified_allocate_owner(req);
     if (!result) return result;
     const alloc_metadata exact = result.owner.metadata();
@@ -30309,6 +30329,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
                     z.allocator = std::make_unique<tlsf_allocator>(z.size);
                 }
             }
+            arena_note_allocators_made();
 
             arena_publish_authorities();
             return true;
@@ -30517,6 +30538,7 @@ bool unified_cache::arena_reserve(sycl::queue & queue,
             z.allocator = std::make_unique<tlsf_allocator>(z.size);
         }
     }
+    arena_note_allocators_made();
 
     arena_publish_authorities();
     return true;
@@ -31142,6 +31164,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
                 }
                 arena_forget_allocation_locked(zone, ptr);
                 zone_used_free(*z.allocator, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
+                arena_note_room_grew(arena_allocator_group_index(zone));
                 if (profile_active) {
                     const size_t idx = static_cast<size_t>(zone);
                     t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31173,6 +31196,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         const auto   p          = reinterpret_cast<uintptr_t>(ptr);
         const size_t chunk_off  = static_cast<size_t>(p - chunk_base);
         zone_used_free(*target->allocator, chunk_off, arena_zones_[static_cast<int>(record_zone)].used);
+        arena_note_room_grew(arena_allocator_group_index(zone));
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31202,6 +31226,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
         }
         arena_forget_allocation_locked(zone, ptr);
         zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
+        arena_note_room_grew(arena_allocator_group_index(zone));
         if (profile_active) {
             const size_t idx = static_cast<size_t>(zone);
             t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31226,6 +31251,7 @@ bool unified_cache::zone_free(vram_zone_id zone, void * ptr) {
     }
     arena_forget_allocation_locked(zone, ptr);
     zone_used_free(*alloc, zone_offset, arena_zones_[static_cast<int>(record_zone)].used);
+    arena_note_room_grew(arena_allocator_group_index(zone));
     if (profile_active) {
         const size_t idx = static_cast<size_t>(zone);
         t_arena_pp_profile.zone_free_calls[idx]++;
@@ -31492,6 +31518,20 @@ bool unified_cache::zone_free_figures(vram_zone_id zone,
     available    = zone_available(zone);
     largest_free = zone_largest_free(zone);
     return true;
+}
+
+uint64_t unified_cache::zone_room_epoch(vram_zone_id zone) const noexcept {
+    return arena_allocator_groups_[arena_allocator_group_index(zone)].room_epoch.load(std::memory_order_acquire);
+}
+
+void unified_cache::arena_note_room_grew(size_t group) noexcept {
+    arena_allocator_groups_[group].room_epoch.fetch_add(1, std::memory_order_release);
+}
+
+void unified_cache::arena_note_allocators_made() noexcept {
+    for (size_t group = 0; group < ARENA_ALLOCATOR_GROUP_COUNT; ++group) {
+        arena_note_room_grew(group);
+    }
 }
 
 // The role half of a zone census tag. A role added to the enum after this list reads as its number, never as another
@@ -32210,6 +32250,7 @@ std::shared_ptr<arena_authority> unified_cache::arena_close_authority(vram_zone_
 }
 
 void unified_cache::arena_group_reset_allocators_locked(size_t group) noexcept {
+    arena_note_room_grew(group);  // every block the group's allocators held is room again
     if (group == arena_allocator_group_index(vram_zone_id::KV)) {
         // KV and WEIGHT share the KV allocator and every per-chunk allocator.
         vram_zone & kv = arena_zones_[static_cast<int>(vram_zone_id::KV)];
