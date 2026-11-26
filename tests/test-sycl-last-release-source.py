@@ -10,19 +10,20 @@ These checks pin the code that does it:
 The model release hook (ggml_sycl_release_model_slot_resources) and a failed load's abort
 (ggml_sycl_abort_owner_effects_noexcept) each end in one call of the one step, ggml_sycl_release_last_model_effects:
 the hook after its slot release and its terms' drop, the abort after the published terms' restore and the drop, outside
-every try stage, both with the scope EVERY_CACHE. The hook retires the model's MoE mmid workspaces just before its step,
-once: the registry's reference to a workspace pool is what keeps its blob in the arena once no lease holds it, so a
-retire after the step left that blob to be read as a holder of an arena no model uses. The hook runs only once the
-teardown's fail-closed gates (the plan's republication and the MoE discovery release) have passed, as the last step of
-the owner effects, so a teardown they refuse retires nothing; the unload hook and its failure branches retire nothing of
-their own, and the other retire sites (a load's end, a runtime context transaction and a live bind) keep theirs. The
-step is noexcept, skips static destruction, asks each existing
+every try stage, both with the scope EVERY_CACHE. The step is noexcept, skips static destruction, asks each existing
 cache once (GLOBAL mode shares one cache between devices), does nothing more when a model is live, and puts a device's
 terms back only when its cache was asked and emptied, through the one list (load_published_terms{}.restore) under the
 inventory lock, never through setters of its own. With the scope DEFERRED_CACHES it asks only a cache whose release a
 failed load's buffers deferred; a cache it leaves out keeps what it holds and its terms, and counts as emptied for the
 two-card flag only when it holds no arena. A step that asked no cache leaves that flag as it is: it records that it
 asked one only once the scope let it, before it asks.
+
+The hook retires the model's MoE mmid workspaces just before its step, once: the registry's reference to a workspace
+pool is what keeps its blob in the arena once no lease holds it, so a retire after the step left that blob to be read
+as a holder of an arena no model uses. The hook runs only once the teardown's fail-closed gates (the plan's
+republication and the MoE discovery release) have passed, as the last step of the owner effects, so a teardown they
+refuse retires nothing. The unload hook and its failure branches retire nothing of their own, and the other retire
+sites (a load's end, a runtime context transaction and a live bind) keep theirs.
 
 The cache member it calls, unified_cache::release_for_no_live_model, is noexcept and catches. In order: it returns when
 a model is live; waits once for one barrier over the cache's queues; releases the PP MoE oneDNN ring and the oneDNN
@@ -201,14 +202,20 @@ UNLOAD_SIG = "ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(
 # Declared before its definition, so it is found by name (fn_def), not by its first signature.
 EFFECTS_NAME = "ggml_sycl_teardown_owner_effects"
 RETIRE_NAME = "ggml_sycl::unified_cache_retire_moe_mmid_workspaces("
-# The dying model's every plan identity (the default 0), named by its exact token. code() leaves one space after the
-# parenthesis when the call breaks its line there.
-HOOK_RETIRE = re.compile(r"\(void\) ggml_sycl::unified_cache_retire_moe_mmid_workspaces\( ?"
-                         r"\{ owner\.model\.value, owner\.load\.value, owner\.owner\.generation \}\);")
+# The dying model's every plan identity (no second argument, so the default 0), named by its exact token: the three
+# identity fields of `owner`, in the token's order. Spacing, the (void) and a spelled-out token type are free; the field
+# names are not, since they are what makes it this model's token and not another's.
+HOOK_RETIRE = re.compile(r"(?:\(void\) ?)?ggml_sycl::unified_cache_retire_moe_mmid_workspaces\( ?"
+                         r"(?:(?:ggml_sycl::)?moe_mmid_model_token ?)?"
+                         r"\{ ?owner\.model\.value ?, ?owner\.load\.value ?, ?owner\.owner\.generation ?\} ?\);")
+# Exact on purpose: the owner effects must end in the hook and then their catch, with nothing between, and the unload
+# hook's finalize-OK branch must hold the erase alone. A looser form would let a statement in between pass, and a
+# change of either shape is one this check should make someone read.
 EFFECTS_TAIL = "ggml_sycl_release_model_slot_resources(owner); return true; } catch (...) { return false; } }"
 UNLOAD_ERASE = ("if (result == ggml_sycl::lifecycle::error::OK) { "
                 "ggml_sycl::lifecycle_erase_placement_plan(owner.model.value, owner.load.value); }")
 # The retire sites other than the hook's, by the function that holds them, with their counts: they keep what they do.
+# A deliberate new retire site, or one removed, updates this table (and so the file's total, checked from it).
 OTHER_RETIRES = {
     "ggml_backend_sycl_model_load_end": 2,
     "ggml_sycl_run_runtime_context_transaction": 2,
@@ -337,7 +344,8 @@ def check_retire_order(gs: str) -> list:
         body = fn_def(gs, name)
         if not body or body.count(RETIRE_NAME) != n:
             out.append(f"{name} no longer retires as it did ({n})")
-    if gs.count(RETIRE_NAME) != 1 + sum(OTHER_RETIRES.values()):
+    # Outside the hook, whose own count the first clause checks, so each clause answers for one thing.
+    if gs.count(RETIRE_NAME) - hook.count(RETIRE_NAME) != sum(OTHER_RETIRES.values()):
         out.append("a retire site was added or removed")
     return out
 
@@ -699,6 +707,27 @@ def _hook_retire(gs: str) -> str:
 
 def test_witness_hook_without_the_retire():
     assert check_retire_order(mutate_in(GS, HOOK_SIG, _hook_retire(GS), ""))
+
+
+def test_witness_hook_retires_twice():
+    r = _hook_retire(GS)
+    out = check_retire_order(mutate_in(GS, HOOK_SIG, r, r + " " + r))
+    assert out == ["the hook does not retire the dying model's MoE mmid workspaces exactly once, by its token"]
+
+
+def test_witness_hook_retires_before_its_summary_line():
+    r = _hook_retire(GS)
+    m = mutate_in(GS, HOOK_SIG, r, "")
+    out = check_retire_order(mutate_in(m, HOOK_SIG, HOOK_WARN, r + " " + HOOK_WARN))
+    assert out == ["the hook's retire is not after its slot release and before its step"]
+
+
+def test_hook_retire_pattern_accepts_another_spelling():
+    other = ("ggml_sycl::unified_cache_retire_moe_mmid_workspaces(ggml_sycl::moe_mmid_model_token{owner.model.value, "
+             "owner.load.value, owner.owner.generation});")
+    assert HOOK_RETIRE.fullmatch(other)
+    assert not HOOK_RETIRE.fullmatch(other.replace("owner.load.value", "owner.model.value"))
+    assert not HOOK_RETIRE.fullmatch(other.replace("});", "}, 7);"))
 
 
 def test_witness_hook_retires_after_the_step():

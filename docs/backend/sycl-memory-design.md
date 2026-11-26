@@ -3821,7 +3821,10 @@ the model's MoE mmid workspaces just before the step
 pool, the registry's reference is what keeps its blob in the RUNTIME zone, so a
 retire after the step left that blob to be read as a holder of an arena no model
 uses. The hook runs only past the teardown's fail-closed gates, so a teardown
-they refuse keeps its model's workspaces. The step asks the
+they refuse keeps its model's workspaces. A teardown the registry then fails to
+finalize (`finalize_teardown()` not OK after the effects ran) has already
+released the model's slot, weights and workspaces; the quarantine reaper retries
+it, and the retry's retire finds nothing left. The step asks the
 cache of each device the scheduler sees
 (`ggml_backend_sycl_get_device_count()`). Each cache it asks gives back what it
 sized for a model (`unified_cache::release_for_no_live_model()`): it waits once

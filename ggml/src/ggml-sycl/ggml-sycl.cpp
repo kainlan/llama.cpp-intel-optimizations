@@ -11014,10 +11014,10 @@ static void ggml_sycl_diag_emit_warn(const char * fmt, ...) {
 enum class ggml_sycl_last_release_scope { EVERY_CACHE, DEFERRED_CACHES };
 
 // The release of the last model in the process, run last by the model release hook (MODEL_RELEASED) and by a failed
-// load's abort (LOAD_ABORTED), after each has dropped and put back what the model published (the hook also retires the
-// model's MoE mmid workspaces first, whose blobs would otherwise read as holders of the arena), and at a load's start for
-// the caches a failed load's buffers held at its abort (LOAD_START, DEFERRED_CACHES). Each cache asked gives back what
-// it sized for a model (unified_cache::release_for_no_live_model), so the next load plans and builds as a first load
+// load's abort (LOAD_ABORTED), after each has dropped and put back what the model published (the hook retires the
+// model's MoE mmid workspaces first), and at a load's start for the caches a failed load's buffers held at its abort
+// (LOAD_START, DEFERRED_CACHES). Each cache asked gives back what it sized for a model
+// (unified_cache::release_for_no_live_model), so the next load plans and builds as a first load
 // does. It walks the scheduler's devices (ggml_backend_sycl_get_device_count()), as the start's reserve does: a
 // two-card host that shows the scheduler one device builds device 1's cache at a load's begin, and it goes unreached.
 // Liveness is process-wide, every cache holds the same mask, so with it 0 asking each walked cache is right; GLOBAL
@@ -11303,12 +11303,13 @@ static void ggml_sycl_release_model_slot_resources(ggml_sycl::lifecycle::ModelTo
                              rows, reclaimed);
     // The model's MoE mmid workspaces, before the step below asks each arena whether it is empty: once no lease holds
     // a pool, the registry's reference is what keeps its blob in the RUNTIME zone, and retired after the step that
-    // blob reads as a holder of an arena no model uses, which then stays reserved until the next load's start. Here,
-    // not after the registry finalizes the teardown, so the step still runs inside the teardown, where no load can
-    // begin. The owner effects reach this hook only past their fail-closed gates, so a teardown that refuses retires
-    // nothing; a teardown the registry then fails to finalize has already released this slot, and its retry finds
-    // nothing left to retire. Retirement blocks new admission at once; a lease still outstanding keeps its blob until
-    // it completes.
+    // blob reads as a holder of an arena no model uses, which then stays reserved until the next load's start. The
+    // retire runs before the step, and the step stays inside the teardown, where no load can begin. The owner effects
+    // reach this hook only past their fail-closed gates, so a teardown that refuses retires nothing (a teardown the
+    // registry fails to finalize: docs/backend/sycl-memory-design.md, "The release of the last model"). Retirement
+    // blocks new admission at once; a lease still outstanding keeps its blob until it completes. The result is true
+    // only when something was retired, and nothing is the normal answer for a dense model or a retried teardown, so
+    // it is not an error.
     (void) ggml_sycl::unified_cache_retire_moe_mmid_workspaces(
         { owner.model.value, owner.load.value, owner.owner.generation });
     // Last, once this model's slot, terms and workspaces are gone: with no model left live, what the caches sized for
@@ -11422,7 +11423,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_model_unloaded_token(ggml_sycl_mode
         }
         const auto result = registry->finalize_teardown(ticket, true);
         if (result == ggml_sycl::lifecycle::error::OK) {
-            // The model's MoE mmid workspaces were retired by the slot release, before its last-model step.
+            // No retire here: the model's MoE mmid workspaces must go before the last-model step asks the arena
+            // whether it is empty, and that step runs inside the owner effects, so the slot release retires them.
             // Full plans can be large; durable replay identity remains compact
             // in Registry::dead_ after this snapshot is deleted.
             ggml_sycl::lifecycle_erase_placement_plan(owner.model.value, owner.load.value);
