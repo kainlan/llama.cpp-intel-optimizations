@@ -39,8 +39,12 @@ K and V 2304->1024 (864, 685 ms), loop gate 4608->64, relative 2304->384, the re
 
 Attention geometry (GGUF): 24 query heads, 8 KV heads, head size 128, `sliding_window` 1024 with a sliding-window
 pattern, a relative-position bias (`attn_rel_bias`, extent 1024), attention sinks, a per-head query clip. 48 attention
-nodes per micro-batch (24 blocks, the loop of blocks 6-17 run three times). The per-call time grows with the KV
-length (5.4 ms at 512 keys, 16 ms median): it is not limited to the 1,024-token window.
+nodes per micro-batch (24 blocks, the loop of blocks 6-17 run three times). The window pattern is five sliding
+layers to one full layer (blocks 5, 11, 17 and 23 are full). Per call: min 5.4 ms, p50 16.4, p95 33.1, max 50.0. The
+median sits on a plateau while the prompt grows, and the max matches a full layer at 4,737 keys: 512 queries x 4,737
+keys x 24 heads x 128 x 4 = 2.98e10 flop in 50 ms is 0.6 TFLOPS, and a sliding layer at 512 x 1,536 keys in 16 ms
+is also 0.6 TFLOPS. So the window looks honoured and the kernel is slow per (query, key) pair; the 691-token profile
+did 512 x 512 in 3.3 ms (1 TFLOPS). Not verified per layer: the profiler aggregates all 480 calls in one row.
 
 ## Host time by stage (stage profiler run)
 
@@ -55,18 +59,31 @@ length (5.4 ms at 512 keys, 16 ms median): it is not limited to the 1,024-token 
 
 21 profile blocks, sum of wall 28,676 ms, sum of host 22,437 ms. There are 880 NVFP4 MoE nodes in the prompt (44 NVFP4 layer
 applications x 2 nodes x 10 micro-batches); each submits about 110 scatter, 110 activation and 110 dequant launches
-(one per active expert group) and 11.4 GEMM executions: the per-expert stage loop of the grouped executor. This is the host side of the 11 s the device sits idle.
+(one per active expert group) and 11.4 GEMM executions: the per-expert stage loop of the grouped executor.
+
+What the 11 s of device idle is made of is **not established**:
+- `moe.pp.dequant.nvfp4` is a marker (0.1 us per launch), not a timed kernel. The F16 dequant of about 110 experts
+  per node is real device work that no row of the table holds, so the 19.7 s device total undercounts.
+- About 290,000 MoE submissions at the plan's measured 23 us each is about 7 s, not 11 s.
+- The stage host total (22.4 s) is well above the submission cost of all 383,000 launches (about 9 s), so the
+  `moe` stage timer includes blocking, likely the ids read-back for the counting sort, which waits for the work
+  queued ahead of it.
+The split between submission cost, the untimed dequant and the ids wait decides between batching the stages
+(Task 21 step 2), the weight-only-quantised arm that removes the dequant (step 3) and the host-gap task. It is the
+first checkpoint item of whichever of them goes next.
 
 ## Ranking and the lead's reading
 
-1. **Attention, 7.7 s (25%).** The single largest kernel. It grows with the prompt and runs at about 1 TFLOPS.
-   Whether the sliding-window layers compute their full KV, and what Inkling's relative bias, sinks and clip
-   cost inside `xmx_v2`, is not known yet.
+1. **Attention, 7.7 s (25%).** The single largest kernel, at about 0.6 TFLOPS per needed (query, key) pair. What
+   Inkling's relative bias, sinks and clip cost inside `xmx_v2`, and why it is slower per pair than on Mistral or
+   GPT-OSS, is not known yet.
 2. **BF16 weights, 8.4 s together (27%).** Dense BF16 (4.4 s) on `bf16_native` at 3.1 TFLOPS, and the BF16
    experts (4.0 s) on the direct kernel at 0.6 TFLOPS. This is the plan's Task 22.
-3. **MoE host time, about 11 s of device idle.** The per-expert stage loop of the NVFP4 executor. This is Task 21
-   step 2 (batch the stages and the GEMM over experts).
+3. **About 11 s of device idle around the MoE nodes.** Its parts are not established (see above).
 4. NVFP4 expert GEMM 1.8 s, the stage kernels 0.65 s, element-wise 0.7 s: smaller, behind the three above.
 
-Raw data: `inkling/m21-kprof-pp-long-b70-06e1c3858/kprof.csv` and `inkling/m21-e2e-pp-long-b70-06e1c3858/inkling.err`
-in the lead's temporary directory (not durable). This page is the durable record.
+No single item reaches the user's target alone: 1,000 t/s on this prompt is 4.7 s, and removing all BF16 device
+time still leaves about 21 s (about 220 t/s). Each task's acceptance is set from this profile.
+
+Raw data: `m21-kprof-pp-long-b70-06e1c3858.csv` next to this page (the kernel profiler's CSV). The stage log stays
+in the lead's temporary directory (not durable); its totals are above.
