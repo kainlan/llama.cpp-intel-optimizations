@@ -530,13 +530,15 @@ def cpu_violations(src: dict[str, str]) -> list[str]:
 
 def funnel_violations(src: dict[str, str]) -> list[str]:
     # The direct block reads src1 rows a deferred CPU scatter may still owe (G4); it relies on the per-op funnel to
-    # flush that scatter first, at the top level of the dispatch function, before the MUL_MAT_ID case.
+    # flush that scatter first, at the top level of the dispatch function, before the MUL_MAT_ID case. The case
+    # dispatches through ggml_sycl_mul_mat_id_with_direct_reentry, which runs ggml_sycl_mul_mat_id and, when the direct
+    # route stepped aside for an executor that then declined, its second pass, both after the flush.
     forward = definition(src["sycl"], "static bool ggml_sycl_compute_forward_impl(")
     if forward is None:
         return ["funnel-order: ggml_sycl_compute_forward_impl was not found"]
     code = code_of(forward)
     flush = re.search(r"\bflush_pending_cpu_scatter_if_consumed\(\s*dst\s*,\s*ctx\.device\s*\)\s*;", code)
-    dispatch = re.search(r"\bggml_sycl_mul_mat_id\(\s*ctx\s*,\s*dst\s*\)\s*;", code)
+    dispatch = re.search(r"\bggml_sycl_mul_mat_id_with_direct_reentry\(\s*ctx\s*,\s*dst\s*\)\s*;", code)
     if flush is None or dispatch is None or flush.start() > dispatch.start():
         return ["funnel-order: the pending CPU scatter is not flushed before MUL_MAT_ID is dispatched"]
     before = code[:flush.start()]
@@ -722,7 +724,7 @@ def test_mutations_are_witnessed() -> None:
                  r"consumed\(dst, ctx\.device\);)", r"\1", "funnel-order"),
         # The funnel's flush moves after the MUL_MAT_ID dispatch.
         ("sycl", r"flush_pending_cpu_scatter_if_consumed\(dst, ctx\.device\);(\s*flush_pending_secondary_scatter_if_"
-                 r"consumed\(dst, ctx\.device\);.*?ggml_sycl_mul_mat_id\(ctx, dst\);)",
+                 r"consumed\(dst, ctx\.device\);.*?ggml_sycl_mul_mat_id_with_direct_reentry\(ctx, dst\);)",
          r"\1 flush_pending_cpu_scatter_if_consumed(dst, ctx.device);", "funnel-order"),
         # The funnel's flush runs only for some ops.
         ("sycl", r"flush_pending_cpu_scatter_if_consumed\(dst, ctx\.device\);(\s*flush_pending_secondary_scatter_if_"

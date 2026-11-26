@@ -16,9 +16,11 @@
 #include "../ggml/src/ggml-sycl/soa-reorder-types.hpp"
 #include "ggml.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <vector>
 
 namespace {
@@ -472,9 +474,12 @@ int main() {
     //    when a kernel decodes one expert of that materialized layout to f16: every quantized type
     //    ggml_get_to_fp16_sycl_for_layout decodes, on AOS; the four with a per-expert SOA dequant (Q4_0, Q8_0, Q4_K,
     //    Q6_K) on SOA too, since the planner materializes experts SOA (the B50 does Q8_0 and Q6_K); MXFP4 on SOA
-    //    only. Q1_0 and NVFP4 are left out, because only their direct kernel may run them on a device. The list is
-    //    the whole set: any other type the f16 arm admits on AOS fails below.
+    //    only. NVFP4 is in on AOS, its only layout: a prompt whose every expert is on the device runs the f16 arm,
+    //    and the direct MMID route keeps decode and every node the executor does not claim. Q1_0 is left out: only
+    //    its direct kernel runs it on a device. The list is the whole set: any other type the f16 arm admits on AOS
+    //    fails below.
     const ggml_type pp_f16_aos_types[] = {
+        GGML_TYPE_NVFP4,
         GGML_TYPE_Q4_0,
         GGML_TYPE_Q8_0,
         GGML_TYPE_Q4_K,
@@ -520,8 +525,7 @@ int main() {
             ++failures;
         }
     }
-    const ggml_type pp_never_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4, GGML_TYPE_F16, GGML_TYPE_F32,
-                                         GGML_TYPE_BF16 };
+    const ggml_type pp_never_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16 };
     for (const ggml_type type : pp_never_types) {
         for (const ggml_layout_mode layout : all_layouts()) {
             if (moe_pp_batched_supports_layout(type, layout, true, true)) {
@@ -937,10 +941,10 @@ int main() {
 
     // 16. The PP MoE oneDNN ring is planned only for a model with an expert a ring consumer runs: the batched prompt
     // executor (the WOQ and f16 tables, in any layout) or the MXFP4 SOA per-expert staging (the f16 table's MXFP4
-    // row). An Inkling 2 Mini load runs its NVFP4 experts on the MMID direct route and its BF16 experts on the BF16
-    // direct route, neither of which draws on the ring, so it plans none. The answer does not follow the runtime
-    // knobs: it is the union of the two tables with both of them on, so a knob that turns the executor off keeps the
-    // ring a load plans, and every type the ring stages for a host expert is served.
+    // row). An Inkling 2 Mini load runs its NVFP4 prompt experts on the executor's f16 arm, so it plans the ring; its
+    // BF16 experts run on the BF16 direct route, which does not draw on the ring. The answer does not follow the
+    // runtime knobs: it is the union of the two tables with both of them on, so a knob that turns the executor off
+    // keeps the ring a load plans, and every type the ring stages for a host expert is served.
     {
         const struct {
             ggml_type    type;
@@ -952,7 +956,7 @@ int main() {
             { GGML_TYPE_Q8_0,   true,  "an f16 row at AOS and SOA"                                 },
             { GGML_TYPE_Q4_0,   true,  "an f16 row at AOS and SOA"                                 },
             { GGML_TYPE_IQ4_XS, true,  "an f16 row at AOS, though no MMVQ-ID kernel"               },
-            { GGML_TYPE_NVFP4,  false, "Inkling's NVFP4 experts run on the MMID direct route"      },
+            { GGML_TYPE_NVFP4,  true,  "Inkling's NVFP4 prompt experts run on the f16 arm"         },
             { GGML_TYPE_Q1_0,   false, "Q1_0 experts run on the MMID direct route"                 },
             { GGML_TYPE_BF16,   false, "Inkling's BF16 experts run on the BF16 direct route"       },
             { GGML_TYPE_F16,    false, "a float expert needs no dequant and keeps its own route"   },
@@ -984,6 +988,189 @@ int main() {
             }
             if (moe_pp_batched_takes_staged_type(type) && !moe_pp_onednn_ring_serves_type(type)) {
                 std::printf("FAIL: type=%d is staged through the ring for a host expert, but plans no ring\n", t);
+                ++failures;
+            }
+        }
+    }
+
+    // 17. The direct MMID route steps aside for a node only when the batched executor can take it: a prompt, a weight
+    // the executor claims on the device, and a ring weight slot planned there. Each term alone keeps the route.
+    {
+        const struct {
+            bool         prompt;
+            bool         claims;
+            size_t       slot;
+            bool         want;
+            const char * why;
+        } defer_cases[] = {
+            { true,  true,  361u << 20, true,  "a claimed prompt with a planned ring"          },
+            { true,  true,  0,          false, "no ring planned: every dispatch would decline" },
+            { true,  false, 361u << 20, false, "the executor does not claim the weight"        },
+            { false, true,  361u << 20, false, "decode: the executor runs prompts only"        },
+            { false, false, 0,          false, "nothing holds"                                 },
+        };
+
+        for (const auto & c : defer_cases) {
+            if (moe_mmid_direct_defers_to_executor(c.prompt, c.claims, c.slot) != c.want) {
+                std::printf("FAIL: the direct route %s for: %s\n", c.want ? "keeps the node" : "steps aside", c.why);
+                ++failures;
+            }
+        }
+    }
+
+    // 18. A type whose host experts run an immutable host recipe (Q1_0 and NVFP4) is never staged through the ring,
+    // although NVFP4 has an f16 row at AOS: its host experts keep their own planned workspace, the B50's host route
+    // and the CPU island's refusal stay as they are, and only a prompt whose every expert is on the device runs the
+    // batched executor.
+    {
+        const ggml_type immutable_types[] = { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 };
+        for (const ggml_type type : immutable_types) {
+            if (moe_pp_batched_takes_staged_type(type)) {
+                std::printf("FAIL: %s is staged through the ring, but its host experts run an immutable recipe\n",
+                            ggml_type_name(type));
+                ++failures;
+            }
+        }
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const ggml_type type = static_cast<ggml_type>(t);
+            if (moe_pp_batched_takes_staged_type(type) && ggml_sycl::moe_type_has_immutable_host_recipe(type)) {
+                std::printf("FAIL: type=%d is staged although its host experts run an immutable recipe\n", t);
+                ++failures;
+            }
+        }
+    }
+
+    // 19. The ring uses a type reaches (moe_pp_ring_uses_of_type): each bit is the table its consumer reads, so a type
+    // gains or loses a use only with that table. The ring decision (moe_pp_ring_check_resident_only) reads two sets of
+    // types from these tables, and both are pinned here by name. The resident-only set is the types that reach the
+    // resident claim alone: NVFP4 (its host experts run an immutable recipe, so the ring never stages them) and IQ1_S,
+    // IQ1_M and IQ4_XS (no MMVQ id kernel, so the ring never stages them either). The drop set is the resident-only
+    // types the MMID direct route also runs (moe_mmid_direct_route_runs_type): NVFP4 alone. A load drops a ring only
+    // when its weights are all of the drop set and the plan made with it leaves one of their experts on the host;
+    // IQ1_S, IQ1_M and IQ4_XS keep it, because the ring is their resident layers' only device prompt route. A staged
+    // type (Qwen's IQ4_NL) and MXFP4, which the per-expert path stages at SOA, keep their ring as before. Q1_0 and F32
+    // reach none.
+    {
+        const auto check_uses = [&](ggml_type type, uint32_t want, const char * why) {
+            const uint32_t got = moe_pp_ring_uses_of_type(type);
+            std::printf("ring use check: %s uses=0x%x want=0x%x (%s)\n", ggml_type_name(type), got, want, why);
+            if (got != want) {
+                ++failures;
+            }
+        };
+        check_uses(GGML_TYPE_NVFP4, MOE_PP_RING_USE_RESIDENT, "Inkling: the executor's f16 arm, never staged");
+        check_uses(GGML_TYPE_IQ1_S, MOE_PP_RING_USE_RESIDENT, "the f16 arm, no MMVQ id kernel to stage beside");
+        check_uses(GGML_TYPE_IQ1_M, MOE_PP_RING_USE_RESIDENT, "the f16 arm, no MMVQ id kernel to stage beside");
+        check_uses(GGML_TYPE_IQ4_XS, MOE_PP_RING_USE_RESIDENT, "the f16 arm, no MMVQ id kernel to stage beside");
+        check_uses(GGML_TYPE_IQ4_NL, MOE_PP_RING_USE_RESIDENT | MOE_PP_RING_USE_STAGED,
+                   "Qwen: host-pinned experts stage through the ring");
+        check_uses(GGML_TYPE_MXFP4, MOE_PP_RING_USE_RESIDENT | MOE_PP_RING_USE_SOA_EXPERT,
+                   "GPT-OSS: the WOQ arm and the per-expert SOA staging");
+        check_uses(GGML_TYPE_Q1_0, MOE_PP_RING_USE_NONE, "the MMID direct route draws on no ring");
+        check_uses(GGML_TYPE_F32, MOE_PP_RING_USE_NONE, "a float expert keeps its own route");
+        // Every bit against its own table, over every type: the function adds no type of its own, and a type with any
+        // use is one the ring is planned for (moe_pp_onednn_ring_serves_type). Then the two sets the ring decision
+        // reads, by name: a type that gains a kernel or a use leaves its set here, and a type that loses one joins it.
+        const auto in_types = [](ggml_type type, std::initializer_list<ggml_type> types) {
+            return std::find(types.begin(), types.end(), type) != types.end();
+        };
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const ggml_type type = static_cast<ggml_type>(t);
+            const uint32_t  uses = moe_pp_ring_uses_of_type(type);
+            const bool      res  = (uses & MOE_PP_RING_USE_RESIDENT) != 0;
+            const bool      stg  = (uses & MOE_PP_RING_USE_STAGED) != 0;
+            const bool      soa  = (uses & MOE_PP_RING_USE_SOA_EXPERT) != 0;
+            if (res != moe_pp_onednn_ring_serves_type(type) || stg != moe_pp_batched_takes_staged_type(type) ||
+                soa != (type == GGML_TYPE_MXFP4) || (uses != MOE_PP_RING_USE_NONE && !res)) {
+                std::printf("FAIL: type=%d ring uses 0x%x disagree with the consumers' tables\n", t, uses);
+                ++failures;
+            }
+            const bool direct        = moe_mmid_direct_route_runs_type(type);
+            const bool resident_only = uses == MOE_PP_RING_USE_RESIDENT;
+            const bool want_direct   = in_types(type, { GGML_TYPE_Q1_0, GGML_TYPE_NVFP4 });
+            const bool want_resident_only =
+                in_types(type, { GGML_TYPE_NVFP4, GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_XS });
+            const bool want_drop_set = in_types(type, { GGML_TYPE_NVFP4 });
+            if (direct != want_direct || resident_only != want_resident_only ||
+                (resident_only && direct) != want_drop_set) {
+                std::printf(
+                    "FAIL: %s direct_route=%d resident_only=%d drop_set=%d (want %d %d %d): the ring decision's type "
+                    "sets moved\n",
+                    ggml_type_name(type), direct ? 1 : 0, resident_only ? 1 : 0, (resident_only && direct) ? 1 : 0,
+                    want_direct ? 1 : 0, want_resident_only ? 1 : 0, want_drop_set ? 1 : 0);
+                ++failures;
+            }
+        }
+        // The use mask of every type the loop visits, by name. The checks above hold each bit to its own table, so a
+        // type that gains a use with its table (Q4_K gaining the SOA per-expert staging, say) still passes them; it
+        // fails here by name. A live type this table does not name fails as unlisted, and a slot whose type support was
+        // removed (ggml_blck_size 0) reaches none.
+        constexpr uint32_t use_none     = MOE_PP_RING_USE_NONE;
+        constexpr uint32_t use_resident = MOE_PP_RING_USE_RESIDENT;
+        constexpr uint32_t use_staged   = MOE_PP_RING_USE_RESIDENT | MOE_PP_RING_USE_STAGED;
+        constexpr uint32_t use_soa      = MOE_PP_RING_USE_RESIDENT | MOE_PP_RING_USE_SOA_EXPERT;
+
+        struct type_uses {
+            ggml_type type;
+            uint32_t  uses;
+        };
+
+        const std::vector<type_uses> want_uses = {
+            { GGML_TYPE_F32,     use_none     },
+            { GGML_TYPE_F16,     use_none     },
+            { GGML_TYPE_Q4_0,    use_staged   },
+            { GGML_TYPE_Q4_1,    use_staged   },
+            { GGML_TYPE_Q5_0,    use_staged   },
+            { GGML_TYPE_Q5_1,    use_staged   },
+            { GGML_TYPE_Q8_0,    use_staged   },
+            { GGML_TYPE_Q8_1,    use_none     },
+            { GGML_TYPE_Q2_K,    use_staged   },
+            { GGML_TYPE_Q3_K,    use_staged   },
+            { GGML_TYPE_Q4_K,    use_staged   },
+            { GGML_TYPE_Q5_K,    use_staged   },
+            { GGML_TYPE_Q6_K,    use_staged   },
+            { GGML_TYPE_Q8_K,    use_none     },
+            { GGML_TYPE_IQ2_XXS, use_staged   },
+            { GGML_TYPE_IQ2_XS,  use_staged   },
+            { GGML_TYPE_IQ3_XXS, use_staged   },
+            { GGML_TYPE_IQ1_S,   use_resident },
+            { GGML_TYPE_IQ4_NL,  use_staged   },
+            { GGML_TYPE_IQ3_S,   use_staged   },
+            { GGML_TYPE_IQ2_S,   use_staged   },
+            { GGML_TYPE_IQ4_XS,  use_resident },
+            { GGML_TYPE_I8,      use_none     },
+            { GGML_TYPE_I16,     use_none     },
+            { GGML_TYPE_I32,     use_none     },
+            { GGML_TYPE_I64,     use_none     },
+            { GGML_TYPE_F64,     use_none     },
+            { GGML_TYPE_IQ1_M,   use_resident },
+            { GGML_TYPE_BF16,    use_none     },
+            { GGML_TYPE_TQ1_0,   use_none     },
+            { GGML_TYPE_TQ2_0,   use_none     },
+            { GGML_TYPE_MXFP4,   use_soa      },
+            { GGML_TYPE_NVFP4,   use_resident },
+            { GGML_TYPE_Q1_0,    use_none     },
+            { GGML_TYPE_Q2_0,    use_staged   },
+            { GGML_TYPE_F8_E4M3, use_none     },
+        };
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            const ggml_type type = static_cast<ggml_type>(t);
+            const uint32_t  uses = moe_pp_ring_uses_of_type(type);
+            if (ggml_blck_size(type) == 0) {
+                if (uses != use_none) {
+                    std::printf("FAIL: removed type slot %d reaches ring uses 0x%x\n", t, uses);
+                    ++failures;
+                }
+                continue;
+            }
+            const auto want = std::find_if(want_uses.begin(), want_uses.end(),
+                                           [type](const type_uses & entry) { return entry.type == type; });
+            if (want == want_uses.end()) {
+                std::printf("FAIL: %s (type=%d) is not in the ring-use table: name its uses (0x%x)\n",
+                            ggml_type_name(type), t, uses);
+                ++failures;
+            } else if (uses != want->uses) {
+                std::printf("FAIL: %s ring uses 0x%x, want 0x%x\n", ggml_type_name(type), uses, want->uses);
                 ++failures;
             }
         }

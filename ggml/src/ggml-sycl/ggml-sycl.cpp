@@ -135,6 +135,7 @@
 #include "ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml-sycl/moe-pp-pack.hpp"
 #include "ggml-sycl/moe-resolved-batch.hpp"
+#include "ggml-sycl/moe-ring-consumer.hpp"
 #include "ggml-sycl/mul-mat-bf16.hpp"
 #include "ggml-sycl/nonfa-stage.hpp"
 #include "ggml-sycl/norm.hpp"
@@ -3440,12 +3441,16 @@ static bool ggml_sycl_secondary_local_agg_enabled() {
 // MoE expert tensor type classification.
 // In MoE FFN: hidden -> gate*up -> SiLU -> down -> output
 // gate+up are read first (enables SiLU overlap), down is read second.
+// A fused gate_up weight (ffn_gate_up_exps) is one matrix whose output holds the gate half and the up half side by
+// side; the graph splits and activates that output itself (build_moe_ffn), so the role has no gate or up partner and
+// none of the paired gate/up paths (the pair-GLU, the gate/up XMX bundle, the gate/up group registry) takes it.
 // ---------------------------------------------------------------------------
 enum moe_tensor_type : int {
-    MOE_TENSOR_GATE    = 0,  // ffn_gate_exps — read first
-    MOE_TENSOR_UP      = 1,  // ffn_up_exps   — read first (with gate)
-    MOE_TENSOR_DOWN    = 2,  // ffn_down_exps — read second (after SiLU)
-    MOE_TENSOR_UNKNOWN = 3,
+    MOE_TENSOR_GATE    = 0,  // ffn_gate_exps    — read first
+    MOE_TENSOR_UP      = 1,  // ffn_up_exps      — read first (with gate)
+    MOE_TENSOR_DOWN    = 2,  // ffn_down_exps    — read second (after SiLU)
+    MOE_TENSOR_GATE_UP = 3,  // ffn_gate_up_exps — read first, gate and up in one matrix
+    MOE_TENSOR_UNKNOWN = 4,
 };
 
 static constexpr int MOE_PROFILE_ROLE_COUNT = static_cast<int>(MOE_TENSOR_UNKNOWN) + 1;
@@ -3454,6 +3459,9 @@ static constexpr int MOE_PROFILE_ROLE_COUNT = static_cast<int>(MOE_TENSOR_UNKNOW
 static moe_tensor_type moe_classify_tensor(const char * name) {
     if (!name) {
         return MOE_TENSOR_UNKNOWN;
+    }
+    if (strstr(name, "ffn_gate_up_exps")) {
+        return MOE_TENSOR_GATE_UP;
     }
     if (strstr(name, "ffn_gate_exps")) {
         return MOE_TENSOR_GATE;
@@ -3475,6 +3483,8 @@ static const char * moe_tensor_type_name(moe_tensor_type type) {
             return "up";
         case MOE_TENSOR_DOWN:
             return "down";
+        case MOE_TENSOR_GATE_UP:
+            return "gate_up";
         case MOE_TENSOR_UNKNOWN:
             return "unknown";
     }
@@ -6691,7 +6701,11 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
                     grp.down_key = meta.canonical_key;
                     grp.has_down = true;
                     break;
-                default:
+                case MOE_TENSOR_GATE_UP:
+                    // The registry keys a block's separate gate, up and down; a fused gate_up weight has no gate or
+                    // up partner to group with, so its block counts as registered and never as complete.
+                    break;
+                case MOE_TENSOR_UNKNOWN:
                     break;
             }
             n_groups_registered++;
@@ -10222,13 +10236,6 @@ static bool ggml_sycl_moe_mmid_route_reachable(const ggml_backend_sycl_context &
     (void) ctx;
     return false;
 #endif
-}
-
-// The expert types the MMID direct route in ggml_sycl_mul_mat_id runs, a card's experts and the host experts beside
-// them in one node. The route's admission asks this, and so does the hybrid decode record build, which runs before it
-// and leaves such a tensor to it, so the two cannot name different types.
-static bool ggml_sycl_moe_mmid_direct_route_runs_type(ggml_type type) {
-    return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;
 }
 
 void ggml_backend_sycl_model_lifecycle_probe_read(struct ggml_backend_sycl_model_lifecycle_probe * out) {
@@ -16205,11 +16212,12 @@ static std::vector<ggml_sycl::placement_tensor_info> ggml_sycl_inventory_planner
     return detail;
 }
 
-// Whether the inventory has a gate, up or down expert, from the names the loader sizes the PP MoE oneDNN ring from,
-// of a type a ring consumer runs (moe_pp_onednn_ring_serves_type). The loader sizes the ring for every MoE model, but
-// only the batched prompt executor and the MXFP4 SOA per-expert staging claim its slots: Q1_0 and NVFP4 experts run on
-// the MMID direct route and BF16 experts on the BF16 direct route. The question asks no runtime knob, so the ring a
-// load plans does not depend on a knob that turns an executor off for one run.
+// Whether the inventory has a gate, up, down or fused gate_up expert, from the names the loader sizes the PP MoE
+// oneDNN ring from (llama_sycl_is_moe_expert_weight_name), of a type a ring consumer runs
+// (moe_pp_onednn_ring_serves_type). The loader sizes the ring for every MoE model, but only the batched prompt
+// executor and the MXFP4 SOA per-expert staging claim its slots: Q1_0 experts run on the MMID direct route and BF16
+// experts on the BF16 direct route. The question asks no runtime knob, so the ring a load plans does not depend on a
+// knob that turns an executor off for one run.
 static bool ggml_sycl_inventory_ring_has_consumer(const ggml_sycl_tensor_inventory * inventory) {
     for (size_t i = 0; i < inventory->count; ++i) {
         const ggml_sycl_tensor_info & t = inventory->tensors[i];
@@ -16221,6 +16229,153 @@ static bool ggml_sycl_inventory_ring_has_consumer(const ggml_sycl_tensor_invento
         }
     }
     return false;
+}
+
+// The expert weights of a planner view that a ring consumer runs, with each one's bytes, the ring uses of its type and
+// whether a resident prompt node of it keeps a device route without the ring, as the ring decision reads them
+// (moe_pp_ring_check_resident_only, moe_pp_ring_experts_worth). The filter is the one the ring's sizing reads
+// (ggml_sycl_inventory_ring_has_consumer): a gate, up, down or gate_up expert with a shape. The names point into
+// `detail`, which outlives the list at every caller.
+static std::vector<ggml_sycl::moe_pp_ring_weight> ggml_sycl_inventory_ring_weights(
+    const std::vector<ggml_sycl::placement_tensor_info> & detail) {
+    std::vector<ggml_sycl::moe_pp_ring_weight> weights;
+    for (const ggml_sycl::placement_tensor_info & info : detail) {
+        if (moe_classify_tensor(info.name.c_str()) == MOE_TENSOR_UNKNOWN || !info.has_shape()) {
+            continue;
+        }
+        const uint32_t uses = moe_pp_ring_uses_of_type(info.type);
+        if (uses == MOE_PP_RING_USE_NONE) {
+            continue;
+        }
+        ggml_sycl::moe_pp_ring_weight weight;
+        weight.name                      = info.name.c_str();
+        weight.n_experts                 = info.ne[2] > 0 ? info.ne[2] : 1;
+        weight.bytes                     = info.size;
+        weight.uses                      = uses;
+        weight.other_device_prompt_route = moe_mmid_direct_route_runs_type(info.type);
+        weights.push_back(weight);
+    }
+    return weights;
+}
+
+// What the plan made with `device`'s published PP MoE oneDNN scratch ring says about that ring: the one decision the
+// load stage (ggml_sycl_stage_drop_displacing_ring) and the plan dry run (ggml_sycl_plan_dry_run_drop_displacing_ring)
+// both act on. A device with no ring published has nothing to decide.
+static ggml_sycl::moe_pp_ring_resident_check ggml_sycl_plan_ring_resident_check(
+    int                                                   device,
+    const std::vector<ggml_sycl::placement_tensor_info> & detail,
+    const ggml_sycl::placement_plan &                     plan) {
+    if (ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(device) == 0) {
+        return {};
+    }
+    const std::vector<ggml_sycl::moe_pp_ring_weight> weights = ggml_sycl_inventory_ring_weights(detail);
+    return ggml_sycl::moe_pp_ring_check_resident_only(plan, weights.data(), weights.size());
+}
+
+// Publishes no PP MoE oneDNN scratch ring on `device`, as a model with no ring consumer publishes
+// (ggml_sycl_inventory_publish_planner_inputs): every slot and the depth are zero, so the zone ensure reserves no ring
+// room, the explicit micro-batch has no ring room to hold, the context's re-plan has no ring to size, and the batched
+// prompt executor's resident claim has no slot to take (its nodes take the MMID direct route).
+static void ggml_sycl_publish_no_pp_moe_onednn_ring(int device) {
+    ggml_sycl::unified_cache_set_planned_pp_moe_onednn_scratch(device, 0, 0, 0, 0);
+}
+
+// The RUNTIME zone the arena reserves for `device`'s terms as published now, as ensure_planned_arena_zones() sizes it
+// (zone_runtime_reserved_bytes over the floor and the planned requirement): the figure the ring decision's room asks
+// for without the ring (moe_pp_ring_runtime_room), and the one ggml_sycl_ring_runtime_with_ring_bytes caps with it.
+// SIZE_MAX when a term is unanswerable, so an unanswerable figure without the ring never reads as room returned.
+static size_t ggml_sycl_planned_runtime_zone_bytes(int device) {
+    size_t requirement = 0;
+    size_t reserved    = 0;
+    if (!ggml_sycl::unified_cache_get_planned_runtime_zone_requirement(device, &requirement) ||
+        !ggml_sycl::zone_runtime_reserved_bytes(ggml_sycl::unified_cache_runtime_zone_floor_bytes(), requirement,
+                                                &reserved)) {
+        return SIZE_MAX;
+    }
+    return reserved;
+}
+
+// The RUNTIME zone `device` holds for the plan made with its ring, read before the ring is unpublished
+// (moe_pp_ring_runtime_with_ring): the planned figure no more than the arena's RUNTIME zone where an arena is active,
+// else the planned figure with an unanswerable one read as the floor the ensure keeps for it. The load stage and the
+// plan dry run both read it here, so both cap it alike. Reads a cache that exists and creates none.
+static size_t ggml_sycl_ring_runtime_with_ring_bytes(int device) {
+    ggml_sycl::unified_cache * const cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    const bool                       arena = cache != nullptr && cache->arena_active();
+    return ggml_sycl::moe_pp_ring_runtime_with_ring(ggml_sycl_planned_runtime_zone_bytes(device), arena,
+                                                    arena ? cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME) : 0,
+                                                    ggml_sycl::unified_cache_runtime_zone_floor_bytes());
+}
+
+// The RUNTIME zone `device`'s active arena holds now, 0 with none. Reads a cache that exists and creates none.
+static size_t ggml_sycl_ring_arena_runtime_zone_bytes(int device) {
+    ggml_sycl::unified_cache * const cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    return cache != nullptr && cache->arena_active() ? cache->zone_capacity(ggml_sycl::vram_zone_id::RUNTIME) : 0;
+}
+
+// Whether the planner that made `plan` packs a device's weights against that device's WEIGHT zone where the device has
+// an active arena (kv_reads_device_arena): a single-device plan's always, a multi-device plan's unless the cache mode
+// is GLOBAL, whose one cache the multi-device planner lends to no device (multi_device_plan_arena_cache), so it packs
+// each device to its budget alone. Where it is false, ggml_sycl_ring_plan_weight_room reads no WEIGHT room.
+static bool ggml_sycl_ring_planner_reads_zone(const ggml_sycl::placement_plan & plan) {
+    return ggml_sycl::kv_reads_device_arena(plan.multi_device, ggml_sycl::unified_cache_mode_is_global());
+}
+
+// The room `device`'s weights have under the planner that made `plan`, read as that planner reads it
+// (unified_cache_kv_weight_capacity, at the budget `plan` packed `device` to): the arena's WEIGHT zone, no more than
+// that budget. 0 where that planner reads no WEIGHT zone (ggml_sycl_ring_planner_reads_zone) or the device has no
+// active arena: the one place the ring decision learns either, so the load stage and the plan dry run both ask
+// moe_pp_ring_drop_can_return_room of this figure. The load stage reads it with the ring, after the give-back, and
+// after a give-back rebuild it keeps, so all three are that planner's figure. Reads an existing cache, creates none.
+static size_t ggml_sycl_ring_plan_weight_room(int device, const ggml_sycl::placement_plan & plan) {
+    ggml_sycl::unified_cache * const cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    if (!ggml_sycl_ring_planner_reads_zone(plan) || cache == nullptr || !cache->arena_active()) {
+        return 0;
+    }
+    size_t budget = plan.vram_budget;
+    if (plan.multi_device) {
+        budget = 0;
+        for (size_t i = 0; i < plan.devices.size() && i < plan.per_device_vram_budgets.size(); ++i) {
+            if (plan.devices[i] == device) {
+                budget = plan.per_device_vram_budgets[i];
+            }
+        }
+    }
+    return ggml_sycl::unified_cache_kv_weight_capacity(device, budget, plan.multi_device);
+}
+
+// Why a ring decision read no WEIGHT room under the planner that made `plan`, from the figure
+// ggml_sycl_ring_plan_weight_room answered (`weight_room`), for the keep lines of the load stage and the plan dry run
+// to name. `reason` is null where that figure is the planner's own, which those lines print instead.
+// `load_reads_none` is true where a load reads none there either, whatever arena its entry ensure builds: a
+// multi-device plan in GLOBAL cache mode reads no WEIGHT zone at all. A device with no active arena, or no budget in
+// the plan, reads none only until an arena answers, which a dry run, building none, cannot see.
+struct ggml_sycl_ring_no_weight_room {
+    const char * reason          = nullptr;
+    bool         load_reads_none = false;
+};
+
+static ggml_sycl_ring_no_weight_room ggml_sycl_ring_no_weight_room_reason(const ggml_sycl::placement_plan & plan,
+                                                                          size_t weight_room) {
+    if (weight_room > 0) {
+        return {};
+    }
+    if (!ggml_sycl_ring_planner_reads_zone(plan)) {
+        return { "its multi-device plan in GLOBAL cache mode packs every device to its budget and reads no WEIGHT zone",
+                 true };
+    }
+    return { "its plan reads no WEIGHT room on the device, which has no active arena or no budget in the plan", false };
+}
+
+// Publishes again on `device` what a ring drop writes before it knows whether the drop returns room, as `with_ring`
+// holds it from before the drop: the ring (its slots, depth, KV-zone slots and micro-batch) and the planners' terms,
+// each group through its own setters (load_published_terms::restore), so they read exactly as they did. A ring the
+// decision keeps (moe_pp_ring_decide) goes back through it, and the plan made with the ring stands on the terms it was
+// made with; the load stage and the plan dry run both put a kept ring back here.
+static void ggml_sycl_put_back_ring_terms(int device, const ggml_sycl::load_published_terms & with_ring) {
+    with_ring.restore(device, ggml_sycl::LOAD_PUBLISHED_GROUP_RING | ggml_sycl::LOAD_PUBLISHED_GROUP_GRAPH |
+                                  ggml_sycl::LOAD_PUBLISHED_GROUP_NONFA | ggml_sycl::LOAD_PUBLISHED_GROUP_CONTROL |
+                                  ggml_sycl::LOAD_PUBLISHED_GROUP_SCATTER | ggml_sycl::LOAD_PUBLISHED_GROUP_MOE_MMVQ);
 }
 
 // The per-device planner inputs an inventory carries, as ggml_sycl_inventory_publish_planner_inputs() published them.
@@ -16248,9 +16403,9 @@ static ggml_sycl_inventory_planner_inputs ggml_sycl_inventory_publish_planner_in
     // device workspace, which also takes RUNTIME room, that demand refuses a later context's micro-batch.
     if (in.pp_moe_onednn_ring_depth != 0 && !ggml_sycl_inventory_ring_has_consumer(inventory)) {
         GGML_LOG_INFO(
-            "[SYCL-PLAN] no PP MoE oneDNN scratch ring on device %d: no gate, up or down expert of this model has a "
-            "type a ring consumer runs, so the plan neither reserves nor demands the %.1f MB weight slot the loader "
-            "sized\n",
+            "[SYCL-PLAN] no PP MoE oneDNN scratch ring on device %d: no gate, up, down or gate_up expert of this model "
+            "has a type a ring consumer runs, so the plan neither reserves nor demands the %.1f MB weight slot the "
+            "loader sized\n",
             device, in.pp_moe_onednn_weight_slot_bytes / (1024.0 * 1024.0));
         in.pp_moe_onednn_weight_slot_bytes = 0;
         in.pp_moe_onednn_ring_depth        = 0;
@@ -17062,6 +17217,210 @@ static bool ggml_sycl_ensure_load_arena_zones(int device, ggml_sycl::zone_arena_
     return ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options);
 }
 
+// The load that dropped each device's PP MoE oneDNN scratch ring (ggml_sycl_stage_drop_displacing_ring), by its load
+// transaction; moe_pp_ring_drop_marks says why one slot per device is enough: one load is open at a time. The inventory
+// intake of each pass publishes the ring the loader sized. Where the early pass dropped it, the late pass publishes
+// none again before its zones are asked for, so the zone the early pass gave back is not asked for again and the late
+// plan is made without the ring, as the early pass's last plan was. Written and read under g_tensor_inventory_mutex.
+static ggml_sycl::moe_pp_ring_drop_marks g_sycl_ring_drop_marks;
+
+// Whether an earlier pass of this thread's staged load dropped `device`'s ring. Never for a direct planner entry.
+static bool ggml_sycl_stage_ring_dropped_by_this_load(int device) {
+    return g_sycl_ring_drop_marks.dropped(device, g_sycl_plan_load_effect_txn);
+}
+
+// Publishes no ring on `device` for the stage, and clears the inventory's copy of the ring the intake published with
+// it, so the two say the same.
+static void ggml_sycl_stage_publish_no_ring(int device) {
+    ggml_sycl_publish_no_pp_moe_onednn_ring(device);
+    g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = 0;
+    g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = 0;
+    g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = 0;
+    g_tensor_inventory_pp_moe_onednn_ring_depth            = 0;
+}
+
+// What a ring drop on `device` writes before it knows whether the drop returns room, as the plan made with the ring
+// left it: the ring and the planners' terms (ggml_sycl_put_back_ring_terms) and the inventory's copy of the ring. A
+// ring the decision keeps is published again from it, so the plan made with the ring stands on the terms it was made
+// with and never over a ring published as none.
+struct ggml_sycl_stage_ring_published {
+    ggml_sycl::load_published_terms terms;
+    size_t                          inventory_weight_slot_bytes     = 0;
+    size_t                          inventory_activation_slot_bytes = 0;
+    size_t                          inventory_output_slot_bytes     = 0;
+    uint32_t                        inventory_ring_depth            = 0;
+
+    static ggml_sycl_stage_ring_published snapshot(int device) {
+        ggml_sycl_stage_ring_published published;
+        published.terms                           = ggml_sycl::load_published_terms::snapshot(device);
+        published.inventory_weight_slot_bytes     = g_tensor_inventory_pp_moe_onednn_weight_slot_bytes;
+        published.inventory_activation_slot_bytes = g_tensor_inventory_pp_moe_onednn_activation_slot_bytes;
+        published.inventory_output_slot_bytes     = g_tensor_inventory_pp_moe_onednn_output_slot_bytes;
+        published.inventory_ring_depth            = g_tensor_inventory_pp_moe_onednn_ring_depth;
+        return published;
+    }
+
+    // Puts the ring back on `device`. Where the drop moved the ring and the dense scratch from the ring's micro-batch
+    // to the load's planning shape (ggml_sycl_stage_unpublish_ring), the dense scratch is planned again at the ring's
+    // micro-batch first, from the inputs the explicit micro-batch's placement planned it from; the ring's own terms
+    // then go back as they were, over the slots that re-plan wrote.
+    void put_back(int device, uint32_t planning_n_ubatch) const {
+        if (terms.ring_n_ubatch != planning_n_ubatch) {
+            (void) ggml_sycl_publish_load_ubatch_scratch(device, terms.ring_n_ubatch);
+        }
+        ggml_sycl_put_back_ring_terms(device, terms);
+        g_tensor_inventory_pp_moe_onednn_weight_slot_bytes     = inventory_weight_slot_bytes;
+        g_tensor_inventory_pp_moe_onednn_activation_slot_bytes = inventory_activation_slot_bytes;
+        g_tensor_inventory_pp_moe_onednn_output_slot_bytes     = inventory_output_slot_bytes;
+        g_tensor_inventory_pp_moe_onednn_ring_depth            = inventory_ring_depth;
+    }
+};
+
+// Publishes `device` as a model with no ring consumer plans it: the ring and the dense scratch at the load's planning
+// shape (an explicit micro-batch's placement may have moved both to its own micro-batch), no ring, and the planner
+// terms as `published_before` holds them, from before the plans made with the ring.
+static void ggml_sycl_stage_unpublish_ring(int                                        device,
+                                           uint32_t                                   planning_n_ubatch,
+                                           const ggml_sycl::planner_published_terms & published_before) {
+    if (ggml_sycl::unified_cache_get_planned_pp_moe_onednn_n_ubatch(device) != planning_n_ubatch) {
+        (void) ggml_sycl_publish_load_ubatch_scratch(device, planning_n_ubatch);
+    }
+    ggml_sycl_stage_publish_no_ring(device);
+    published_before.restore(device);
+}
+
+// What the load stage did with a device's PP MoE oneDNN scratch ring after a plan made with it.
+enum class ggml_sycl_stage_ring_drop {
+    KEPT,             // the ring is published as the plan made with it found it, and that plan stands
+    KEPT_PLAN_AGAIN,  // the ring is published as the plan made with it found it, but the zones asked for again with it
+                      // after a give-back rebuild leave less WEIGHT room than that plan was packed against: the caller
+                      // plans once more with the ring, and that is final
+    DROPPED,          // no ring is published and the arena was rebuilt with a smaller RUNTIME zone and a larger WEIGHT
+                      // zone: the caller plans once more, and that is final
+    REFUSED,          // the zones could not be asked for again: the refusal is logged, and the caller refuses the load
+};
+
+// Decides `device`'s PP MoE oneDNN scratch ring after the plan made with it, by the rule in moe-ring-consumer.hpp; its
+// measured outcomes are in docs/backend/sycl-memory-design.md. (a) to (c) keep the ring before anything is written.
+// Otherwise the stage reads the RUNTIME zone the plan made with the ring holds
+// (ggml_sycl_ring_runtime_with_ring_bytes), publishes the device as a model with no ring consumer plans it
+// (ggml_sycl_stage_unpublish_ring), and reads the room the ring takes there and the WEIGHT room that plan was packed
+// against (ggml_sycl_ring_plan_weight_room). Only where a drop can return room (moe_pp_ring_drop_can_return_room) are
+// the zones asked for with the RUNTIME zone's surplus given back (zone_arena_ensure_options::give_back), and the WEIGHT
+// room read again. The decision (moe_pp_ring_decide) is recorded for the rest of this load
+// (moe_pp_ring_drop_marks::record): a drop marks the device, a keep marks nothing. A kept ring is published again as it
+// was (ggml_sycl_stage_ring_published::put_back); where the give-back rebuilt the arena, the zones are asked for again
+// with the ring, and the stage answers KEPT_PLAN_AGAIN where that leaves less WEIGHT room than the plan was packed
+// against. A WARN for a drop, a held arena or a kept rebuild, an INFO where no room returns. Caller holds
+// g_tensor_inventory_mutex.
+static ggml_sycl_stage_ring_drop ggml_sycl_stage_drop_displacing_ring(
+    int                                        device,
+    const ggml_sycl::placement_plan &          plan,
+    const ggml_sycl::planner_published_terms & published_before) {
+    const ggml_sycl::moe_pp_ring_resident_check check =
+        ggml_sycl_plan_ring_resident_check(device, g_tensor_inventory_detail, plan);
+    if (!check.displaces_experts()) {
+        return ggml_sycl_stage_ring_drop::KEPT;
+    }
+    const size_t   ring_bytes        = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device);
+    const uint32_t planning_n_ubatch = ggml_sycl::placement_load_n_ubatch(g_placement_kv_info.n_ubatch);
+
+    const ggml_sycl_stage_ring_published with_ring         = ggml_sycl_stage_ring_published::snapshot(device);
+    const size_t                         runtime_with_ring = ggml_sycl_ring_runtime_with_ring_bytes(device);
+    ggml_sycl_stage_unpublish_ring(device, planning_n_ubatch, published_before);
+    const size_t runtime_room =
+        ggml_sycl::moe_pp_ring_runtime_room(runtime_with_ring, ggml_sycl_planned_runtime_zone_bytes(device));
+
+    ggml_sycl::moe_pp_ring_zone_answer zone;
+    ggml_sycl::zone_arena_give_back    give_back;
+    zone.weight_with_ring    = ggml_sycl_ring_plan_weight_room(device, plan);
+    zone.weight_without_ring = zone.weight_with_ring;
+    if (ggml_sycl::moe_pp_ring_drop_can_return_room(zone.weight_with_ring, runtime_room)) {
+        ggml_sycl::zone_arena_ensure_options options = ggml_sycl_load_arena_options();
+        options.give_back                            = &give_back;
+        ggml_sycl::zone_arena_refusal refusal;
+        if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal, options)) {
+            GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
+            return ggml_sycl_stage_ring_drop::REFUSED;
+        }
+        zone.weight_without_ring = ggml_sycl_ring_plan_weight_room(device, plan);
+        zone.held                = give_back.held;
+    }
+    const ggml_sycl::moe_pp_ring_decision decision = ggml_sycl::moe_pp_ring_decide(zone);
+    g_sycl_ring_drop_marks.record(device, g_sycl_plan_load_effect_txn, decision);
+    constexpr double mb = 1024.0 * 1024.0;
+    if (decision != ggml_sycl::moe_pp_ring_decision::DROP) {
+        with_ring.put_back(device, planning_n_ubatch);
+        bool plan_again = false;
+        if (give_back.rebuilt) {
+            // The arena was rebuilt for the plan without the ring, so the zones are asked for again with the ring put
+            // back: the RUNTIME zone the published ring needs is reserved again before anything plans against it. That
+            // rebuild's layout is the reserve's, so the WEIGHT room is read again, and a plan packed against more than
+            // it is made once more (moe_pp_ring_kept_plan_again).
+            ggml_sycl::zone_arena_refusal refusal;
+            if (!ggml_sycl::unified_cache_ensure_planned_arena_zones(device, &refusal,
+                                                                     ggml_sycl_load_arena_options())) {
+                GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
+                return ggml_sycl_stage_ring_drop::REFUSED;
+            }
+            const size_t weight_kept = ggml_sycl_ring_plan_weight_room(device, plan);
+            plan_again               = ggml_sycl::moe_pp_ring_kept_plan_again(zone.weight_with_ring, weight_kept);
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): its arena was rebuilt with a "
+                "RUNTIME zone %.1f MB smaller without it, but the WEIGHT room its plan packs against did not grow "
+                "(%.1f MB with the ring, %.1f MB without it), so the zones were asked for again with the ring, which "
+                "leaves %.1f MB of WEIGHT room: %s\n",
+                device, ring_bytes / mb, (give_back.have_runtime - give_back.need_runtime) / mb,
+                zone.weight_with_ring / mb, zone.weight_without_ring / mb, weight_kept / mb,
+                plan_again ? "less than the plan made with the ring was packed against, so the device is planned once "
+                             "more with it" :
+                             "the plan made with it stands");
+        } else if (decision == ggml_sycl::moe_pp_ring_decision::KEEP_HELD) {
+            const std::vector<ggml_sycl::moe_pp_ring_weight> weights =
+                ggml_sycl_inventory_ring_weights(g_tensor_inventory_detail);
+            GGML_LOG_WARN(
+                "[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB) although the plan made with it "
+                "left %" PRId64
+                " experts of its %zu resident-only expert weights on the host: its RUNTIME zone would need %.1f MB "
+                "less without it, but something points into the arena, so it could not be rebuilt, and in this load "
+                "the ring displaces %" PRId64 " experts' worth of room from the weights\n",
+                device, ring_bytes / mb, check.host_experts, check.n_weights, runtime_room / mb,
+                ggml_sycl::moe_pp_ring_experts_worth(weights.data(), weights.size(), runtime_room));
+        } else {
+            const ggml_sycl_ring_no_weight_room no_room =
+                ggml_sycl_ring_no_weight_room_reason(plan, zone.weight_with_ring);
+            if (no_room.reason != nullptr) {
+                GGML_LOG_INFO(
+                    "[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop would give the "
+                    "weights no room, as %s\n",
+                    device, ring_bytes / mb, no_room.reason);
+            } else {
+                GGML_LOG_INFO(
+                    "[SYCL-PLAN] device %d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop would give the "
+                    "weights no room (its RUNTIME zone needs %.1f MB less without it, and the WEIGHT room its plan "
+                    "packs against is %.1f MB with the ring and %.1f MB without it)\n",
+                    device, ring_bytes / mb, runtime_room / mb, zone.weight_with_ring / mb,
+                    zone.weight_without_ring / mb);
+            }
+        }
+        if (plan_again) {
+            return ggml_sycl_stage_ring_drop::KEPT_PLAN_AGAIN;
+        }
+        return ggml_sycl_stage_ring_drop::KEPT;
+    }
+    const size_t runtime_rebuilt = ggml_sycl_ring_arena_runtime_zone_bytes(device);
+    GGML_LOG_WARN(
+        "[SYCL-PLAN] device %d drops its PP MoE oneDNN scratch ring (%.1f MB): the plan made with it left %" PRId64
+        " experts of its %zu resident-only expert weights on the host, and a ring that serves only resident layers "
+        "trades prompt room for a decode loss on every token; its RUNTIME zone was rebuilt at %.1f MB, %.1f MB less, "
+        "and its WEIGHT zone grew from %.1f MB to %.1f MB, and the device is planned once more without it. The "
+        "[PLACEMENT] and [SYCL-PLAN] lines of the plan made with the ring, above this one, describe a plan that is "
+        "not kept\n",
+        device, ring_bytes / mb, check.host_experts, check.n_weights, runtime_rebuilt / mb,
+        (give_back.have_runtime - runtime_rebuilt) / mb, zone.weight_with_ring / mb, zone.weight_without_ring / mb);
+    return ggml_sycl_stage_ring_drop::DROPPED;
+}
+
 // Phase C helper: run compute_placement_plan (single- or multi-device) and
 // store the plan into per-device unified caches.  Idempotent — replaces any
 // previous plan.  Caller must hold g_tensor_inventory_mutex. False when the
@@ -17094,6 +17453,15 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
         // because a discarded plan goes back to the shape the ensure sized the zones for.
         (void) ggml_sycl::unified_cache_publish_planned_onednn_graph_scratch_shape(ctx->device, g_placement_kv_info,
                                                                                    envelope_arg);
+    }
+    // A ring an earlier pass of this load dropped stays dropped (ggml_sycl_stage_drop_displacing_ring): the intake
+    // published it again from the inventory, and the zones are asked for below without it.
+    if (ggml_sycl_stage_ring_dropped_by_this_load(ctx->device) &&
+        ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx->device) != 0) {
+        ggml_sycl_stage_publish_no_ring(ctx->device);
+        GGML_LOG_INFO(
+            "[SYCL-PLAN] device %d plans with no PP MoE oneDNN scratch ring: an earlier pass of this load dropped it\n",
+            ctx->device);
     }
     ggml_sycl::zone_arena_refusal refusal;
     if (ggml_sycl::get_unified_cache_for_device(ctx->device) &&
@@ -17147,12 +17515,31 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                 "host fallback may be used for overflow\n");
         }
 
-        const std::vector<ggml_sycl::device_budget> budgets =
-            ggml_sycl_plan_device_budgets(budget_pct, cache_device_ready);
         const ggml_sycl::multi_gpu_mode gpu_mode = ggml_sycl_plan_multi_gpu_mode(is_moe);
-        plan_candidate                           = ggml_sycl::compute_multi_device_plan(
-            budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
-            envelope_arg, g_moe_n_experts_total, ggml_sycl::host_ledger_budget(), g_sycl_lazy_plan_slot);
+
+        // The budgets are read at each plan: a dropped ring's give-back can rebuild this device's arena in between.
+        auto plan_multi_device = [&]() {
+            const std::vector<ggml_sycl::device_budget> budgets =
+                ggml_sycl_plan_device_budgets(budget_pct, cache_device_ready);
+            return ggml_sycl::compute_multi_device_plan(
+                budgets, g_tensor_inventory_detail, static_cast<int>(g_model_n_layer), gpu_mode, g_placement_kv_info,
+                envelope_arg, g_moe_n_experts_total, ggml_sycl::host_ledger_budget(), g_sycl_lazy_plan_slot);
+        };
+        // The planner terms as they stand before the plan, for a ring drop to put back (the single-device branch takes
+        // its own snapshot, published_before, for the plans with the micro-batch room as well).
+        const ggml_sycl::planner_published_terms terms_before_plan =
+            ggml_sycl::planner_published_terms::snapshot(ctx->device);
+        plan_candidate = plan_multi_device();
+        switch (ggml_sycl_stage_drop_displacing_ring(ctx->device, plan_candidate, terms_before_plan)) {
+            case ggml_sycl_stage_ring_drop::KEPT:
+                break;
+            case ggml_sycl_stage_ring_drop::KEPT_PLAN_AGAIN:
+            case ggml_sycl_stage_ring_drop::DROPPED:
+                plan_candidate = plan_multi_device();
+                break;
+            case ggml_sycl_stage_ring_drop::REFUSED:
+                return false;
+        }
         if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
             size_t moe_entries = 0;
             size_t xmx_entries = 0;
@@ -17232,6 +17619,8 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
             (void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);
         }
         plan_candidate = plan_single_device(/*with_room=*/true);
+        // Whether plan_candidate holds the micro-batch's room: a ring the stage keeps is planned once more alike.
+        bool candidate_with_room = true;
         if (plan_candidate.explicit_ubatch.action == ggml_sycl::pp_moe_onednn_explicit_ubatch_action::GROW_ZONE) {
             // The experts can give the room: grow the RUNTIME zone for the micro-batch's ring and dense scratch, which
             // takes the room from the weight capacity, and plan again. The hold is the whole room either way, so the
@@ -17265,12 +17654,27 @@ static bool compute_and_store_plan_for_inventory(ggml_backend_sycl_context * ctx
                     GGML_LOG_ERROR("%s\n", ggml_sycl::zone_arena_refusal_text(refusal).c_str());
                     return false;
                 }
-                plan_candidate = plan_single_device(/*with_room=*/false);
+                candidate_with_room = false;
+                plan_candidate      = plan_single_device(/*with_room=*/false);
                 GGML_LOG_WARN(
                     "[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB more RUNTIME zone, "
                     "which the arena could not reserve on device %d; the ring is re-planned when the context opens\n",
                     explicit_n_ubatch, room_short / (1024.0 * 1024.0), ctx->device);
             }
+        }
+        // A kept ring planned once more keeps the candidate's room; with no ring there is no micro-batch room to hold,
+        // so the last plan after a drop is made without it.
+        switch (ggml_sycl_stage_drop_displacing_ring(ctx->device, plan_candidate, published_before)) {
+            case ggml_sycl_stage_ring_drop::KEPT:
+                break;
+            case ggml_sycl_stage_ring_drop::KEPT_PLAN_AGAIN:
+                plan_candidate = plan_single_device(candidate_with_room);
+                break;
+            case ggml_sycl_stage_ring_drop::DROPPED:
+                plan_candidate = plan_single_device(/*with_room=*/false);
+                break;
+            case ggml_sycl_stage_ring_drop::REFUSED:
+                return false;
         }
         have_plan = true;
         GGML_LOG_INFO(
@@ -17582,7 +17986,8 @@ static void ggml_sycl_warn_runtime_zone_kept_from_earlier_load(int device) {
 // streaming and releases no stale ring: what it decided to change is returned in *effects (device -1 when it planned
 // nothing or refused), for the caller to run with ggml_sycl_run_inventory_effects() once it has decided every refusal.
 // The planner's zone decision still changes the device: the entry ensure may release the PP MoE ring as its last
-// resort, and it or the micro-batch's grow leg may rebuild an arena nothing holds. A refused load's abort tears that
+// resort, and it, the micro-batch's grow leg or the give-back after a dropped ring
+// (ggml_sycl_stage_drop_displacing_ring) may rebuild an arena nothing holds. A refused load's abort tears that
 // arena down again when no model is live (ggml_sycl_release_last_model_effects), and the next load's start reserves
 // the early arena; an arena the load's own buffers still hold at the abort stays, and that start runs the release
 // again before its reserve. While a model is live on another device, the rebuilt arena (or, after a failed reserve,
@@ -18058,7 +18463,8 @@ ggml_sycl_lifecycle_result ggml_backend_sycl_stage_load_inventory_plan(const ggm
         // The decide pass: every device plans and every refusal is decided before this pass's host zones, layer
         // streaming or stale-ring release, and the rollback guard's abort puts back what the pass published. The
         // planner's zone decision still changes a device here: the entry ensure's last resort releases a ring that
-        // alone holds the arena, and an arena nothing holds may be rebuilt for the plan's zones. With no model live
+        // alone holds the arena, and an arena nothing holds may be rebuilt for the plan's zones, or with a smaller
+        // RUNTIME zone once a ring that displaced experts is dropped. With no model live
         // the abort's release of the last model tears that arena down again, or the next load's start does when the
         // load's own buffers still hold it; while a model is live a refused load keeps it (or no arena, after a failed
         // reserve). The secondary MoE queues and caches a plan creates stay too.
@@ -18452,6 +18858,65 @@ ggml_sycl_plan_dry_run_plan test_plan_dry_run_record(uint32_t index, const place
 }  // namespace ggml_sycl
 #endif
 
+// The plan dry run's side of the ring decision the load stage makes (ggml_sycl_stage_drop_displacing_ring), by the
+// rule in moe-ring-consumer.hpp, on the dry run's own figures: the plan made with `device`'s ring answers (a) to (c);
+// the RUNTIME room is read as the stage reads it, with the ring (ggml_sycl_ring_runtime_with_ring_bytes) and after no
+// ring is published and the planner terms are put back as `terms_before_plan` holds them; and the stage's question,
+// moe_pp_ring_drop_can_return_room on the WEIGHT room the plan was packed against (ggml_sycl_ring_plan_weight_room),
+// decides whether a drop can return room at all. The dry run rebuilds no arena and reads no holders, so where it can it
+// answers from the RUNTIME room alone (moe_pp_ring_dry_run_answer), and its drop line says what it cannot see. A ring
+// it keeps is published again as it was (ggml_sycl_put_back_ring_terms) and the plan made with it stands; its plan
+// without the ring is made against the budget it planned the first with, and its saved state puts the ring back at the
+// end. True when it dropped the ring, for the caller to plan the device once more.
+static bool ggml_sycl_plan_dry_run_drop_displacing_ring(int                                                   device,
+                                                        const std::vector<ggml_sycl::placement_tensor_info> & detail,
+                                                        const ggml_sycl::placement_plan &                     plan,
+                                                        const ggml_sycl::planner_published_terms & terms_before_plan) {
+    const ggml_sycl::moe_pp_ring_resident_check check = ggml_sycl_plan_ring_resident_check(device, detail, plan);
+    if (!check.displaces_experts()) {
+        return false;
+    }
+    const size_t ring_bytes = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_scratch_bytes(device);
+    const ggml_sycl::load_published_terms with_ring         = ggml_sycl::load_published_terms::snapshot(device);
+    const size_t                          runtime_with_ring = ggml_sycl_ring_runtime_with_ring_bytes(device);
+    ggml_sycl_publish_no_pp_moe_onednn_ring(device);
+    terms_before_plan.restore(device);
+    const size_t runtime_room =
+        ggml_sycl::moe_pp_ring_runtime_room(runtime_with_ring, ggml_sycl_planned_runtime_zone_bytes(device));
+    const size_t     weight_room = ggml_sycl_ring_plan_weight_room(device, plan);
+    const bool       can_return  = ggml_sycl::moe_pp_ring_drop_can_return_room(weight_room, runtime_room);
+    constexpr double mb          = 1024.0 * 1024.0;
+    if (ggml_sycl::moe_pp_ring_decide(ggml_sycl::moe_pp_ring_dry_run_answer(can_return, runtime_room)) !=
+        ggml_sycl::moe_pp_ring_decision::DROP) {
+        ggml_sycl_put_back_ring_terms(device, with_ring);
+        const ggml_sycl_ring_no_weight_room no_room = ggml_sycl_ring_no_weight_room_reason(plan, weight_room);
+        if (no_room.reason != nullptr) {
+            GGML_LOG_INFO(
+                "[PLAN-DRY-RUN] device=%d keeps its PP MoE oneDNN scratch ring (%.1f MB): a drop returns no room it "
+                "sees, as %s%s\n",
+                device, ring_bytes / mb, no_room.reason,
+                no_room.load_reads_none ? "; a load reads none there either" :
+                                          ". A load's entry ensure builds the arena first, and its own drop "
+                                          "decision, on that arena, may differ");
+        } else {
+            GGML_LOG_INFO(
+                "[PLAN-DRY-RUN] device=%d keeps its PP MoE oneDNN scratch ring (%.1f MB), as a load would: its RUNTIME "
+                "zone needs no less without it (%.1f MB with it)\n",
+                device, ring_bytes / mb, runtime_with_ring / mb);
+        }
+        return false;
+    }
+    GGML_LOG_INFO(
+        "[PLAN-DRY-RUN] device=%d drops its PP MoE oneDNN scratch ring (%.1f MB), as a load would whose arena nothing "
+        "points into and whose WEIGHT zone takes the RUNTIME zone's room: the plan made with it left %" PRId64
+        " experts of its %zu resident-only expert weights on the host, and its RUNTIME zone needs %.1f MB less "
+        "without it; the device is planned once more without it. A load keeps the ring where the plan without it "
+        "would grow another zone or the give-back's rebuild would leave the WEIGHT zone no larger, which the dry run "
+        "cannot see\n",
+        device, ring_bytes / mb, check.host_experts, check.n_weights, runtime_room / mb);
+    return true;
+}
+
 // Plans `inventory` as the load's stage plans it: once per device the scheduler exposes, publishing that device's
 // planner inputs first, through the stage's helpers, against `budget`, the one computed from `sample`. A multi-device
 // plan packs each physical device to its budget authority's answer; a single-device plan to the arena's reservation
@@ -18544,9 +19009,18 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
                 }
             }
             const bool is_moe = n_experts > 0;
-            plans.push_back(ggml_sycl::compute_multi_device_plan(budgets, detail, static_cast<int>(inventory->n_layer),
-                                                                 ggml_sycl_plan_multi_gpu_mode(is_moe), kv,
-                                                                 opts.envelope, n_experts, host_budget, coverage_pin));
+
+            auto plan_multi = [&]() {
+                return ggml_sycl::compute_multi_device_plan(budgets, detail, static_cast<int>(inventory->n_layer),
+                                                            ggml_sycl_plan_multi_gpu_mode(is_moe), kv, opts.envelope,
+                                                            n_experts, host_budget, coverage_pin);
+            };
+            const ggml_sycl::planner_published_terms terms_before_plan =
+                ggml_sycl::planner_published_terms::snapshot(i);
+            plans.push_back(plan_multi());
+            if (ggml_sycl_plan_dry_run_drop_displacing_ring(i, detail, plans.back(), terms_before_plan)) {
+                plans.back() = plan_multi();
+            }
         } else {
             const size_t forced = override_for(i);
             const size_t plan_budget =
@@ -18556,8 +19030,16 @@ static std::vector<ggml_sycl::placement_plan> ggml_sycl_plan_dry_run_plans(
             // As the stage publishes it before a single-device plan, from the inputs the plan is built from. The dry
             // run sizes no zone, and its saved state puts the shape back.
             (void) ggml_sycl::unified_cache_publish_planned_onednn_graph_scratch_shape(i, kv, opts.envelope);
-            plans.push_back(ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope, n_experts,
-                                                              host_budget, coverage_pin));
+            auto plan_single = [&]() {
+                return ggml_sycl::compute_placement_plan(detail, plan_budget, i, kv, opts.envelope, n_experts,
+                                                         host_budget, coverage_pin);
+            };
+            const ggml_sycl::planner_published_terms terms_before_plan =
+                ggml_sycl::planner_published_terms::snapshot(i);
+            plans.push_back(plan_single());
+            if (ggml_sycl_plan_dry_run_drop_displacing_ring(i, detail, plans.back(), terms_before_plan)) {
+                plans.back() = plan_single();
+            }
         }
     }
     std::string no_arena;
@@ -33197,8 +33679,9 @@ struct moe_profile_state {
         cur_layer.secondary.batches++;
     }
 
-    // Called at MoE MUL_MAT_ID exit
-    void moe_op_end() {
+    // Called at MoE MUL_MAT_ID exit. counts_call is false on a node's second pass on the direct MMID route: its time
+    // adds to the node's, and its first pass already counted the op.
+    void moe_op_end(bool counts_call) {
         if (!token_active) {
             return;
         }
@@ -33223,7 +33706,9 @@ struct moe_profile_state {
         cur_layer.post_compute_us += post_compute_us;
         cur_layer.n_cpu_experts += op_n_cpu;
         cur_layer.n_gpu_experts += op_n_gpu;
-        cur_layer.n_calls++;
+        if (counts_call) {
+            cur_layer.n_calls++;
+        }
 
         auto & role_t = cur_layer.role_timings[moe_profile_role_index(cur_op_role)];
         role_t.ids_d2h_us += ids_us;
@@ -33233,7 +33718,9 @@ struct moe_profile_state {
         role_t.post_compute_us += post_compute_us;
         role_t.n_cpu_experts += op_n_cpu;
         role_t.n_gpu_experts += op_n_gpu;
-        role_t.n_calls++;
+        if (counts_call) {
+            role_t.n_calls++;
+        }
 
         // U6 diagnostic: detect when compute_done was never set (falls back to
         // op_start or routing_done), causing entire op time to be misattributed
@@ -87982,8 +88469,12 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     if (!weight || !ggml_sycl_moe_pp_batched_takes_type(weight->type)) {
         return false;
     }
-    const moe_tensor_type role = moe_classify_tensor(weight->name ? weight->name : "");
-    if (role != MOE_TENSOR_GATE && role != MOE_TENSOR_UP && role != MOE_TENSOR_DOWN) {
+    // A fused gate_up weight (MOE_TENSOR_GATE_UP) is one plain matrix per expert to this executor, so the resident
+    // claim takes it. The staged claim does not: the ring's windows stage a layer's separate gate, up and down host
+    // matrices only (moe_expert_role_is_triplet), so a staged gate_up weight would decline at its first host expert.
+    const moe_tensor_type role         = moe_classify_tensor(weight->name ? weight->name : "");
+    const bool            triplet_role = role == MOE_TENSOR_GATE || role == MOE_TENSOR_UP || role == MOE_TENSOR_DOWN;
+    if (!triplet_role && !(role == MOE_TENSOR_GATE_UP && !host_staged)) {
         return false;
     }
     layout_mode planned_layout = GGML_LAYOUT_AOS;
@@ -88025,7 +88516,35 @@ static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_sycl::place
     return ggml_sycl_moe_pp_batched_takes_layout(weight->type, planned_layout);
 }
 
+// A MUL_MAT_ID node's second pass on the direct MMID route (ggml_sycl_mul_mat_id_with_direct_reentry), per thread:
+// the first pass names the node it asks a second pass for, and the second pass runs with the batched executor's claim
+// on that node's weight suppressed, so the node takes the route it took before the executor claimed it.
+struct ggml_sycl_mmid_direct_reentry {
+    const ggml_tensor * requested         = nullptr;  // the executor declined this node before its first submission
+    const ggml_tensor * suppressed_weight = nullptr;  // the weight the executor does not claim during the second pass
+};
+
+static thread_local ggml_sycl_mmid_direct_reentry g_mmid_direct_reentry;
+
+// True the first time a node goes back to the direct MMID route for `refusal` on `device`: the re-entry WARN fires once
+// per (device, cause). One bit per cause, so the shift below is defined only while COUNT fits the mask.
+static bool ggml_sycl_moe_pp_direct_reentry_first(int device, moe_pp_batched_refusal refusal) {
+    static_assert(static_cast<uint32_t>(moe_pp_batched_refusal::COUNT) <= 32,
+                  "the direct route's re-entry latch holds one bit per moe_pp_batched_refusal cause");
+    static std::atomic<uint32_t> seen[GGML_SYCL_MAX_DEVICES] = {};
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES || refusal >= moe_pp_batched_refusal::COUNT) {
+        return false;
+    }
+    const uint32_t bit = 1u << static_cast<uint32_t>(refusal);
+    return (seen[device].fetch_or(bit, std::memory_order_relaxed) & bit) == 0;
+}
+
+// The claim ggml_sycl_mul_mat_id asks, from the device's own cache plan. During a node's second pass on the direct
+// route it answers false for that node's weight, at every site of the pass that asks it.
 static bool ggml_sycl_moe_pp_onednn_batched_claims_tensor(const ggml_tensor * weight, int device) {
+    if (weight != nullptr && weight == g_mmid_direct_reentry.suppressed_weight) {
+        return false;
+    }
     return ggml_sycl_moe_pp_onednn_batched_claims_tensor(nullptr, weight, device, false);
 }
 
@@ -88197,12 +88716,14 @@ struct moe_hybrid_decode_record {
 };
 
 // The one tensor of a block whose op counts the routed experts: its gate tensor, or its fused gate/up tensor when the
-// pack stores the two as one (moe_classify_tensor knows only the separate names, and other code keys off it, so the
-// fused spelling is named here). Gate, up and down of a block route the same ids, so counting on one of them counts a
+// pack stores the two as one. Gate, up and down of a block route the same ids, so counting on one of them counts a
 // (token, expert) pair once per block.
 static bool ggml_sycl_moe_route_counts_tensor(const char * name) {
-    return name != nullptr &&
-           (moe_classify_tensor(name) == MOE_TENSOR_GATE || std::strstr(name, "ffn_gate_up_exps") != nullptr);
+    if (name == nullptr) {
+        return false;
+    }
+    const moe_tensor_type role = moe_classify_tensor(name);
+    return role == MOE_TENSOR_GATE || role == MOE_TENSOR_GATE_UP;
 }
 
 // Counts the experts a prompt op routed, from its host ids snapshot (the ids tensor's n_used ids per token),
@@ -88210,6 +88731,11 @@ static bool ggml_sycl_moe_route_counts_tensor(const char * name) {
 // its ids on this thread already, so this adds increments and no wait.
 static void ggml_sycl_moe_route_counts_add_prompt(int device, const ggml_tensor * src0, const int32_t * ids, size_t n) {
     if (!src0 || !ggml_sycl_moe_route_counts_tensor(src0->name)) {
+        return;
+    }
+    // A node's second pass on the direct MMID route (ggml_sycl_mul_mat_id_with_direct_reentry) reads the snapshot its
+    // first pass already counted.
+    if (src0 == g_mmid_direct_reentry.suppressed_weight) {
         return;
     }
     const std::shared_ptr<ggml_sycl::moe_route_counts> table = ggml_sycl::moe_route_counts_current(device);
@@ -88278,7 +88804,7 @@ static bool ggml_sycl_moe_hybrid_decode_table_allocate(sycl::queue &           q
 //    host-expert layers have this shape.
 // Refuses, and the retained route keeps the tensor, when there is no host expert, a device expert with no readable
 // layout, an expert planned on another device, more than one routable card, or a split tensor the MMID direct route
-// runs (ggml_sycl_moe_mmid_direct_route_runs_type, with its card experts in AOS).
+// runs (moe_mmid_direct_route_runs_type, with its card experts in AOS).
 static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_build(
     ggml_backend_sycl_context &                       ctx,
     const ggml_tensor *                               src0,
@@ -88339,7 +88865,7 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     // experts of a tensor of a type it runs, with its card experts in AOS, itself, in one node: no hybrid record is
     // built for such a tensor. An all-host tensor has no card expert for that block to run, so its record is built.
     if (!all_host && layout == GGML_LAYOUT_AOS && ggml_sycl_moe_mmid_route_reachable(ctx) &&
-        ggml_sycl_moe_mmid_direct_route_runs_type(src0->type)) {
+        moe_mmid_direct_route_runs_type(src0->type)) {
         return refuse("the MMID direct route runs this tensor's card and host experts");
     }
 
@@ -89309,15 +89835,21 @@ static sycl::event ggml_sycl_moe_direct_host_scatter(sycl::queue &              
 
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {
     ggml_sycl_test_inject_device_lost("mmid");
+    // A node's second pass on the direct MMID route (ggml_sycl_mul_mat_id_with_direct_reentry) is the node its first
+    // pass declined: every per-call count below counts the node once, on its first pass, and every timer adds both
+    // passes' time, which is the node's.
+    const bool mmid_second_pass = dst->src[0] != nullptr && dst->src[0] == g_mmid_direct_reentry.suppressed_weight;
     // llama.cpp-1tjn (B3 rework census v2, temporary): the real function
     // entry, counted regardless of which internal branch/early-return this
     // call takes. The v1 census's print trigger sat at the ne12==1
     // fallback admission (~line 66936 pre-rework), which the team lead
     // proved is DEAD on the production decode path -- the decode-fused
     // RESTORE-T1 pair-GLU block dispatches and returns before reaching it.
-    g_moe_decode_route_census.mul_mat_id_calls.fetch_add(1, std::memory_order_relaxed);
-    if (g_moe_decode_route_census.mul_mat_id_calls.load(std::memory_order_relaxed) % 200 == 0) {
-        moe_decode_route_census_maybe_print();
+    if (!mmid_second_pass) {
+        g_moe_decode_route_census.mul_mat_id_calls.fetch_add(1, std::memory_order_relaxed);
+        if (g_moe_decode_route_census.mul_mat_id_calls.load(std::memory_order_relaxed) % 200 == 0) {
+            moe_decode_route_census_maybe_print();
+        }
     }
     // llama.cpp-1tjn (B3 rework census v3, temporary): segment-timing
     // markers S1-S4 for the decode path, per the team lead's pivot after the
@@ -89342,7 +89874,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // the destructor. Enabled by GGML_SYCL_MOE_PROLOGUE_TIMING=1; removed by
     // task B5 (llama.cpp-rty8).
     struct b1_mmid_host_timer {
-        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point t0          = std::chrono::steady_clock::now();
+        bool                                  counts_call = true;  // false on a node's second pass
         static bool enabled() {
             static const bool e = [] {
                 const char * v = std::getenv("GGML_SYCL_MOE_PROLOGUE_TIMING");
@@ -89359,6 +89892,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const uint64_t ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
             const uint64_t t = ns_total.fetch_add(ns, std::memory_order_relaxed) + ns;
+            if (!counts_call) {
+                return;
+            }
             const uint64_t c = calls.fetch_add(1, std::memory_order_relaxed) + 1;
             if (c % 720 == 0) {
                 fprintf(stderr, "[B1-MMID-HOST] calls=%llu total_ms=%.1f avg_us=%.1f\n", (unsigned long long) c,
@@ -89366,6 +89902,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
         }
     } b1_mmid_host_timer_instance;
+
+    b1_mmid_host_timer_instance.counts_call = !mmid_second_pass;
 #if GGML_SYCL_DNNL
     // llama.cpp-iikr (unphased-host-time cycle): brackets the WHOLE function,
     // entry to every exit (RAII -- return, throw, or the six-phase block's
@@ -89382,8 +89920,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // function it was declared, as long as it is declared before first use
     // and stays in scope, which it does for the rest of this function body.
     struct mxfp4_pp_host_whole_span_guard {
-        std::chrono::high_resolution_clock::time_point t0     = std::chrono::high_resolution_clock::now();
-        bool                                           active = mxfp4_pp_batched_profile_enabled();
+        std::chrono::high_resolution_clock::time_point t0          = std::chrono::high_resolution_clock::now();
+        bool                                           active      = mxfp4_pp_batched_profile_enabled();
+        bool                                           counts_call = true;  // false on a node's second pass
 
         ~mxfp4_pp_host_whole_span_guard() {
             if (!active) {
@@ -89393,9 +89932,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 std::chrono::duration<double, std::micro>(std::chrono::high_resolution_clock::now() - t0).count();
             auto & p = g_mxfp4_pp_batched_profile;
             p.host_whole_us += us;
-            ++p.host_whole_calls;
+            if (counts_call) {
+                ++p.host_whole_calls;
+            }
         }
     } mxfp4_pp_host_whole_span;
+
+    mxfp4_pp_host_whole_span.counts_call = !mmid_second_pass;
 
     const bool host_phase_profile = mxfp4_pp_batched_profile_enabled();
     auto       host_phase_clock   = mxfp4_pp_host_whole_span.t0;
@@ -89409,7 +89952,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         host_phase_clock   = now;
         auto & p           = g_mxfp4_pp_batched_profile;
         p.*total_field += delta;
-        ++(p.*calls_field);
+        if (!mmid_second_pass) {
+            ++(p.*calls_field);
+        }
     };
 #endif
     const ggml_tensor * src0 = dst->src[0];
@@ -89455,13 +90000,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // RAII guard to call moe_op_end at ALL exit points
     struct moe_profile_guard_t {
         bool active;
+        bool counts_call;  // false on a node's second pass
 
         ~moe_profile_guard_t() {
             if (active) {
-                g_moe_profile.moe_op_end();
+                g_moe_profile.moe_op_end(counts_call);
             }
         }
-    } moe_profile_guard_{ g_moe_profile_enabled };
+    } moe_profile_guard_{ g_moe_profile_enabled, !mmid_second_pass };
 
     // --- Drain deferred scatter from previous CPU-TG call ---
     // The previous call's H2D scatter may still be in-flight reading from
@@ -92726,8 +93272,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     const ggml_sycl::moe_resolved_batch_result & direct_admission =
         ne12 == 1 ? retained_decode_batch_result : retained_prompt_batch_result;
     const layout_mode direct_layout = ne12 == 1 ? route_layout : retained_prompt_layout;
+    // The route steps aside for a prompt the batched executor claims on this device while the ring the executor runs in
+    // is planned there (moe_mmid_direct_defers_to_executor). If the executor then declines before its first submission,
+    // the node comes back here on a second pass with the claim suppressed (ggml_sycl_mul_mat_id_with_direct_reentry).
+    const bool        pp_direct_deferred =
+        moe_mmid_direct_route_runs_type(src0->type) &&
+        moe_mmid_direct_defers_to_executor(
+            ne12 != 1, pp_onednn_batched_route,
+            ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(ctx.device));
+    // How a pass of a deferred node asks for its second pass on the direct route, the one writer of the request. The
+    // pass that asks returns at once, having written nothing to dst, and the node runs again once it has unwound
+    // (ggml_sycl_mul_mat_id_with_direct_reentry). The WARN fires once per (device, cause).
+    const auto request_direct_reentry = [&](moe_pp_batched_refusal cause, const char * why) {
+        if (ggml_sycl_moe_pp_direct_reentry_first(ctx.device, cause)) {
+            GGML_LOG_WARN("[PP-MOE] direct MMID route re-entered device=%d cause=%s tensor=%s type=%s: %s\n",
+                          ctx.device, moe_pp_batched_refusal_name(cause), src0->name, ggml_type_name(src0->type), why);
+        }
+        g_mmid_direct_reentry.requested = dst;
+    };
     if ((q1_nvfp4_direct_b70_validated || q1_nvfp4_private_test_authorized) &&
-        ggml_sycl_moe_mmid_direct_route_runs_type(src0->type) && direct_layout == GGML_LAYOUT_AOS && direct_admission) {
+        moe_mmid_direct_route_runs_type(src0->type) && direct_layout == GGML_LAYOUT_AOS && direct_admission &&
+        !pp_direct_deferred) {
 #ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
         g_q1_nvfp4_test_candidate.fetch_add(1, std::memory_order_relaxed);
 #endif
@@ -96234,7 +96799,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const char * env = std::getenv("GGML_SYCL_MOE_SINGLE_GPU_PP_PLANNED_BATCHED");
             return env && std::atoi(env) != 0;
         }();
-        if (!pp_cpu_reference_force_router && pp_planned_local_batched_enabled && try_pp_planned_local_batched()) {
+        // A node the direct MMID route stepped aside for (pp_direct_deferred) goes to the batched executor, or back to
+        // that route: this batched MMVQ dispatch is neither, and it has no NVFP4 or Q1_0 coverage of its own.
+        if (!pp_cpu_reference_force_router && pp_planned_local_batched_enabled && !pp_direct_deferred &&
+            try_pp_planned_local_batched()) {
             return;
         }
 
@@ -96524,6 +97092,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // until graph_compute's catch has drained the queue. The transient down SOA has no owner on this
                 // frame, so it is released here; with nothing submitted that reads it, the release needs no marker.
                 release_prompt_down_soa_once(false);
+                // The direct MMID route needs no row map, so a node it stepped aside for goes back to it.
+                if (pp_direct_deferred) {
+                    request_direct_reentry(moe_pp_batched_refusal::ROW_MAP_STAGING,
+                                           "the prompt row-map staging did not fit before the batched executor ran");
+                    return;
+                }
                 ggml_sycl_moe_pp_refuse_staging(src0, ctx.device, "moe_pp_row_mappings", row_maps_total,
                                                 row_maps_total * sizeof(mmid_row_mapping),
                                                 "MUL_MAT_ID prompt row-map staging did not fit");
@@ -96626,6 +97200,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const size_t src1_contiguous_f32_row_bytes = nb11;
         const size_t src1_contiguous_f16_row_bytes = static_cast<size_t>(ne10) * sizeof(sycl::half);
 
+        // A node the direct MMID route stepped aside for (pp_direct_deferred) has that route to go back to only until
+        // the executor submits its first device work: until then a decline returns false, and the call site below asks
+        // for the node's second pass on the route, naming the cause the executor recorded; after it, a decline throws
+        // like a tiled-claimed op's.
+        bool                   pp_batched_submitted = false;
+        moe_pp_batched_refusal pp_batched_refusal   = moe_pp_batched_refusal::NONE;
+
         auto try_pp_onednn_f16_batched = [&]() -> bool {
             // The island runs every expert of this op (moe_pp_cpu_split::ISLAND): the executor has no device expert to
             // take, and the decision gave the layer to the CPU.
@@ -96691,6 +97272,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const auto decline_batched = [&](moe_pp_batched_refusal refusal, const char * detail, int64_t expert_id,
                                              bool route_logged) -> bool {
                 const char * reason = detail ? detail : moe_pp_batched_refusal_name(refusal);
+                pp_batched_refusal  = refusal;
                 if (route_logged && ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
                     static std::atomic<int> reject_log{ 0 };
                     if (reject_log.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -96729,6 +97311,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                                       "); refusing rather than falling through to the SOA-only staging fallback "
                                       "(llama.cpp-71hx)";
                     throw ggml_sycl_fallback_error(tiled_claim_msg.c_str());
+                }
+                if (pp_direct_deferred && pp_batched_submitted) {
+                    // Same thread_local reason as the tiled message above.
+                    static thread_local std::string deferred_submitted_msg;
+                    deferred_submitted_msg = std::string("[MOE-PP-ONEDNN-BATCHED] op '") +
+                                             (src0 != nullptr ? src0->name : "?") +
+                                             "' that the direct MMID route deferred to this executor declined (" +
+                                             reason + ") after its first submission";
+                    throw ggml_sycl_fallback_error(deferred_submitted_msg.c_str());
                 }
                 return false;
             };
@@ -97241,6 +97832,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 return batched_out + pack.slot_base_row[slot] * static_cast<size_t>(ne0);
             };
             batched_scratch_claim.mark_used();
+            // Every decline from here on follows device work this dispatch submitted (see pp_batched_submitted).
+            pp_batched_submitted = true;
 
             // The device experts' ready events. A deferred expert's copy is ordered by its window's own barrier, in
             // the phase loop (llama.cpp-8epx): it is not submitted yet.
@@ -97628,6 +98221,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     tiled_claim_gemm_msg = std::string("[MOE-PP-ONEDNN-BATCHED] XMX_TILED-claimed op '") +
                                            (src0 && src0->name ? src0->name : "?") + "' GEMM dispatch failed: " + what;
                     throw ggml_sycl_fallback_error(tiled_claim_gemm_msg.c_str());
+                }
+                // The GEMM stage runs after the first submission, so a node the direct MMID route deferred to this
+                // executor fails here too (pp_batched_submitted).
+                if (pp_direct_deferred) {
+                    static thread_local std::string deferred_gemm_msg;
+                    deferred_gemm_msg = std::string("[MOE-PP-ONEDNN-BATCHED] op '") +
+                                        (src0 != nullptr ? src0->name : "?") +
+                                        "' that the direct MMID route deferred to this executor: GEMM dispatch failed "
+                                        "after its first submission: " +
+                                        what;
+                    throw ggml_sycl_fallback_error(deferred_gemm_msg.c_str());
                 }
                 return false;
             };
@@ -98168,6 +98772,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 #endif
         };
         if (try_pp_onednn_f16_batched()) {
+            return;
+        }
+        // The direct MMID route stepped aside for this node and the executor declined it before its first submission
+        // (after it, the decline throws). The per-expert path below has no executor for the direct route's types, so
+        // the node goes back to that route. A decline that named no cause reads "none".
+        if (pp_direct_deferred) {
+            request_direct_reentry(pp_batched_refusal,
+                                   "the batched executor declined the node before its first submission");
             return;
         }
 
@@ -99459,6 +100071,31 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
 }
 
 #undef GGML_SYCL_MOE_PP_STAGING_FAILPOINT
+
+// Runs a MUL_MAT_ID node, and runs it once more when its first pass asks: the direct MMID route stepped aside for the
+// node (moe_mmid_direct_defers_to_executor), and then the prompt row-map staging did not fit or the batched executor
+// declined the node before its first submission. The first pass is not free of device work: it may have submitted the
+// row-map copy, and its ready guard submits a queue sync event as dst's ready event on the way out. Neither writes
+// dst, and the second pass publishes its own. By then the first pass has unwound, so the executor's ring slot claim
+// and its experts' leases are released, while the host ids snapshot stays in the graph-local ids cache and the prompt
+// admission in its cache: the second pass reads both again with no device wait. It runs with the executor's claim on
+// the node's weight suppressed, so the node takes the route it took before the executor claimed it. One retry, never
+// a loop: the second pass cannot ask.
+static void ggml_sycl_mul_mat_id_with_direct_reentry(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    g_mmid_direct_reentry.requested = nullptr;
+    ggml_sycl_mul_mat_id(ctx, dst);
+    if (g_mmid_direct_reentry.requested != dst) {
+        return;
+    }
+    g_mmid_direct_reentry.requested         = nullptr;
+    g_mmid_direct_reentry.suppressed_weight = dst->src[0];
+
+    struct suppression_end {
+        ~suppression_end() { g_mmid_direct_reentry.suppressed_weight = nullptr; }
+    } end;
+
+    ggml_sycl_mul_mat_id(ctx, dst);
+}
 
 static void ggml_sycl_scale(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_tensor dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst.raw(), /*num_src=*/1);
@@ -102575,7 +103212,7 @@ static bool ggml_sycl_compute_forward_impl(ggml_backend_sycl_context & ctx, stru
                         dst->name ? dst->name : "", ctx.device);
                 return false;
             }
-            ggml_sycl_mul_mat_id(ctx, dst);
+            ggml_sycl_mul_mat_id_with_direct_reentry(ctx, dst);
             ggml_sycl_moe_down_shadow_compare(ctx, dst);
             ggml_sycl_moe_stream_layer_done(ctx, dst);
             break;

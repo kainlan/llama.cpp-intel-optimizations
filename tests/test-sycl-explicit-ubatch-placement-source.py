@@ -341,6 +341,9 @@ GROW_REPLAN = ("if (placed) { plan_candidate = plan_single_device(true); placed 
 GROW_FALLBACK = ("if (!placed) { "
                  "(void) ggml_sycl_publish_load_ubatch_scratch(ctx->device, g_placement_kv_info.n_ubatch);")
 FALLBACK_PLAN = "plan_candidate = plan_single_device(false);"
+# The one other plan without the room: a dropped PP MoE ring has no micro-batch room to hold (the ring-drop contract,
+# test-sycl-moe-ring-drop-source, pins where it runs).
+RING_DROP_PLAN = "case ggml_sycl_stage_ring_drop::DROPPED: plan_candidate = plan_single_device(false);"
 # The fallback says so at every verbosity: the user named a micro-batch and the load did not place it.
 REVERT_WARN = ('GGML_LOG_WARN("[SYCL-PLAN] PP MoE oneDNN scratch ring for n_ubatch=%u needs %.1f MB more RUNTIME zone, '
                'which the arena could not reserve on device %d; the ring is re-planned when the context opens\\n", '
@@ -598,7 +601,7 @@ def claim_load_grows_the_zone_before_the_plan(sycl_cpp: str) -> bool:
     return (bool(store)
             and ordered(store, LAMBDA_ROOM, FIRST_PLAN, GROW_BRANCH, GROW_PUBLISH, GROW_REPLAN, GROW_FALLBACK,
                         FALLBACK_PLAN)
-            and store.count("plan_single_device(false)") == 1)
+            and store.count("plan_single_device(false)") == 2 and store.count(RING_DROP_PLAN) == 1)
 
 
 def claim_held_room_is_republished_before_the_plan(sycl_cpp: str) -> bool:
@@ -1390,7 +1393,7 @@ def test_mutant_failed_growth_plans_with_the_room_fails():
     """Planned with the room after the zone failed to grow, the fill reads GROW_ZONE again and the hold moves experts
     to the host tier for a ring the zone cannot hold: worse than the load's planning-shape plan."""
     assert not claim_load_grows_the_zone_before_the_plan(
-        _once(SYCL_CPP, FALLBACK_PLAN, "plan_candidate = plan_single_device(true);"))
+        _once(SYCL_CPP, FALLBACK_PLAN + " GGML_LOG_WARN(", "plan_candidate = plan_single_device(true); GGML_LOG_WARN("))
 
 
 def test_mutant_failed_growth_at_info_fails():

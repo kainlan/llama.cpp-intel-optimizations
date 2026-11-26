@@ -15,6 +15,7 @@
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../src/llama-impl.h"
 #include "../src/llama-load-measure.h"
+#include "../src/llama-sycl-expert-names.h"
 #include "ggml-backend.h"
 #include "ggml.h"
 
@@ -1237,6 +1238,23 @@ static void test_probe_unfundable_text() {
           "the second capacity was not consulted: %s", refused2.c_str());
 }
 
+// The SYCL loader sizes the prompt MoE oneDNN ring from every routed-expert weight it names, and the fused gate+up
+// tensor (Inkling 2 Mini's ffn_gate_up_exps) is the widest one there: the batched prompt executor runs it, so a name
+// test that misses it plans a ring too small for the executor's own dispatch.
+static void test_sycl_expert_weight_names() {
+    CHECK(llama_sycl_is_moe_expert_weight_name("blk.3.ffn_gate_up_exps.weight"), "the fused gate+up tensor is missed");
+    CHECK(llama_sycl_is_moe_expert_weight_name("blk.3.ffn_gate_exps.weight"), "ffn_gate_exps is missed");
+    CHECK(llama_sycl_is_moe_expert_weight_name("blk.3.ffn_up_exps.weight"), "ffn_up_exps is missed");
+    CHECK(llama_sycl_is_moe_expert_weight_name("blk.3.ffn_down_exps.weight"), "ffn_down_exps is missed");
+    CHECK(llama_sycl_is_moe_expert_weight_name("blk.3.ffn_gate_exps.bias"), "a name the old check matched is lost");
+    CHECK(!llama_sycl_is_moe_expert_weight_name("blk.3.ffn_gate_inp.weight"), "the router is not an expert weight");
+    CHECK(!llama_sycl_is_moe_expert_weight_name(nullptr), "a null name matched");
+    // An "_exps" suffix alone is not an expert matrix: an expert norm is not one.
+    CHECK(!llama_sycl_is_moe_expert_weight_name("blk.3.ffn_norm_exps.weight"), "an expert norm matched");
+    // grovemoe's chunked families: the executor's claim does not take them, so the ring is not sized for them.
+    CHECK(!llama_sycl_is_moe_expert_weight_name("blk.3.ffn_gate_chexps.weight"), "a chunked expert matched");
+}
+
 int main() {
     test_guard();
     test_plan_absent();
@@ -1257,6 +1275,7 @@ int main() {
     test_state_terms();
     test_state_excess();
     test_probe_unfundable_text();
+    test_sycl_expert_weight_names();
     if (n_failed != 0) {
         fprintf(stderr, "%d check(s) failed\n", n_failed);
         return 1;

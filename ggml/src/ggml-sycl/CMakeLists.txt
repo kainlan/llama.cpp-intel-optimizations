@@ -6071,6 +6071,36 @@ set_tests_properties(sycl-placement-residency-summary PROPERTIES
     TIMEOUT 120
 )
 
+# Whether a load keeps a device's PP MoE oneDNN ring, from the plan made with it (moe-ring-consumer.hpp): a ring whose
+# weights reach only the batched executor's resident claim is dropped when the plan leaves one of their experts on the
+# host. Host-only: synthetic plans, no queue, no device, no model. Built like the residency-summary test above, which
+# links ggml-sycl for placement_plan, inside the same NOT GGML_BACKEND_DL guard.
+add_executable(test-sycl-moe-ring-consumer
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-ring-consumer.cpp
+)
+target_include_directories(test-sycl-moe-ring-consumer PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-moe-ring-consumer PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-sycl-moe-ring-consumer PRIVATE "-fsycl")
+target_compile_definitions(test-sycl-moe-ring-consumer PRIVATE
+    GGML_SYCL_WARP_SIZE=32
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-moe-ring-consumer PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-moe-ring-consumer PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+add_test(NAME sycl-moe-ring-consumer COMMAND test-sycl-moe-ring-consumer)
+set_tests_properties(sycl-moe-ring-consumer PROPERTIES
+    LABELS "sycl;moe;plan;host;tdd"
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+)
+
 add_test(NAME test-sycl-moe-handle-resolution COMMAND test-sycl-moe-handle-resolution)
 set_tests_properties(test-sycl-moe-handle-resolution PROPERTIES
     LABELS "sycl;moe;hostonly;tdd;0igs-batch1"
@@ -6587,6 +6617,11 @@ endif() # private SYCL backend fixture
 # the ordinary DSO) and closes the MMID route those objects compile in. It loads a model onto the card, so it carries
 # the `model` label, which the full sweep excludes. Pinned to the B50; a run with no SYCL GPU or more than one visible
 # card exits 77.
+# test-moe-pp-staging-refusal-direct-reentry runs the same binary with --direct-reentry, in a process of its own
+# because the WARN it checks fires once per process: on a planned NVFP4 model, the row-map failpoint armed on a prompt
+# node the direct MMID route stepped aside for sends that node back to the direct route, which must match the CPU
+# backend with one WARN naming the cause, while the graph's next node still takes the batched executor. The MMID route
+# stays open in that mode. Same labels, selector and skip code; it also exits 77 when the weights are not evictable.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-pp-staging-refusal ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-pp-staging-refusal.cpp)
 target_include_directories(test-moe-pp-staging-refusal PRIVATE
@@ -6598,6 +6633,14 @@ target_link_libraries(test-moe-pp-staging-refusal PRIVATE ggml-sycl-private-fixt
 set_target_properties(test-moe-pp-staging-refusal PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_test(NAME test-moe-pp-staging-refusal COMMAND test-moe-pp-staging-refusal)
 set_tests_properties(test-moe-pp-staging-refusal PROPERTIES
+    LABELS "sycl;moe;device;B50;model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
+)
+add_test(NAME test-moe-pp-staging-refusal-direct-reentry COMMAND test-moe-pp-staging-refusal --direct-reentry)
+set_tests_properties(test-moe-pp-staging-refusal-direct-reentry PROPERTIES
     LABELS "sycl;moe;device;B50;model"
     SKIP_RETURN_CODE 77
     RUN_SERIAL TRUE
