@@ -29369,6 +29369,13 @@ struct test_swap_scope {
     ~test_swap_scope() { test_swap_forget(device); }
 };
 
+// A route table of one block and `n_experts` experts installed for `device`, and read back as the device's current
+// one: false when it is not (the device has no route table slot, which installs without replacing anything).
+bool test_swap_install_table(int device, int n_experts) {
+    const std::shared_ptr<moe_route_counts> table = moe_route_counts_install(device, 1, n_experts);
+    return table && moe_route_counts_current(device) == table;
+}
+
 // The fixture's plan with a dense weight on the card, which the driver needs to run: a plan that holds the card only
 // through experts is one it stays off.
 placement_plan test_swap_plan(const test_loan_fixture & fx, int host_expert) {
@@ -29407,13 +29414,6 @@ std::string test_swap_prepare(test_loan_fixture & fx, int host_expert, int n_tab
         return "the route table installed is not the device's current one";
     }
     return {};
-}
-
-// A route table of one block and `n_experts` experts installed for `device`, and read back as the device's current
-// one: false when it is not (the device has no route table slot, which installs without replacing anything).
-bool test_swap_install_table(int device, int n_experts) {
-    const std::shared_ptr<moe_route_counts> table = moe_route_counts_install(device, 1, n_experts);
-    return table && moe_route_counts_current(device) == table;
 }
 
 // `pairs` routed decode pairs of block 0's `expert`, counted into the device's current route table.
