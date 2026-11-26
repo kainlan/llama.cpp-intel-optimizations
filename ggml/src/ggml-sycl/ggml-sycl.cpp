@@ -26365,13 +26365,13 @@ std::string test_expert_refill_moves_two_triplets_per_call() {
 
 std::string test_expert_loan_and_refill_size_from_the_tensor() {
     // An expert's size is its tensor's, never a cache entry's. Each device entry is staged as the load stages a Q4_0
-    // expert of 640 columns, at its triplet's slot: 216 bytes of row padding past the tensor's bytes per expert,
-    // rounded to the zone's grain, 512 bytes in all. The tensor's bytes are what a loan and a refill must move. The
-    // loan copies the expert's own bytes and leaves the tail on the device; the refill mints the device copy at the
-    // slot, copies the expert's bytes and zero-fills the tail. Sized from the entry instead, every host copy would
-    // carry the tail, and every expert that went to the host and back would be recorded over the padded size. The
-    // free WEIGHT zone is poisoned before the refill, so a tail the refill did not fill reads the poison, and each
-    // tail is checked to lie in poisoned storage.
+    // expert of 640 columns, at its triplet's slot: 216 bytes of row padding past the tensor's bytes per expert (a
+    // multiple of the zone's 256-byte grain), rounded to that grain, 256 bytes in all. The tensor's bytes are what a
+    // loan and a refill must move. The loan copies the expert's own bytes and leaves the tail on the device; the
+    // refill mints the device copy at the slot, copies the expert's bytes and zero-fills the tail. Sized from the
+    // entry instead, every host copy would carry the tail, and every expert that went to the host and back would be
+    // recorded over the padded size. The free WEIGHT zone is poisoned before the refill, so a tail the refill did not
+    // fill reads the poison, and each tail is checked to lie in poisoned storage.
     test_loan_fixture fx(/*layers=*/2, /*experts=*/4, /*model_id=*/0x7075387601ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
@@ -26386,9 +26386,9 @@ std::string test_expert_loan_and_refill_size_from_the_tensor() {
     }
     // The load stages every member of a triplet at its slot, the staged size rounded to the zone's grain.
     const size_t slot = expert_triplet_slot_bytes({ staged, staged, staged });
-    if (slot != bytes + 512) {
+    if (slot != bytes + 256) {
         return test_loan_fail("a triplet of %zu-byte staged members takes a %zu-byte slot, not %zu", staged, slot,
-                              bytes + 512);
+                              bytes + 256);
     }
     fx.staged_bytes = slot;
     if (!test_ensure_weight_zone(fx.cache, *fx.queue, fx.names.size() * fx.n_experts * slot)) {
@@ -27266,7 +27266,7 @@ std::string test_expert_admit_zero_fills_a_padded_tail() {
     // An admit mints each device copy at its triplet's slot, the size the load gives every member: the host bytes, for
     // a quantized width that is not a multiple of MATRIX_ROW_PADDING the tail that completes the last row, and the
     // rounding to the zone's grain, all zero-filled behind the copy. The resolver reports Q4_0 rows of 640 columns,
-    // which staging pads by 384 columns (216 bytes), a 512-byte tail with the rounding; the cache checks sizes, not
+    // which staging pads by 384 columns (216 bytes), a 256-byte tail with the rounding; the cache checks sizes, not
     // that the host bytes are whole rows. The other expert is staged at the slot too, as S1-PRELOAD stages a Q4_0
     // tensor's device experts. The free WEIGHT zone is poisoned first, so a tail the admit did not fill reads
     // the poison, and each tail is checked to lie in poisoned storage.
@@ -27284,9 +27284,9 @@ std::string test_expert_admit_zero_fills_a_padded_tail() {
     }
     // The load stages every member of a triplet at its slot, the staged size rounded to the zone's grain.
     const size_t slot = expert_triplet_slot_bytes({ staged, staged, staged });
-    if (slot != bytes + 512) {
+    if (slot != bytes + 256) {
         return test_loan_fail("a triplet of %zu-byte staged members takes a %zu-byte slot, not %zu", staged, slot,
-                              bytes + 512);
+                              bytes + 256);
     }
     fx.staged_bytes = slot;
     if (!test_ensure_weight_zone(fx.cache, *fx.queue, 6 * slot)) {
@@ -27774,7 +27774,7 @@ std::string test_expert_admit_reads_the_tensor_bytes_from_a_longer_host_copy() {
     // The control: sized from the longer host copy, the device copy would take a larger slot than the tensor's.
     const size_t from_host_staged = staged_expert_bytes(GGML_LAYOUT_AOS, fx.resolved_type, fx.resolved_ncols, slot);
     const size_t from_host        = expert_triplet_slot_bytes({ from_host_staged, from_host_staged, from_host_staged });
-    if (staged != bytes + 216 || slot != bytes + 512 || from_host <= slot) {
+    if (staged != bytes + 216 || slot != bytes + 256 || from_host <= slot) {
         return test_loan_fail("the control: the slots of %zu and %zu bytes are %zu and %zu", bytes, slot, slot,
                               from_host);
     }

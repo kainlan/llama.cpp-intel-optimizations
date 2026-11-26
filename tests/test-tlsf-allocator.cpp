@@ -1884,6 +1884,12 @@ static void test_expert_triplet_slot_bytes() {
     REQUIRE(expert_triplet_slot_bytes(down_first) == 921856 && "the largest member, wherever it is");
     const size_t uniform[3] = { 4096, 4096, 4096 };
     REQUIRE(expert_triplet_slot_bytes(uniform) == 4096 && "members already on the grain keep their size");
+    // The device loan fixtures' Q4_0 expert of 640 columns: 1 MiB and 216 bytes of row padding round up one grain, to
+    // 1 MiB and 256 bytes; the 1 MiB expert itself, already on the grain, is not bumped a grain.
+    const size_t q4_0_640[3] = { 1048576 + 216, 1048576 + 216, 1048576 + 216 };
+    REQUIRE(expert_triplet_slot_bytes(q4_0_640) == 1048576 + 256 && "216 bytes past the grain round up to one grain");
+    const size_t aligned[3] = { 1048576, 1048576, 1048576 };
+    REQUIRE(expert_triplet_slot_bytes(aligned) == 1048576 && "an aligned size stays as it is");
     const size_t sub_grain[3] = { 1, 100, 200 };
     REQUIRE(expert_triplet_slot_bytes(sub_grain) == 256 && "a slot is at least one grain");
     const size_t unstaged[3] = { SWAP_GATE_UP, 0, SWAP_DOWN };
