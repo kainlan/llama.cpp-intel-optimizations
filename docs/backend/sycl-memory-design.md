@@ -3815,7 +3815,13 @@ allocation.
 but nothing in it stays sized for a model once no model is live. The model
 release hook, when it drops the last model, and a failed load's abort, when no
 model is live, run one step last (`ggml_sycl_release_last_model_effects()`),
-after each has dropped and put back what its model published. The step asks the
+after each has dropped and put back what its model published. The hook retires
+the model's MoE mmid workspaces just before the step
+(`unified_cache_retire_moe_mmid_workspaces()`): once no lease holds a workspace
+pool, the registry's reference is what keeps its blob in the RUNTIME zone, so a
+retire after the step left that blob to be read as a holder of an arena no model
+uses. The hook runs only past the teardown's fail-closed gates, so a teardown
+they refuse keeps its model's workspaces. The step asks the
 cache of each device the scheduler sees
 (`ggml_backend_sycl_get_device_count()`). Each cache it asks gives back what it
 sized for a model (`unified_cache::release_for_no_live_model()`): it waits once
