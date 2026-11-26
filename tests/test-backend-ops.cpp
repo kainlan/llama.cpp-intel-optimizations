@@ -14310,6 +14310,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, {4, 1}, 512, 3, true, true, 8, 10, GGML_PREC_F32,
         GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, 4));
 
+    // FLASH_ATTN_EXT: per-head mask (mask->ne[2] > 1) WITHOUT sinks, D=128, F16 K/V,
+    // ne03 = ne33 = 1 and >= 8 queries: the shape a backend's prompt-processing path
+    // (e.g. SYCL's oneDNN SDPA) takes. The sinks cases above never reach such a path.
+    // A per-head bias (Inkling 2 Mini folds one into its mask) must be applied per head
+    // (head % ne32), not head 0's to every head (llama.cpp-44d0). mask_heads=1 is the
+    // head-broadcast control of the same shape. GQA (8 Q heads over 2 KV heads) and MHA.
+    for (int nq : {32, 35}) {
+        for (int mh : {1, 2, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {4, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+        }
+        for (int mh : {1, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+        }
+    }
+
     // FLASH_ATTN_EXT: large logits
     test_cases.emplace_back(new test_flash_attn_ext_large_logits( 64,  64, 16, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128,  8, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

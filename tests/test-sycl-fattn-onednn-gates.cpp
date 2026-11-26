@@ -1092,6 +1092,62 @@ static bool test_planner_rejects_paged_layout() {
     return true;
 }
 
+// llama.cpp-44d0: a mask with a head axis (ne32 > 1) carries a different bias
+// per Q head (ggml indexes it as head % ne32). The oneDNN SDPA graph describes
+// the mask with extent 1 on every head axis, so a per-head mask that reached
+// it would apply head 0's rows to every head -- silently wrong attention.
+// Inkling 2 Mini folds a per-head relative-position bias into exactly this
+// shape (src/llama-graph.cpp). The helpers below leave params.mask null, so
+// each case sets a non-null dummy pointer: the planner tests the pointer, and
+// a null mask would make the ne32 axis meaningless.
+//
+// Built on mha_like_params (H_q == H_kv, nc == D) so the plan does not depend
+// on GGML_SYCL_FA_ONEDNN_MATERIALIZE: the case holds in all three states.
+static fattn_params masked_mha_like_params(int32_t mask_heads) {
+    static const sycl::half dummy_mask[1] = {};
+    fattn_params            params        = mha_like_params();
+    params.mask                           = reinterpret_cast<const char *>(dummy_mask);
+    params.ne30                           = params.ne11;
+    params.ne31                           = params.ne01;
+    params.ne32                           = mask_heads;
+    params.ne33                           = 1;
+    params.nb31                           = params.ne30 * (int) sizeof(sycl::half);
+    params.nb32                           = params.nb31 * params.ne31;
+    params.nb33                           = (int64_t) params.nb32 * params.ne32;
+    return params;
+}
+
+static bool test_planner_accepts_head_broadcast_mask() {
+    // Positive control: the same masked shape with ne32 == 1 is the shape the
+    // oneDNN descriptor does describe, so the per-head rejection below is
+    // about the head axis and nothing else in the masked setup.
+    const fattn_params params = masked_mha_like_params(/*mask_heads=*/1);
+    const auto         plan   = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
+                                                                     /*multi_seq=*/false);
+
+    TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::DIRECT,
+                "a head-broadcast mask (ne32 == 1) on a contiguous MHA shape should plan DIRECT");
+    TEST_ASSERT(plan.reason == ggml_sycl_onednn_fa_layout_reason::OK,
+                "a head-broadcast mask (ne32 == 1) should have OK reason");
+    return true;
+}
+
+static bool test_planner_rejects_per_head_mask() {
+    // ne32 == H_q (one mask per head, the Inkling form) and 1 < ne32 < H_q
+    // (broadcast by head % ne32): neither can be described by the extent-1
+    // head axes of the oneDNN mask descriptor.
+    for (int32_t mask_heads : { 2, 8, 32 }) {
+        const fattn_params params = masked_mha_like_params(mask_heads);
+        const auto plan = ggml_sycl_flash_attn_ext_onednn_plan(params, params.ne02, params.ne12, params.kv_is_fp8,
+                                                               /*multi_seq=*/false);
+
+        TEST_ASSERT(plan.kind == ggml_sycl_onednn_fa_layout_kind::REJECT,
+                    "a per-head mask (ne32 > 1) must reject oneDNN: its mask descriptor has extent 1 on the head "
+                    "axes and would apply head 0's mask to every head (llama.cpp-44d0)");
+    }
+    return true;
+}
+
 // Only two descriptor fields follow the planner's decision -- `required` and the
 // `bytes_per_tensor` derived from it. Every geometry field is filled the same
 // way whether the plan came back DIRECT or MATERIALIZE_REQUIRED, so those stay
@@ -1290,6 +1346,8 @@ int main() {
     ok &= test_planner_rejects_unsupported_d();
     ok &= test_planner_rejects_unproven_batch();
     ok &= test_planner_rejects_paged_layout();
+    ok &= test_planner_accepts_head_broadcast_mask();
+    ok &= test_planner_rejects_per_head_mask();
     ok &= test_planner_accepts_prescaled_q_at_d80();
     ok &= test_planner_accepts_prescaled_q_at_d256();
     ok &= test_planner_rejects_nonfinite_scale();
