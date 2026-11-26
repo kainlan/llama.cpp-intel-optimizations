@@ -33,6 +33,33 @@
 //
 // The process exits 1 if any run failed and 0 when all passed, after it has unloaded the model. It exits 77 when there
 // is no SYCL GPU or more than one card is visible. Pin one card: the registration selects level_zero:1, the B50.
+//
+// --direct-reentry runs one case more, in a process of its own because the WARN it checks fires once per (device,
+// cause) per process; its registration is test-moe-pp-staging-refusal-direct-reentry. The direct MMID route, which runs
+// NVFP4 and Q1_0 experts, steps aside for a prompt node the batched oneDNN executor claims while the executor's ring is
+// planned (moe_mmid_direct_defers_to_executor). When that node's row-map staging does not fit, it goes back to the
+// direct route on a second pass (ggml_sycl_mul_mat_id_with_direct_reentry), which needs no row map, instead of
+// refusing. The vehicle is a planned NVFP4 model loaded as test-moe-pp-batched-dequant loads one: gate, up and down
+// tensors of 32 experts of 2048 x 768, 4 used, in the card's SYCL host buffer type, with the ring planned for the WOQ
+// arm as libllama plans it by default; the commit materializes the experts on the card, AoS at this shape. One graph
+// holds two MUL_MAT_ID prompt nodes on the gate weight at 64 tokens, each with its own activation (broadcast to every
+// used expert) and its own ids. The MMID route stays open and no layout is forced, as in an ordinary build. The mode
+// sets GGML_SYCL_MOE_ROUTE_LOG=1, for the executor's success line "[MOE-PP-ONEDNN-F16-BATCHED] tensor=", and
+// GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1, so any executor decline prints "[PP-MOE] refused". Four runs on that
+// graph, each matching the CPU backend at the same NMSE bound for both nodes, every value finite, with no
+// "[PP-MOE] refused", "[MOE-PROMPT-REFUSAL]", [MOE-PP-STAGING] or fallback line:
+//   * baseline, nothing armed: both nodes take the executor (two success lines), and the direct route's candidate,
+//     admit, submit and terminal counters do not move;
+//   * reentered, the row-map failpoint armed: the first node meets it and the direct route runs that node (each counter
+//     +1, the terminal one read after the synchronize), with exactly one "[PP-MOE] direct MMID route re-entered" WARN,
+//     which names device 0, the row-map-staging cause, the tensor and its type, and none for any other cause; the
+//     second node, nothing armed, takes the executor (one success line), so the first node's decline does not carry
+//     over to it;
+//   * reentered-again: the same, with no WARN;
+//   * after, nothing armed: as at the baseline.
+// The fixture models the default load only, GGML_SYCL_WEIGHTS_EVICTABLE on; with it off the mode exits 77. The causes
+// the direct route re-enters for after an executor decline (the second request site in ggml_sycl_mul_mat_id) have no
+// failpoint, so no test reaches them.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -46,6 +73,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -165,6 +193,23 @@ ggml_backend_buffer_t alloc_tensor(ggml_backend_buffer_type_t buft,
     ggml_backend_buffer_set_usage(buffer, usage);
     ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer));
     return buffer;
+}
+
+// The NMSE of `got` against `ref`, of the same size, over the finite values of `got`; each non-finite one adds to
+// `nonfinite`.
+double nmse_of(const std::vector<float> & ref, const std::vector<float> & got, size_t & nonfinite) {
+    double err  = 0.0;
+    double norm = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        if (!std::isfinite(got[i])) {
+            ++nonfinite;
+            continue;
+        }
+        const double d = double(ref[i]) - double(got[i]);
+        err += d * d;
+        norm += double(ref[i]) * double(ref[i]);
+    }
+    return err / (norm > 0.0 ? norm : 1.0);
 }
 
 // The unplanned model: the expert tensor registered inside a load transaction that stages no plan, a backend on the
@@ -352,21 +397,8 @@ bool run_matches(mmid_op & op, const std::vector<float> & ref, const std::string
     const ggml_status  status   = op.compute(got);
     const uint64_t     consumed = failures_consumed() - consumed_before;
 
-    double err       = 0.0;
-    double norm      = 0.0;
-    size_t nonfinite = 0;
-    if (status == GGML_STATUS_SUCCESS) {
-        for (size_t i = 0; i < ref.size(); ++i) {
-            if (!std::isfinite(got[i])) {
-                ++nonfinite;
-                continue;
-            }
-            const double d = double(ref[i]) - double(got[i]);
-            err += d * d;
-            norm += double(ref[i]) * double(ref[i]);
-        }
-    }
-    const double nmse      = status != GGML_STATUS_SUCCESS ? NAN : err / (norm > 0.0 ? norm : 1.0);
+    size_t       nonfinite = 0;
+    const double nmse      = status == GGML_STATUS_SUCCESS ? nmse_of(ref, got, nonfinite) : NAN;
     const size_t warns     = g_log.count(from, { k_staging_warn });
     const size_t fallbacks = g_log.count(from, { k_fallback_any });
 
@@ -435,11 +467,438 @@ bool run_refused(mmid_op & op, const staging_arm & arm) {
     return why.empty();
 }
 
+// --- --direct-reentry: the direct MMID route takes back a node whose row-map staging did not fit --------------------
+
+constexpr ggml_type k_reentry_type     = GGML_TYPE_NVFP4;
+constexpr int       k_reentry_experts  = 32;
+constexpr int       k_reentry_used     = 4;
+constexpr int       k_reentry_in       = 2048;
+constexpr int       k_reentry_out      = 768;
+constexpr int       k_reentry_tokens   = 64;
+constexpr uint32_t  k_reentry_n_ubatch = 512;
+constexpr uint32_t  k_reentry_n_ctx    = 512;
+constexpr size_t    k_reentry_rows     = size_t(k_reentry_used) * k_reentry_tokens;
+
+constexpr const char * k_reentry_tensor_names[3] = { "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight",
+                                                     "blk.0.ffn_down_exps.weight" };
+constexpr const char * k_reentry_split_path      = "test-moe-pp-staging-refusal-direct-reentry.gguf";
+
+constexpr const char * k_reentry_warn     = "[PP-MOE] direct MMID route re-entered";
+constexpr const char * k_executor_success = "[MOE-PP-ONEDNN-F16-BATCHED] tensor=";
+constexpr const char * k_executor_refused = "[PP-MOE] refused";
+constexpr const char * k_prompt_refusal   = "[MOE-PROMPT-REFUSAL]";
+
+size_t align_256(size_t n) {
+    return (n + 255u) & ~size_t(255u);
+}
+
+// The inventory libllama stages for this model: gate, up and down of one shape, with the PP MoE ring fields libllama
+// computes for that shape with GGML_SYCL_MOE_PP_WOQ at its default (on), as test-moe-pp-batched-dequant stages them.
+struct planned_inventory {
+    ggml_sycl_tensor_info        tensors[3]{};
+    ggml_sycl_tensor_inventory   inventory{};
+    ggml_sycl_placement_envelope envelope{ k_reentry_n_ctx, k_reentry_n_ubatch, 1, -1 };
+
+    planned_inventory() {
+        for (int i = 0; i < 3; ++i) {
+            tensors[i].name  = k_reentry_tensor_names[i];
+            tensors[i].type  = k_reentry_type;
+            tensors[i].ne[0] = k_reentry_in;
+            tensors[i].ne[1] = k_reentry_out;
+            tensors[i].ne[2] = k_reentry_experts;
+            tensors[i].ne[3] = 1;
+            tensors[i].size  = ggml_row_size(k_reentry_type, k_reentry_in) * k_reentry_out * k_reentry_experts;
+            inventory.total_size += tensors[i].size;
+        }
+        inventory.tensors       = tensors;
+        inventory.count         = 3;
+        inventory.n_expert      = k_reentry_experts;
+        inventory.n_expert_used = k_reentry_used;
+        inventory.n_layer       = 1;
+        inventory.n_ctx         = k_reentry_n_ctx;
+        inventory.n_ubatch      = k_reentry_n_ubatch;
+
+        const size_t woq_slot = align_256(size_t(k_reentry_out) * (k_reentry_in / 2)) +
+                                align_256(size_t(k_reentry_in / 32) * k_reentry_out);
+        inventory.pp_moe_onednn_weight_slot_bytes        = woq_slot * k_reentry_experts;
+        // One scratch row: k_in half floats in, k_out floats out. The backend sizes the activation and output slots
+        // from these and the expert counts, so the loader leaves both slots 0 and plans only the weight slot.
+        inventory.pp_moe_onednn_activation_bytes_per_row = size_t(k_reentry_in) * sizeof(ggml_fp16_t);
+        inventory.pp_moe_onednn_output_bytes_per_row     = size_t(k_reentry_out) * sizeof(float);
+        inventory.pp_moe_onednn_activation_slot_bytes    = 0;
+        inventory.pp_moe_onednn_output_slot_bytes        = 0;
+        inventory.pp_moe_onednn_ring_depth               = 1;
+        inventory.pp_moe_onednn_scratch_bytes            = inventory.pp_moe_onednn_weight_slot_bytes;
+    }
+};
+
+// The planned model's lifecycle, as libllama drives it through the public entry points: stage the inventory plan,
+// register and fill the weights while the load is open, commit (its preload materializes the experts on the card),
+// activate the plan, and bind an execution context and the runtime context. The destructor unloads it as libllama
+// does: drain the context, free the weights, report the model unloaded, free the backend.
+struct planned_model_fixture {
+    ggml_backend_t            backend = nullptr;
+    ggml_sycl_load_txn        load{};
+    bool                      load_open = false;
+    ggml_sycl_model_token     model{};
+    ggml_sycl_exec_context_id context{};
+    ggml_context *            weight_ctx    = nullptr;
+    ggml_backend_buffer_t     weight_buffer = nullptr;
+    ggml_tensor *             gate          = nullptr;  // the loaded expert tensor both nodes multiply by
+    std::vector<uint8_t>      gate_bytes;               // its quantized bytes, for the CPU reference
+
+    explicit planned_model_fixture(std::mt19937 & rng) {
+        try {
+            require(ggml_backend_sycl_model_load_begin(&load) == GGML_SYCL_LIFECYCLE_OK, "load begin failed");
+            load_open = true;
+            planned_inventory fixture;
+            const auto        stage =
+                ggml_backend_sycl_stage_load_inventory_plan(&fixture.inventory, &fixture.envelope, false);
+            require(stage == GGML_SYCL_LIFECYCLE_OK,
+                    "inventory staging result=" + std::to_string(static_cast<int>(stage)));
+            // Staging uses temporary backends; the retained backend is created after it, so load_end's exact-queue
+            // lookup cannot observe a transient context that was cleared.
+            backend = ggml_backend_sycl_init(0);
+            require(backend != nullptr, "ggml_backend_sycl_init(0) returned null");
+            load_weights(rng);
+            const auto commit = ggml_backend_sycl_model_load_end(load, true, &model);
+            if (commit != GGML_SYCL_LIFECYCLE_BUSY) {
+                load_open = false;
+            }
+            require(commit == GGML_SYCL_LIFECYCLE_OK, "load commit result=" + std::to_string(static_cast<int>(commit)));
+            require(ggml_backend_sycl_activate_model_plan(model) == GGML_SYCL_LIFECYCLE_OK, "plan activation failed");
+            require(ggml_backend_sycl_execution_context_create(&context) == GGML_SYCL_EXECUTION_OK,
+                    "context create failed");
+            require(ggml_backend_sycl_execution_context_bind_backend(backend, context) == GGML_SYCL_EXECUTION_OK,
+                    "context bind failed");
+            require(
+                ggml_backend_sycl_set_runtime_context_for_model(backend, model, k_reentry_n_ctx, k_reentry_n_ubatch, 1,
+                                                                /*kv_unified=*/false, /*swa_full=*/false,
+                                                                /*flash_attn_enabled=*/true) == GGML_SYCL_LIFECYCLE_OK,
+                "runtime context bind failed");
+        } catch (...) {
+            cleanup();
+            throw;
+        }
+    }
+
+    // What libllama's loader does for each weight, in its order (register_sycl_tensor_metadata in
+    // src/llama-model-loader.cpp): its split's file identity, its own identity, its host-weight row (weights are
+    // evictable here: the mode skips otherwise) and its usage while the load is open; then the tensors are allocated in
+    // the card's SYCL host buffer type and filled. One quantization serves all three tensors: only the gate runs.
+    void load_weights(std::mt19937 & rng) {
+        ggml_init_params params = { 3 * ggml_tensor_overhead(), nullptr, true };
+        weight_ctx              = ggml_init(params);
+        require(weight_ctx != nullptr, "ggml_init for the weights failed");
+        ggml_backend_dev_t dev        = ggml_backend_get_device(backend);
+        ggml_tensor *      tensors[3] = {};
+        for (int i = 0; i < 3; ++i) {
+            tensors[i] = ggml_new_tensor_3d(weight_ctx, k_reentry_type, k_reentry_in, k_reentry_out, k_reentry_experts);
+            ggml_set_name(tensors[i], k_reentry_tensor_names[i]);
+            const size_t nbytes = ggml_nbytes(tensors[i]);
+            ggml_backend_sycl_register_gguf_file_identity(0, k_reentry_split_path, uint64_t(3) * nbytes);
+            ggml_backend_sycl_register_weight_identity(tensors[i], 0, size_t(i) * nbytes, nbytes, 0);
+            ggml_backend_sycl_register_host_weight_tensor(dev, tensors[i]);
+            require(ggml_backend_sycl_try_register_weight_usage(k_reentry_tensor_names[i],
+                                                                GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT),
+                    std::string("usage registration refused for ") + k_reentry_tensor_names[i]);
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_sycl_host_buffer_type_for_device(dev);
+        require(buft != nullptr, "no SYCL host buffer type for the pinned card");
+        weight_buffer = ggml_backend_alloc_ctx_tensors_from_buft(weight_ctx, buft);
+        require(weight_buffer != nullptr, "host weight buffer allocation failed");
+        ggml_backend_buffer_set_usage(weight_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        std::vector<float>                    weight_f32(size_t(k_reentry_experts) * k_reentry_out * k_reentry_in);
+        for (float & v : weight_f32) {
+            v = 0.5f * dist(rng);
+        }
+        gate_bytes.resize(ggml_nbytes(tensors[0]));
+        const size_t written = ggml_quantize_chunk(k_reentry_type, weight_f32.data(), gate_bytes.data(), 0,
+                                                   int64_t(k_reentry_experts) * k_reentry_out, k_reentry_in, nullptr);
+        require(written == gate_bytes.size(), "quantize wrote a short buffer");
+        for (ggml_tensor * tensor : tensors) {
+            ggml_backend_tensor_set(tensor, gate_bytes.data(), 0, gate_bytes.size());
+        }
+        gate = tensors[0];
+    }
+
+    void cleanup() noexcept {
+        ggml_sycl_exec_drain_ticket             ticket{};
+        ggml_sycl_exec_control_host_alloc_batch batch{};
+        if (context.value &&
+            ggml_backend_sycl_execution_context_begin_drain(context, &ticket) == GGML_SYCL_EXECUTION_OK &&
+            ggml_backend_sycl_execution_context_extract_control_host_allocs(&ticket, &batch) ==
+                GGML_SYCL_EXECUTION_OK) {
+            (void) ggml_backend_sycl_execution_context_release_control_host_allocs(ticket, &batch);
+            (void) ggml_backend_sycl_execution_context_finish_drain(ticket, &batch);
+        }
+        context = {};
+        if (weight_buffer) {
+            ggml_backend_buffer_free(weight_buffer);
+            weight_buffer = nullptr;
+        }
+        if (weight_ctx) {
+            ggml_free(weight_ctx);
+            weight_ctx = nullptr;
+        }
+        gate = nullptr;
+        if (model.model_id) {
+            (void) ggml_backend_sycl_model_unloaded_token(model);
+            model = {};
+        } else if (load_open) {
+            (void) ggml_backend_sycl_model_load_end(load, false, nullptr);
+            load_open = false;
+        }
+        if (backend) {
+            ggml_backend_free(backend);
+            backend = nullptr;
+        }
+    }
+
+    ~planned_model_fixture() { cleanup(); }
+
+    planned_model_fixture(const planned_model_fixture &)             = delete;
+    planned_model_fixture & operator=(const planned_model_fixture &) = delete;
+};
+
+// What each of the two nodes multiplies: its activation, broadcast to every used expert, and its ids.
+struct node_inputs {
+    std::vector<float>   input;
+    std::vector<int32_t> ids;
+};
+
+// Two MUL_MAT_ID prompt nodes on the same expert weight in one graph, built once on `backend` so it can be computed
+// more than once, the first node ahead of the second. The SYCL graph passes the fixture's loaded gate as
+// `loaded_weights`; the CPU reference passes null, and `weight_bytes` go into a fresh tensor on the CPU backend.
+struct two_node_op {
+    ggml_backend_t                                      backend;
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx{ nullptr, &ggml_free };
+    std::vector<ggml_backend_buffer_t>                  buffers;
+    ggml_tensor *                                       dst[2] = {};
+    ggml_cgraph *                                       graph  = nullptr;
+
+    two_node_op(ggml_backend_t               on_backend,
+                ggml_tensor *                loaded_weights,
+                const std::vector<uint8_t> & weight_bytes,
+                const node_inputs (&nodes)[2]) :
+        backend(on_backend) {
+        ggml_init_params params = { 1024 * 1024, nullptr, true };
+        ctx.reset(ggml_init(params));
+        require(ctx != nullptr, "ggml_init failed");
+        ggml_tensor * weights = loaded_weights;
+        if (!weights) {
+            weights = ggml_new_tensor_3d(ctx.get(), k_reentry_type, k_reentry_in, k_reentry_out, k_reentry_experts);
+            ggml_set_name(weights, k_reentry_tensor_names[0]);
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
+        ggml_tensor *              inputs[2]{};
+        ggml_tensor *              ids[2]{};
+        graph = ggml_new_graph(ctx.get());
+        for (int n = 0; n < 2; ++n) {
+            inputs[n] = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, k_reentry_in, 1, k_reentry_tokens);
+            ids[n]    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, k_reentry_used, k_reentry_tokens);
+            dst[n]    = ggml_mul_mat_id(ctx.get(), weights, inputs[n], ids[n]);
+            ggml_set_name(dst[n], n == 0 ? "moe_out_first" : "moe_out_second");
+            buffers.push_back(alloc_tensor(buft, inputs[n], GGML_BACKEND_BUFFER_USAGE_COMPUTE));
+            buffers.push_back(alloc_tensor(buft, ids[n], GGML_BACKEND_BUFFER_USAGE_COMPUTE));
+            buffers.push_back(alloc_tensor(buft, dst[n], GGML_BACKEND_BUFFER_USAGE_COMPUTE));
+            ggml_build_forward_expand(graph, dst[n]);
+        }
+        if (!loaded_weights) {
+            buffers.push_back(alloc_tensor(buft, weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS));
+        }
+        for (ggml_backend_buffer_t buffer : buffers) {
+            require(buffer != nullptr, "tensor buffer allocation failed");
+        }
+        if (!loaded_weights) {
+            ggml_backend_tensor_set(weights, weight_bytes.data(), 0, weight_bytes.size());
+        }
+        for (int n = 0; n < 2; ++n) {
+            ggml_backend_tensor_set(inputs[n], nodes[n].input.data(), 0, nodes[n].input.size() * sizeof(float));
+            ggml_backend_tensor_set(ids[n], nodes[n].ids.data(), 0, nodes[n].ids.size() * sizeof(int32_t));
+        }
+    }
+
+    ~two_node_op() {
+        for (ggml_backend_buffer_t buffer : buffers) {
+            if (buffer) {
+                ggml_backend_buffer_free(buffer);
+            }
+        }
+    }
+
+    two_node_op(const two_node_op &)             = delete;
+    two_node_op & operator=(const two_node_op &) = delete;
+
+    // Fills both dst with NaN, computes the graph and, on success, reads each dst into `out`.
+    ggml_status compute(std::vector<float> (&out)[2]) {
+        const std::vector<float> poison(size_t(k_reentry_out) * k_reentry_rows,
+                                        std::numeric_limits<float>::quiet_NaN());
+        for (ggml_tensor * d : dst) {
+            ggml_backend_tensor_set(d, poison.data(), 0, poison.size() * sizeof(float));
+        }
+        const ggml_status status = ggml_backend_graph_compute(backend, graph);
+        ggml_backend_synchronize(backend);
+        for (int n = 0; n < 2; ++n) {
+            out[n].clear();
+            if (status == GGML_STATUS_SUCCESS) {
+                out[n].resize(poison.size());
+                ggml_backend_tensor_get(dst[n], out[n].data(), 0, out[n].size() * sizeof(float));
+            }
+        }
+        return status;
+    }
+};
+
+// What one run of the two nodes must show besides matching the CPU backend.
+struct reentry_want {
+    bool     armed;           // the row-map failpoint is armed, so the first node meets it
+    size_t   reentry_warns;   // re-entry WARNs, each naming device 0, the row-map cause, the tensor and its type
+    size_t   executor_lines;  // the executor's success lines: one per node it ran
+    uint64_t direct_runs;     // nodes the direct route ran: its candidate, admit, submit and terminal counters each
+};
+
+bool run_reentry(two_node_op & op, const std::vector<float> (&ref)[2], const char * name, const reentry_want & want) {
+    ggml_sycl_q1_nvfp4_test_counters before{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&before);
+    const size_t from = g_log.mark();
+    if (want.armed) {
+        ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_ROW_MAP_STAGING);
+    }
+    std::vector<float> got[2];
+    const ggml_status  status = op.compute(got);
+
+    // compute() synchronized, so the direct route's terminal host task has counted.
+    ggml_sycl_q1_nvfp4_test_counters after{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&after);
+    const uint64_t consumed = after.failure_consumed - before.failure_consumed;
+    if (want.armed && consumed == 0) {
+        // The op never reached the failpoint; disarm it so the next run measures only itself.
+        ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_NONE);
+    }
+
+    size_t            nonfinite   = 0;
+    const double      nmse_first  = status == GGML_STATUS_SUCCESS ? nmse_of(ref[0], got[0], nonfinite) : NAN;
+    const double      nmse_second = status == GGML_STATUS_SUCCESS ? nmse_of(ref[1], got[1], nonfinite) : NAN;
+    const std::string named       = std::string("device=0 cause=row-map-staging tensor=") + k_reentry_tensor_names[0] +
+                              " type=" + ggml_type_name(k_reentry_type) + ":";
+    const size_t named_warns = g_log.count(from, { k_reentry_warn, named.c_str() });
+    const size_t any_warns   = g_log.count(from, { k_reentry_warn });
+    const size_t executor    = g_log.count(from, { k_executor_success });
+    const size_t refusals    = g_log.count(from, { k_executor_refused }) + g_log.count(from, { k_prompt_refusal }) +
+                            g_log.count(from, { k_staging_warn }) + g_log.count(from, { k_fallback_any });
+    const uint64_t candidate = after.candidate - before.candidate;
+    const uint64_t admit     = after.admit - before.admit;
+    const uint64_t submit    = after.submit - before.submit;
+    const uint64_t terminal  = after.terminal - before.terminal;
+
+    std::string why;
+    if (status != GGML_STATUS_SUCCESS) {
+        why += " compute-status";
+    } else {
+        if (nonfinite != 0) {
+            why += " nonfinite";
+        }
+        if (!(nmse_first <= k_nmse_tol) || !(nmse_second <= k_nmse_tol)) {
+            why += " nmse";
+        }
+    }
+    if (consumed != (want.armed ? 1u : 0u)) {
+        why += " failpoint-consumed";
+    }
+    if (named_warns != want.reentry_warns || any_warns != want.reentry_warns) {
+        why += " reentry-warn";
+    }
+    if (executor != want.executor_lines) {
+        why += " executor-lines";
+    }
+    if (candidate != want.direct_runs || admit != want.direct_runs || submit != want.direct_runs ||
+        terminal != want.direct_runs) {
+        why += " direct-route";
+    }
+    if (refusals != 0) {
+        why += " refusal";
+    }
+    std::fprintf(stderr,
+                 "RUN name=%s status=%d nmse=%.3e,%.3e nonfinite=%zu failpoint_consumed=%llu reentry_warns=%zu "
+                 "any_reentry_warns=%zu executor_lines=%zu direct=+%llu/+%llu/+%llu/+%llu refusal_lines=%zu -> %s%s\n",
+                 name, static_cast<int>(status), nmse_first, nmse_second, nonfinite, (unsigned long long) consumed,
+                 named_warns, any_warns, executor, (unsigned long long) candidate, (unsigned long long) admit,
+                 (unsigned long long) submit, (unsigned long long) terminal, refusals,
+                 why.empty() ? "PASS" : "FAIL:", why.c_str());
+    return why.empty();
+}
+
+// The --direct-reentry mode (see the header). Returns the process's exit status.
+int run_direct_reentry_mode() {
+    if (!ggml_backend_sycl_weights_evictable()) {
+        throw test_skip("not-evictable",
+                        "GGML_SYCL_WEIGHTS_EVICTABLE is off, so libllama would load these experts into the device "
+                        "buffer, which this fixture does not model");
+    }
+    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu(
+        ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr), &ggml_backend_free);
+    require(cpu != nullptr, "CPU backend init failed");
+
+    std::mt19937                          rng(9137);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    node_inputs                           nodes[2];
+    for (int n = 0; n < 2; ++n) {
+        nodes[n].input.resize(size_t(k_reentry_in) * k_reentry_tokens);
+        for (float & v : nodes[n].input) {
+            v = dist(rng);
+        }
+        // Distinct experts per token, every expert active; the second node's routing is shifted from the first's.
+        nodes[n].ids.resize(k_reentry_rows);
+        for (int t = 0; t < k_reentry_tokens; ++t) {
+            const int base = (t * 3 + t / 16 + n * 5) % k_reentry_experts;
+            for (int i = 0; i < k_reentry_used; ++i) {
+                nodes[n].ids[size_t(t) * k_reentry_used + i] =
+                    (base + i * (k_reentry_experts / k_reentry_used)) % k_reentry_experts;
+            }
+        }
+    }
+
+    bool ok = true;
+    {
+        planned_model_fixture model(rng);
+        std::vector<float>    ref[2];
+        {
+            two_node_op reference(cpu.get(), nullptr, model.gate_bytes, nodes);
+            require(reference.compute(ref) == GGML_STATUS_SUCCESS, "CPU reference compute failed");
+        }
+        two_node_op op(model.backend, model.gate, model.gate_bytes, nodes);
+        ok = run_reentry(op, ref, "baseline", { false, 0, 2, 0 }) && ok;
+        ok = run_reentry(op, ref, "reentered", { true, 1, 1, 1 }) && ok;
+        ok = run_reentry(op, ref, "reentered-again", { true, 0, 1, 1 }) && ok;
+        ok = run_reentry(op, ref, "after", { false, 0, 2, 0 }) && ok;
+    }
+    if (!ok) {
+        std::fprintf(stderr, "FAIL: a run of the direct route's re-entry failed\n");
+        return 1;
+    }
+    std::fprintf(stderr,
+                 "PASS: the node whose row-map staging did not fit ran on the direct MMID route and matched the CPU "
+                 "backend, the WARN named its cause once, and the next node took the batched executor\n");
+    return 0;
+}
+
 }  // namespace
 
-int main() {
-    // Read once by the backend, so it is set before anything touches it.
+int main(int argc, char ** argv) {
+    const bool direct_reentry = argc == 2 && std::strcmp(argv[1], "--direct-reentry") == 0;
+    if (argc != 1 && !direct_reentry) {
+        std::fprintf(stderr, "usage: %s [--direct-reentry]\n", argv[0]);
+        return 1;
+    }
+    // Read once by the backend, so they are set before anything touches it.
     setenv("GGML_SYCL_DISABLE_GRAPH", "1", 1);
+    if (direct_reentry) {
+        setenv("GGML_SYCL_MOE_ROUTE_LOG", "1", 1);
+        setenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE", "1", 1);
+    }
     ggml_log_set(log_callback, nullptr);
     try {
         bool have_gpu = false;
@@ -455,8 +914,12 @@ int main() {
         }
         if (ggml_backend_sycl_get_device_count() > 1) {
             throw test_skip("multi-card",
-                            "more than one SYCL card is visible; the refusal must name device 0 "
+                            "more than one SYCL card is visible; the lines this test reads must name device 0 "
                             "(pin ONEAPI_DEVICE_SELECTOR to one card)");
+        }
+        // The MMID route stays open and no layout is forced: the mode runs as an ordinary build does.
+        if (direct_reentry) {
+            return run_direct_reentry_mode();
         }
         // Dispatch as an ordinary build does, and publish the unplanned experts as AoS views, for the whole run: the
         // model is unloaded before either guard ends.

@@ -6617,6 +6617,11 @@ endif() # private SYCL backend fixture
 # the ordinary DSO) and closes the MMID route those objects compile in. It loads a model onto the card, so it carries
 # the `model` label, which the full sweep excludes. Pinned to the B50; a run with no SYCL GPU or more than one visible
 # card exits 77.
+# test-moe-pp-staging-refusal-direct-reentry runs the same binary with --direct-reentry, in a process of its own
+# because the WARN it checks fires once per process: on a planned NVFP4 model, the row-map failpoint armed on a prompt
+# node the direct MMID route stepped aside for sends that node back to the direct route, which must match the CPU
+# backend with one WARN naming the cause, while the graph's next node still takes the batched executor. The MMID route
+# stays open in that mode. Same labels, selector and skip code; it also exits 77 when the weights are not evictable.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-pp-staging-refusal ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-pp-staging-refusal.cpp)
 target_include_directories(test-moe-pp-staging-refusal PRIVATE
@@ -6628,6 +6633,14 @@ target_link_libraries(test-moe-pp-staging-refusal PRIVATE ggml-sycl-private-fixt
 set_target_properties(test-moe-pp-staging-refusal PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_test(NAME test-moe-pp-staging-refusal COMMAND test-moe-pp-staging-refusal)
 set_tests_properties(test-moe-pp-staging-refusal PROPERTIES
+    LABELS "sycl;moe;device;B50;model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 300
+)
+add_test(NAME test-moe-pp-staging-refusal-direct-reentry COMMAND test-moe-pp-staging-refusal --direct-reentry)
+set_tests_properties(test-moe-pp-staging-refusal-direct-reentry PROPERTIES
     LABELS "sycl;moe;device;B50;model"
     SKIP_RETURN_CODE 77
     RUN_SERIAL TRUE
