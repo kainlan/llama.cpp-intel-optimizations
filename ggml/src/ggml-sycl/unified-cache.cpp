@@ -29428,6 +29428,10 @@ allocation_result unified_cache_zone_allocate_owner(
     // Only a block of `zone` is accepted below, so a zone with no room is the answer: a raw block would be made, found
     // not zone-managed and given back, after its gate walked the whole runtime registry for a figure nobody uses.
     req.intent.constraints.forbid_vram_zone_spill = true;
+    // That answer is a zone out of room, not a plan that was wrong: every caller takes the refusal and goes on (a later
+    // boundary, its own second request, an eviction, or a load step that reports the failure itself), so it is counted
+    // as a cascade miss.
+    req.intent.constraints.cascade_step           = true;
 
     allocation_result result = unified_allocate_owner(req);
     if (!result) return result;

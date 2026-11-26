@@ -523,6 +523,14 @@
       "count": 1,
       "outcome": "CASCADE",
       "reason": "The NVFP4 resident decode route's Q8_1 input slice in the SCRATCH zone, spill forbidden. A refusal has a declared next path in the caller: the route declines the node by name (reason=scratch) and the admitted MUL_MAT_ID route runs it from its own workspace, so the miss is a counted cascade miss, not a plan fault."
+    },
+    {
+      "id": "H-ZONE-EXACT-OWNER",
+      "code": "H-CASCADE",
+      "key": "unified-cache.cpp::unified_cache_zone_allocate_owner::declaration:req:f988257e::write:cascade_step#0",
+      "count": 1,
+      "outcome": "CASCADE",
+      "reason": "The zone-exact owner request: a block of the zone asked for or a refusal there, spill forbidden. The refusal is a zone out of room, and every caller takes it and goes on: the expert move answers BUSY and a later boundary asks again, the stream ring makes its own second request and then stops at the slots it holds, the device pool falls back to its unified-cache request, allocate_slot goes to its eviction path, and the direct-stage steps of a load return the failure to their caller with an ERROR line of their own. So the miss is a counted cascade miss; counted as a plan refusal it would label every full WEIGHT zone a planning bug."
     }
   ]
 }

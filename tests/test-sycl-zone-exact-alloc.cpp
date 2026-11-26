@@ -3,11 +3,16 @@
 //
 //   full zone   the request is refused without a raw-allocation gate reading its figure (a walk of the whole runtime
 //               registry), without a raw device allocation, and with the error a caller reads as "no room":
-//               PHYSICAL_ALLOCATION_FAILED, never the control failure direct staging treats as fatal
+//               PHYSICAL_ALLOCATION_FAILED, never the control failure direct staging treats as fatal; and it is
+//               counted once as a cascade miss (zone_cascade_miss), since every caller has a next path, never as a
+//               plan refusal (zone_plan_refusal), which says the plan was wrong
 //   room        the request is served from the zone as an exact, zone-managed block, and no raw gate is read either
 //   room epoch  the zone's room epoch (unified_cache::zone_room_epoch) moves when a block goes back to the zone and
 //               stands still for a refusal and for an allocation; KV reads the same count as WEIGHT, whose allocator
 //               it shares, and RUNTIME's does not move for a WEIGHT block
+//   give-back   a block the caller minted and gives back, as a move does with the members it minted before a later
+//               member was refused, moves the epoch at once, on the caller's thread and with no drain: a read right
+//               before and right after the release measures the whole move
 //
 // The cache is a real unified_cache on the OpenCL CPU device, registered through unified_cache_register_for_queue(),
 // so no GPU is touched (the registration pins the selector to the CPU device). Its arena is one chunk, where the
@@ -118,11 +123,15 @@ void test_full_zone_refuses_at_the_zone(unified_cache * cache) {
     const uint64_t reads_before = unified_cache_test_raw_gate_reads(MOCK_DEVICE);
     const uint64_t raw_before   = unified_cache_ext_alloc_count_for_testing(MOCK_DEVICE);
     const uint64_t epoch_before = cache->zone_room_epoch(vram_zone_id::WEIGHT);
+    const uint64_t plan_before  = unified_cache_zone_plan_refusal_count_for_testing(MOCK_DEVICE);
+    const uint64_t casc_before  = unified_cache_zone_cascade_miss_count_for_testing(MOCK_DEVICE);
 
     allocation_result miss = unified_cache_zone_allocate_owner(MOCK_DEVICE, vram_zone_id::WEIGHT, REQUEST);
 
     const uint64_t reads = unified_cache_test_raw_gate_reads(MOCK_DEVICE) - reads_before;
     const uint64_t raw   = unified_cache_ext_alloc_count_for_testing(MOCK_DEVICE) - raw_before;
+    const uint64_t plan  = unified_cache_zone_plan_refusal_count_for_testing(MOCK_DEVICE) - plan_before;
+    const uint64_t casc  = unified_cache_zone_cascade_miss_count_for_testing(MOCK_DEVICE) - casc_before;
     CHECK_EQ(cache->zone_room_epoch(vram_zone_id::WEIGHT), epoch_before, "full zone: a refusal moved the room epoch");
     std::printf("  request=%zu zone_available=%zu: served=%d error=%d raw_gate_reads=%llu raw_allocations=%llu\n",
                 REQUEST, cache->zone_available(vram_zone_id::WEIGHT), miss ? 1 : 0, static_cast<int>(miss.error),
@@ -133,6 +142,10 @@ void test_full_zone_refuses_at_the_zone(unified_cache * cache) {
     CHECK_EQ(static_cast<int>(miss.error), static_cast<int>(allocation_error::PHYSICAL_ALLOCATION_FAILED),
              "full zone: the miss does not read as a failed physical allocation");
     CHECK_EQ(cache->zone_available(vram_zone_id::WEIGHT), 0, "full zone: the refusal changed the zone's free bytes");
+    std::printf("  counted: zone_plan_refusal +%llu, zone_cascade_miss +%llu\n", static_cast<unsigned long long>(plan),
+                static_cast<unsigned long long>(casc));
+    CHECK_EQ(plan, 0, "full zone: a capacity miss was counted as a plan refusal");
+    CHECK_EQ(casc, 1, "full zone: a capacity miss was not counted once as a cascade miss");
 }
 
 void test_room_is_served_from_the_zone(unified_cache * cache, alloc_owner * hole) {
@@ -176,6 +189,44 @@ void test_room_is_served_from_the_zone(unified_cache * cache, alloc_owner * hole
     settle();
 }
 
+// The zone has room for one REQUEST. A caller mints one, is refused the next, and gives the first back by dropping its
+// handle, as a named move does with a triplet whose later member the zone refused. Nothing is drained in between.
+void test_a_mint_given_back_moves_the_epoch_at_once(unified_cache * cache) {
+    std::printf("a block the caller minted and gives back moves the room epoch at once:\n");
+    CHECK_EQ(cache->zone_available(vram_zone_id::WEIGHT), REQUEST, "give-back: the zone does not hold one request");
+    const uint64_t epoch_start = cache->zone_room_epoch(vram_zone_id::WEIGHT);
+
+    allocation_result first  = unified_cache_zone_allocate_owner(MOCK_DEVICE, vram_zone_id::WEIGHT, REQUEST);
+    allocation_result second = unified_cache_zone_allocate_owner(MOCK_DEVICE, vram_zone_id::WEIGHT, REQUEST);
+    CHECK(static_cast<bool>(first), "give-back: the first member was refused");
+    CHECK(!second, "give-back: the second member was served by a zone with no room for it");
+    CHECK_EQ(cache->zone_room_epoch(vram_zone_id::WEIGHT), epoch_start,
+             "give-back: a mint or a refusal moved the epoch");
+    if (!first) {
+        return;
+    }
+
+    uint64_t measured = 0;
+    {
+        mem_handle     member = mem_handle::from_owned_alloc(std::move(first.owner), GGML_LAYOUT_AOS);
+        const uint64_t before = cache->zone_room_epoch(vram_zone_id::WEIGHT);
+        member                = mem_handle{};
+        measured              = cache->zone_room_epoch(vram_zone_id::WEIGHT) - before;
+    }
+    const uint64_t moved = cache->zone_room_epoch(vram_zone_id::WEIGHT) - epoch_start;
+    std::printf(
+        "  room epoch moved by %llu over the mint, the refusal and the give-back; measured around the "
+        "give-back: %llu; zone_available=%zu\n",
+        static_cast<unsigned long long>(moved), static_cast<unsigned long long>(measured),
+        cache->zone_available(vram_zone_id::WEIGHT));
+    CHECK(measured != 0, "give-back: the release did not move the epoch before it returned");
+    CHECK_EQ(measured, moved, "give-back: the reads around the release did not measure the whole move");
+    CHECK_EQ(cache->zone_available(vram_zone_id::WEIGHT), REQUEST, "give-back: the bytes were not back at once");
+    settle();
+    CHECK_EQ(cache->zone_room_epoch(vram_zone_id::WEIGHT) - epoch_start, moved,
+             "give-back: a drain moved the epoch again");
+}
+
 }  // namespace
 
 int main(int, char ** argv) {
@@ -198,6 +249,7 @@ int main(int, char ** argv) {
     if (full) {
         test_full_zone_refuses_at_the_zone(cache);
         test_room_is_served_from_the_zone(cache, &hole);
+        test_a_mint_given_back_moves_the_epoch_at_once(cache);
     }
 
     (void) hole.reset();
