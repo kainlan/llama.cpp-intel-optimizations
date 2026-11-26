@@ -632,8 +632,9 @@ counted the moves it had in flight as open slots)
 - WARN `[MOE-SWAP] device %d: WEIGHT zone refused %llu of %llu admits for room: a triplet needs 3 x %zu = %zu bytes,
   largest free block at refusal %zu bytes; after the batch zone_available %zu bytes, zone_largest_free %zu bytes`:
   one line for each boundary whose transaction refused at least one admit because the device WEIGHT zone had no
-  room, whether or not anything else in the batch moved: the admits refused of the admits sent, what the largest
-  refused triplet needed (each of its three members is minted at the triplet's slot, `expert_triplet_slot_bytes`),
+  room, whether or not anything else in the batch moved: the admits refused of the admits sent, the largest size a
+  refused member asked and three times it (`expert_triplet_member_bytes`: a slotted triplet's three members each take
+  its slot, so that is the triplet; a triplet with no slot keeps each member's own size, so it is an upper bound),
   the largest free block the zone had when a mint was refused (the largest any refusal saw), and what the zone had
   free after the batch, read together (`unified_cache::zone_free_figures`). `zone_available` at or above the slot
   with the largest block below it is fragmentation; both below it is a zone with no room. A boundary whose

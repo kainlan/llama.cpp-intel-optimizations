@@ -21923,8 +21923,8 @@ struct ggml_sycl_expert_loan_target {
     ggml_tensor_extra_gpu *         extra = nullptr;
     // The member's weight type, row width and bytes per expert (nb[2]), from its tensor. The expert's size is a fact of
     // its tensor, never of a cache entry, whose storage may be padded: every move copies those bytes and records them
-    // as the new record's range, and a move to the device mints its copy at its triplet's slot, the largest of the
-    // three members' staged sizes (staged_expert_bytes, expert_triplet_slot_bytes).
+    // as the new record's range, and a move to the device mints its copy at what the load gave it: its triplet's slot
+    // when it has one, else its own staged size (staged_expert_bytes, expert_triplet_member_bytes).
     ggml_type                       type          = GGML_TYPE_COUNT;
     int64_t                         ncols         = 0;
     size_t                          logical_bytes = 0;
@@ -22040,9 +22040,10 @@ static bool ggml_sycl_expert_move_to_device(ggml_sycl_expert_move_kind kind) {
 // says which list named it, the admits' or the evicts'. device_bytes is the device storage a moved triplet took (an
 // admit) or gives back once the cache reaps the entries it retired (an evict). zone_room_bytes is nonzero when a BUSY
 // admit was refused because the device WEIGHT zone had no room for a member (the "WEIGHT zone full" answer, typed),
-// and is the triplet's slot, the size each member asks: the one refusal that passes only once the zone gains room, so
-// its caller can wait for that instead of asking again, and can say what the zone was asked for.
-// zone_largest_free_at_refusal is the zone's largest free block when it refused, which is smaller than the slot.
+// and is the size the refused member asked (its triplet's slot, or its own staged size when the triplet has none): the
+// one refusal that passes only once the zone gains room, so its caller can wait for that instead of asking again, and
+// can say what the zone was asked for. zone_largest_free_at_refusal is the zone's largest free block when it refused,
+// which is smaller than that size.
 struct ggml_sycl_expert_move_outcome {
     ggml_sycl::moe_expert_triplet_ref triplet;
     bool                              to_device                    = true;
@@ -22317,9 +22318,9 @@ static const char * ggml_sycl_expert_named_stop(const std::vector<ggml_sycl_expe
 // One triplet prepared outside the locks: its members with the storage minted for them, the extra that remembers each
 // member's storage, what its move is, for a named move its place in the caller's list, and the microseconds its
 // preparation spent in the resolver, which looks each member up in the expert metadata. mint_refused_bytes is the size
-// of the member whose device mint was refused, the triplet's slot, 0 when none was: with a transient refusal that is
-// the WEIGHT zone answering that it has no room for those bytes. mint_refused_largest_free is the zone's largest free
-// block read right after that refusal, before anything the triplet took goes back.
+// the member whose device mint was refused asked (expert_triplet_member_bytes), 0 when none was: with a transient
+// refusal that is the WEIGHT zone answering that it has no room for those bytes. mint_refused_largest_free is the
+// zone's largest free block read right after that refusal, before anything the triplet took goes back.
 struct ggml_sycl_expert_prepared_triplet {
     ggml_sycl::expert_move_member members[3];
     ggml_tensor_extra_gpu *       extras[3]                 = { nullptr, nullptr, nullptr };
@@ -22382,15 +22383,16 @@ struct ggml_sycl_expert_prepared_give_back {
 // Prepare `out` (its kind already set) for the triplet `keys` names, with no lock held: map each member to the cache
 // through `resolver` and mint its storage owner-first. Every size comes from the members' tensors, never from a cache
 // entry, whose storage direct staging may have padded: a move to the host mints pinned storage for the expert's own
-// bytes, and a move to the device mints WEIGHT zone storage for every member at the triplet's slot, the size the load
-// stages each of them at (expert_triplet_slot_bytes), with the tail past the expert's bytes the cache zero-fills behind
-// the copy. So an expert that goes to the host and back does not grow, and its record keeps resolving, and the block
-// an admitted member takes is one any evicted member gave back. All three members are resolved before any is minted,
-// as the slot is a fact of all three. A member with no cache entry to copy from stops with the refusal the cache would
-// give. Returns null when every member is prepared, else the refusal, with *transient true when a later boundary may
-// prepare it: a full WEIGHT zone, which the ring gives back, or an evict's exhausted pinned pool. A refused device mint
-// leaves the slot in out.mint_refused_bytes and the zone's largest free block at that moment in
-// out.mint_refused_largest_free. The storage minted before a refusal goes back with `out`.
+// bytes, and a move to the device mints WEIGHT zone storage for each member at the size the load stages it at
+// (expert_triplet_member_bytes: the triplet's slot when it has one, else the member's own staged bytes), with the tail
+// past the expert's bytes the cache zero-fills behind the copy. So an expert that goes to the host and back does not
+// grow, and its record keeps resolving, and the block an admitted member of a slotted triplet takes is one any evicted
+// member gave back. All three members are resolved before any is minted, as the slot is a fact of all three. A member
+// with no cache entry to copy from stops with the refusal the cache would give. Returns null when every member is
+// prepared, else the refusal, with *transient true when a later boundary may prepare it: a full WEIGHT zone, which the
+// ring gives back, or an evict's exhausted pinned pool. A refused device mint leaves the size it asked for in
+// out.mint_refused_bytes and the zone's largest free block at that moment in out.mint_refused_largest_free. The
+// storage minted before a refusal goes back with `out`.
 static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache &             cache,
                                                      int                                    device,
                                                      const ggml_sycl::placement_plan &      plan,
@@ -22426,19 +22428,16 @@ static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache & 
             }
         }
     }
-    // The one size every device member is minted at: what the load gave each member of this triplet.
-    const size_t slot = to_device ? ggml_sycl::expert_triplet_slot_bytes(staged) : 0;
-    if (to_device && slot == 0) {
-        return "layout";
-    }
     for (int r = 0; r < 3; ++r) {
         const ggml_sycl::expert_placement_key & k      = keys[r];
         ggml_sycl_expert_loan_target &          target = targets[r];
         ggml_sycl::mem_handle                   storage;
         if (to_device) {
-            storage = ggml_sycl_device_expert_alloc(device, slot);
+            // What the load gave this member: the triplet's slot when it has one, else the member's own staged bytes.
+            const size_t member_bytes = ggml_sycl::expert_triplet_member_bytes(staged, r);
+            storage                   = ggml_sycl_device_expert_alloc(device, member_bytes);
             if (!storage.valid()) {
-                out.mint_refused_bytes = slot;
+                out.mint_refused_bytes = member_bytes;
                 // The zone's largest free block as it refused, with the members minted before still held: what the
                 // refusal line prints beside the slot. Left 0 with no arena.
                 size_t capacity        = 0;

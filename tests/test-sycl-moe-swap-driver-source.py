@@ -63,12 +63,12 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       a throw unwinds, where a throw ends the process, so the reserves are what make its pushes safe;
   D18 the hold of an admit refused for device room has its two inputs: the caller hands the step the device WEIGHT
       zone's room epoch (unified_cache::zone_room_epoch), read before the step; and the refusal's cause reaches the
-      move typed, not as text: the preparation leaves the size of a refused device mint (the triplet's slot) on the
-      prepared triplet, right where the mint fails, with the WEIGHT zone's largest free block read right there; the
-      transaction marks the named triplet's outcome when that refusal is transient (the "WEIGHT zone full" answer,
-      and no other); and the callback gives the move MOE_SWAP_BUSY_CAUSE_ZONE_ROOM
-      from the outcome. Without either the driver holds nothing, sends a refused admit again at every boundary, and
-      no unit test sees it;
+      move typed, not as text: the preparation leaves the size of a refused device mint (what the member asked: its
+      triplet's slot, else its own staged size) on the prepared triplet, right where the mint fails, with the WEIGHT
+      zone's largest free block read right there; the transaction marks the named triplet's outcome when that refusal
+      is transient (the "WEIGHT zone full" answer, and no other); and the callback gives the move
+      MOE_SWAP_BUSY_CAUSE_ZONE_ROOM from the outcome. Without either the driver holds nothing, sends a refused admit
+      again at every boundary, and no unit test sees it;
   D19 a boundary whose transaction refused admits for device room says so in one WARN line: the callback counts the
       answers that carry a refused size and keeps the largest, with the largest free block any refusal saw, and after
       its loop over the batch, on that count alone (so a batch that moved nothing prints it too, and no admit prints
@@ -204,8 +204,8 @@ NO_GROWTH_ROOM_FIELDS = (f"const size_t bound = {ROOM_BOUND};", "const size_t li
 ROOM_EPOCH_READ = "call.room_epoch = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;"
 BUSY_CAUSE_SET = ("m.busy_cause = o.zone_room_bytes != 0 ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM : "
                   "ggml_sycl::MOE_SWAP_BUSY_CAUSE_TRANSIENT;")
-ZONE_ROOM_MINT = ("storage = ggml_sycl_device_expert_alloc(device, slot); if (!storage.valid()) { "
-                  "out.mint_refused_bytes = slot; size_t capacity = 0; size_t used = 0; size_t available = 0; "
+ZONE_ROOM_MINT = ("storage = ggml_sycl_device_expert_alloc(device, member_bytes); if (!storage.valid()) { "
+                  "out.mint_refused_bytes = member_bytes; size_t capacity = 0; size_t used = 0; size_t available = 0; "
                   "(void) cache.zone_free_figures(ggml_sycl::vram_zone_id::WEIGHT, capacity, used, available, "
                   "out.mint_refused_largest_free);")
 ZONE_FREE_OUTCOME = ("(*named_moves)[triplet.named].zone_largest_free_at_refusal = "
@@ -941,9 +941,9 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", CALLER_SIG, "o.zone_room_bytes != 0 ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM",
                   "false ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM")])
     expect_fail("refused-mint-not-recorded", "D18",
-                [("sycl", PREP_SIG, "out.mint_refused_bytes = slot;", "")])
+                [("sycl", PREP_SIG, "out.mint_refused_bytes = member_bytes;", "")])
     expect_fail("refused-mint-records-its-own-staged-size", "D18",
-                [("sycl", PREP_SIG, "out.mint_refused_bytes = slot;", "out.mint_refused_bytes = staged[r];")])
+                [("sycl", PREP_SIG, "out.mint_refused_bytes = member_bytes;", "out.mint_refused_bytes = 1;")])
     expect_fail("largest-free-at-refusal-not-read", "D18",
                 [("sycl", PREP_SIG, "(void) cache.zone_free_figures(", "(void) sizeof(")])
     expect_fail("largest-free-at-refusal-not-on-the-outcome", "D18",

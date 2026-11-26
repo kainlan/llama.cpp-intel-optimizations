@@ -11897,13 +11897,12 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
         }
         deps[i].reserve(2);
     }
-    // The storage every member must own: its triplet's WEIGHT-zone slot (expert-slot.hpp), from the members' staged
-    // bytes as AOS, the one layout this stages (each host copy is checked to be AOS below).
+    // The storage every member must own: what the WEIGHT zone hands it (expert_triplet_member_bytes, expert-slot.hpp),
+    // from the members' staged bytes as AOS, the one layout this stages (each host copy is checked to be AOS below).
     size_t staged[3] = { 0, 0, 0 };
     for (int i = 0; i < 3; ++i) {
         staged[i] = staged_expert_bytes(GGML_LAYOUT_AOS, members[i].type, members[i].ncols, members[i].logical_bytes);
     }
-    const size_t slot = expert_triplet_slot_bytes(staged);
 
     // 1. Each member's host copy is one the direction copies from, a loan's for a refill and any whole pinned
     // host-zone copy for an admit, all three members before anything changes.
@@ -11968,11 +11967,12 @@ bool unified_cache::copy_host_triplet_to_device(const expert_move_member members
                 refusal = "host copy size";
                 break;
             }
-            // The storage is the triplet's slot, the size direct staging gives each of its members: the expert's
-            // bytes and a tail the copy below zero-fills (the row padding the kernels may read, then the slot's own
-            // rounding), never less than its bytes. The entry is published at that size, so it owns its whole
-            // allocation, which a loan that later lends it again requires.
-            if (device_size[i] != slot || slot < logical) {
+            // The storage is the size direct staging gives the member, its triplet's slot or else its own staged
+            // bytes: the expert's bytes and a tail the copy below zero-fills (the row padding the kernels may read,
+            // then any slot rounding), never less than its bytes. The entry is published at that size, so it owns its
+            // whole allocation, which a loan that later lends it again requires.
+            const size_t member_bytes = expert_triplet_member_bytes(staged, i);
+            if (device_size[i] != member_bytes || member_bytes < logical) {
                 refusal = "device storage size";
                 break;
             }
@@ -34708,6 +34708,39 @@ static void add_multi_moe_decode_secondary_alternates(placement_plan &          
     }
 }
 
+// After a pass that re-laid out expert entries, charging each the size it now stages alone: charge every member of a
+// triplet with a slot the slot again, as the load stages it, and move the totals of the device each changed entry is
+// on by its change. A host entry's charge moves no device total, and an entry on a device `room_of` gives no room for
+// moves none either, as the pass that changed it accounts only those devices. A device short of the difference is
+// still charged it, since the load stages the slot whatever the plan says, and the plan warns how far past its budget
+// that put the device. Returns the bytes charged past every device's remaining room.
+struct planner_device_room {
+    size_t   index     = 0;        // the device's index in plan.per_device_vram
+    size_t * remaining = nullptr;  // its remaining room, null for a device the pass does not account
+};
+
+template <typename RoomOf>
+static size_t planner_recharge_expert_slots(placement_plan & plan, RoomOf room_of, const char * pass) {
+    size_t over = 0;
+    for (const placement_charge_change & c : placement_entries_recharge_expert_slots(plan.entries)) {
+        const placement_entry & e = plan.entries[c.index];
+        if (!e.on_device) {
+            continue;
+        }
+        const planner_device_room room = room_of(e.target_device);
+        if (!room.remaining || room.index >= plan.per_device_vram.size()) {
+            continue;
+        }
+        over += placement_charge_move(c.old_charge, c.new_charge, *room.remaining, plan.per_device_vram[room.index],
+                                      plan.weight_vram_bytes, plan.vram_bytes);
+    }
+    if (over > 0) {
+        GGML_LOG_WARN("[PLACEMENT-MOE-MULTI] %s: expert slots re-charged %.1f MB past the devices' remaining room\n",
+                      pass, over / (1024.0 * 1024.0));
+    }
+    return over;
+}
+
 static void apply_multi_moe_per_target_layouts(placement_plan &                   plan,
                                                std::vector<size_t> &              remaining,
                                                const std::vector<device_budget> & device_budgets,
@@ -34838,6 +34871,18 @@ static void apply_multi_moe_per_target_layouts(placement_plan &                 
         }
     }
 
+    // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot.
+    planner_recharge_expert_slots(
+        plan,
+        [&](int device_id) {
+            const auto it = device_to_index.find(device_id);
+            if (it == device_to_index.end() || it->second >= remaining.size()) {
+                return planner_device_room{};
+            }
+            return planner_device_room{ it->second, &remaining[it->second] };
+        },
+        "per-target layouts");
+
     GGML_LOG_INFO(
         "[PLACEMENT-MOE-MULTI] per-target layouts: device_changed=%zu host_changed=%zu xmx_tiled=%zu "
         "i8_or_dpas=%zu soa=%zu aos=%zu skipped_capacity=%zu device_delta=%.1f MB host_delta=%.1f MB\n",
@@ -34932,6 +34977,14 @@ static void maybe_upgrade_multi_moe_primary_layouts(placement_plan & plan,
             soa_entries++;
         }
     }
+    // A member moved into AOS was charged its own staged size; the load stages it at its triplet's slot. Only this
+    // device's entries changed, so only its totals move.
+    planner_recharge_expert_slots(
+        plan,
+        [&](int target) {
+            return target == device_id ? planner_device_room{ device_index, &remaining } : planner_device_room{};
+        },
+        "primary executor layout upgrades");
 
     if (upgraded_entries > 0) {
         GGML_LOG_INFO(

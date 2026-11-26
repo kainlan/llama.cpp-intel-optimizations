@@ -921,8 +921,9 @@ inline std::string moe_swap_driver_summary_faults(const moe_swap_driver_stats & 
 }
 
 // The line a boundary prints when its transaction refused admits because the device WEIGHT zone had no room: how many
-// of the admits it sent, what the largest refused triplet needed (its three members, each minted at the triplet's
-// slot), the largest free block the zone had when it refused, and what the zone had free after the batch, in bytes.
+// of the admits it sent, the largest size a refused member asked and three times it (a slotted triplet's three members
+// each take its slot, so that is the triplet; a triplet with no slot keeps each member's own size, so it is a bound),
+// the largest free block the zone had when it refused, and what the zone had free after the batch, in bytes.
 // zone_available is every free byte and zone_largest_free the largest free block, so a zone with the bytes and no block
 // large enough for a slot reads apart from one with no bytes.
 inline std::string moe_swap_zone_refusal_line(int      device,

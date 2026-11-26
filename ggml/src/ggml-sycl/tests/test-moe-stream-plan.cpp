@@ -702,6 +702,104 @@ void test_loan_whose_post_loan_ring_exceeds_the_cap_is_refused() {
     CHECK(!nothing_short.converged && nothing_short.steps == 0);
 }
 
+// One routed-expert member planned on device 0 in `layout`, charged its own staged bytes as the planner first builds
+// it.
+ggml_sycl::placement_entry slot_member(int                layer,
+                                       int                expert,
+                                       expert_tensor_role role,
+                                       ggml_type          type,
+                                       int64_t            ncols,
+                                       size_t             bytes,
+                                       ggml_layout_mode   layout = GGML_LAYOUT_AOS) {
+    ggml_sycl::placement_entry e("blk.0.ffn_exps.weight", bytes, bytes, 0, placement_priority::MOE_UP, layer, expert,
+                                 role, true, 0);
+    e.type              = type;
+    e.ne[0]             = ncols;
+    e.layout            = layout;
+    const size_t staged = ggml_sycl::staged_expert_bytes(layout, type, ncols, bytes);
+    e.vram_charge_size  = ggml_sycl::placement_vram_charge_bytes(staged != 0 ? staged : bytes);
+    return e;
+}
+
+constexpr expert_tensor_role kGate = expert_tensor_role::GATE;
+constexpr expert_tensor_role kUp   = expert_tensor_role::UP;
+constexpr expert_tensor_role kDown = expert_tensor_role::DOWN;
+
+// A 640 x 2560 IQ4_NL expert (gate and up 921600 bytes, down 921816 staged), a Q4_K gate and up beside a Q5_K down, and
+// an IQ4_NL expert whose down is SOA.
+std::vector<ggml_sycl::placement_entry> slot_triplets() {
+    return {
+        slot_member(0, 0, kGate, GGML_TYPE_IQ4_NL, 2560, 921600),
+        slot_member(0, 0, kUp, GGML_TYPE_IQ4_NL, 2560, 921600),
+        slot_member(0, 0, kDown, GGML_TYPE_IQ4_NL, 640, 921600),
+        slot_member(0, 1, kGate, GGML_TYPE_Q4_K, 2048, 589824),
+        slot_member(0, 1, kUp, GGML_TYPE_Q4_K, 2048, 589824),
+        slot_member(0, 1, kDown, GGML_TYPE_Q5_K, 512, 720896),
+        slot_member(0, 2, kGate, GGML_TYPE_IQ4_NL, 2560, 921600),
+        slot_member(0, 2, kUp, GGML_TYPE_IQ4_NL, 2560, 921600),
+        slot_member(0, 2, kDown, GGML_TYPE_IQ4_NL, 640, 921600, GGML_LAYOUT_SOA),
+    };
+}
+
+// The planner charges each member of a triplet with a slot the slot, and leaves a triplet the slot would pad past 1/128
+// (mixed quant types) or whose member does not stage as AOS at each member's own charge.
+void test_charge_expert_slots_takes_the_slot_only_where_nearly_free() {
+    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    std::vector<size_t>                     own;
+    for (const ggml_sycl::placement_entry & e : entries) {
+        own.push_back(e.vram_charge_size);
+    }
+    CHECK(own[0] == 921600 && own[2] == 921856);
+    CHECK(ggml_sycl::placement_entries_charge_expert_slots(entries) == 1);
+    for (size_t i = 0; i < 3; ++i) {
+        CHECK(entries[i].vram_charge_size == 921856);
+    }
+    for (size_t i = 3; i < entries.size(); ++i) {
+        CHECK(entries[i].vram_charge_size == own[i]);
+    }
+}
+
+// After a layout pass reset a member's charge to its own size (or left it 0, read as its dst_size's charge), the
+// re-charge gives the triplet its slot again and reports each changed entry with its charge before and after.
+void test_recharge_reports_each_changed_charge() {
+    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    ggml_sycl::placement_entries_charge_expert_slots(entries);
+    entries[0].vram_charge_size = 921600;
+    entries[1].vram_charge_size = 0;
+    const std::vector<ggml_sycl::placement_charge_change> changes =
+        ggml_sycl::placement_entries_recharge_expert_slots(entries);
+    CHECK(changes.size() == 2);
+    if (changes.size() == 2) {
+        CHECK(changes[0].index == 0 && changes[0].old_charge == 921600 && changes[0].new_charge == 921856);
+        CHECK(changes[1].index == 1 && changes[1].old_charge == 921600 && changes[1].new_charge == 921856);
+    }
+    CHECK(entries[0].vram_charge_size == 921856 && entries[1].vram_charge_size == 921856);
+    CHECK(ggml_sycl::placement_entries_recharge_expert_slots(entries).empty());
+}
+
+// One device's totals move by one charge change: a larger charge takes room (and past the budget still charges it,
+// spends what is left and returns the excess), a smaller one gives room back, and no total wraps.
+void test_charge_move() {
+    size_t remaining = 1000;
+    size_t device    = 5000;
+    size_t weight    = 7000;
+    size_t vram      = 9000;
+    CHECK(ggml_sycl::placement_charge_move(100, 300, remaining, device, weight, vram) == 0);
+    CHECK(remaining == 800 && device == 5200 && weight == 7200 && vram == 9200);
+    CHECK(ggml_sycl::placement_charge_move(100, 1300, remaining, device, weight, vram) == 400);
+    CHECK(remaining == 0 && device == 6400 && weight == 8400 && vram == 10400);
+    CHECK(ggml_sycl::placement_charge_move(300, 100, remaining, device, weight, vram) == 0);
+    CHECK(remaining == 200 && device == 6200 && weight == 8200 && vram == 10200);
+    CHECK(ggml_sycl::placement_charge_move(500, 500, remaining, device, weight, vram) == 0);
+    CHECK(remaining == 200 && device == 6200 && weight == 8200 && vram == 10200);
+    size_t small_remaining = 0;
+    size_t small_device    = 50;
+    size_t small_weight    = 60;
+    size_t small_vram      = 70;
+    CHECK(ggml_sycl::placement_charge_move(200, 0, small_remaining, small_device, small_weight, small_vram) == 0);
+    CHECK(small_remaining == 200 && small_device == 0 && small_weight == 0 && small_vram == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -793,6 +891,9 @@ int main() {
     test_loan_into_a_smaller_ring_is_covered();
     test_loan_into_a_larger_slot_credits_no_held_slot();
     test_loan_into_another_slot_size_that_does_not_grow_is_refused();
+    test_charge_expert_slots_takes_the_slot_only_where_nearly_free();
+    test_recharge_reports_each_changed_charge();
+    test_charge_move();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);
