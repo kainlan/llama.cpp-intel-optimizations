@@ -923,7 +923,8 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", HOOK_SIG, "const ::ggml_sycl_moe_swap_claim claim{ inst.claimed };", "")])
     call = "    ::ggml_sycl_run_expert_swap_claimed(device, decodes, graphs, resolver);\n"
     expect_fail("hook-claims-after-the-call", "D22",
-                [("sycl", HOOK_SIG, call, ""), ("sycl", HOOK_SIG, "    if (!claim.held) {", call + "    if (!claim.held) {")])
+                [("sycl", HOOK_SIG, call, ""),
+                 ("sycl", HOOK_SIG, "    if (!claim.held) {", call + "    if (!claim.held) {")])
     expect_fail("env-spelled-in-the-backend", "D6",
                 [("sycl", "", "ggml_sycl::MOE_SWAP_ENV)", "\"GGML_SYCL_MOE_SWAP\")")])
     expect_fail("env-read-at-every-boundary", "D6",
@@ -1135,7 +1136,8 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("cost-not-returned", "D20",
                 [("sycl", CORE_SIG, "{ epoch_after, result.room_self_delta, cost }",
                   "{ epoch_after, result.room_self_delta, {} }")])
-    for field, anchor in (("meta", "r.meta_us         = answer.meta_us;"), ("copy", "r.copy_us         = answer.copy_us;"),
+    for field, anchor in (("meta", "r.meta_us         = answer.meta_us;"),
+                          ("copy", "r.copy_us         = answer.copy_us;"),
                           ("remap", "r.remap_us        = answer.remap_us;"),
                           ("total", "r.total_us        = ggml_sycl::expert_move_us_since(call_start);")):
         expect_fail(f"{field}-cost-not-carried-by-the-entry", "D20", [("sycl", ENTRY_SIG, anchor, "")])
