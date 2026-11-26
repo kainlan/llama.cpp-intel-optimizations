@@ -100,7 +100,7 @@
 // only at D=64 with one query row, which is the d64_sinks_decode shape.
 //
 // TWO INKLING-SHAPED CASES guard the XMX v2 prompt kernel that multiplies the
-// softmax weights by V on the matrix engine (xmx_v2_f16_ncols16_large_f32sv,
+// softmax weights by V on the matrix engine (xmx_v2_f16_ncols32_large_f32sv,
 // _v8 when the K/V rows are 16-byte aligned and it copies them in vectors):
 //   d128_sinks_window  an Inkling-2-Mini prompt layer: GQA 3, one mask per query
 //                      head (a sliding window plus a finite per-head relative
@@ -727,17 +727,18 @@ static const expect_kernel expected_kernels[] = {
     // ne01 > 16 under PREC_F32: the F32-accumulator leaf with S*V on the matrix
     // engine (Task 23). Predicted: these four ran as _f32sv at d135812c1; their
     // K/V rows are 16-byte aligned, so from S2 on the leaf copies them to SLM
-    // in 16-byte vectors (_v8).
-    { "noonednn",                  "d128_pp72",                   "xmx_v2_f16_ncols16_large_f32sv_v8"    },
-    { "noonednn",                  "d128_pp72_row1_masked",       "xmx_v2_f16_ncols16_large_f32sv_v8"    },
-    { "noonednn",                  "d128_sinks_window",           "xmx_v2_f16_ncols16_large_f32sv_v8"    },
-    { "noonednn",                  "d128_tail_mass",              "xmx_v2_f16_ncols16_large_f32sv_v8"    },
+    // in 16-byte vectors (_v8), and from S3 on a work-group takes 32 query rows
+    // (ncols32), as every row of this leaf below does.
+    { "noonednn",                  "d128_pp72",                   "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noonednn",                  "d128_pp72_row1_masked",       "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noonednn",                  "d128_sinks_window",           "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noonednn",                  "d128_tail_mass",              "xmx_v2_f16_ncols32_large_f32sv_v8"    },
     // Predicted: rows that start 8 bytes off a 16-byte bound take the scalar copy.
-    { "noonednn",                  "d128_pp72_kv_unaligned",      "xmx_v2_f16_ncols16_large_f32sv"       },
+    { "noonednn",                  "d128_pp72_kv_unaligned",      "xmx_v2_f16_ncols32_large_f32sv"       },
     // Predicted: the same leaf at D=256 and with a logit softcap (F16 Q).
-    { "noonednn",                  "d256_pp72",                   "xmx_v2_f16_ncols16_large_f32sv_v8"    },
-    { "noonednn",                  "d128_pp72_softcap",           "xmx_v2_f16_ncols16_large_f32sv_v8"    },
-    { "noonednn",                  "d256_pp72_softcap",           "xmx_v2_f16_ncols16_large_f32sv_v8"    },
+    { "noonednn",                  "d256_pp72",                   "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noonednn",                  "d128_pp72_softcap",           "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noonednn",                  "d256_pp72_softcap",           "xmx_v2_f16_ncols32_large_f32sv_v8"    },
     { "noonednn",                  "d256_pp16",                   "xmx_v2_f16_ncols16"                   },
 
     { "v1pp",                      "d128_pp72",                   "xmx_v1_f16_ncols8_large_kv"           },
@@ -762,8 +763,8 @@ static const expect_kernel expected_kernels[] = {
     { "noesimd",                   "d512_mq4",                    "tile_d512"                            },
     // Predicted: D=64 below the 64-row XMX-v2 PP batch, with ESIMD off and the
     // sinks keeping oneDNN out, reaches the F32-accumulator leaf of Task 23.
-    { "noesimd",                   "d64_sinks_pp32",              "xmx_v2_f16_ncols16_large_f32sv_v8"    },
-    { "noesimd",                   "d64_sinks_pp32_softcap",      "xmx_v2_f16_ncols16_large_f32sv_v8"    },
+    { "noesimd",                   "d64_sinks_pp32",              "xmx_v2_f16_ncols32_large_f32sv_v8"    },
+    { "noesimd",                   "d64_sinks_pp32_softcap",      "xmx_v2_f16_ncols32_large_f32sv_v8"    },
 
     { "force-v2-decode",           "d64_sinks_decode",            "force_xmx_v2_decode_m1n64"            },
     { "force-v2-decode",           "d64_sinks_decode_all_masked", "force_xmx_v2_decode_m1n64"            },
