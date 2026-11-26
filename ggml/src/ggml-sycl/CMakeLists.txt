@@ -1479,10 +1479,10 @@ endif()
 
 # SYCL queue profiling is not set through a compile definition here. The enable_profiling queue property is added by
 # default_queue_properties() (ggml-sycl/common.hpp) and by the dpct create_queue_impl() overloads
-# (ggml-sycl/dpct/helper.hpp), and only when the resolver in queue-profiling.hpp answers on: GGML_SYCL_QUEUE_PROFILING=1,
-# or a requested profiling diagnostic with the knob unset. A compile definition read by an `#ifdef` inside those
-# header-only inline functions would not be interposition-safe across translation units, which is why the decision is an
-# out-of-line function in common.cpp.
+# (ggml-sycl/dpct/helper.hpp), and only when the resolver in queue-profiling.hpp answers on:
+# GGML_SYCL_QUEUE_PROFILING=1, or a requested profiling diagnostic with the knob unset. A compile definition read by an
+# `#ifdef` inside those header-only inline functions would not be interposition-safe across translation units, which is
+# why the decision is an out-of-line function in common.cpp.
 #
 # On the Level Zero v2 adapter a profiling queue reads a device timestamp for every command, so the default is off:
 # turning it off measured GPT-OSS 20B decode 12 to 26 % faster and a Qwen prefill 34 % faster, nothing slower.

@@ -88,8 +88,8 @@ sycl::async_handler ggml_sycl_async_handler(int /*slot*/) {
     GGML_ABORT("test-esimd-dpas-gate created a dpct queue");
 }
 
-// The same create_queue_impl bodies ask the resolver whether the queue carries profiling. This test creates no queue, so
-// the answer is never used; the seam only has to link, and false is the resolver's default answer.
+// The same create_queue_impl bodies ask the resolver whether the queue carries profiling. This test creates no queue,
+// so the answer is never used; the seam only has to link, and false is the resolver's default answer.
 bool ggml_sycl_queue_profiling_enabled() {
     return false;
 }

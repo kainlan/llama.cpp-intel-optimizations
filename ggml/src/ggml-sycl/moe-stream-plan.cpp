@@ -32,7 +32,8 @@ const char * moe_stream_getenv(const char * name) {
 
 // A mark's or a read gate's device command_end in ns, for the window timing line; false when the event has none (its
 // queue was built without profiling, which is every queue unless a profiling diagnostic or GGML_SYCL_QUEUE_PROFILING=1
-// asks for it, or the runtime refuses the query). Read only at the synchronize boundary, and never of a copy: the copy queue has no profiling.
+// asks for it, or the runtime refuses the query). Read only at the synchronize boundary, and never of a copy: the copy
+// queue has no profiling.
 bool moe_stream_event_end(const sycl::event & ev, uint64_t * end_ns) {
     if (!ggml_sycl_queue_profiling_warn_unless_readable("GGML_SYCL_MOE_EXEC_TRACE")) {
         return false;

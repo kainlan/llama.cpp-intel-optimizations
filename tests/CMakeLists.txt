@@ -4944,12 +4944,12 @@ if (Python3_Interpreter_FOUND)
         TIMEOUT 30)
 endif()
 
-# GGML_SYCL_QUEUE_PROFILING (default off): the three-state knob that decides whether
-# every queue the backend builds carries enable_profiling. Host-only source gate: the resolver reads the environment once
-# and not a macro, the one list of diagnostics matches the readers and each diagnostic's own parse, the three property
-# sites go through the predicate, and every get_profiling_info reader asks it first. Same registration shape as the
-# sibling above; each pin carries a mutant inside the test. The resolver's pure parts have a C++ test beside the other
-# host-only SYCL tests (ggml/src/ggml-sycl/CMakeLists.txt, sycl-queue-profiling-resolver).
+# GGML_SYCL_QUEUE_PROFILING (default off): the three-state knob that decides whether every queue the backend builds
+# carries enable_profiling. Host-only source gate: the resolver reads the environment once and not a macro, the one
+# list of diagnostics matches the readers and each diagnostic's own parse, the three property sites go through the
+# predicate, and every get_profiling_info reader asks it first. Same registration shape as the sibling above; each pin
+# carries a mutant inside the test. The resolver's pure parts and its three states, WARN lines included, have a C++
+# test beside the other host-only SYCL tests (ggml/src/ggml-sycl/CMakeLists.txt, sycl-queue-profiling-resolver).
 if (Python3_Interpreter_FOUND)
     llama_test_pytest(${Python3_EXECUTABLE}
         NAME test-sycl-queue-profiling-knob-source

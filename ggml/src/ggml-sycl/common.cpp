@@ -3383,10 +3383,10 @@ ggml_sycl_queue_profiling_decision ggml_sycl_queue_profiling_decide(const char *
              requested ? ggml_sycl_queue_profiling_reason::DIAGNOSTIC : ggml_sycl_queue_profiling_reason::DEFAULT_OFF };
 }
 
-// Whether the diagnostic `name` asks for itself, by the diagnostic's own parse of its own variable. The helpers are the
-// ones the diagnostics call (queue-profiling.hpp). A name without a branch here counts as requested when its variable is
-// set, non-empty and not exactly "0": the resolver errs towards on, never towards a diagnostic that is enabled while the
-// queues carry no profiling.
+// Whether the diagnostic `name` asks for itself, by the diagnostic's own parse of its own variable. The helpers are
+// the ones the diagnostics call (queue-profiling.hpp). A name without a branch here counts as requested when its
+// variable is set, non-empty and not exactly "0": the resolver errs towards on, never towards a diagnostic that is
+// enabled while the queues carry no profiling.
 static bool ggml_sycl_queue_profiling_diagnostic_requested(const char * name,
                                                            const char * (*getenv_fn)(const char *) ) {
     const char * value = getenv_fn(name);
@@ -3420,9 +3420,10 @@ static const char * ggml_sycl_queue_profiling_process_getenv(const char * name) 
     return std::getenv(name);
 }
 
-// The one resolution of the knob. A function-local static runs once per process, on the first query, which is the first
-// queue the backend builds: the knob and the diagnostics' variables are read here and nowhere else, and the WARN lines
-// that describe the answer print here, so each prints at most once.
+// The one resolution of the knob. A function-local static runs once per process, on the first query, which is usually
+// the first queue the backend builds but can be a reader's guard before any queue exists: the knob and the diagnostics'
+// variables are read here and nowhere else, and the WARN lines that describe the answer print here, so each prints at
+// most once.
 static const ggml_sycl_queue_profiling_decision & ggml_sycl_queue_profiling_state() {
     static const ggml_sycl_queue_profiling_decision state = [] {
         const char * knob = std::getenv("GGML_SYCL_QUEUE_PROFILING");
@@ -3438,7 +3439,7 @@ static const ggml_sycl_queue_profiling_decision & ggml_sycl_queue_profiling_stat
             GGML_LOG_WARN(
                 "[SYCL] %s is set, so the backend's queues carry event profiling and every command reads a device "
                 "timestamp: this run is slower than an unprofiled one "
-                "(unprofiled decode measured 12 to 26 %% faster on the Level Zero v2 adapter) and its figures "
+                "(unprofiled decode was up to 26 %% faster, measured on GPT-OSS 20B) and its figures "
                 "include that cost. GGML_SYCL_QUEUE_PROFILING=0 refuses profiling.\n",
                 requested);
         }
@@ -3472,10 +3473,11 @@ void ggml_sycl_queue_profiling_warn_unavailable(const char * diagnostic) {
             name.c_str());
         return;
     }
-    // Not the knob: the diagnostic's variable was set after the queues were built, so the one resolution did not see it.
+    // Not the knob: the one resolution did not see this diagnostic. Its variable was set after the process started, or
+    // it was enabled without its variable (a test hook, or a trace level the variable does not name).
     GGML_LOG_WARN(
         "[SYCL] %s reads event profiling and the backend's queues do not carry it. "
-        "The knob was resolved off when the first queue was built, before %s asked for profiling. "
-        "It reports no figure. Set %s before the process starts, or set GGML_SYCL_QUEUE_PROFILING=1.\n",
+        "The knob resolved off before %s asked for profiling (set after the process started, or enabled without its "
+        "variable). It reports no figure. Set %s before the process starts, or set GGML_SYCL_QUEUE_PROFILING=1.\n",
         name.c_str(), name.c_str(), name.c_str());
 }

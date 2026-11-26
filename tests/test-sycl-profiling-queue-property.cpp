@@ -98,10 +98,10 @@ int main(int, char ** argv) {
                      std::strerror(errno));
     }
 
-    // The queue property under test (enable_profiling) is on only when asked: GGML_SYCL_QUEUE_PROFILING=1, or a profiling
-    // diagnostic with the knob unset. This test asks the way a real profiling run does, with a diagnostic and no knob.
-    // The answer is resolved once, at the first queue the backend builds, so the variable is set before
-    // ggml_backend_sycl_init() and nothing before this point in main() builds a queue.
+    // The queue property under test (enable_profiling) is on only when asked: GGML_SYCL_QUEUE_PROFILING=1, or a
+    // profiling diagnostic with the knob unset. This test asks the way a real profiling run does, with a diagnostic and
+    // no knob. The answer is resolved once, at the first query, so the variable is set before ggml_backend_sycl_init()
+    // and nothing before this point in main() builds a queue or asks the resolver.
     setenv("GGML_SYCL_KERNEL_PROFILE", "1", 1);
 
     ggml_backend_t backend = ggml_backend_sycl_init(0);

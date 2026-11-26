@@ -2250,7 +2250,7 @@ int main(int, char ** argv) {
     setenv("GGML_SYCL_ONEDNN_GRAPH_TEST_HOOKS", "1", 1);
     // The ordering checks read command_start/command_end of events on the cache's queue (actual_kernel_duration_ms(),
     // and the write-order check after the early-exit re-park). The backend's queues carry profiling only when asked
-    // (GGML_SYCL_QUEUE_PROFILING=1, or a profiling diagnostic), and the answer is resolved once at the first queue, so
+    // (GGML_SYCL_QUEUE_PROFILING=1, or a profiling diagnostic), and the answer is resolved once at the first query, so
     // it is set here, before ggml_backend_sycl_init.
     setenv("GGML_SYCL_QUEUE_PROFILING", "1", 1);
 

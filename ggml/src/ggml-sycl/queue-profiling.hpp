@@ -19,8 +19,9 @@
 //   "1"    on;
 //   "0"    off; a requested diagnostic prints one WARN and reports no figure (warn_unless_readable below);
 //   any other value: one WARN, then treated as unset.
-// The answer is resolved once per process, at the first queue the backend builds, and never changes after that. A
-// diagnostic variable set later than that is refused as if the knob were "0".
+// The answer is resolved once per process, at the first query, and never changes after that. The first query is usually
+// the first queue the backend builds, but a reader's guard can ask before any queue exists. A diagnostic variable set
+// later than that is refused as if the knob were "0".
 //
 // The answer comes from the environment, never from a macro. The queue builders (dpct/helper.hpp, common.hpp) and the
 // readers of profiling info sit in many translation units, and a macro read in a header-only inline would let the
