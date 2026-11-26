@@ -1,9 +1,10 @@
 """Source contract for the lifetime of the MXFP4 MoE decode reuse store's graph-local handles.
 
 The store (g_mxfp4_moe_tg_reuse in mmvq.cpp, one per thread) keeps, besides its own Q8 staging buffers, a copy of the
-mem_handle of the tensor whose Q8 copy it published (src1_handle) and that copy's ready event. That half is graph-local:
-the start of every graph compute invalidates it, because a layer's GLU output sits at the same address every token. A
-copy of a tensor extra's handle takes a chunk lease of its own, so the copy the last decode token stored kept a VRAM
+mem_handle of the tensor whose Q8 copy it published (src1_handle) and that copy's ready event. That half is graph-local,
+because a layer's GLU output sits at the same address every token. ggml_backend_sycl_graph_compute_impl invalidates it
+at its start, but the segmented record and replay paths never pass through compute_impl, and nothing dropped it at the
+end of any graph. A copy of a tensor extra's handle takes a chunk lease of its own, so the copy the last decode token stored kept a VRAM
 arena chunk leased past the model's release, and the last release found the arena held by one tensor_extra(copy)
 lease (GGML_SYCL_LEASE_HOLDERS=1 named mxfp4_moe_tg_reuse_store, GPT-OSS 20B on the B70, 2026-11-26).
 
