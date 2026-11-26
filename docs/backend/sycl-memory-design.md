@@ -3397,7 +3397,10 @@ asks (a) to (c) on synthetic plans, every type class named, and (d) through the
 functions the stage and the dry run call, in the stage's order, on the zone
 figures the lead's B50 runs printed: the RUNTIME figures through the shared cap,
 the WEIGHT room through the planner's own figure (`kv_weight_capacity`, the pure
-part of `unified_cache_kv_weight_capacity`), the shared predicate, each of
+part of `unified_cache_kv_weight_capacity`), or as none where the backend reads
+no WEIGHT zone (the test stands in for that gate, which is
+`ggml_sycl_ring_plan_weight_room`'s and which `test-sycl-moe-ring-drop-source`
+pins and mutates), the shared predicate, each of
 `moe_pp_ring_decide`'s three outcomes (`DROP`, `KEEP_HELD`,
 `KEEP_NO_ROOM_RETURNS`) and the record each leaves
 (`moe_pp_ring_drop_marks::record`): the Inkling drop, a give-back kept as built,

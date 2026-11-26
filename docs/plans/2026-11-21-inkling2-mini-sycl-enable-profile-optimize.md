@@ -6774,7 +6774,8 @@ What step 1d wrote (implementer record, 2026-11-24; device behaviour is the lead
   callers, no cache getter in the stage, the arena helper, the record.
   (7) `test-sycl-moe-ring-consumer` asks (d) through the functions the stage and the dry run call, in the stage's
   order, on the B50 runs' figures, with the WEIGHT room through `kv_weight_capacity` and every decision through
-  `record`, the keep path included.
+  `record`, the keep path included. Where the backend reads no WEIGHT zone the test reads 0 itself: that gate
+  (`ggml_sycl_ring_plan_weight_room`) is the ring-drop contract's, whose mutants drop either half of it.
   (8) `sycl-memory-design.md`: the stale MEASURED comment and the 69c4ea428 Qwen B50 row (a drop (d) now keeps) are
   gone, the two device-test sentences are one, and the tables wider than 120 columns are lists.
   (9) The rule is stated once, in the header comment of `moe-ring-consumer.hpp`; the stage's comment, the test
