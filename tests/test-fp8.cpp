@@ -351,21 +351,9 @@ static void check_fp8_attention(llama_model * model, bool offload_kqv = true) {
             }
             if (offload_kqv) {
                 // Cache writes cannot fall back from a preallocated device buffer.
-                // Fork-local (llama.cpp-ol6a): the cache refuses, by throwing, a type no backend can write into its
-                // buffer, so a refusal here is the same "not supported" as the per-op check below.
-                std::unique_ptr<llama_kv_cache> probe_ptr;
-                try {
-                    probe_ptr = std::make_unique<llama_kv_cache>(*model, false, model->hparams, params.type_k,
-                                                                 params.type_v, flash == LLAMA_FLASH_ATTN_TYPE_DISABLED,
-                                                                 false, true, params.n_ctx, 1, 0, LLAMA_SWA_TYPE_NONE,
-                                                                 nullptr, nullptr, nullptr, nullptr);
-                } catch (const std::runtime_error & err) {
-                    LOG("FP8 attention: flash=%s scaled=%d offload=1: %s, skipping\n",
-                        llama_flash_attn_type_name(flash), scaled, err.what());
-                    continue;
-                }
-                llama_kv_cache & probe = *probe_ptr;
-
+                llama_kv_cache probe(*model, false, model->hparams, params.type_k, params.type_v,
+                        flash == LLAMA_FLASH_ATTN_TYPE_DISABLED, false, true, params.n_ctx, 1,
+                        0, LLAMA_SWA_TYPE_NONE, nullptr, nullptr, nullptr, nullptr);
                 ggml_context_ptr ctx(ggml_init({ 64*ggml_tensor_overhead(), nullptr, true }));
                 llama_kv_cache::slot_info slots;
                 bool supported = true;
