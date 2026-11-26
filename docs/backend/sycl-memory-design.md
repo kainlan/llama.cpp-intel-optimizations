@@ -414,33 +414,30 @@ materialization reorder that follows the last charge keeps entries of one role
 in plan order (a stable sort on the role alone), so the index's first entry is
 still the one charged. The load stages each member at that size: a tensor whose
 experts' triplets have a slot past their staged bytes is not bulk-staged, since
-the bulk copy has one
-stride, and is staged expert by expert, so the loan's selection reads it as not
-bulk and its experts can be lent (`moe_loan_tensor_bulk_staged`);
-a DPAS promotion that rolls back restores an AOS base at its triplet's slot. A
-host copy may be longer than the expert when another writer padded it; a loan
-or an evict copies only the expert's bytes, so the host copies they make hold
-exactly `nb[2]` and a padded device entry's tail stays on the card. The copy
-moves exactly `nb[2]` bytes from the host copy's offset 0 and never reads past
-them, so an expert that goes to the host and back does not grow. A host copy
-shorter than `nb[2]` is refused "host copy size", REFUSED. The cache requires
-the device size to equal `expert_triplet_member_bytes()` and to be at least
-`nb[2]`. The tail
-is zero-filled behind the copy on the same queue, the device entry is published
-behind the fill, and the extra's record covers
-`nb[2]` bytes, as direct staging's does, while the entry holds its whole
-allocation.
-The admit gives back the whole host entry, all of its zone bytes. A Q4_0
-expert 640 columns wide gains 216 bytes. The first graph after the publish
-serves the admitted expert from the card. The selected-ids pointer table
-(`ggml_sycl_update_moe_ptr_table`) is built only outside graph recording: each
-of its callers checks the flag or runs before a recording starts. It orders
-its upload behind the entry's ready event on the context's in-order stream, so
-nothing waits on the host, and that graph queues behind at most the admitted
-triplets' copy and fill. The decode direct route
-(`ggml_sycl_moe_decode_direct_table`) keeps its decision per storage
-generation, and the admit's device records bump the tensor's generation, so
-the route decides again and serves a block the admit completed from its
+the bulk copy has one stride, and is staged expert by expert, so the loan's
+selection reads it as not bulk and its experts can be lent
+(`moe_loan_tensor_bulk_staged`); a DPAS promotion that rolls back restores an
+AOS base at its triplet's slot. A host copy may be longer than the expert when
+another writer padded it; a loan or an evict copies only the expert's bytes, so
+the host copies they make hold exactly `nb[2]` and a padded device entry's tail
+stays on the card. The copy moves exactly `nb[2]` bytes from the host copy's
+offset 0 and never reads past them, so an expert that goes to the host and back
+does not grow. A host copy shorter than `nb[2]` is refused "host copy size",
+REFUSED. The cache requires the device size to equal
+`expert_triplet_member_bytes()` and to be at least `nb[2]`. The tail is
+zero-filled behind the copy on the same queue, the device entry is published
+behind the fill, and the extra's record covers `nb[2]` bytes, as direct
+staging's does, while the entry holds its whole allocation. The admit gives back
+the whole host entry, all of its zone bytes. A Q4_0 expert 640 columns wide
+gains 216 bytes. The first graph after the publish serves the admitted expert
+from the card. The selected-ids pointer table (`ggml_sycl_update_moe_ptr_table`)
+is built only outside graph recording: each of its callers checks the flag or
+runs before a recording starts. It orders its upload behind the entry's ready
+event on the context's in-order stream, so nothing waits on the host, and that
+graph queues behind at most the admitted triplets' copy and fill. The decode
+direct route (`ggml_sycl_moe_decode_direct_table`) keeps its decision per
+storage generation, and the admit's device records bump the tensor's generation,
+so the route decides again and serves a block the admit completed from its
 full-coverage table. Outside recording, that table's upload
 (`ggml_sycl_upload_moe_transient_ptr_table`) chains each slot's ready event in
 the same way. The publish bumps the exec-graph epoch, so the first graph after
