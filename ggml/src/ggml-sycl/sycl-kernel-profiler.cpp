@@ -137,12 +137,6 @@ std::string to_lower_ascii(std::string value) {
     return value;
 }
 
-// The same parse the queue-profiling resolver uses for GGML_SYCL_KERNEL_PROFILE (queue-profiling.hpp): the profiler and
-// the resolver cannot disagree on whether the profiler was asked for.
-bool parse_bool_env(const char * value, bool default_value) {
-    return ggml_sycl_profile_env_flag(value, default_value);
-}
-
 int parse_positive_int_env(const char * value, int default_value) {
     if (value == nullptr || value[0] == '\0') {
         return default_value;
@@ -731,7 +725,7 @@ ggml_sycl_kernel_profile_config ggml_sycl_kernel_profile_config_from_env() {
     }
     cfg.output_format = parse_output_format(std::getenv("GGML_SYCL_KERNEL_PROFILE_FORMAT"));
     cfg.top_n         = parse_positive_int_env(std::getenv("GGML_SYCL_KERNEL_PROFILE_TOP_N"), cfg.top_n);
-    cfg.raw_events    = parse_bool_env(std::getenv("GGML_SYCL_KERNEL_PROFILE_RAW"), false);
+    cfg.raw_events    = ggml_sycl_profile_env_flag(std::getenv("GGML_SYCL_KERNEL_PROFILE_RAW"), false);
     cfg.flush_mode    = parse_flush_mode(std::getenv("GGML_SYCL_KERNEL_PROFILE_FLUSH"));
 
     return cfg;
