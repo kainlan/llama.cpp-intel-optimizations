@@ -6,13 +6,17 @@ places. GGML_SYCL_LEASE_HOLDERS=1 names that code. These checks pin its parts:
 
 Every take of a chunk lease records the address it was taken for in its tag: the return address of from_chunk_ptr, of
 a weight lease snapshot, of a weight resolve, and of a copy. A copy records its copier, never its source's address. That
-is one store per take, whatever the knob says, and nothing on a release.
+is one store per take, whatever the knob says, and nothing on a release. Every function in mem-handle.cpp that takes,
+copies or moves a lease reads its own return address, so a new copy path without one fails here. A move hands the lease
+to a new keeper: when the lease is counted in a named holder slot (the knob is on) the move records its own address and
+the cache counts the lease again under the mover's stack, keeping the take it came from; with the knob off that is one
+compare.
 
 The knob is read once, out of line, in one function, and the cache keeps the answer in a const member. Only when it is
 on does a take walk the call stack, claim a slot in the holder table for the stack from the recorded address outward,
 write the slot back into the caller's tag and count the lease in that slot; the release lowers the slot its tag carries,
 and only after the chunk's own count did not underflow. A tag without an address (a caller of the cache's lease API that
-keeps no tag) counts in slot 0.
+keeps no tag) counts in slot 0, and a holder that finds the table full in slot 1, and the report tells the two apart.
 
 The holders report prints the counts by site at the caller's level, the level of the line that called it (ERROR at a
 last release, WARN at a load start), so a tool that shows only errors shows them. With the knob on it names each holder
@@ -180,8 +184,88 @@ def claim_takes_record_the_takers_address(mh: str) -> bool:
         all(ordered(fn_body(c, sig), *parts) for sig, *parts in TAKES)
         # A copy's address is its own; a tag never takes the address its source recorded.
         and "chunk_tag_.pc" not in c
-        # The address is read in the take itself, not in a helper whose return address would be the take.
-        and c.count(PC) - c.count("void * ret_addr = " + PC) == len(TAKES)
+    )
+
+
+# ---- every function that takes, copies or moves a lease reads its own return address ----
+
+# The calls that put a lease in a handle: an acquire (a take), the copy's bump (a copy) and taking another handle's
+# lease state (a move). The bump helper itself is exempt: its caller's tag carries the caller's address.
+LEASE_CALLS = ("arena_acquire_chunk_lease(", "bump_chunk_lease_for_copy(", "other.take_lease_state_locked()")
+MOVE_NOTE = "note_chunk_lease_move("
+# Each take (3), each copy (2) and each move (2) in mem-handle.cpp today.
+LEASE_PATHS = 7
+
+
+def enclosing(text: str, pos: int) -> tuple:
+    """(signature, body) of the innermost function defined at column 0 whose body holds `pos`, or ("", "")."""
+    for m in reversed([m for m in re.finditer(r"^(?=[A-Za-z_])", text, flags=re.M) if m.start() < pos]):
+        st = m.start()
+        brace, semi = text.find("{", st), text.find(";", st)
+        if brace == -1 or (semi != -1 and semi < brace):
+            continue
+        body = block_at(text, st)
+        if brace < pos < brace + len(body):
+            return text[st:brace], body
+    return "", ""
+
+
+def claim_every_lease_path_records_an_address(mh: str) -> bool:
+    t = strip_comments(mh)
+    paths = 0
+    for call in LEASE_CALLS:
+        for m in re.finditer(re.escape(call), t):
+            # The bump helper's own definition line is not a call.
+            if t.startswith("static void " + call, t.rfind("\n", 0, m.start()) + 1):
+                continue
+            sig, body = enclosing(t, m.start())
+            if not body or sig.startswith("namespace"):
+                return False
+            if "bump_chunk_lease_for_copy(" in sig:
+                continue
+            if PC not in body:
+                return False
+            if call == LEASE_CALLS[2] and not re.search(re.escape(MOVE_NOTE) + r"[^;]*" + re.escape(PC), body):
+                return False
+            paths += 1
+    return paths == LEASE_PATHS
+
+
+MOVE_CTOR_SIG = "mem_handle::mem_handle(mem_handle && other) noexcept"
+MOVE_ASSIGN_SIG = "mem_handle & mem_handle::operator=(mem_handle && other) noexcept"
+MOVE_CTOR_NOTE = "note_chunk_lease_move(chunk_source_, chunk_device_, chunk_tag_, " + PC + ");"
+MOVE_ASSIGN_NOTE = "note_chunk_lease_move(fresh.chunk_source, fresh.chunk_device, fresh.chunk_tag, " + PC + ");"
+NOTE_SIG = ("static void note_chunk_lease_move(uint8_t chunk_source, int chunk_device, chunk_lease_tag & tag, "
+            "const void * pc) noexcept")
+NOTE_GATE = "{ if (tag.holder < CHUNK_LEASE_HOLDER_FIRST || chunk_source != 2) { return; }"
+UC_MOVE_SIG = "void unified_cache::arena_move_chunk_lease_holder(chunk_lease_tag & tag) noexcept"
+UC_MOVE_GATE = "{ if (!chunk_lease_holders_ || tag.holder < CHUNK_LEASE_HOLDER_FIRST) { return; }"
+UC_MOVE_PARTS = ("chunk_lease_holder_claim(tag, chunk_lease_holders().origin_of(tag.holder));",
+                 "if (moved < CHUNK_LEASE_HOLDER_FIRST || moved == tag.holder) { return; }",
+                 "arena_chunk_lease_holder_of(tag).fetch_sub(1, std::memory_order_relaxed);",
+                 "tag.holder = moved;",
+                 "arena_chunk_lease_holder_of(tag).fetch_add(1, std::memory_order_relaxed);")
+
+
+def claim_moves_note_their_keeper(mh: str, uc: str) -> bool:
+    c = code(mh)
+    ctor = fn_body(c, MOVE_CTOR_SIG)
+    lock = ctor.find("{ mem_handle_lock_guard g(other.lock_);")
+    assign = fn_body(c, MOVE_ASSIGN_SIG)
+    note = fn_body(c, NOTE_SIG)
+    return (
+        # The move constructor notes after its lock on the source is released: the note calls into the cache.
+        lock != -1
+        and MOVE_CTOR_NOTE not in block_at(ctor, lock)
+        and ordered(ctor, "chunk_tag_ = st.chunk_tag;", MOVE_CTOR_NOTE)
+        and ordered(assign, "fresh = other.take_lease_state_locked();", MOVE_ASSIGN_NOTE,
+                    "mem_handle_lock_guard g(lock_);",
+                    "store_lease_state_locked(fresh);")
+        # With the knob off the slot is 0: the note is one compare and touches nothing.
+        and note.startswith(NOTE_GATE)
+        and ordered(note, "tag.pc = pc;", "cache->arena_move_chunk_lease_holder(tag);")
+        and fn_body(code(uc), UC_MOVE_SIG).startswith(UC_MOVE_GATE)
+        and ordered(fn_body(code(uc), UC_MOVE_SIG), *UC_MOVE_PARTS)
     )
 
 
@@ -206,13 +290,13 @@ UC_RELEASE_SIG = "void unified_cache::arena_release_chunk_lease(int chunk_idx, c
 FLAG = "if (chunk_lease_holders_) {"
 SITE_ADD = "arena_chunk_leases_of(tag).fetch_add(1, std::memory_order_relaxed);"
 SITE_SUB = "arena_chunk_leases_of(tag).fetch_sub(1, std::memory_order_relaxed);"
-HOLDER_CLAIM = "tag.holder = chunk_lease_holder_claim(tag);"
+HOLDER_CLAIM = "tag.holder = chunk_lease_holder_claim(tag, 0);"
 HOLDER_ADD = "arena_chunk_lease_holder_of(tag).fetch_add(1, std::memory_order_relaxed);"
 HOLDER_SUB = "arena_chunk_lease_holder_of(tag).fetch_sub(1, std::memory_order_relaxed);"
 UNDERFLOW_RETURN = "lease_count.fetch_add(1); return; }"
 FLAG_MEMBER = "const bool chunk_lease_holders_ = chunk_lease_holders_enabled();"
-CLAIM_SIG = "static uint16_t chunk_lease_holder_claim(const chunk_lease_tag & tag)"
-CLAIM_NULL = "if (tag.pc == nullptr) { return 0; }"
+CLAIM_SIG = "static uint16_t chunk_lease_holder_claim(const chunk_lease_tag & tag, uint16_t origin)"
+CLAIM_NULL = "if (tag.pc == nullptr) { return CHUNK_LEASE_HOLDER_NO_ADDRESS; }"
 
 
 def claim_holder_counts_only_behind_the_flag(uc: str, uch: str) -> bool:
@@ -282,6 +366,9 @@ def claim_report_at_the_callers_level(uc: str) -> bool:
         and "GGML_LOG_" not in rep
         and ordered(hold, "arena_chunk_leases_by_holder_[", HOLDER_LINE, HOLDER_SUM)
         and "GGML_LOG_" not in hold
+        # A full table is told apart from a take with no address.
+        and ordered(hold, "if (slot == CHUNK_LEASE_HOLDER_NO_ADDRESS) {",
+                    "} else if (slot == CHUNK_LEASE_HOLDER_FULL) {")
     )
 
 
@@ -299,6 +386,75 @@ def test_takes_record_the_takers_address():
     assert claim_takes_record_the_takers_address(MH), (
         "a chunk lease take (from_chunk_ptr, a weight snapshot or resolve, a copy) does not record its own return "
         "address in its tag before the acquire and keep that tag, or a copy records its source's address"
+    )
+
+
+def test_every_lease_path_records_an_address():
+    assert claim_every_lease_path_records_an_address(MH), (
+        "a function in mem-handle.cpp that takes, copies or moves a chunk lease does not read its own return "
+        "address (a move: does not pass it to note_chunk_lease_move), so its lease would count under no holder"
+    )
+
+
+def test_moves_note_their_keeper():
+    assert claim_moves_note_their_keeper(MH, UC), (
+        "a mem_handle move does not hand its address to note_chunk_lease_move after its lock on the source, the note "
+        "does more than a compare with the knob off, or the cache does not move the count to the mover's slot"
+    )
+
+
+def test_witness_new_copy_path_without_an_address():
+    probe = (
+        "\nmem_handle mem_handle::copy_for_probe(const mem_handle & other) {\n"
+        "    chunk_lease_tag tag{ other.chunk_tag_.site, true };\n"
+        "    bump_chunk_lease_for_copy(other.chunk_source_, other.chunk_device_, other.cached_.ptr, tag,\n"
+        "                              host_chunk_handle_, vram_chunk_idx_);\n"
+        "    return *this;\n"
+        "}\n"
+    )
+    assert not claim_every_lease_path_records_an_address(MH + probe)
+
+
+def test_witness_move_ctor_without_a_note():
+    raw = "    note_chunk_lease_move(chunk_source_, chunk_device_, chunk_tag_, __builtin_return_address(0));\n"
+    assert MH.count(raw) == 1
+    mutant = MH.replace(raw, "")
+    assert not claim_every_lease_path_records_an_address(mutant)
+    assert not claim_moves_note_their_keeper(mutant, UC)
+
+
+def test_witness_move_assign_notes_no_address():
+    raw = "note_chunk_lease_move(fresh.chunk_source, fresh.chunk_device, fresh.chunk_tag, __builtin_return_address(0));"
+    assert MH.count(raw) == 1
+    mutant = MH.replace(raw, "note_chunk_lease_move(fresh.chunk_source, fresh.chunk_device, fresh.chunk_tag, nullptr);")
+    assert not claim_every_lease_path_records_an_address(mutant)
+    assert not claim_moves_note_their_keeper(mutant, UC)
+
+
+def test_witness_move_note_under_the_source_lock():
+    assert not claim_moves_note_their_keeper(
+        mutate_in(MH, MOVE_CTOR_SIG, "chunk_tag_ = st.chunk_tag;", "chunk_tag_ = st.chunk_tag; " + MOVE_CTOR_NOTE), UC
+    )
+
+
+def test_witness_move_note_without_the_gate():
+    assert not claim_moves_note_their_keeper(
+        mutate_in(MH, NOTE_SIG, "if (tag.holder < CHUNK_LEASE_HOLDER_FIRST || chunk_source != 2) {",
+                  "if (chunk_source != 2) {"), UC
+    )
+
+
+def test_witness_cache_move_without_the_flag():
+    assert not claim_moves_note_their_keeper(
+        MH, mutate_in(UC, UC_MOVE_SIG, "if (!chunk_lease_holders_ || tag.holder < CHUNK_LEASE_HOLDER_FIRST) {",
+                      "if (tag.holder < CHUNK_LEASE_HOLDER_FIRST) {")
+    )
+
+
+def test_witness_full_table_reads_as_no_address():
+    assert not claim_report_at_the_callers_level(
+        mutate_in(UC, HOLDER_REPORT_SIG, "} else if (slot == CHUNK_LEASE_HOLDER_FULL) {",
+                  "} else if (slot == CHUNK_LEASE_HOLDER_NO_ADDRESS) {")
     )
 
 
