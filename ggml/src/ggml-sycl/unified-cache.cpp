@@ -9645,6 +9645,60 @@ static unified_cache_key make_direct_stage_key(cache_entry_type           type,
     return key;
 }
 
+// The two keys an expert's id is resolved by as it moves between the card and the host: its device entry's (the AOS
+// layout, which every named move and loan stages) and a host copy's. The loan, its rollback and the restore name them
+// alike, so they are named here once.
+static unified_cache_key expert_device_key(const ggml_sycl_cache_id & id) {
+    return make_direct_stage_key(cache_entry_type::MOE_EXPERT, id, GGML_LAYOUT_AOS);
+}
+
+static unified_cache_key expert_host_key(const ggml_sycl_cache_id & id) {
+    return unified_cache_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };
+}
+
+// The loan's id hand-over and its rollback. The id names the device entry when the loan starts; it is handed to the
+// host copy's key before the device entry is retired, so the retire finds the id gone from its entry and walks no
+// entry of the cache looking for another to hand it to. A rollback hands it back, unless another registrant's live
+// entry holds the host key, and an id that was erased while the locks were released takes the spare node minted before
+// anything changed, so nothing is built where nothing may throw.
+template <typename Map>
+static typename Map::node_type expert_spare_mapping(const Map &                ids,
+                                                    const ggml_sycl_cache_id & id,
+                                                    const unified_cache_key &  device_key) {
+    const auto mapped = ids.find(id);
+    if (mapped == ids.end() || !(mapped->second == device_key)) {
+        return {};
+    }
+    Map spare;
+    return spare.extract(spare.emplace(id, device_key).first);
+}
+
+template <typename Map>
+static void expert_id_hand_over(Map &                      ids,
+                                const ggml_sycl_cache_id & id,
+                                const unified_cache_key &  device_key,
+                                const unified_cache_key &  host_key) {
+    const auto mapped = ids.find(id);
+    if (mapped != ids.end() && mapped->second == device_key) {
+        mapped->second = host_key;
+    }
+}
+
+template <typename Map>
+static void expert_id_hand_back(Map &                      ids,
+                                const ggml_sycl_cache_id & id,
+                                const unified_cache_key &  host_key,
+                                const unified_cache_key &  device_key,
+                                bool                       held_by_another,
+                                typename Map::node_type &  spare) {
+    const auto mapped = ids.find(id);
+    if (mapped != ids.end() && mapped->second == host_key && !held_by_another) {
+        mapped->second = device_key;
+    } else if (mapped == ids.end() && !spare.empty()) {
+        ids.insert(std::move(spare));
+    }
+}
+
 static bool can_replace_cache_entry_locked(const unified_cache_key &   key,
                                            const unified_cache_entry & old,
                                            const char *                path) {
@@ -11677,9 +11731,8 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
         std::lock(direct_lock, cache_lock);
         unified_cache_entry * device_entry[3] = { nullptr, nullptr, nullptr };
         for (int i = 0; i < 3 && !refusal; ++i) {
-            const unified_cache_key device_key =
-                make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
-            const auto it = entries_.find(device_key);
+            const unified_cache_key device_key = expert_device_key(members[i].key);
+            const auto              it         = entries_.find(device_key);
             if (it == entries_.end() || it->second.retired ||
                 it->second.direct_alloc_owner.owner_control_id() != src_control[i]) {
                 refusal = "entry changed";
@@ -11692,23 +11745,15 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             // registered under it finds no live entry to hand it to), and the restore re-inserts only nodes its own
             // retire took out, which the hand-over leaves in place: the rollback puts the device entry back under its
             // id through this node, building none.
-            const auto handed = id_to_key_.find(members[i].key);
-            if (handed != id_to_key_.end() && handed->second == device_key) {
-                id_map spare;
-                spare_mapping[i] = spare.extract(spare.emplace(members[i].key, device_key).first);
-            }
+            spare_mapping[i] = expert_spare_mapping(id_to_key_, members[i].key, device_key);
         }
         const auto remap_from = std::chrono::steady_clock::now();
         for (int i = 0; i < 3 && !refusal; ++i) {
-            const unified_cache_key device_key =
-                make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
-            device_entry[i]->last_write_event = out.copy_events[i];
-            device_entry[i]->has_write_event  = true;
-            const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].key, -1, -1 };
-            const auto              mapped = id_to_key_.find(members[i].key);
-            if (mapped != id_to_key_.end() && mapped->second == device_key) {
-                mapped->second = host_key;
-            }
+            const unified_cache_key device_key = expert_device_key(members[i].key);
+            device_entry[i]->last_write_event  = out.copy_events[i];
+            device_entry[i]->has_write_event   = true;
+            const unified_cache_key host_key   = expert_host_key(members[i].key);
+            expert_id_hand_over(id_to_key_, members[i].key, device_key, host_key);
             // The move's publication bumps the exec-graph epoch, so this entry's reap leaves has_evictions_ alone.
             device_entry[i]->retired_by_expert_move = true;
             out.retire_status[i]                    = retire_expert_entry_at_locked(device_key, &device_nodes[i]);
@@ -11771,35 +11816,28 @@ bool unified_cache::loan_expert_triplet(const expert_move_member members[3], exp
             std::unique_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock);
             std::lock(direct_lock, cache_lock);
             for (int i = 0; i < 3; ++i) {
-                const unified_cache_key device_key =
-                    make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS);
-                const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].key, -1, -1 };
-                const auto              mapped = id_to_key_.find(members[i].key);
-                const auto              host   = entries_.find(host_key);
+                const unified_cache_key device_key = expert_device_key(members[i].key);
+                const unified_cache_key host_key   = expert_host_key(members[i].key);
+                const auto              host       = entries_.find(host_key);
                 const bool              held_by_another =
                     host != entries_.end() && !host->second.retired &&
                     host->second.direct_alloc_owner.owner_control_id() != members[i].owner.owner_control_id();
-                if (mapped != id_to_key_.end() && mapped->second == host_key && !held_by_another) {
-                    mapped->second = device_key;
-                } else if (mapped == id_to_key_.end() && !spare_mapping[i].empty()) {
-                    id_to_key_.insert(std::move(spare_mapping[i]));
-                }
+                expert_id_hand_back(id_to_key_, members[i].key, host_key, device_key, held_by_another,
+                                    spare_mapping[i]);
             }
             size_t r = 0;
             for (int i = 0; i < 3; ++i) {
                 const uint64_t host_control = members[i].owner.owner_control_id();
                 for (int k = 0; k < registered[i]; ++k) {
-                    const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].host_keys[k], -1, -1 };
-                    const auto              host = entries_.find(host_key);
+                    const unified_cache_key host_key = expert_host_key(members[i].host_keys[k]);
+                    const auto              host     = entries_.find(host_key);
                     if (host != entries_.end() && host->second.direct_alloc_owner.owner_control_id() == host_control) {
                         (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);
                     }
                 }
             }
             for (int i = 0; i < 3; ++i) {
-                restore_expert_entry_at_locked(
-                    make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, GGML_LAYOUT_AOS),
-                    device_nodes[i]);
+                restore_expert_entry_at_locked(expert_device_key(members[i].key), device_nodes[i]);
             }
         }
         host_nodes.clear();

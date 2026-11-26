@@ -329,8 +329,7 @@ MIRROR_BACK = ("if (!released.mirror.empty() && direct_expert_entries_.find(exac
                "{ direct_expert_entries_.insert(std::move(released.mirror)); }")
 HOST_WITHDRAW = ("if (host != entries_.end() && host->second.direct_alloc_owner.owner_control_id() == host_control) "
                  "{ (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
-RESTORE_CALL = ("restore_expert_entry_at_locked(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, "
-                "GGML_LAYOUT_AOS), device_nodes[i]);")
+RESTORE_CALL = "restore_expert_entry_at_locked(expert_device_key(members[i].key), device_nodes[i]);"
 REGISTRATION_REFUSED = 'out.reason = "host registration failed";'
 RELEASED_SIZED = ("std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + "
                   "members[1].host_keys.size() + members[2].host_keys.size());")
@@ -1644,10 +1643,23 @@ def claim_a_missing_source_refuses_before_the_insert(cache: str) -> bool:
 # key is another registrant's live entry, which keeps it. A registration that fails after it named its copy under the
 # id hands the id back to the entry it was to replace, which its mover puts back, so the rollback finds the id to hand
 # back without building a mapping. The remap counts each walk, which the device test reads across an evict.
-LOAN_HOST_KEY = "const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].key, -1, -1 };"
-LOAN_REPOINT = "if (mapped != id_to_key_.end() && mapped->second == device_key) { mapped->second = host_key; }"
-LOAN_HAND_BACK = ("if (mapped != id_to_key_.end() && mapped->second == host_key && !held_by_another) "
-                  "{ mapped->second = device_key; }")
+LOAN_HOST_KEY = "const unified_cache_key host_key = expert_host_key(members[i].key);"
+LOAN_REPOINT = "expert_id_hand_over(id_to_key_, members[i].key, device_key, host_key);"
+LOAN_HAND_BACK = ("expert_id_hand_back(id_to_key_, members[i].key, host_key, device_key, held_by_another, "
+                  "spare_mapping[i]);")
+# The three helpers the loan and its rollback call, which hold the mapping edits; the key helpers name the two keys.
+HAND_OVER_SIG = "static void expert_id_hand_over("
+HAND_BACK_SIG = "static void expert_id_hand_back("
+SPARE_SIG = "static typename Map::node_type expert_spare_mapping("
+HAND_OVER_BODY = ("const auto mapped = ids.find(id); if (mapped != ids.end() && mapped->second == device_key) "
+                  "{ mapped->second = host_key; }")
+HAND_BACK_BODY = ("const auto mapped = ids.find(id); if (mapped != ids.end() && mapped->second == host_key && "
+                  "!held_by_another) { mapped->second = device_key; } else if (mapped == ids.end() && !spare.empty()) "
+                  "{ ids.insert(std::move(spare)); }")
+SPARE_BODY = ("const auto mapped = ids.find(id); if (mapped == ids.end() || !(mapped->second == device_key)) "
+              "{ return {}; } Map spare; return spare.extract(spare.emplace(id, device_key).first);")
+DEVICE_KEY_BODY = "return make_direct_stage_key(cache_entry_type::MOE_EXPERT, id, GGML_LAYOUT_AOS);"
+HOST_KEY_BODY = "return unified_cache_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };"
 LOAN_HELD_BY_ANOTHER = ("const bool held_by_another = host != entries_.end() && !host->second.retired && "
                         "host->second.direct_alloc_owner.owner_control_id() != members[i].owner.owner_control_id();")
 REGISTER_HAND_BACK = ("if (id != id_to_key_.end() && id->second == cache_key) { if (moved_from && "
@@ -1664,6 +1676,9 @@ def claim_the_evict_hands_the_id_over_before_it_retires(cache: str) -> bool:
     reg = body(c, REGISTER_BODY_SIG)
     remap = body(c, REMAP_SIG)
     return (loan.count(LOAN_REPOINT) == 1 and loan.count(LOAN_HAND_BACK) == 1 and loan.count(LOAN_HELD_BY_ANOTHER) == 1
+            and body(c, HAND_OVER_SIG).count(HAND_OVER_BODY) == 1 and body(c, HAND_BACK_SIG).count(HAND_BACK_BODY) == 1
+            and body(c, "static unified_cache_key expert_device_key(").count(DEVICE_KEY_BODY) == 1
+            and body(c, "static unified_cache_key expert_host_key(").count(HOST_KEY_BODY) == 1
             and ordered(loan, STAMP_FLAG, LOAN_HOST_KEY, LOAN_REPOINT, DEVICE_RETIRE, REGISTER)
             and ordered(loan, REGISTER_CATCH, LOAN_HELD_BY_ANOTHER, LOAN_HAND_BACK, HOST_WITHDRAW, RESTORE_CALL)
             and reg.count(REGISTER_HAND_BACK) == 1
@@ -1692,7 +1707,18 @@ def test_mutant_rollback_leaves_the_id_on_the_host_key_fails():
 
 def test_mutant_rollback_takes_the_id_from_another_registrant_fails():
     assert not claim_the_evict_hands_the_id_over_before_it_retires(
-        _once_in(CACHE, LOAN_SIG, LOAN_HAND_BACK, LOAN_HAND_BACK.replace(" && !held_by_another", "")))
+        _once_in(CACHE, HAND_BACK_SIG, " && !held_by_another", ""))
+
+
+def test_mutant_hand_over_moves_whatever_the_id_names_fails():
+    """The id handed over from an entry it no longer names would point a reader at the host key of a stale copy."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, HAND_OVER_SIG, " && mapped->second == device_key", ""))
+
+
+def test_mutant_device_key_names_another_layout_fails():
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, "static unified_cache_key expert_device_key(", "GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA"))
 
 
 def test_mutant_failed_registration_drops_the_moved_id_fails():
@@ -1713,20 +1739,21 @@ def test_mutant_remap_walks_uncounted_fails():
 # check loop, where minting may still throw and nothing has changed, and the rollback inserts it when the id maps to
 # nothing: no node is built in the rollback.
 SPARE_DECL = "id_map::node_type spare_mapping[3];"
-SPARE_MINT = ("if (handed != id_to_key_.end() && handed->second == device_key) { id_map spare; "
-              "spare_mapping[i] = spare.extract(spare.emplace(members[i].key, device_key).first); }")
-SPARE_INSERT = ("else if (mapped == id_to_key_.end() && !spare_mapping[i].empty()) { "
-                "id_to_key_.insert(std::move(spare_mapping[i])); }")
+SPARE_MINT = "spare_mapping[i] = expert_spare_mapping(id_to_key_, members[i].key, device_key);"
+SPARE_INSERT = "ids.insert(std::move(spare));"
 
 
 def claim_a_rollback_restores_a_lost_id(cache: str) -> bool:
     loan = body(norm(cache), LOAN_SIG)
     at = loan.find("if (failed) {")
     rollback = loan[at:loan.find(REGISTRATION_REFUSED, at)] if at >= 0 else ""
-    return (loan.count(SPARE_DECL) == 1 and loan.count(SPARE_MINT) == 1 and loan.count(SPARE_INSERT) == 1
+    hand_back = body(norm(cache), HAND_BACK_SIG)
+    return (loan.count(SPARE_DECL) == 1 and loan.count(SPARE_MINT) == 1
+            and body(norm(cache), SPARE_SIG).count(SPARE_BODY) == 1 and hand_back.count(SPARE_INSERT) == 1
             and ordered(loan, SPARE_DECL, HOLD, SPARE_MINT, LOAN_REPOINT)
-            and ordered(rollback, LOAN_HAND_BACK, SPARE_INSERT, HOST_WITHDRAW, RESTORE_CALL)
-            and bool(rollback) and not any(x in rollback for x in NODE_BUILDERS))
+            and ordered(rollback, LOAN_HAND_BACK, HOST_WITHDRAW, RESTORE_CALL)
+            and bool(rollback) and not any(x in rollback for x in NODE_BUILDERS)
+            and not any(x in hand_back for x in NODE_BUILDERS))
 
 
 def test_a_rollback_restores_a_lost_id():
@@ -1735,14 +1762,13 @@ def test_a_rollback_restores_a_lost_id():
 
 def test_mutant_rollback_leaves_a_lost_id_lost_fails():
     """The device entry goes back with no id mapping: every reader that resolves the expert through its id misses."""
-    assert not claim_a_rollback_restores_a_lost_id(_once_in(CACHE, LOAN_SIG, SPARE_INSERT, ""))
+    assert not claim_a_rollback_restores_a_lost_id(_once_in(CACHE, HAND_BACK_SIG, SPARE_INSERT, ""))
 
 
 def test_mutant_rollback_builds_the_mapping_fails():
     """Emplaced in the rollback, the mapping allocates where nothing may throw."""
     assert not claim_a_rollback_restores_a_lost_id(
-        _once_in(CACHE, LOAN_SIG, SPARE_INSERT,
-                 "else if (mapped == id_to_key_.end()) { id_to_key_.emplace(members[i].key, device_key); }"))
+        _once_in(CACHE, HAND_BACK_SIG, SPARE_INSERT, "ids.emplace(id, device_key);"))
 
 
 def test_mutant_spare_minted_after_the_hand_over_fails():

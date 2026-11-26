@@ -185,8 +185,8 @@ ROW_WRITE_ALLOWLIST = {
     ("offload_stats_note_host_alloc", "entry.second += bytes;"): (1, "offload host-alloc stats, keyed by tag"),
     ("remap_or_extract_id_mapping_locked", "mapped->second = replacement;"): (1, "the id_to_key_ map"),
     # An expert move points each id at the copy that now holds the expert: id_to_key_ map writes, not registry rows.
-    ("loan_expert_triplet", "mapped->second = host_key;"): (1, "id_to_key_: the loan hands the id to its host copy"),
-    ("loan_expert_triplet", "mapped->second = device_key;"): (
+    ("expert_id_hand_over", "mapped->second = host_key;"): (1, "id_to_key_: the loan hands the id to its host copy"),
+    ("expert_id_hand_back", "mapped->second = device_key;"): (
         1,
         "id_to_key_: the loan's rollback hands the id back to the restored device entry",
     ),
