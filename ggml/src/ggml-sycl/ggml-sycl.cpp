@@ -131820,7 +131820,7 @@ static bool ggml_sycl_layer_plan_applies_to_op(const ggml_tensor * op) {
         //       GGML_SYCL_VRAM_BUDGET_PCT=30 on GPT-OSS 20B), attn_sinks is
         //       host-pinned too.  The FA dispatch handles this via a
         //       targeted per-op staging step
-        //       (ggml_sycl_fattn_stage_weight_src in fattn.cpp) rather than
+        //       (ggml_sycl_fattn_operand_stage_src in fattn.cpp) rather than
         //       through the layer plan -- staging is cheap (256 B for
         //       GPT-OSS 20B) and avoids routing all of FA to CPU just
         //       because one small weight source is host-resident.

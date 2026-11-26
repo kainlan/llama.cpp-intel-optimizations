@@ -1,12 +1,15 @@
 // Device test: FlashAttention's device buffers belong to the backend context.
 //
-// The sequence-id buffers and the operand-staging slots (sinks and mask) used to be thread_local, so they ended
-// with the thread that ran the op and, on a thread that never exits, outlived every model. They are members of the
-// backend context now. This test allocates both groups on a context from a worker thread and checks, for each, that
+// The sequence-id buffers and the operand-staging slots (sinks and mask) are members of the backend context. This
+// test reserves both groups on a context from a worker thread and checks, for each group, that
 //   - the allocations are still held after that thread has exited (a thread's end releases nothing),
-//   - a second touch reuses them, and
+//   - a second reserve of the same size reuses every buffer,
+//   - a larger reserve replaces every buffer, one freed for one allocated,
+//   - a reserve on another queue replaces every buffer, so none stays on the queue the context left, and
 //   - freeing the backend releases all of them, on a thread that stays alive.
-// The file keeps its name from the thread_local era: its registration and the test inventory carry it.
+// It reads the counters the buffers' release keeps and the allocator ids of their handles, which are never reused.
+// It does not read the device arena.
+// The file name is the one its registration and the test inventory carry.
 //
 // Usage:
 //   ONEAPI_DEVICE_SELECTOR=level_zero:0 ./build/bin/test-fattn-thread-local
@@ -17,8 +20,11 @@
 #include "sycl-selector-fallback.hpp"
 #include "test-skip.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <sycl/sycl.hpp>
 #include <thread>
 
 #if !defined(GGML_USE_SYCL)
@@ -29,27 +35,144 @@ int main() {
 #else
 
 extern "C" {
-int  ggml_sycl_test_seq_id_buffer_allocs();
-bool ggml_sycl_test_seq_id_buffers_touch(ggml_backend_t backend);
-int  ggml_sycl_test_fattn_operand_stage_allocs();
-bool ggml_sycl_test_fattn_operand_stage_touch(ggml_backend_t backend);
+int           ggml_sycl_test_seq_id_buffer_allocs();
+bool          ggml_sycl_test_seq_id_buffers_touch(ggml_backend_t backend, size_t bytes, sycl::queue * stream);
+size_t        ggml_sycl_test_seq_id_buffer_ids(ggml_backend_t backend, uint64_t * ids, size_t capacity);
+int           ggml_sycl_test_fattn_operand_stage_allocs();
+bool          ggml_sycl_test_fattn_operand_stage_touch(ggml_backend_t backend, size_t bytes, sycl::queue * stream);
+size_t        ggml_sycl_test_fattn_operand_stage_ids(ggml_backend_t backend, uint64_t * ids, size_t capacity);
+sycl::queue * ggml_sycl_test_fattn_context_stream(ggml_backend_t backend);
 }
 
-// One group of context-owned buffers: how to allocate it, how to count what is live, and how many allocations a
-// context holds once the whole group is allocated.
+static const size_t MAX_PER_CONTEXT = 4;
+static const size_t SMALL_BYTES     = 64 * sizeof(float);
+static const size_t LARGE_BYTES     = 16 * SMALL_BYTES;
+
+// One group of context-owned buffers: how to reserve it (a null stream is the context's own queue), how to count
+// what is live, how to read the allocator ids of what the context holds, and how many buffers the group has.
 struct buffer_group {
     const char * name;
-    bool (*touch)(ggml_backend_t backend);
+    bool (*touch)(ggml_backend_t backend, size_t bytes, sycl::queue * stream);
     int (*live)();
-    int per_context;
+    size_t (*ids)(ggml_backend_t backend, uint64_t * ids, size_t capacity);
+    size_t per_context;
 };
 
 static const buffer_group BUFFER_GROUPS[] = {
-    { "seq-id buffers",        ggml_sycl_test_seq_id_buffers_touch,      ggml_sycl_test_seq_id_buffer_allocs,       4 },
-    { "operand-staging slots", ggml_sycl_test_fattn_operand_stage_touch, ggml_sycl_test_fattn_operand_stage_allocs, 2 },
+    { "seq-id buffers",        ggml_sycl_test_seq_id_buffers_touch,      ggml_sycl_test_seq_id_buffer_allocs,
+     ggml_sycl_test_seq_id_buffer_ids,       4 },
+    { "operand-staging slots", ggml_sycl_test_fattn_operand_stage_touch, ggml_sycl_test_fattn_operand_stage_allocs,
+     ggml_sycl_test_fattn_operand_stage_ids, 2 },
 };
 
 static const size_t N_BUFFER_GROUPS = sizeof(BUFFER_GROUPS) / sizeof(BUFFER_GROUPS[0]);
+
+struct buffer_ids {
+    uint64_t id[MAX_PER_CONTEXT] = {};
+};
+
+// Reads the ids of the group's buffers. False, with its own message, when the group has another number of buffers
+// than the table says or when one of them has no id: the checks below could not tell reused from replaced.
+static bool buffer_ids_read(const buffer_group & group, ggml_backend_t backend, buffer_ids & out) {
+    const size_t n = group.ids(backend, out.id, MAX_PER_CONTEXT);
+    if (n != group.per_context) {
+        fprintf(stderr, "The context reports %zu %s, expected %zu\n", n, group.name, group.per_context);
+        return false;
+    }
+    for (size_t i = 0; i < group.per_context; ++i) {
+        if (out.id[i] == 0) {
+            fprintf(stderr, "Buffer %zu of the context's %s has no allocator id\n", i, group.name);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Reserves `bytes` in every buffer of the group on `stream` and reads the ids back. False, with its own message,
+// when the reserve fails or an id cannot be read.
+static bool buffer_group_touch(const buffer_group & group,
+                               ggml_backend_t       backend,
+                               size_t               bytes,
+                               sycl::queue *        stream,
+                               buffer_ids &         out) {
+    if (!group.touch(backend, bytes, stream)) {
+        fprintf(stderr, "Failed to reserve %zu bytes in the context's %s\n", bytes, group.name);
+        return false;
+    }
+    return buffer_ids_read(group, backend, out);
+}
+
+// How many of the group's buffers are the same allocation in both readings.
+static size_t buffer_ids_kept(const buffer_group & group, const buffer_ids & a, const buffer_ids & b) {
+    size_t kept = 0;
+    for (size_t i = 0; i < group.per_context; ++i) {
+        kept += a.id[i] == b.id[i] ? 1 : 0;
+    }
+    return kept;
+}
+
+// Runs the checks that need a live context on one group. `before` is the group's live count before the context
+// allocated anything, and `other` is a second queue on the context's device.
+static bool buffer_group_check(const buffer_group & group, ggml_backend_t backend, int before, sycl::queue & other) {
+    const int expected = before + static_cast<int>(group.per_context);
+
+    bool        touched = false;
+    std::thread worker([&]() { touched = group.touch(backend, SMALL_BYTES, nullptr); });
+    worker.join();
+    if (!touched) {
+        fprintf(stderr, "Failed to allocate the context's %s in the worker thread\n", group.name);
+        return false;
+    }
+
+    // The worker has exited. The allocations are the context's, so they are still held.
+    if (group.live() != expected) {
+        fprintf(stderr, "The %s did not outlive the thread that allocated them (before=%d after=%d)\n", group.name,
+                before, group.live());
+        return false;
+    }
+    buffer_ids first;
+    if (!buffer_ids_read(group, backend, first)) {
+        return false;
+    }
+
+    // The same size again: every buffer is found, none is allocated.
+    buffer_ids again;
+    if (!buffer_group_touch(group, backend, SMALL_BYTES, nullptr, again)) {
+        return false;
+    }
+    if (group.live() != expected || buffer_ids_kept(group, first, again) != group.per_context) {
+        fprintf(stderr, "A second touch did not reuse the context's %s (count=%d, expected %d, kept %zu of %zu)\n",
+                group.name, group.live(), expected, buffer_ids_kept(group, first, again), group.per_context);
+        return false;
+    }
+
+    // A larger size: every buffer is replaced, and each replacement frees the buffer it replaces.
+    buffer_ids grown;
+    if (!buffer_group_touch(group, backend, LARGE_BYTES, nullptr, grown)) {
+        return false;
+    }
+    if (group.live() != expected || buffer_ids_kept(group, again, grown) != 0) {
+        fprintf(stderr, "Growing the context's %s did not replace each one for one (count=%d, expected %d, kept %zu)\n",
+                group.name, group.live(), expected, buffer_ids_kept(group, again, grown));
+        return false;
+    }
+
+    // Another queue, the size unchanged: the whole group moves, although no buffer is too small. A buffer that
+    // stayed would be read through a queue it was not allocated on.
+    buffer_ids moved;
+    if (!buffer_group_touch(group, backend, LARGE_BYTES, &other, moved)) {
+        return false;
+    }
+    if (group.live() != expected || buffer_ids_kept(group, grown, moved) != 0) {
+        fprintf(stderr,
+                "A touch on another queue left the context's %s on the queue they came from (count=%d, expected %d, "
+                "kept %zu)\n",
+                group.name, group.live(), expected, buffer_ids_kept(group, grown, moved));
+        return false;
+    }
+
+    return true;
+}
 
 int main(int, char ** argv) {
     sycl_test_selector_fallback(argv, "level_zero:0");
@@ -65,36 +188,23 @@ int main(int, char ** argv) {
         return 1;
     }
 
+    sycl::queue * home = ggml_sycl_test_fattn_context_stream(backend);
+    if (!home) {
+        fprintf(stderr, "The backend context has no queue\n");
+        ggml_backend_free(backend);
+        return 1;
+    }
+    // A second queue on the context's device. It is declared here so that it outlives the backend: the buffers the
+    // last check leaves on it are released by ggml_backend_free().
+    sycl::queue other(home->get_context(), home->get_device());
+
     int before[N_BUFFER_GROUPS];
     for (size_t g = 0; g < N_BUFFER_GROUPS; ++g) {
         before[g] = BUFFER_GROUPS[g].live();
     }
 
     for (size_t g = 0; g < N_BUFFER_GROUPS; ++g) {
-        const buffer_group & group = BUFFER_GROUPS[g];
-
-        bool        touched = false;
-        std::thread worker([&]() { touched = group.touch(backend); });
-        worker.join();
-        if (!touched) {
-            fprintf(stderr, "Failed to allocate the context's %s in the worker thread\n", group.name);
-            ggml_backend_free(backend);
-            return 1;
-        }
-
-        // The worker has exited. The allocations are the context's, so they are still held.
-        const int after_thread_exit = group.live();
-        if (after_thread_exit != before[g] + group.per_context) {
-            fprintf(stderr, "The %s did not outlive the thread that allocated them (before=%d after=%d)\n", group.name,
-                    before[g], after_thread_exit);
-            ggml_backend_free(backend);
-            return 1;
-        }
-
-        // A second touch finds them and allocates nothing.
-        if (!group.touch(backend) || group.live() != after_thread_exit) {
-            fprintf(stderr, "A second touch did not reuse the context's %s (count=%d, expected %d)\n", group.name,
-                    group.live(), after_thread_exit);
+        if (!buffer_group_check(BUFFER_GROUPS[g], backend, before[g], other)) {
             ggml_backend_free(backend);
             return 1;
         }

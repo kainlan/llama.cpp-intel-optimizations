@@ -21,7 +21,6 @@
 #include "fattn-vec.hpp"
 #include "fattn-xmx-f16-v2.hpp"
 #include "fattn-xmx-f16.hpp"
-#include "ggml-backend-impl.h"
 #include "gpu-arch.hpp"
 #include "kv-cache-quant.hpp"
 #include "l144i-probe.hpp"
@@ -40,6 +39,11 @@
 #include <new>
 #include <utility>
 #include <vector>
+
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+// The test hooks reach a backend's context through the backend struct.
+#    include "ggml-backend-impl.h"
+#endif
 
 // Non-inline forwarder — ggml-sycl.cpp's ~ggml_backend_sycl_context() calls this
 // without including fattn-xmx-f16-v2.hpp (which drags the SYCL matrix extension).
@@ -753,8 +757,10 @@ class fattn_v2_fill_seq_lens_kernel;
 static bool g_sycl_paged_v2_enabled     = false;
 static bool g_sycl_paged_v2_initialized = false;
 
-// Live sequence-id device buffers over every backend context, for the test hooks below.
+// Live sequence-id device buffers and live operand-staging slots, over every backend context. The device test reads
+// them through the hooks below.
 static std::atomic<int> g_seq_id_buffer_allocs{ 0 };
+static std::atomic<int> g_fattn_operand_stage_allocs{ 0 };
 
 static bool ggml_sycl_fattn_alloc_device_owner(size_t                      bytes,
                                                sycl::queue *               stream,
@@ -821,6 +827,19 @@ static void ggml_sycl_fattn_release_owner(T *& ptr, size_t & capacity, ggml_sycl
     capacity = 0;
 }
 
+// Drops a buffer of a counted group: `live` goes down when the handle held an allocation, and the handle is reset
+// whatever it held.
+template <typename T>
+static void ggml_sycl_fattn_counted_free(std::atomic<int> &      live,
+                                         T *&                    ptr,
+                                         size_t &                bytes,
+                                         ggml_sycl::mem_handle & owner) {
+    if (owner.valid()) {
+        live.fetch_sub(1);
+    }
+    ggml_sycl_fattn_release_owner(ptr, bytes, owner);
+}
+
 static void init_paged_v2_config() {
     if (g_sycl_paged_v2_initialized) {
         return;
@@ -850,16 +869,9 @@ static void ggml_sycl_fattn_v2_auto_free_all(ggml_backend_sycl_context::fattn_v2
     buffers.alloc_queue = nullptr;
 }
 
-// The multi-sequence device buffers (the backend context's fattn_buffers.seq_ids)
-// are allocated and dropped one at a time through these two, which keep the
-// count the test hooks read.
-static void ggml_sycl_fattn_seq_ids_free(int32_t *& ptr, size_t & bytes, ggml_sycl::mem_handle & owner) {
-    if (owner.valid()) {
-        g_seq_id_buffer_allocs.fetch_sub(1);
-    }
-    ggml_sycl_fattn_release_owner(ptr, bytes, owner);
-}
-
+// The multi-sequence device buffers (the backend context's fattn_buffers.seq_ids):
+// the two id buffers and the two offset buffers. They are allocated in
+// ggml_sycl_fattn_seq_ids_reserve() and nowhere else.
 static int32_t * ggml_sycl_fattn_seq_ids_alloc(size_t count, sycl::queue * stream, ggml_sycl::mem_handle & owner) {
     int32_t * ptr = nullptr;
     if (ggml_sycl_fattn_alloc_device_owner_t(count, stream, ggml_sycl::alloc_role::GRAPH_TMP,
@@ -870,12 +882,65 @@ static int32_t * ggml_sycl_fattn_seq_ids_alloc(size_t count, sycl::queue * strea
 }
 
 static void ggml_sycl_fattn_seq_ids_free_all(ggml_backend_sycl_context::fattn_seq_id_buffers & buffers) {
-    ggml_sycl_fattn_seq_ids_free(buffers.q_seq_ids_dev, buffers.q_seq_ids_size, buffers.q_seq_ids_owner);
-    ggml_sycl_fattn_seq_ids_free(buffers.kv_seq_ids_dev, buffers.kv_seq_ids_size, buffers.kv_seq_ids_owner);
-    ggml_sycl_fattn_seq_ids_free(buffers.seq_q_offsets_dev, buffers.seq_offsets_capacity, buffers.seq_q_offsets_owner);
-    ggml_sycl_fattn_seq_ids_free(buffers.seq_kv_offsets_dev, buffers.seq_offsets_capacity,
+    ggml_sycl_fattn_counted_free(g_seq_id_buffer_allocs, buffers.q_seq_ids_dev, buffers.q_seq_ids_size,
+                                 buffers.q_seq_ids_owner);
+    ggml_sycl_fattn_counted_free(g_seq_id_buffer_allocs, buffers.kv_seq_ids_dev, buffers.kv_seq_ids_size,
+                                 buffers.kv_seq_ids_owner);
+    ggml_sycl_fattn_counted_free(g_seq_id_buffer_allocs, buffers.seq_q_offsets_dev, buffers.seq_offsets_capacity,
+                                 buffers.seq_q_offsets_owner);
+    ggml_sycl_fattn_counted_free(g_seq_id_buffer_allocs, buffers.seq_kv_offsets_dev, buffers.seq_offsets_capacity,
                                  buffers.seq_kv_offsets_owner);
     buffers.alloc_queue = nullptr;
+}
+
+// Makes the group hold, on `stream`, at least `q_count` and `kv_count` elements in the two id buffers and
+// `offsets_count` in each offset buffer. A count of zero asks nothing of its buffers, so the op reserves the ids
+// first and the offsets once it has counted the sequences.
+// Buffers allocated on another stream are all dropped first, whichever counts are asked for: the op may run on
+// another device than last time, and a buffer left on the old one cannot be read on the new one.
+// False when a buffer that was asked for could not be allocated.
+static bool ggml_sycl_fattn_seq_ids_reserve(ggml_backend_sycl_context::fattn_seq_id_buffers & buffers,
+                                            sycl::queue *                                     stream,
+                                            size_t                                            q_count,
+                                            size_t                                            kv_count,
+                                            size_t                                            offsets_count) {
+    if (buffers.alloc_queue && buffers.alloc_queue != stream) {
+        ggml_sycl_fattn_seq_ids_free_all(buffers);
+    }
+    buffers.alloc_queue = stream;
+
+    bool         reserved = true;
+    const size_t q_bytes  = q_count * sizeof(int32_t);
+    if (q_bytes > 0 && (!buffers.q_seq_ids_dev || buffers.q_seq_ids_size < q_bytes)) {
+        ggml_sycl_fattn_counted_free(g_seq_id_buffer_allocs, buffers.q_seq_ids_dev, buffers.q_seq_ids_size,
+                                     buffers.q_seq_ids_owner);
+        buffers.q_seq_ids_dev  = ggml_sycl_fattn_seq_ids_alloc(q_count, stream, buffers.q_seq_ids_owner);
+        buffers.q_seq_ids_size = buffers.q_seq_ids_dev ? q_bytes : 0;
+        reserved               = reserved && buffers.q_seq_ids_dev;
+    }
+    const size_t kv_bytes = kv_count * sizeof(int32_t);
+    if (kv_bytes > 0 && (!buffers.kv_seq_ids_dev || buffers.kv_seq_ids_size < kv_bytes)) {
+        ggml_sycl_fattn_counted_free(g_seq_id_buffer_allocs, buffers.kv_seq_ids_dev, buffers.kv_seq_ids_size,
+                                     buffers.kv_seq_ids_owner);
+        buffers.kv_seq_ids_dev  = ggml_sycl_fattn_seq_ids_alloc(kv_count, stream, buffers.kv_seq_ids_owner);
+        buffers.kv_seq_ids_size = buffers.kv_seq_ids_dev ? kv_bytes : 0;
+        reserved                = reserved && buffers.kv_seq_ids_dev;
+    }
+    // The two offset buffers share one capacity, so they grow together.
+    const size_t offsets_bytes = offsets_count * sizeof(int32_t);
+    if (offsets_bytes > 0 &&
+        (!buffers.seq_q_offsets_dev || !buffers.seq_kv_offsets_dev || buffers.seq_offsets_capacity < offsets_bytes)) {
+        ggml_sycl_fattn_counted_free(g_seq_id_buffer_allocs, buffers.seq_q_offsets_dev, buffers.seq_offsets_capacity,
+                                     buffers.seq_q_offsets_owner);
+        ggml_sycl_fattn_counted_free(g_seq_id_buffer_allocs, buffers.seq_kv_offsets_dev, buffers.seq_offsets_capacity,
+                                     buffers.seq_kv_offsets_owner);
+        buffers.seq_q_offsets_dev  = ggml_sycl_fattn_seq_ids_alloc(offsets_count, stream, buffers.seq_q_offsets_owner);
+        buffers.seq_kv_offsets_dev = ggml_sycl_fattn_seq_ids_alloc(offsets_count, stream, buffers.seq_kv_offsets_owner);
+        const bool both            = buffers.seq_q_offsets_dev && buffers.seq_kv_offsets_dev;
+        buffers.seq_offsets_capacity = both ? offsets_bytes : 0;
+        reserved                     = reserved && both;
+    }
+    return reserved;
 }
 
 // =============================================================================
@@ -907,20 +972,12 @@ static void ggml_sycl_fattn_seq_ids_free_all(ggml_backend_sycl_context::fattn_se
 // stream, so it is correctly ordered before the FA kernel that reads it
 // (in-order queue) without an explicit barrier.
 //
-// The slots are allocated and dropped one at a time through the helpers
-// below, which keep the count of live slots the device test reads.
-static std::atomic<int> g_fattn_operand_stage_allocs{ 0 };
-
-static void ggml_sycl_fattn_operand_stage_slot_free(void *& ptr, size_t & bytes, ggml_sycl::mem_handle & owner) {
-    if (owner.valid()) {
-        g_fattn_operand_stage_allocs.fetch_sub(1);
-    }
-    ggml_sycl_fattn_release_owner(ptr, bytes, owner);
-}
-
+// The slots are allocated in ggml_sycl_fattn_operand_stage_reserve() and
+// nowhere else.
 static void ggml_sycl_fattn_operand_stage_free_all(ggml_backend_sycl_context::fattn_operand_stage & stage) {
-    ggml_sycl_fattn_operand_stage_slot_free(stage.sinks.dev, stage.sinks.capacity, stage.sinks.owner);
-    ggml_sycl_fattn_operand_stage_slot_free(stage.mask.dev, stage.mask.capacity, stage.mask.owner);
+    ggml_sycl_fattn_counted_free(g_fattn_operand_stage_allocs, stage.sinks.dev, stage.sinks.capacity,
+                                 stage.sinks.owner);
+    ggml_sycl_fattn_counted_free(g_fattn_operand_stage_allocs, stage.mask.dev, stage.mask.capacity, stage.mask.owner);
     stage.alloc_queue = nullptr;
 }
 
@@ -940,7 +997,7 @@ static bool ggml_sycl_fattn_operand_stage_reserve(ggml_backend_sycl_context::fat
     if (bytes <= slot.capacity) {
         return true;
     }
-    ggml_sycl_fattn_operand_stage_slot_free(slot.dev, slot.capacity, slot.owner);
+    ggml_sycl_fattn_counted_free(g_fattn_operand_stage_allocs, slot.dev, slot.capacity, slot.owner);
     if (!ggml_sycl_fattn_alloc_device_owner(bytes, stream, ggml_sycl::alloc_role::STAGING,
                                             ggml_sycl::runtime_category::STAGING, "fattn_weight_stage", &slot.dev,
                                             slot.owner)) {
@@ -959,12 +1016,12 @@ static bool ggml_sycl_fattn_operand_stage_reserve(ggml_backend_sycl_context::fat
 // Returns nullptr when `src` does not resolve; when the slot cannot be
 // allocated it returns the resolved host-pinned pointer (which is
 // GPU-accessible but slower).
-static const char * ggml_sycl_fattn_stage_weight_src(ggml_backend_sycl_context::fattn_operand_stage &       stage,
-                                                     ggml_backend_sycl_context::fattn_operand_stage::slot & slot,
-                                                     const ggml_tensor *                                    src,
-                                                     int                                                    device,
-                                                     sycl::queue *                                          stream,
-                                                     const char *                                           role) {
+static const char * ggml_sycl_fattn_operand_stage_src(ggml_backend_sycl_context::fattn_operand_stage &       stage,
+                                                      ggml_backend_sycl_context::fattn_operand_stage::slot & slot,
+                                                      const ggml_tensor *                                    src,
+                                                      int                                                    device,
+                                                      sycl::queue *                                          stream,
+                                                      const char *                                           role) {
     if (!src || !stream) {
         return nullptr;
     }
@@ -993,7 +1050,7 @@ static const char * ggml_sycl_fattn_stage_weight_src(ggml_backend_sycl_context::
         static bool warned = false;
         if (!warned) {
             GGML_LOG_WARN(
-                "[SYCL] fattn weight staging: failed to allocate %zu bytes for %s; "
+                "[SYCL] fattn operand staging: failed to allocate %zu bytes for %s; "
                 "falling back to host-pinned zero-copy (may be slower)\n",
                 bytes, role);
             warned = true;
@@ -1010,7 +1067,7 @@ static const char * ggml_sycl_fattn_stage_weight_src(ggml_backend_sycl_context::
 
     static std::atomic<int> staged_log_left{ 8 };
     if (staged_log_left.fetch_sub(1) > 0) {
-        GGML_LOG_INFO("[SYCL] fattn staged weight-source '%s' (%s, %zu B) from alloc_kind=%d to device\n",
+        GGML_LOG_INFO("[SYCL] fattn operand staging: '%s' (%s, %zu B) from alloc_kind=%d to device\n",
                       src->name[0] ? src->name : "?", role, bytes, static_cast<int>(alloc_kind));
     }
     return static_cast<const char *>(slot.dev);
@@ -1024,8 +1081,27 @@ void ggml_sycl_fattn_release_context_buffers(ggml_backend_sycl_context & ctx) {
     ggml_sycl_fattn_operand_stage_free_all(ctx.fattn_buffers.operand_stage);
 }
 
-// Test hooks: the counts of live sequence-id device buffers and of live operand-staging slots, and a way to
-// allocate each group on a context without a graph.
+#    if defined(GGML_SYCL_PRIVATE_TESTING)
+// Test hooks. For each counted group: the number of live allocations over every context, a way to reserve the
+// group on a context without a graph, and the allocator ids of what the context holds, which tell a reused buffer
+// from a reallocated one.
+static ggml_backend_sycl_context * ggml_sycl_test_fattn_context(ggml_backend_t backend) {
+    return backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+}
+
+static size_t ggml_sycl_test_fattn_owner_ids(std::initializer_list<const ggml_sycl::mem_handle *> owners,
+                                             uint64_t *                                           ids,
+                                             size_t                                               capacity) {
+    size_t n = 0;
+    for (const ggml_sycl::mem_handle * owner : owners) {
+        if (ids && n < capacity) {
+            ids[n] = owner->identity().allocation_id;
+        }
+        ++n;
+    }
+    return n;
+}
+
 extern "C" int ggml_sycl_test_seq_id_buffer_allocs() {
     return g_seq_id_buffer_allocs.load();
 }
@@ -1034,48 +1110,58 @@ extern "C" int ggml_sycl_test_fattn_operand_stage_allocs() {
     return g_fattn_operand_stage_allocs.load();
 }
 
-#    if defined(GGML_SYCL_PRIVATE_TESTING)
-// Fills the context's sinks and mask slots through the helper the op stages through, with no tensor behind them.
-extern "C" bool ggml_sycl_test_fattn_operand_stage_touch(ggml_backend_t backend) {
-    if (!backend || !backend->context) {
+// Reserves `bytes` in each of the context's four sequence-id buffers the way the op does: the ids, then the
+// offsets. A null `stream` is the context's own.
+extern "C" bool ggml_sycl_test_seq_id_buffers_touch(ggml_backend_t backend, size_t bytes, sycl::queue * stream) {
+    ggml_backend_sycl_context * ctx = ggml_sycl_test_fattn_context(backend);
+    if (!ctx) {
         return false;
     }
-    ggml_backend_sycl_context & ctx    = *static_cast<ggml_backend_sycl_context *>(backend->context);
-    auto &                      stage  = ctx.fattn_buffers.operand_stage;
-    sycl::queue *               stream = ctx.stream();
-    const size_t                bytes  = 64 * sizeof(float);
-    return ggml_sycl_fattn_operand_stage_reserve(stage, stage.sinks, bytes, stream) &&
-           ggml_sycl_fattn_operand_stage_reserve(stage, stage.mask, bytes, stream);
+    auto &        buffers = ctx->fattn_buffers.seq_ids;
+    sycl::queue * target  = stream ? stream : ctx->stream();
+    const size_t  count   = bytes / sizeof(int32_t);
+    return ggml_sycl_fattn_seq_ids_reserve(buffers, target, count, count, 0) &&
+           ggml_sycl_fattn_seq_ids_reserve(buffers, target, 0, 0, count);
 }
 
-extern "C" bool ggml_sycl_test_seq_id_buffers_touch(ggml_backend_t backend) {
-    if (!backend || !backend->context) {
+// Reserves `bytes` in the context's sinks and mask slots, with no tensor behind them.
+extern "C" bool ggml_sycl_test_fattn_operand_stage_touch(ggml_backend_t backend, size_t bytes, sycl::queue * stream) {
+    ggml_backend_sycl_context * ctx = ggml_sycl_test_fattn_context(backend);
+    if (!ctx) {
         return false;
     }
-    ggml_backend_sycl_context & ctx     = *static_cast<ggml_backend_sycl_context *>(backend->context);
-    auto &                      buffers = ctx.fattn_buffers.seq_ids;
-    sycl::queue *               stream  = ctx.stream();
-    if (buffers.alloc_queue && buffers.alloc_queue != stream) {
-        ggml_sycl_fattn_seq_ids_free_all(buffers);
-    }
-    buffers.alloc_queue = stream;
+    auto &        stage  = ctx->fattn_buffers.operand_stage;
+    sycl::queue * target = stream ? stream : ctx->stream();
+    return ggml_sycl_fattn_operand_stage_reserve(stage, stage.sinks, bytes, target) &&
+           ggml_sycl_fattn_operand_stage_reserve(stage, stage.mask, bytes, target);
+}
 
-    if (!buffers.q_seq_ids_dev) {
-        buffers.q_seq_ids_dev  = ggml_sycl_fattn_seq_ids_alloc(1, stream, buffers.q_seq_ids_owner);
-        buffers.q_seq_ids_size = sizeof(int32_t);
-    }
-    if (!buffers.kv_seq_ids_dev) {
-        buffers.kv_seq_ids_dev  = ggml_sycl_fattn_seq_ids_alloc(1, stream, buffers.kv_seq_ids_owner);
-        buffers.kv_seq_ids_size = sizeof(int32_t);
-    }
-    if (!buffers.seq_q_offsets_dev) {
-        buffers.seq_q_offsets_dev = ggml_sycl_fattn_seq_ids_alloc(1, stream, buffers.seq_q_offsets_owner);
-    }
-    if (!buffers.seq_kv_offsets_dev) {
-        buffers.seq_kv_offsets_dev = ggml_sycl_fattn_seq_ids_alloc(1, stream, buffers.seq_kv_offsets_owner);
-    }
+// The queue the context allocates on when a touch names none. The test builds its second queue on this one's device.
+extern "C" sycl::queue * ggml_sycl_test_fattn_context_stream(ggml_backend_t backend) {
+    ggml_backend_sycl_context * ctx = ggml_sycl_test_fattn_context(backend);
+    return ctx ? ctx->stream() : nullptr;
+}
 
-    return buffers.q_seq_ids_dev && buffers.kv_seq_ids_dev && buffers.seq_q_offsets_dev && buffers.seq_kv_offsets_dev;
+// Each writes the allocator ids of its group's buffers to `ids` (0 for a buffer that is not allocated) and returns
+// how many buffers the group has.
+extern "C" size_t ggml_sycl_test_seq_id_buffer_ids(ggml_backend_t backend, uint64_t * ids, size_t capacity) {
+    ggml_backend_sycl_context * ctx = ggml_sycl_test_fattn_context(backend);
+    if (!ctx) {
+        return 0;
+    }
+    const auto & buffers = ctx->fattn_buffers.seq_ids;
+    return ggml_sycl_test_fattn_owner_ids({ &buffers.q_seq_ids_owner, &buffers.kv_seq_ids_owner,
+                                            &buffers.seq_q_offsets_owner, &buffers.seq_kv_offsets_owner },
+                                          ids, capacity);
+}
+
+extern "C" size_t ggml_sycl_test_fattn_operand_stage_ids(ggml_backend_t backend, uint64_t * ids, size_t capacity) {
+    ggml_backend_sycl_context * ctx = ggml_sycl_test_fattn_context(backend);
+    if (!ctx) {
+        return 0;
+    }
+    const auto & stage = ctx->fattn_buffers.operand_stage;
+    return ggml_sycl_test_fattn_owner_ids({ &stage.sinks.owner, &stage.mask.owner }, ids, capacity);
 }
 #    endif
 
@@ -3741,10 +3827,10 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
     auto &        operand_stage = ctx.fattn_buffers.operand_stage;
     params.mask =
         graph_mask ? graph_mask :
-        mask ? ggml_sycl_fattn_stage_weight_src(operand_stage, operand_stage.mask, mask, device, stream_ptr, "mask") :
+        mask ? ggml_sycl_fattn_operand_stage_src(operand_stage, operand_stage.mask, mask, device, stream_ptr, "mask") :
                nullptr;
-    params.sinks = sinks ? ggml_sycl_fattn_stage_weight_src(operand_stage, operand_stage.sinks, sinks, device,
-                                                            stream_ptr, "attn_sinks") :
+    params.sinks = sinks ? ggml_sycl_fattn_operand_stage_src(operand_stage, operand_stage.sinks, sinks, device,
+                                                             stream_ptr, "attn_sinks") :
                            nullptr;
     params.dst               = safe_dst.resolve_as<float>();
 
@@ -3885,26 +3971,10 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
         } else {
             // We have valid host pointers (either from tensor or from cache)
             // Need to copy from host to device for kernel access
-            // Reallocate device buffers if size changed or first time
-            if (!seq_buffers.q_seq_ids_dev || seq_buffers.alloc_queue != stream ||
-                seq_buffers.q_seq_ids_size < q_size) {
-                ggml_sycl_fattn_seq_ids_free(seq_buffers.q_seq_ids_dev, seq_buffers.q_seq_ids_size,
-                                             seq_buffers.q_seq_ids_owner);
-                seq_buffers.q_seq_ids_dev =
-                    ggml_sycl_fattn_seq_ids_alloc(q_seq_ids->ne[0], stream, seq_buffers.q_seq_ids_owner);
-                seq_buffers.q_seq_ids_size = q_size;
-            }
-            if (!seq_buffers.kv_seq_ids_dev || seq_buffers.alloc_queue != stream ||
-                seq_buffers.kv_seq_ids_size < kv_size) {
-                ggml_sycl_fattn_seq_ids_free(seq_buffers.kv_seq_ids_dev, seq_buffers.kv_seq_ids_size,
-                                             seq_buffers.kv_seq_ids_owner);
-                seq_buffers.kv_seq_ids_dev =
-                    ggml_sycl_fattn_seq_ids_alloc(kv_seq_ids->ne[0], stream, seq_buffers.kv_seq_ids_owner);
-                seq_buffers.kv_seq_ids_size = kv_size;
-            }
-            seq_buffers.alloc_queue = stream;
+            const bool ids_reserved = ggml_sycl_fattn_seq_ids_reserve(
+                seq_buffers, stream, static_cast<size_t>(q_seq_ids->ne[0]), static_cast<size_t>(kv_seq_ids->ne[0]), 0);
 
-            if (seq_buffers.q_seq_ids_dev && seq_buffers.kv_seq_ids_dev) {
+            if (ids_reserved && seq_buffers.q_seq_ids_dev && seq_buffers.kv_seq_ids_dev) {
                 // Copy from host (USM) to device using the correct host pointers
                 // Note: In-order queue ensures memcpy completes before subsequent kernel launch
                 ggml_sycl_trace_memcpy_during_recording("fattn.cpp:q_seq_ids", q_size);
@@ -3929,22 +3999,10 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_sycl::sycl_t
                 if (n_seqs > 1) {
                     const size_t offsets_size = (n_seqs + 1) * sizeof(int32_t);
 
-                    // Reallocate device buffers if capacity is insufficient
-                    if (!seq_buffers.seq_q_offsets_dev || !seq_buffers.seq_kv_offsets_dev ||
-                        seq_buffers.seq_offsets_capacity < offsets_size) {
-                        ggml_sycl_fattn_seq_ids_free(seq_buffers.seq_q_offsets_dev, seq_buffers.seq_offsets_capacity,
-                                                     seq_buffers.seq_q_offsets_owner);
-                        ggml_sycl_fattn_seq_ids_free(seq_buffers.seq_kv_offsets_dev, seq_buffers.seq_offsets_capacity,
-                                                     seq_buffers.seq_kv_offsets_owner);
-                        seq_buffers.seq_q_offsets_dev =
-                            ggml_sycl_fattn_seq_ids_alloc(n_seqs + 1, stream, seq_buffers.seq_q_offsets_owner);
-                        seq_buffers.seq_kv_offsets_dev =
-                            ggml_sycl_fattn_seq_ids_alloc(n_seqs + 1, stream, seq_buffers.seq_kv_offsets_owner);
-                        seq_buffers.seq_offsets_capacity =
-                            (seq_buffers.seq_q_offsets_dev && seq_buffers.seq_kv_offsets_dev) ? offsets_size : 0;
-                    }
+                    const bool offsets_reserved =
+                        ggml_sycl_fattn_seq_ids_reserve(seq_buffers, stream, 0, 0, static_cast<size_t>(n_seqs) + 1);
 
-                    if (seq_buffers.seq_q_offsets_dev && seq_buffers.seq_kv_offsets_dev) {
+                    if (offsets_reserved && seq_buffers.seq_q_offsets_dev && seq_buffers.seq_kv_offsets_dev) {
                         // Copy offsets to device
                         // Note: In-order queue ensures memcpy completes before subsequent kernel launch
                         ggml_sycl_trace_memcpy_during_recording("fattn.cpp:seq_q_offsets", offsets_size);

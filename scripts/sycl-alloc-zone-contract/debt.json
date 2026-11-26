@@ -278,7 +278,7 @@
     {"code": "G-CATCH", "key": "fattn-xmx-f16-v2.hpp::fattn_xmx_v2_query_combinations::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "fattn-xmx-f16-v2.hpp::launch_fattn_xmx_v2_decode_gqa_split_leaf::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "fattn-xmx-f16-v2.hpp::launch_fattn_xmx_v2_decode_gqa_split_leaf::catch_clause:all#1"},
-    {"code": "G-CATCH", "key": "fattn.cpp::ggml_sycl_fattn_stage_weight_src::catch_clause:all#0"},
+    {"code": "G-CATCH", "key": "fattn.cpp::ggml_sycl_fattn_operand_stage_src::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "fattn.cpp::ggml_sycl_fattn_xmx_materialize_packed_k::catch_clause:all#0"},
     {"code": "G-CATCH", "key": "fattn.cpp::ggml_sycl_fattn_xmx_materialize_packed_k::catch_clause:all#1"},
     {"code": "G-CATCH", "key": "fattn.cpp::ggml_sycl_fattn_xmx_submit_set_rows_update::catch_clause:all#0"},
