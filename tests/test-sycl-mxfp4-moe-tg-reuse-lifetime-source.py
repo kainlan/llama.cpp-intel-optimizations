@@ -172,7 +172,7 @@ RELEASE_SIG = "static void ggml_sycl_release_model_slot_resources(ggml_sycl::lif
 # The reclaim clears the dying model's live bit. Read before it, the liveness still counts that model and never says
 # that no model is live, so the WARN could never fire.
 SLOT_RECLAIM = "ggml_sycl::unified_cache_release_model_slot(slot);"
-INFLIGHT_READ ="const int inflight = ggml_sycl_graph_inflight_count();"
+INFLIGHT_READ = "const int inflight = ggml_sycl_graph_inflight_count();"
 # Only at the last live model's release: while another model is live the last-release step reports nothing, and a call
 # in flight is that model's decode.
 INFLIGHT_GUARD = "if (inflight != 0 && ggml_sycl_no_model_live()) {"
