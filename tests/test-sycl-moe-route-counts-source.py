@@ -52,6 +52,7 @@ device; that the increments cost little is the lead's before/after decode readin
 
 from __future__ import annotations
 
+import functools
 import re
 import sys
 from pathlib import Path
@@ -67,7 +68,7 @@ RESOLVE = "auto resolve = ["
 BUILD_FN = "static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_build("
 INIT_FN = "static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {"
 PROMPT_HELPER = "static void ggml_sycl_moe_route_counts_add_prompt("
-SWAP_FN = "static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {"
+SWAP_FN = "static void ggml_sycl_run_expert_swap_claimed("
 REPORT_FN = "void moe_route_counts_report_final(int device, int64_t tokens) {"
 INSTALL_FN = "std::shared_ptr<moe_route_counts> moe_route_counts_install("
 COUNT_GUARD = "if (record->route_counts && record->route_block >= 0) {"
@@ -131,11 +132,32 @@ _COMMENT_OR_LITERAL = re.compile(
 )
 
 
+# The self-test runs the gate on a mutant of each source in turn. The unmutated sources, and what is cut from them,
+# stay cached because every mutant reads them; a mutated text is used for its one check and evicted. The caches are
+# small on purpose: a key holds a whole 7 MB source, so a large cache would keep hundreds of dead mutants in memory. A
+# cache hit returns what the same text gave before, so each mutant is still judged on its own text.
+_WHOLE_SOURCE = 1 << 20  # a text this long is a whole source or a whole stripped copy of one, not a body cut from it
+
+
+def content_cache(fn):
+    """Cache `fn` by its text argument in two tiers: the few whole-source texts stay hot, and the many short texts cut
+    from them are held in a larger cache whose keys are each under a megabyte."""
+    short = functools.lru_cache(maxsize=256)(fn)
+    whole = functools.lru_cache(maxsize=8)(fn)
+
+    @functools.wraps(fn)
+    def cached(text):
+        return (whole if len(text) >= _WHOLE_SOURCE else short)(text)
+
+    return cached
+
+
+@functools.lru_cache(maxsize=8)
 def _blank(text: str, keep_literals: bool) -> str:
     def repl(m: re.Match) -> str:
         t = m.group(0)
         if t.startswith("//") or t.startswith("/*"):
-            return "".join("\n" if c == "\n" else " " for c in t)
+            return " " * len(t) if "\n" not in t else re.sub(r"[^\n]", " ", t)
         if keep_literals:
             return t
         return t[0] + " " * (len(t) - 2) + t[-1] if len(t) >= 2 else t
@@ -207,15 +229,49 @@ def brace_text(text: str, open_at: int, pin: str) -> str:
     raise ContractError(f"FAIL [pin {pin}]: unbalanced block")
 
 
+@content_cache
 def squash(text: str) -> str:
     t = re.sub(r"\s+", " ", text)
     t = re.sub(r"\( ", "(", t)
     return re.sub(r" \)", ")", t)
 
 
+@functools.lru_cache(maxsize=8)
+def without_private_testing(text: str) -> str:
+    """`text` with the PRIVATE_TESTING arm of each `#if defined(GGML_SYCL_PRIVATE_TESTING)` blanked, newlines kept, so
+    the pins read what production runs: the private device tests count into a table and take it from the registry on
+    purpose. The arm after a depth-1 `#else` or `#elif` is production code and is kept."""
+    out: list[str] = []
+    depth = 0  # nesting of conditionals inside the conditional being read; 0 outside any private conditional
+    keep = False  # inside the `#else`/`#elif` arm of a private conditional
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if depth == 0:
+            if re.match(r"#\s*if\s+defined\(GGML_SYCL_PRIVATE_TESTING\)\s*$", stripped):
+                depth, keep = 1, False
+                out.append("")
+            else:
+                out.append(line)
+            continue
+        if re.match(r"#\s*if", stripped):
+            depth += 1
+        elif re.match(r"#\s*(else|elif)\b", stripped) and depth == 1:
+            keep = True
+            out.append("")
+            continue
+        elif re.match(r"#\s*endif", stripped):
+            depth -= 1
+            if depth == 0:
+                keep = False
+                out.append("")
+                continue
+        out.append(line if keep else "")
+    return "\n".join(out)
+
+
 class Sources:
     def __init__(self, backend: str, prefetch: str, header: str, docs: str):
-        self.backend = Source(backend)
+        self.backend = Source(without_private_testing(backend))
         self.prefetch = Source(prefetch)
         self.header = Source(header)
         self.docs = docs
@@ -603,6 +659,13 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    record->route_counts = ggml_sycl::moe_route_counts_current(device);",
                   "    record->route_counts = ggml_sycl::moe_route_counts_current(device);\n"
                   "        (void) ggml_sycl::moe_route_counts_current(device);")])
+    anchor = "    record->route_counts = ggml_sycl::moe_route_counts_current(device);"
+    expect_fail("table-taken-in-the-else-arm-of-a-private-block", "P10", B,
+                [(anchor, anchor + "\n#if defined(GGML_SYCL_PRIVATE_TESTING)\n        (void) 0;\n#else\n"
+                  "        (void) ggml_sycl::moe_route_counts_current(device);\n#endif")])
+    expect_fail("table-taken-in-a-nested-block-of-the-else-arm", "P10", B,
+                [(anchor, anchor + "\n#if defined(GGML_SYCL_PRIVATE_TESTING)\n        (void) 0;\n#else\n#ifdef X\n"
+                  "#endif\n        (void) ggml_sycl::moe_route_counts_current(device);\n#endif")])
     expect_fail("header-reaches-sycl", "P11", "header",
                 [("namespace ggml_sycl {\n\nclass moe_route_counts {",
                   "namespace ggml_sycl {\n\ninline void* dev_alloc(sycl::queue& q) { return sycl::malloc_host(8, q); }\n"

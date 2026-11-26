@@ -741,6 +741,13 @@ std::string test_expert_move_whose_swap_lost_sets_the_eviction_latch();
 // A host copy registered in place of a device entry whose mirror cannot be published hands the id it took back to that
 // entry, and the same registration without the failure maps the id to the copy.
 std::string test_expert_failed_moved_copy_hands_its_id_back();
+// The swap driver's boundary on a real cache (ggml_sycl_run_expert_swap_claimed), through the fixture's resolver: an
+// evict at the period boundary and its admit at the next, with the outcome of each list mapped to the driver's figures,
+// the call's after-prompt and cache-settled fields, and a boundary after a prompt that seeds and moves nothing. Then a
+// replaced route table: the same shape carries the pending admit to the new driver, another shape drops it as an open
+// slot the replaced driver reports.
+std::string test_expert_swap_boundary_maps_an_evict_then_an_admit();
+std::string test_expert_swap_boundary_carries_or_drops_what_is_in_flight();
 // Each copy a move publishes belongs to the model that owned the entry it replaces, so that model's release reclaims
 // it: an admitted device entry, an evicted triplet's host copy, and a refilled device entry after its loan. An entry
 // no model ever owned stays through the release. A copy made while its source's load is still pending takes that

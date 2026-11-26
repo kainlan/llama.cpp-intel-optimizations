@@ -4526,9 +4526,10 @@ struct unified_cache_entry {
     // cache's own direct-stage mirror holds a lease. Never set on a primary.
     bool                  optional_layout       = false;
 
-    // Retired by an expert move (loan_expert_triplet(), copy_host_triplet_to_device()), which sets it at its retire
-    // and nowhere else; a restore clears it. The move's publication bumps the exec-graph epoch, so its reap need not
-    // set has_evictions_ (see there). Any other retire of the same entry leaves it false, and its reap latches.
+    // Retired by an expert move: loan_expert_triplet() sets it on the device entries it retires, and nowhere else; a
+    // restore clears it. The move's publication bumps the exec-graph epoch, so its reap need not set has_evictions_
+    // (see there). Any other retire of the same entry leaves it false, and its reap latches. A host copy needs no
+    // mark, because the latch skips host-resident entries.
     bool                  retired_by_expert_move = false;
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
     // entry -- a distinct string literal stamped at each of the ~16 sites that
@@ -5691,12 +5692,22 @@ class unified_cache {
     // arena rebuild refused for leases can say who holds them. The count is one
     // relaxed atomic add on each side and takes no lock: the lease paths are
     // per-resolve hot paths and the count is read only for a diagnostic.
+    // With GGML_SYCL_LEASE_HOLDERS=1 the tagged acquire also files the take's
+    // call stack in the holder table, writes the holder slot into `tag` and
+    // counts the lease there; the caller keeps that tag for the release. With
+    // the knob off the tag is left as it came. The untagged acquire is for a
+    // caller that keeps no tag: its lease counts as untagged, in holder slot 0.
     int      arena_find_chunk(const void * ptr) const;
-    int      arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag tag = chunk_lease_tag());
-    void     arena_release_chunk_lease(int chunk_idx, chunk_lease_tag tag = chunk_lease_tag());
+    int      arena_acquire_chunk_lease(const void * ptr);
+    int      arena_acquire_chunk_lease(const void * ptr, chunk_lease_tag & tag);
+    // A mem_handle move hands its lease to a new keeper. With the knob on and the lease counted in a named slot, the
+    // lease is counted again under the stack of the move whose address `tag.pc` recorded, keeping the take it came
+    // from, and `tag.holder` is updated; otherwise nothing changes. Never throws.
+    void     arena_move_chunk_lease_holder(chunk_lease_tag & tag) noexcept;
+    void     arena_release_chunk_lease(int chunk_idx, const chunk_lease_tag & tag = chunk_lease_tag());
     bool     arena_chunk_has_leases(int chunk_idx) const;
     uint32_t arena_chunk_lease_count(int chunk_idx) const;
-    uint32_t arena_chunk_lease_count_at(chunk_lease_tag tag) const;
+    uint32_t arena_chunk_lease_count_at(const chunk_lease_tag & tag) const;
     // The leases by site, each site apart from the copies of its handles, written into `out` (`size` bytes, always
     // NUL-terminated when `size` is not 0) as " site=N" for every count that is not zero, and empty when all are.
     // Returns the counts' sum. It writes only into the caller's buffer and allocates nothing, so a teardown can call it
@@ -6893,7 +6904,9 @@ class unified_cache {
     id_map    id_to_key_;
     // How often remap_or_extract_id_mapping_locked() walked entries_ for an entry to hand an id to: a retire whose
     // id still named it. Each walk visits every entry under both locks, so a move hands its ids over before it
-    // retires and makes none; the device tests read the count across one.
+    // retires and makes none; the device tests read the count across one. The count is kept in every build, not only
+    // under GGML_SYCL_PRIVATE_TESTING: one relaxed add costs nothing beside the walk it counts, and a member that one
+    // build variant has and another lacks would give the class two layouts.
     std::atomic<uint64_t> id_remap_walks_{ 0 };
 
     // Slots held by llama_model objects that are still alive (llama.cpp-0qlw).
@@ -6953,10 +6966,24 @@ class unified_cache {
 
     // The cell a lease of `tag` moves. A site out of range counts as UNTAGGED, so a corrupt tag cannot index past the
     // array.
-    std::atomic<uint32_t> & arena_chunk_leases_of(chunk_lease_tag tag) const {
+    std::atomic<uint32_t> & arena_chunk_leases_of(const chunk_lease_tag & tag) const {
         const size_t site = static_cast<size_t>(tag.site);
         return arena_chunk_leases_by_site_[site < static_cast<size_t>(chunk_lease_site::COUNT) ? site : 0]
                                           [tag.copy ? 1 : 0];
+    }
+
+    // GGML_SYCL_LEASE_HOLDERS, resolved once per process and kept here so a lease's take and release read a member.
+    const bool                                     chunk_lease_holders_enabled_ = chunk_lease_holders_enabled();
+    // The leases on all chunks by holder-table slot, moved only when chunk_lease_holders_enabled_ is set, beside the
+    // counts by site. Slots 0 and 1 count the leases taken with no address and those whose holder found the table
+    // full. Allocated (zeroed) only when the knob is on, so a run without it carries no 16 KB of counters in the cache.
+    const std::unique_ptr<std::atomic<uint32_t>[]> arena_chunk_leases_by_holder_ =
+        chunk_lease_holders_enabled_ ? std::make_unique<std::atomic<uint32_t>[]>(CHUNK_LEASE_HOLDER_SLOTS) : nullptr;
+
+    // The cell a lease of `tag` moves by holder. A slot out of range counts in slot 0, as a lease with no address.
+    // Called only behind chunk_lease_holders_enabled_, which is when the counters exist.
+    std::atomic<uint32_t> & arena_chunk_lease_holder_of(const chunk_lease_tag & tag) const {
+        return arena_chunk_leases_by_holder_[tag.holder < CHUNK_LEASE_HOLDER_SLOTS ? tag.holder : 0];
     }
 
     // Adds the cache's scratch buffers to `holders`: those whose pointer the arena owns, which keep it from a
@@ -6973,8 +7000,10 @@ class unified_cache {
 
     // Names who holds the arena on `dev_id`, from the figures arena_read_holders() read: one line at `level` with each
     // zone's live bytes, the queued frees those zones still count, the device's releases waiting for a retry, the
-    // retired entries not yet finalized and the evictions in flight, which it also fills into `holders`; one WARN
-    // line with the chunk leases by site; then each zone with live bytes lists its live allocations under `site`.
+    // retired entries not yet finalized and the evictions in flight, which it also fills into `holders`; one line at
+    // `level` with the chunk leases by site, then either a line per holder (GGML_SYCL_LEASE_HOLDERS=1) or, when a
+    // lease is held, a line that names that knob; then each zone with live bytes lists its live allocations under
+    // `site`.
     // `level` is ERROR where a holder refuses what the caller needs (a rebuild, a model's release) and WARN at a
     // load's start, where the holder may still be the failed model's buffers. It only reads: it drains, frees,
     // evicts, resets and allocates nothing.
@@ -6983,6 +7012,10 @@ class unified_cache {
                               zone_arena_holders & holders,
                               const char *         site,
                               ggml_log_level       level);
+    // One line at `level` per holder-table slot that holds a lease on this cache's chunks: the count, the site, and
+    // the call stack that took it as module+offset frames, innermost first; then their sum beside `chunk_leases`,
+    // the per-chunk total the caller read.
+    void arena_report_chunk_lease_holders(int dev_id, ggml_log_level level, uint32_t chunk_leases) const;
 
     // The oneDNN scratchpad pair's release for the last model. False, with nothing released, while a reservation holds
     // the pair. The fields are emptied under onednn_scratch_mutex_ and the blocks freed after it is released, so no

@@ -365,6 +365,29 @@ returns their room to the WEIGHT zone. So an admit in the same call never gets
 an evict's room: in a full zone the admit is BUSY "WEIGHT zone full" beside the
 evict that moved, and moves at a later boundary, after the pass.
 
+**An expert move's retires stay out of the eviction latch.** The cache's latch (`has_evictions_`) is set by the reap
+of an entry the cache evicts, and it turns off graph replay and persistent TG until the next model load, to guard
+pointers that nothing then replays. Two retires are left out of it. A named evict's device entries carry
+`retired_by_expert_move`, which the loan body sets on each as it retires them and a restore clears; their reap leaves
+the latch alone. A host copy never needed the mark: the latch is set only for a device entry that is not host
+resident. The exemption is sound for four reasons, and it holds only while all four do:
+- Every recording that may bake a moved expert's pointer is dropped before it replays. The move publishes its plan
+  through the swap, and that publication bumps the exec-graph epoch. Each context compares the epoch at its next graph
+  compute (`optional_layout_epoch`) and, when it differs, drops its whole-graph recording (`exec_graph`), its valid
+  MoE segments and its block graphs. Those are the recordings that can name an expert's address.
+- The keyed decode slots survive that bump, and they hold no expert's address. A keyed split records every
+  `MUL_MAT_ID` as a direct boundary, outside its recorded segments, and that node resolves its experts at each call.
+  "Every recording that may bake a pointer is dropped" is true only because of this: the slots the check leaves
+  alone cannot bake one.
+- Persistent TG never holds an expert's pointer. It refuses every graph with a `MUL_MAT_ID`, so it re-resolves nothing
+  of an expert's between tokens.
+- The reap does not run before the bump. The retired entries' leases go to the transaction, which drops them only
+  after the publication that won its swap, so the deferred-free pass cannot erase an entry a recorded graph still
+  names. A move whose publication does not run (a lost swap, an exception) sets the latch itself
+  (`ggml_sycl_expert_move_latch_guard`), so the exemption is never unearned.
+The mark is per retire, not per kind of entry: a pressure eviction, a drop or an async evict of an expert's device
+entry outside a move still latches, which `test_expert_moves_leave_the_eviction_latch_clear` holds as its control.
+
 A move to the device needs a card the published plan uses. A publication gives a
 card's cache the plan only while the plan places something there (an entry, a
 layer, the KV or a layer block) and leaves every other card's cache without one,

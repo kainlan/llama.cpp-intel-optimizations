@@ -254,6 +254,18 @@
 //                           copy. With expert 0's device entry retired exactly (its id mapping gone, the extra's record
 //                           keeping it), a host copy registered in its place whose mirror allocation fails is refused,
 //                           leaves no host copy, and leaves the id naming the device entry.
+//   swap_boundary_maps_an_evict_then_an_admit
+//                           The swap driver's boundary (ggml_sycl_run_expert_swap_claimed) on this fixture, through its
+//                           resolver. The first boundary reaches the policy's period and evicts the coldest resident
+//                           expert for the hottest host one; the driver's figures show the moved evict and its bytes,
+//                           its admit pending, and the triplet on the host in the plan. The call says it is not settled
+//                           while the evicted entries wait for the deferred-free pass and while a triplet is lent, and
+//                           settled once the pass ran. The next boundary admits it; a boundary after a prompt (more
+//                           graphs than decode graphs) is counted as one, seeds the policy and moves nothing.
+//   swap_boundary_carries_or_drops_what_is_in_flight
+//                           A route table replaced with the same shape hands the pending admit to the new driver,
+//                           which sends it. One of another shape cannot take a later pending admit: the replaced
+//                           driver counts it as an open slot and prints its summary with it.
 //
 // Who owns a moved copy. Each case claims some triplets for a model as a load claims what it staged, moves one, then
 // releases the model as its teardown does, its tensors' records first; they run last, since a release scans the whole
@@ -401,6 +413,10 @@ int main() {
     ok &= run_case("move_whose_swap_lost_sets_the_eviction_latch",
                    ggml_sycl::test_expert_move_whose_swap_lost_sets_the_eviction_latch);
     ok &= run_case("failed_moved_copy_hands_its_id_back", ggml_sycl::test_expert_failed_moved_copy_hands_its_id_back);
+    ok &= run_case("swap_boundary_maps_an_evict_then_an_admit",
+                   ggml_sycl::test_expert_swap_boundary_maps_an_evict_then_an_admit);
+    ok &= run_case("swap_boundary_carries_or_drops_what_is_in_flight",
+                   ggml_sycl::test_expert_swap_boundary_carries_or_drops_what_is_in_flight);
     // Last: each releases a model slot, a teardown scan of the whole device cache.
     ok &=
         run_case("admit_belongs_to_the_host_copys_model", ggml_sycl::test_expert_admit_belongs_to_the_host_copys_model);

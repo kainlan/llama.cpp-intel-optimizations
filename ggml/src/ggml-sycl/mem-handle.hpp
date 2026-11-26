@@ -6,11 +6,12 @@
 
 #pragma once
 
+#include "chunk-lease-holders.hpp"
 #include "unified-cache-key.hpp"
 
 #include <atomic>
-#include <cstddef>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -46,47 +47,7 @@ class alloc_owner_control;
 class allocation_release_coordinator;
 struct release_attempt;
 
-// Where a lease on a VRAM arena chunk was taken. A chunk lease keeps the arena from being destroyed, so an arena
-// rebuild that finds leases has to say who holds them: the cache counts the leases on its chunks by this site, and a
-// mem_handle keeps the site it acquired with, so its release lowers the count its acquire raised.
-enum class chunk_lease_site : uint8_t {
-    UNTAGGED,         // a caller of the cache's lease API that names no site (the device tests' probes)
-    WEIGHT_SNAPSHOT,  // a WEIGHT handle minted from a lease snapshot
-    WEIGHT_RESOLVE,   // a WEIGHT handle's resolve, which pins the chunk its pointer lies in
-    CHUNK_VIEW,       // a handle made from a raw pointer for one use (from_chunk_ptr's default)
-    TENSOR_EXTRA,     // a handle a tensor extra keeps for its data on a device
-    EXPERT_DISPATCH,  // the lease an expert dispatch entry keeps for its raw pointer
-    COUNT,
-};
-
-// The site a lease was taken at, and whether a copy of a handle took it. A copy acquires a lease of its own and keeps
-// its source's site, so copies count apart from the handles they copy and the counts by site and copy sum to the
-// chunks' leases.
-struct chunk_lease_tag {
-    chunk_lease_site site = chunk_lease_site::UNTAGGED;
-    bool             copy = false;
-};
-
-// The site's name in the lines that print the counts.
-inline const char * chunk_lease_site_name(chunk_lease_site site) {
-    switch (site) {
-        case chunk_lease_site::UNTAGGED:
-            return "untagged";
-        case chunk_lease_site::WEIGHT_SNAPSHOT:
-            return "weight_snapshot";
-        case chunk_lease_site::WEIGHT_RESOLVE:
-            return "weight_resolve";
-        case chunk_lease_site::CHUNK_VIEW:
-            return "chunk_view";
-        case chunk_lease_site::TENSOR_EXTRA:
-            return "tensor_extra";
-        case chunk_lease_site::EXPERT_DISPATCH:
-            return "expert_dispatch";
-        case chunk_lease_site::COUNT:
-            break;
-    }
-    return "unknown";
-}
+// chunk_lease_site, chunk_lease_tag and chunk_lease_site_name live in chunk-lease-holders.hpp.
 
 // Move-only allocation owner returned by unified_allocate_owner().  Its
 // intrusive control is the sole physical-release authority.
@@ -768,8 +729,12 @@ class mem_handle {
     // and no production path does it.
     mutable mem_handle_spin_lock lock_;
 
-    mem_handle_kind   kind_   = mem_handle_kind::DIRECT;
-    int               device_ = HOST_DEVICE;
+    mem_handle_kind   kind_         = mem_handle_kind::DIRECT;
+    // Which chunk lease the handle holds; described with the chunk lease fields below. It sits here, in the padding
+    // after the one-byte lock and kind, so the 16-byte chunk_tag_ costs the handle no size over a 2-byte one: a tensor
+    // extra embeds dozens of handles, and handles are copied per op.
+    mutable uint8_t   chunk_source_ = 0;  // GUARDED by lock_
+    int               device_       = HOST_DEVICE;
     unified_cache_key key_    = {};
 
     // Arena-specific fields (only used for ARENA_* kinds).
@@ -852,7 +817,8 @@ class mem_handle {
     //
     // A CHUNK_LEASE-kind handle stores its protected raw ptr in cached_.ptr;
     // resolve() returns cached_ directly (never re-queries the cache).
-    mutable uint8_t  chunk_source_      = 0;           // GUARDED by lock_
+    //
+    // chunk_source_ is declared beside kind_ above, for the handle's size.
     mutable uint64_t host_chunk_handle_ = UINT64_MAX;  // GUARDED (pinned_chunk_pool::INVALID_CHUNK_HANDLE)
     mutable int32_t  vram_chunk_idx_    = -1;          // GUARDED by lock_
     mutable int32_t  chunk_device_      = -1;          // GUARDED by lock_

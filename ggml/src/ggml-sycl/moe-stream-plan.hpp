@@ -1910,7 +1910,9 @@ static inline moe_stream_loan_sizing moe_stream_loan_size_post_loan(const moe_st
 // triplet is whole on one side, at least one is resident, and each resident one is individually owned, so an evict
 // can hand it back (a bulk-staged tensor is views into one allocation: moe_loan_triplet_is_lendable); a cell the plan
 // has no triplet for, a split triplet, or one on another card makes the block not eligible. pair_bytes: the pinned
-// host bytes an evict of one of the block's triplets takes, its three copies each aligned as the pinned pool aligns.
+// host bytes an evict of one of the block's triplets takes, its three copies each aligned as the pinned pool aligns
+// and one TLSF grain more, as the host zone's plan counts a block (tlsf_bound), so the room trim does not admit a pair
+// the zone has no room for.
 // admissible_count: each block's admissible cells, so a boundary need not read them. file_mapped counts the
 // file-mapped host triplets of eligible blocks, the ones the driver passes over. device_held: a non-expert entry (or
 // its alternate, or the multi-device layer map) holds this card, so a plan that moves every expert off the card still
@@ -1973,7 +1975,7 @@ static inline void moe_swap_plan_view_build(const placement_plan &              
                 size_t bytes = 0;
                 for (int r = 0; r < 3; ++r) {
                     const size_t a = pinned_chunk_pool::DEFAULT_ALIGNMENT;
-                    bytes += (t.e[r]->src_size + a - 1) / a * a;
+                    bytes += (t.e[r]->src_size + a - 1) / a * a + tlsf_allocator::block_grain;
                 }
                 out.pair_bytes[b] = bytes;
             }

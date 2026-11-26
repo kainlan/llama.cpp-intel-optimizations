@@ -22,6 +22,7 @@ using ggml_sycl::moe_swap_move_kind;
 using ggml_sycl::moe_swap_move_outcome;
 using ggml_sycl::moe_swap_params;
 using ggml_sycl::moe_swap_plan_view;
+using ggml_sycl::moe_swap_txn_cost;
 
 using ggml_sycl::MOE_SWAP_DRIVER_HELD;
 using ggml_sycl::MOE_SWAP_DRIVER_IDLE;
@@ -43,11 +44,17 @@ static int g_failed = 0;
         }                                                              \
     } while (0)
 
-// Every heap allocation of this binary is counted, so a test can say a boundary allocated nothing. One thread.
-static size_t g_allocs = 0;
+// Every heap allocation of this binary is counted, so a test can say a boundary allocated nothing. One thread. While
+// g_fail_allocs is set every allocation fails, as the heap does when it is exhausted: a test arms it right after a
+// transaction has answered, to say the step needs no allocation to record what the transaction moved.
+static size_t g_allocs      = 0;
+static bool   g_fail_allocs = false;
 
 void * operator new(std::size_t n) {
     ++g_allocs;
+    if (g_fail_allocs) {
+        throw std::bad_alloc();
+    }
     if (void * p = std::malloc(n != 0 ? n : 1)) {
         return p;
     }
@@ -104,11 +111,14 @@ struct rig {
     int                                     room_reads        = 0;
     int                                     throw_after       = -1;
     int                                     throws            = 0;
+    bool                                    fail_allocs       = false;  // the next transaction arms g_fail_allocs
+    int                                     alloc_failures    = 0;      // boundaries that ended in bad_alloc
     uint64_t                                room_epoch        = 0;
     uint64_t                                txn_self_moves    = 0;
     uint64_t                                txn_outside_moves = 0;
-    const uint64_t *                        counts_decode_at  = nullptr;  // the arrays the counts callback was handed
-    const uint64_t *                        counts_prompt_at  = nullptr;
+    moe_swap_txn_cost                       txn_cost;                    // what the next transaction reports it cost
+    const uint64_t *                        counts_decode_at = nullptr;  // the arrays the counts callback was handed
+    const uint64_t *                        counts_prompt_at = nullptr;
     moe_swap_driver_state                   d;
 
     rig(int n_blocks, int n_experts, int resident_per_block, const moe_swap_params & p = moe_swap_params{}) :
@@ -232,17 +242,22 @@ struct rig {
                         reply(batch[i]);
                     }
                     calls.push_back(batch);
+                    g_fail_allocs = fail_allocs;
                     if (throw_after >= 0) {
                         throw_after = -1;
                         throw std::runtime_error("submit failed");
                     }
                     room_epoch += txn_self_moves + txn_outside_moves;
                     txn_outside_moves = 0;
-                    return ggml_sycl::moe_swap_txn_room{ room_epoch, txn_self_moves };
+                    return ggml_sycl::moe_swap_txn_room{ room_epoch, txn_self_moves, txn_cost };
                 });
         } catch (const std::runtime_error &) {
             ++throws;  // the step rethrew; what the moves answered before it is published below, as the move does
+        } catch (const std::bad_alloc &) {
+            ++alloc_failures;  // the step needed memory after the transaction had moved something
         }
+        g_fail_allocs = false;
+        fail_allocs   = false;
         for (size_t i = before; i < calls.size(); ++i) {
             publish(calls[i]);
         }
@@ -677,6 +692,28 @@ static void test_decode_graphs_after_a_move_are_counted() {
     CHECK(contains(faults, "accepted transactions 2 (evict 1, admit 1) over 14 decode graphs"));
 }
 
+// What each transaction cost the boundary thread is summed in the stats and printed in the second summary line, so the
+// named move's per-move line can stay at DEBUG: every transaction the driver sends adds its copy submission, id
+// remap, metadata lookup and whole time, an accepted one or not, and the line says over how many it summed.
+static void test_the_summary_sums_what_the_transactions_cost() {
+    rig r(1, 8, 4);
+    r.decode[r.index(0, 5)] = 10;
+    r.txn_cost              = moe_swap_txn_cost{ 10, 20, 30, 100 };
+    r.to_period();  // the evict
+    r.txn_cost = moe_swap_txn_cost{ 1, 2, 3, 4 };
+    r.boundary();   // the admit
+    CHECK(r.d.stats.txn_sent == 2);
+    CHECK(r.d.stats.txn_copy_us == 11);
+    CHECK(r.d.stats.txn_remap_us == 22);
+    CHECK(r.d.stats.txn_meta_us == 33);
+    CHECK(r.d.stats.txn_total_us == 104);
+    const std::string faults = ggml_sycl::moe_swap_driver_summary_faults(r.d.stats, 0);
+    CHECK(contains(faults,
+                   "transaction cost over 2: copy submit 11 us, id remap 22 us, meta lookup 33 us, total 104 us"));
+    rig quiet(1, 8, 4);
+    CHECK(contains(ggml_sycl::moe_swap_driver_summary_faults(quiet.d.stats, 0), "transaction cost over 0: "));
+}
+
 // The two summary lines carry every figure: moves, prompt boundaries, K, open slots, deferrals, file-mapped triplets,
 // the off reason and the refusal, busy and drop reasons.
 static void test_the_summary_lines_name_every_figure() {
@@ -762,8 +799,10 @@ static void test_an_evict_batch_that_threw_is_settled_from_the_next_view() {
     r.decode[r.index(0, 9)]  = 30;
     r.decode[r.index(0, 10)] = 20;
     r.throw_after            = 1;
+    r.txn_cost               = moe_swap_txn_cost{ 10, 20, 30, 100 };
     r.to_period();
     CHECK(r.throws == 1);
+    CHECK(r.d.stats.txn_sent == 0 && r.d.stats.txn_total_us == 0);  // a transaction that threw is not counted
     CHECK(r.calls.size() == 1 && r.last().size() == 3);
     CHECK(r.d.unsettled.size() == 3);
     CHECK(r.d.pending.empty());
@@ -1237,6 +1276,67 @@ static void test_a_throw_leaves_a_held_admit_pending() {
     CHECK(reasons(r.d.stats.busy, ggml_sycl::MOE_SWAP_UNSETTLED_REASON) == 1);
 }
 
+// What a transaction moved is recorded without allocating: the step reserves the lists it records into before it sends
+// the batch, since a moved triplet cannot be taken back and an allocation that failed after the move would leave the
+// driver not knowing it moved. Every allocation fails from the moment the transaction has answered. The batch holds a
+// moved evict, a final refusal and a BUSY one, each of a reason the driver has not counted yet.
+static void test_the_evict_batch_is_recorded_without_allocating() {
+    rig r(3, 8, 4);
+    for (int b = 0; b < 3; ++b) {
+        r.decode[r.index(b, 5)] = 10;
+    }
+    r.answer(MOE_SWAP_MOVE_EVICT, 1, 0, MOE_SWAP_MOVE_REFUSED, "refused for one triplet");
+    r.answer(MOE_SWAP_MOVE_EVICT, 2, 0, MOE_SWAP_MOVE_BUSY, "busy for now");
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_IDLE);
+    r.fail_allocs = true;
+    CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);
+    CHECK(r.alloc_failures == 0);
+    CHECK(r.d.stats.evicts == 1);
+    CHECK(r.d.pending.size() == 1);
+    if (r.d.pending.size() == 1) {
+        CHECK(r.d.pending[0].block == 0 && r.d.pending[0].admit_expert == 5 && r.d.pending[0].evict_expert == 0);
+    }
+    CHECK(reasons(r.d.stats.refused, "refused for one triplet") == 1);
+    CHECK(reasons(r.d.stats.busy, "busy for now") == 1);
+}
+
+// The same for a batch of pending admits: the answers a boundary counts are a final refusal of a reason not met yet,
+// and the drop of an admit that was BUSY at the streak, whose reason the dropped list has not held.
+static void test_the_admit_batch_is_recorded_without_allocating() {
+    {
+        rig r(2, 8, 4);
+        r.decode[r.index(0, 5)] = 10;
+        r.decode[r.index(1, 5)] = 10;
+        r.to_period();
+        CHECK(r.d.pending.size() == 2);
+        r.answer(MOE_SWAP_MOVE_ADMIT, 0, 5, MOE_SWAP_MOVE_REFUSED, "admit refused for good");
+        r.answer(MOE_SWAP_MOVE_ADMIT, 1, 5, MOE_SWAP_MOVE_BUSY, "graph active");
+        r.fail_allocs = true;
+        CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);
+        CHECK(r.alloc_failures == 0);
+        CHECK(reasons(r.d.stats.refused, "admit refused for good") == 1);
+        CHECK(reasons(r.d.stats.busy, "graph active") == 1);
+        CHECK(r.d.pending.size() == 2);  // the refused admit became a restore; the busy one stays
+    }
+    {
+        rig r(1, 8, 4);
+        r.decode[r.index(0, 5)] = 10;
+        r.to_period();
+        r.answer(MOE_SWAP_MOVE_ADMIT, 0, 5, MOE_SWAP_MOVE_BUSY, "graph active");
+        for (int i = 0; i < ggml_sycl::MOE_SWAP_PENDING_DROP_STREAK - 1; ++i) {
+            CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);
+        }
+        CHECK(reasons(r.d.stats.dropped, "graph active") == 0);
+        r.fail_allocs = true;
+        CHECK(r.boundary() == MOE_SWAP_DRIVER_SENT);
+        CHECK(r.alloc_failures == 0);
+        CHECK(reasons(r.d.stats.dropped, "graph active") == 1);
+        CHECK(r.d.pending.size() == 1 && r.d.pending[0].restore);
+    }
+}
+
 // The zone-refusal line names what the refused triplet needed (three slots for a triplet with a slot, its members'
 // own bytes summed for one with none), the largest free block the zone had when it refused, and what the zone had
 // free after the batch, the sizes in bytes, under the driver's prefix.
@@ -1308,6 +1408,7 @@ int main() {
     test_no_admissible_host_expert_proposes_nothing_and_says_so();
     test_decode_graphs_after_a_move_are_counted();
     test_the_summary_lines_name_every_figure();
+    test_the_summary_sums_what_the_transactions_cost();
     test_a_boundary_with_nothing_to_do_does_not_allocate();
     test_the_prompt_gate_is_zero_unless_both_rates_are_positive();
     test_the_counts_go_into_the_drivers_own_arrays();
@@ -1326,6 +1427,8 @@ int main() {
     test_a_held_admit_follows_the_epoch_past_another_admits_transaction();
     test_a_zone_full_admit_sent_at_every_boundary_follows_the_drop_streak();
     test_a_throw_leaves_a_held_admit_pending();
+    test_the_evict_batch_is_recorded_without_allocating();
+    test_the_admit_batch_is_recorded_without_allocating();
     test_the_zone_refusal_line_names_its_figures();
     test_the_zone_free_census_line_names_the_largest_sizes();
 
