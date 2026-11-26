@@ -1,7 +1,10 @@
+#include "ggml-backend.h"
 #include "llama-kv-cache.h"
 #include "llama-model.h"
 
+#include <memory>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -173,6 +176,42 @@ int main() {
         add(0, 5, 1);
         GGML_ASSERT(kv.seq_rm(0, 5, 6));
         GGML_ASSERT(kv.seq_pos_max(0) == 4);
+    }
+
+    // a KV type no backend can write into the layer's buffer is refused when the cache is built, by name, instead of
+    // reaching the scheduler's pre-allocated-tensor abort at the first graph (llama.cpp-ol6a)
+    {
+        ggml_backend_dev_t         cpu      = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+        GGML_ASSERT(cpu != nullptr);
+
+        // the CPU writes every cache type it has a from_float for; the IQ2/IQ3/IQ1 types it does not
+        for (ggml_backend_dev_t dev : { cpu, (ggml_backend_dev_t) nullptr }) {
+            for (ggml_type type :
+                 { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F8_E4M3, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                   GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1 }) {
+                GGML_ASSERT(llama_kv_cache_type_writable(dev, cpu_buft, type));
+            }
+            GGML_ASSERT(!llama_kv_cache_type_writable(dev, cpu_buft, GGML_TYPE_IQ2_XXS));
+        }
+
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+        init_model(*model, 1);
+
+        for (bool bad_k : { true, false }) {
+            const ggml_type type_k = bad_k ? GGML_TYPE_IQ2_XXS : GGML_TYPE_F16;
+            const ggml_type type_v = bad_k ? GGML_TYPE_F16 : GGML_TYPE_IQ2_XXS;
+            std::string     what;
+            try {
+                llama_kv_cache kv(*model, false, model->hparams, type_k, type_v, false, false, true, 32, 1, 0,
+                                  LLAMA_SWA_TYPE_NONE, nullptr, nullptr, nullptr, nullptr);
+            } catch (const std::runtime_error & err) {
+                what = err.what();
+            }
+            GGML_ASSERT(what.find("KV cache type iq2_xxs") != std::string::npos);
+            GGML_ASSERT(what.find(bad_k ? "for K" : "for V") != std::string::npos);
+            GGML_ASSERT(what.find(bad_k ? "use -ctk f16" : "use -ctv f16") != std::string::npos);
+        }
     }
 
     llama_backend_free();
