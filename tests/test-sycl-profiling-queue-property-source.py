@@ -2,7 +2,7 @@
 """Source gate for llama.cpp-yke2. Full mechanism: see
 ggml/src/ggml-sycl/dpct/helper.hpp's create_queue_impl() comment (the
 canonical explanation of why sycl::property::queue::enable_profiling() must
-not depend on `#ifdef DPCT_PROFILING_ENABLED`; since llama.cpp-vwmj it is off
+not depend on `#ifdef DPCT_PROFILING_ENABLED`; it is off
 by default and only the environment turns it on (GGML_SYCL_QUEUE_PROFILING=1, or
 a profiling diagnostic with the knob unset), through
 ggml_sycl_queue_profiling_enabled()) and
@@ -818,7 +818,7 @@ def test_create_queue_impl_defined_exactly_twice():
     )
 
 
-def test_create_queue_impl_enables_profiling_by_default_without_a_macro():
+def test_create_queue_impl_asks_the_predicate_without_a_macro():
     # Checked against the MASKED body, never the original (quality review
     # c-4rrx audit): either check on raw text is foolable by an
     # explanatory comment -- ENABLE_PROFILING_CALL spelled out nearby would
@@ -828,7 +828,7 @@ def test_create_queue_impl_enables_profiling_by_default_without_a_macro():
     for body in _create_queue_impl_bodies():
         masked_body = _mask_comments_and_strings(body)
         assert ENABLE_PROFILING_CALL in masked_body, (
-            f"create_queue_impl must add {ENABLE_PROFILING_CALL} to its property_list by default "
+            f"create_queue_impl must add {ENABLE_PROFILING_CALL} to its property_list when the predicate answers on "
             "(llama.cpp-yke2) -- a macro-gated `#ifdef DPCT_PROFILING_ENABLED` cannot be interposition-safe "
             "in a header-only inline"
         )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source gate for the GGML_SYCL_QUEUE_PROFILING knob (llama.cpp-atiz, default flipped by llama.cpp-vwmj).
+"""Source gate for the GGML_SYCL_QUEUE_PROFILING knob (three states, default off).
 
 Every queue of the SYCL backend is built WITHOUT sycl::property::queue::enable_profiling by default. On the Level Zero
 v2 adapter a profiling queue reads a device timestamp for every command, and only diagnostics read the result. The knob
