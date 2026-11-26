@@ -9940,6 +9940,29 @@ struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     }
 };
 
+// a KQ scale other than 1/sqrt(hsk): gemma-style models pre-scale Q and pass 1.0
+struct test_flash_attn_ext_kq_scale : public test_flash_attn_ext {
+    static constexpr float kq_scale = 1.0f;
+
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",kq_scale=1";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * ref = test_flash_attn_ext::build_graph(ctx);
+        ggml_set_name(ref, "ref");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, ref->src[0], ref->src[1], ref->src[2], ref->src[3], kq_scale, max_bias, logit_softcap);
+        ggml_flash_attn_ext_add_sinks(out, ref->src[4]);
+        ggml_prec_set_acc(out, prec);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with kv_rows: each q slice attends to its own list of K/V cache rows
 struct test_flash_attn_ext_kv_rows : public test_case {
     const int64_t hs;
@@ -14323,6 +14346,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         for (int mh : {1, 8}) {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+        }
+    }
+    // The same at D=512, where a backend may have a dedicated D=512 prompt kernel (SYCL: oneDNN, else tile).
+    // The GQA arm (gqa_ratio 4, kv a multiple of 256) is the shape a tile kernel groups Q heads for: with a
+    // per-head mask the heads of one group must not share a mask plane. The kq_scale=1 arm is the gemma-style
+    // pre-scaled-Q variant, which a backend may route away from its 1/sqrt(D) kernel.
+    for (int nq : {32, 35}) {
+        for (int mh : {1, 2, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {4, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+            test_cases.emplace_back(new test_flash_attn_ext_kq_scale(512, 512, 2, {4, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+        }
+        for (int mh : {1, 8}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 8, {1, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
+            test_cases.emplace_back(new test_flash_attn_ext_kq_scale(512, 512, 8, {1, 1}, 512, nq, true, false, 0, 0, GGML_PREC_F32,
                 GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 0, mh));
         }
     }
