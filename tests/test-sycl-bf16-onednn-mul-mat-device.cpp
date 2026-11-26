@@ -93,10 +93,10 @@ constexpr float        DST_SENTINEL        = -12345.25f;  // dst padding: no pat
 
 // How a case lays out its activations and its output.
 enum case_layout {
-    LAYOUT_PLAIN,         // src1 [K, N] and dst [M, N], contiguous
-    LAYOUT_STRIDED_SRC1,  // src1 a view of [K + PAD, N]: ldx = K + PAD, the padding NaN
-    LAYOUT_STRIDED_DST,   // dst columns of M + PAD: ldy = M + PAD, the padding DST_SENTINEL
-    LAYOUT_SRC1_3D,       // src1 [K, N / 3, 3] and dst [M, N / 3, 3]: three planes
+    CASE_LAYOUT_PLAIN,         // src1 [K, N] and dst [M, N], contiguous
+    CASE_LAYOUT_STRIDED_SRC1,  // src1 a view of [K + PAD, N]: ldx = K + PAD, the padding NaN
+    CASE_LAYOUT_STRIDED_DST,   // dst columns of M + PAD: ldy = M + PAD, the padding DST_SENTINEL
+    CASE_LAYOUT_SRC1_3D,       // src1 [K, N / 3, 3] and dst [M, N / 3, 3]: three planes
 };
 
 float input_value(int64_t i, int64_t salt) {
@@ -168,7 +168,7 @@ run_result run_case(ggml_backend_t        backend,
                     int64_t               N,
                     int                   inject,
                     const std::string &   label,
-                    case_layout           layout = LAYOUT_PLAIN) {
+                    case_layout           layout = CASE_LAYOUT_PLAIN) {
     run_result res;
     ggml_sycl_test_scratchpad_sites_reset();
     if (inject != 0 && !ggml_sycl_test_inject_scratchpad_decline(SITE, inject)) {
@@ -187,22 +187,22 @@ run_result run_case(ggml_backend_t        backend,
         return res;
     }
     // `x_in` is the tensor the activations are written to: x itself, or the wider tensor a strided x views.
-    const int64_t x_cols = layout == LAYOUT_STRIDED_SRC1 ? pw.K + PAD : pw.K;
+    const int64_t x_cols = layout == CASE_LAYOUT_STRIDED_SRC1 ? pw.K + PAD : pw.K;
     ggml_tensor * x_in   = nullptr;
     ggml_tensor * x      = nullptr;
-    if (layout == LAYOUT_SRC1_3D) {
+    if (layout == CASE_LAYOUT_SRC1_3D) {
         x_in = x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, pw.K, N / 3, 3);
     } else {
         x_in = x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x_cols, N);
-        if (layout == LAYOUT_STRIDED_SRC1) {
+        if (layout == CASE_LAYOUT_STRIDED_SRC1) {
             x = ggml_view_2d(ctx, x_in, pw.K, N, x_in->nb[1], 0);
         }
     }
     ggml_set_input(x_in);
     ggml_tensor * out = ggml_mul_mat(ctx, pw.w, x);
     ggml_set_output(out);
-    const int64_t ldy = layout == LAYOUT_STRIDED_DST ? pw.M + PAD : pw.M;
-    if (layout == LAYOUT_STRIDED_DST) {
+    const int64_t ldy = layout == CASE_LAYOUT_STRIDED_DST ? pw.M + PAD : pw.M;
+    if (layout == CASE_LAYOUT_STRIDED_DST) {
         // Set before the tensor is allocated, so its allocation holds the padded columns.
         out->nb[1] = (size_t) ldy * sizeof(float);
         out->nb[2] = out->nb[1] * (size_t) out->ne[1];
@@ -580,7 +580,7 @@ int main(int argc, char ** argv) {
                    taken ? "(route)" : "(native)");
             fflush(stdout);
             if (taken) {
-                report(run_taken(*pw, N, label, LAYOUT_PLAIN));
+                report(run_taken(*pw, N, label, CASE_LAYOUT_PLAIN));
                 continue;
             }
             const run_result first = run_case(backend, *pw, N, 0, label);
@@ -602,9 +602,9 @@ int main(int argc, char ** argv) {
                 case_layout  layout;
                 const char * name;
             } layouts[] = {
-                { LAYOUT_STRIDED_SRC1, "src1 columns wider than K" },
-                { LAYOUT_STRIDED_DST,  "dst columns wider than M"  },
-                { LAYOUT_SRC1_3D,      "src1 of three planes"      },
+                { CASE_LAYOUT_STRIDED_SRC1, "src1 columns wider than K" },
+                { CASE_LAYOUT_STRIDED_DST,  "dst columns wider than M"  },
+                { CASE_LAYOUT_SRC1_3D,      "src1 of three planes"      },
             };
 
             for (const auto & l : layouts) {

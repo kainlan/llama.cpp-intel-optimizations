@@ -29,7 +29,8 @@ to nearest even, in the planned dense src1 buffer, then one bf16 x bf16 -> f32
 GEMM. The gate pins that the route allocates nothing and waits on nothing; that
 it declines (and the tiled kernel runs) while a graph is recorded, before it
 reads its buffer; that a short or unresolved buffer is a loud decline (one WARN
-per device slot, an under-estimate on the buffer's cohort); that it asks oneDNN
+per device slot, on a flag of its own; an under-estimate on the buffer's cohort
+only for a copy wider than the plan, a zone-short WARN otherwise); that it asks oneDNN
 for the primitive before it converts anything and runs the GEMM on the
 conversion's event; that the graph-entry walk counts its copy with the
 executor's own questions, apart from the f16 arm's, and caps the buffer rather
@@ -351,14 +352,20 @@ def test_route_declines_while_recording_before_anything_else():
 def test_route_declines_on_a_short_or_unresolved_buffer_loudly():
     flat = nows(_route())
     short = _branch(flat, "if (capacity < act_bytes) {")
-    assert "ggml_sycl::zone_sizing_record_underestimate(buffer.cohort_id, act_bytes, planned);" in short, \
-        "a buffer shorter than the copy counts the plan's under-estimate under the buffer's cohort"
-    assert "if (!stats.warned) { stats.warned = true; GGML_LOG_WARN(" in short, \
-        "a buffer shorter than the copy warns once per device slot"
+    # Only a copy wider than the plan is the plan's under-estimate. A copy within the plan that the buffer cannot hold
+    # is a zone short of its plan (the walk capped the buffer), which the WARN names instead.
+    assert "const bool beyond_plan = act_bytes > planned;" in short, "the decline asks whether the copy exceeds the plan"
+    assert ("if (beyond_plan) { ggml_sycl::zone_sizing_record_underestimate(buffer.cohort_id, act_bytes, planned); }"
+            in short), "a copy wider than the plan, and only that, counts the plan's under-estimate under the cohort"
+    assert 'beyond_plan ? "" : ": the RUNTIME zone could not hold the plan"' in short, \
+        "a copy within the plan warns that the zone, not the plan, was short"
+    # The route's flag is its own: a shared one would let a route decline silence an f16 op's growth WARN.
+    assert "stats.warned" not in flat, "the route does not touch the in-op growth WARN's flag"
+    once = "if (!stats.route_declined_warned) { stats.route_declined_warned = true; GGML_LOG_WARN("
+    assert once in short, "a buffer shorter than the copy warns once per device slot"
     assert short.rstrip().endswith("return false;"), "a buffer shorter than the copy is a decline"
     unresolved = _branch(flat, "if (!act || !act.on_device) {")
-    assert "if (!stats.warned) { stats.warned = true; GGML_LOG_WARN(" in unresolved, \
-        "a buffer that does not resolve on the device warns once per device slot"
+    assert once in unresolved, "a buffer that does not resolve on the device warns once per device slot"
     assert unresolved.rstrip().endswith("return false;"), "a buffer that does not resolve on the device is a decline"
     assert "const size_t capacity = buffer.capacity(ctx.device);" in flat, "the decline reads the buffer's capacity"
     assert flat.find("if (capacity < act_bytes) {") < flat.find("backing_handle.resolve(ctx.device)"), \
@@ -444,7 +451,7 @@ def test_walk_caps_a_route_demand_and_refuses_only_an_f16_demand():
                 "b.buffer.ensure_buffer(bytes, d, queue) != nullptr; });")
     assert decide >= 0, "the walk grows the buffer only through the decision, which may cap it"
     assert walk.count("ensure_buffer(") == 1, "the decision's grow is the walk's only one"
-    refused = at("if (held != ggml_sycl::ZONE_WALK_BUFFER_REFUSED) { continue; }")
+    refused = at("if (held != ggml_sycl::ZONE_WALK_BUFFER_RESULT_REFUSED) { continue; }")
     error = at('GGML_LOG_ERROR("[DEQUANT-F16] graph refused before submission')
     assert 0 <= decide < refused < error, "a held or capped buffer goes on; only a refusal reaches the graph's refusal"
 
@@ -530,11 +537,26 @@ MUTANTS = [
      [(ROUTE, "ggml_sycl::zone_sizing_record_underestimate(buffer.cohort_id, act_bytes, planned);", "")],
      "a short buffer is not counted against the plan"),
     (test_route_declines_on_a_short_or_unresolved_buffer_loudly, "code",
-     [(ROUTE, "planned); if (!stats.warned) {", "planned); if (false) {")],
+     [(ROUTE, "if (beyond_plan) { ggml_sycl::zone_sizing_record_underestimate(",
+       "{ ggml_sycl::zone_sizing_record_underestimate(")],
+     "a copy within the plan is counted as the plan's under-estimate"),
+    (test_route_declines_on_a_short_or_unresolved_buffer_loudly, "code",
+     [(ROUTE, "act_bytes > planned;", "act_bytes >= planned;")],
+     "a copy as wide as the plan is counted as the plan's under-estimate"),
+    (test_route_declines_on_a_short_or_unresolved_buffer_loudly, "code",
+     [(ROUTE, '": the RUNTIME zone could not hold the plan"', '""')],
+     "a zone short of its plan warns as a short plan"),
+    (test_route_declines_on_a_short_or_unresolved_buffer_loudly, "code",
+     [(ROUTE, "planned); } if (!stats.route_declined_warned) {", "planned); } if (false) {")],
      "a short buffer's decline is silent"),
     (test_route_declines_on_a_short_or_unresolved_buffer_loudly, "code",
-     [(ROUTE, "if (!act || !act.on_device) { if (!stats.warned) {", "if (!act || !act.on_device) { if (false) {")],
+     [(ROUTE, "if (!act || !act.on_device) { if (!stats.route_declined_warned) {",
+       "if (!act || !act.on_device) { if (false) {")],
      "an unresolved buffer's decline is silent"),
+    (test_route_declines_on_a_short_or_unresolved_buffer_loudly, "code",
+     [(ROUTE, "if (!act || !act.on_device) { if (!stats.route_declined_warned) { stats.route_declined_warned = true;",
+       "if (!act || !act.on_device) { if (!stats.warned) { stats.warned = true;")],
+     "the route's decline shares the growth WARN's flag"),
     (test_route_rounds_the_copy_to_nearest_even_in_a_profiler_row, "code",
      [(ROUTE, "ggml_sycl_bf16::f32_to_bf16_rne(", "ggml_sycl_bf16::f32_to_bf16_trunc(")],
      "the copy truncates"),
@@ -568,7 +590,7 @@ MUTANTS = [
        'std::max(demand[d].src1_bytes, demand[d].bf16_src1_bytes), demand[d].src1_node, "src1", true },')],
      "the route's demand is required"),
     (test_walk_caps_a_route_demand_and_refuses_only_an_f16_demand, "code",
-     [(WALK, "if (held != ggml_sycl::ZONE_WALK_BUFFER_REFUSED) {", "if (held == ggml_sycl::ZONE_WALK_BUFFER_HELD) {")],
+     [(WALK, "if (held != ggml_sycl::ZONE_WALK_BUFFER_RESULT_REFUSED) {", "if (held == ggml_sycl::ZONE_WALK_BUFFER_RESULT_HELD) {")],
      "a capped buffer refuses the graph"),
     (test_walk_caps_a_route_demand_and_refuses_only_an_f16_demand, "code",
      [(WALK, "bytes <= ggml_sycl_dequant_f16_walk_limit() &&", "")],

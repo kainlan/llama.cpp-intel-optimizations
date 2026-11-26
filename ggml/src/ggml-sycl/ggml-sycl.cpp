@@ -79838,8 +79838,10 @@ static constexpr size_t ggml_sycl_dequant_f16_walk_limit() {
 //     zone could not hold the copy (the walk then holds the buffer at what the ops with no other path need,
 //     zone_walk_ensure_dense_buffer) or the walk did not predict this node. The route has a next path, so this is a
 //     decline: nothing is allocated here, and the buffer does not grow. It is loud, as an op that grows a planned
-//     buffer is (ggml_sycl_planned_scratch_acquire): one WARN per device slot, and a short buffer is counted against
-//     the plan (zone_sizing_record_underestimate under the buffer's cohort);
+//     buffer is (ggml_sycl_planned_scratch_acquire): one WARN per device slot (its own flag, so neither WARN silences
+//     the other). A copy wider than the plan is counted against the plan (zone_sizing_record_underestimate under the
+//     buffer's cohort); a copy within the plan that the buffer cannot hold is a zone short of its plan (the walk
+//     capped the buffer), which the WARN names and which is not the plan's under-estimate;
 //   * when gemm() declines: its scratchpad, or a primitive oneDNN cannot create (remembered per shape, with one WARN,
 //     so the creation is not retried per op). gemm() is asked first with query_only, before the conversion, so such a
 //     decline writes nothing at all. A decline of the second call, after the query passed, leaves the conversion's
@@ -79867,20 +79869,24 @@ static constexpr size_t ggml_sycl_dequant_f16_walk_limit() {
     const char *                                       name     = src0->name[0] != '\0' ? src0->name : "?";
     if (capacity < act_bytes) {
         const size_t planned = ggml_sycl::unified_cache_get_planned_dequant_f16_buffer_bytes(ctx.device, /*src1=*/true);
-        ggml_sycl::zone_sizing_record_underestimate(buffer.cohort_id, act_bytes, planned);
-        if (!stats.warned) {
-            stats.warned = true;
+        const bool   beyond_plan = act_bytes > planned;
+        if (beyond_plan) {
+            ggml_sycl::zone_sizing_record_underestimate(buffer.cohort_id, act_bytes, planned);
+        }
+        if (!stats.route_declined_warned) {
+            stats.route_declined_warned = true;
             GGML_LOG_WARN(
                 "[SCRATCH] %s device %d: the BF16 oneDNN route needs %zu bytes for %s but the planned buffer holds %zu "
-                "(plan %zu); the route declines and the native tiled kernel computes the op\n",
-                buffer.cohort_id, ctx.device, act_bytes, name, capacity, planned);
+                "(plan %zu)%s; the route declines and the native tiled kernel computes the op\n",
+                buffer.cohort_id, ctx.device, act_bytes, name, capacity, planned,
+                beyond_plan ? "" : ": the RUNTIME zone could not hold the plan");
         }
         return false;
     }
     const ggml_sycl::resolved_ptr act = buffer.slot(ctx.device).backing_handle.resolve(ctx.device);
     if (!act || !act.on_device) {
-        if (!stats.warned) {
-            stats.warned = true;
+        if (!stats.route_declined_warned) {
+            stats.route_declined_warned = true;
             GGML_LOG_WARN(
                 "[SCRATCH] %s device %d: the planned buffer (%zu bytes) does not resolve on the device; the BF16 "
                 "oneDNN route declines and the native tiled kernel computes %s\n",
@@ -120459,7 +120465,7 @@ static bool ggml_sycl_dequant_f16_ensure_for_graph(ggml_backend_sycl_context & c
                     return bytes <= ggml_sycl_dequant_f16_walk_limit() &&
                            b.buffer.ensure_buffer(bytes, d, queue) != nullptr;
                 });
-            if (held != ggml_sycl::ZONE_WALK_BUFFER_REFUSED) {
+            if (held != ggml_sycl::ZONE_WALK_BUFFER_RESULT_REFUSED) {
                 continue;
             }
             ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(d);
