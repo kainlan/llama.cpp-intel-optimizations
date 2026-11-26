@@ -22035,10 +22035,10 @@ static bool ggml_sycl_expert_move_to_device(ggml_sycl_expert_move_kind kind) {
 // that instead of asking again, and can say what the zone was asked for.
 struct ggml_sycl_expert_move_outcome {
     ggml_sycl::moe_expert_triplet_ref triplet;
-    bool                              to_device    = true;
-    bool                              moved        = false;
-    ggml_sycl_txn_result              code         = ggml_sycl_txn_result::REFUSED;
-    const char *                      reason       = nullptr;
+    bool                              to_device       = true;
+    bool                              moved           = false;
+    ggml_sycl_txn_result              code            = ggml_sycl_txn_result::REFUSED;
+    const char *                      reason          = nullptr;
     size_t                            device_bytes    = 0;
     size_t                            zone_room_bytes = 0;
 };
@@ -22691,6 +22691,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     // A named move measures what its own give-backs do to the zone's room epoch, for the swap driver's hold.
     ggml_sycl_expert_room_meter         room_meter{ named ? cache : nullptr };
     ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr };
+
     const char * stop      = nullptr;
     bool         transient = false;
     // The batch's host time, in microseconds, for the named move's result line: the members' metadata lookups in the
@@ -22717,6 +22718,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
             refuse_named(triplet.named, transient ? ggml_sycl_txn_result::BUSY : ggml_sycl_txn_result::REFUSED, stop);
             // A device mint refused transiently is the "WEIGHT zone full" answer: the zone had no room for a member.
             (*named_moves)[triplet.named].zone_room_bytes = transient ? triplet.mint_refused_bytes : 0;
+
             stop      = nullptr;
             transient = false;
             // The storage minted for its other members goes back here, so a refusal leaves nothing behind, and
@@ -23115,14 +23117,14 @@ struct ggml_sycl_expert_move_request {
 // only when the cache reaps the entries it retired, after the call, so no admit in the same call can use it. A call
 // that ends in an exception writes none of it (see the entry).
 struct ggml_sycl_expert_move_result {
-    bool                                       accepted       = false;
-    uint32_t                                   n_evicted      = 0;
-    uint32_t                                   n_admitted     = 0;
-    size_t                                     bytes_evicted  = 0;  // device storage the evicted triplets give back
-    size_t                                     bytes_admitted = 0;  // device storage the admitted triplets took
+    bool                                       accepted        = false;
+    uint32_t                                   n_evicted       = 0;
+    uint32_t                                   n_admitted      = 0;
+    size_t                                     bytes_evicted   = 0;  // device storage the evicted triplets give back
+    size_t                                     bytes_admitted  = 0;  // device storage the admitted triplets took
     // How far the call's own give-backs moved the device WEIGHT zone's room epoch (ggml_sycl_expert_room_meter).
     uint64_t                                   room_self_delta = 0;
-    const char *                               reason         = "none";
+    const char *                               reason          = "none";
     std::vector<ggml_sycl_expert_move_outcome> evicted;
     std::vector<ggml_sycl_expert_move_outcome> admitted;
 };
@@ -23165,10 +23167,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int           
     // once the plan was published, so a call that published nothing reports none.
     if (out) {
         ggml_sycl_expert_move_result r;
-        r.accepted       = answer.accepted;
-        r.reason         = answer.reason;
-        r.bytes_evicted  = answer.bytes_freed;
-        r.bytes_admitted = answer.bytes_readmitted;
+        r.accepted        = answer.accepted;
+        r.reason          = answer.reason;
+        r.bytes_evicted   = answer.bytes_freed;
+        r.bytes_admitted  = answer.bytes_readmitted;
         r.room_self_delta = answer.room_self_delta;
         for (ggml_sycl_expert_move_outcome & m : moves) {
             if (m.moved) {
@@ -23913,9 +23915,10 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
             }
             ggml_sycl_expert_move_result result;
             const ggml_sycl_txn_result code = ggml_sycl_expert_move_transaction_run(device, request, nullptr, &result);
+
             // Read as soon as the transaction has returned, with nothing of this thread's freed in between: with how
             // far the transaction's own give-backs moved it, it tells the step whether the zone gained room meanwhile.
-            const uint64_t epoch_after        = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;
+            const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;
 
             // Each move's answer comes back in its own list, in list order. The call answers every triplet it was
             // given; a move it did not answer takes the call's own answer. The admits refused for device room are

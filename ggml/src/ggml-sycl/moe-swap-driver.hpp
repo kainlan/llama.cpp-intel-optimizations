@@ -313,11 +313,11 @@ inline double moe_swap_prompt_gate_of(double cpu_gbps, double h2d_gbps) {
 
 // What the caller knows of this boundary.
 struct moe_swap_driver_call {
-    bool   after_prompt      = false;  // a prompt pass ran since the last boundary
-    int    n_tokens          = 0;      // decode graphs the context computed since the last boundary
-    bool   loans_outstanding = false;  // triplets are lent to a prompt ring
-    bool   cache_settled     = true;   // nothing lent and no deferred free pending
-    double prompt_gate       = 0.0;    // K for the policy: 0 when the host-to-device rate is not probed
+    bool     after_prompt      = false;  // a prompt pass ran since the last boundary
+    int      n_tokens          = 0;      // decode graphs the context computed since the last boundary
+    bool     loans_outstanding = false;  // triplets are lent to a prompt ring
+    bool     cache_settled     = true;   // nothing lent and no deferred free pending
+    double   prompt_gate       = 0.0;    // K for the policy: 0 when the host-to-device rate is not probed
     // The device WEIGHT zone's room epoch, read before the transaction runs: a count that moves each time the zone
     // could have gained room, and never for an allocation or a refusal. Read before, so the step can tell, with what
     // the transaction returns (moe_swap_txn_room), whether the zone gained room while it ran.
@@ -677,6 +677,7 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
         // moved it has the zone gained no room, and only then is an admit held under the epoch the transaction left:
         // one it just refused for room, and one this boundary held and did not send.
         const bool room_stood = moe_swap_detail::moe_swap_room_stood(c.room_epoch, room);
+
         // The answers are in the order the batch was built in: one per pending admit that was not held, which is asked
         // of each entry before the answer changes it.
         size_t kept = 0;

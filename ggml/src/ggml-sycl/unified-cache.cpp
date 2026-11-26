@@ -29425,6 +29425,7 @@ allocation_result unified_cache_zone_allocate_owner(
     req.intent.cohort_id                    = "exact_zone_allocate_owner";
     req.intent.constraints.must_device      = true;
     req.intent.constraints.prefer_vram_zone = zone;
+
     // Only a block of `zone` is accepted below, so a zone with no room is the answer: a raw block would be made, found
     // not zone-managed and given back, after its gate walked the whole runtime registry for a figure nobody uses.
     req.intent.constraints.forbid_vram_zone_spill = true;

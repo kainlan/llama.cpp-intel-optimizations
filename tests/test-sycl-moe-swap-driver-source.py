@@ -934,8 +934,8 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", ENTRY_SIG, "r.room_self_delta = answer.room_self_delta;", "")])
     expect_fail("epoch-after-not-read", "D20",
                 [("sycl", CALLER_SIG,
-                  "epoch_after        = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;",
-                  "epoch_after        = 0;")])
+                  "const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;",
+                  "const uint64_t epoch_after = 0;")])
     expect_fail("self-delta-not-returned", "D20",
                 [("sycl", CALLER_SIG, "{ epoch_after, result.room_self_delta }", "{ epoch_after, 0 }")])
 

@@ -936,8 +936,9 @@ def self_test(raw: dict[str, str]) -> int:
                                                     "s.expert_storage_generation == expert_storage_generation && ", "")])
     expect_fail("evict-refusal-ends-the-list", "E4", [("sycl", TXN_SIG, "if (!loaned && (admit || evict)) {",
                                                        "if (!loaned && admit) {")])
-    expect_fail("evict-bytes-counted-as-admitted", "E5", [("sycl", ENTRY_SIG, "r.bytes_evicted  = answer.bytes_freed;",
-                                                           "r.bytes_evicted  = answer.bytes_readmitted;")])
+    expect_fail("evict-bytes-counted-as-admitted", "E5",
+                [("sycl", ENTRY_SIG, "r.bytes_evicted   = answer.bytes_freed;",
+                  "r.bytes_evicted   = answer.bytes_readmitted;")])
     expect_fail("body-sums-both-directions", "E5", [("sycl", TXN_SIG,
                                                      "(to_device ? taken : freed) += record.device_bytes;",
                                                      "freed += record.device_bytes;")])

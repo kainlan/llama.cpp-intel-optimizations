@@ -82,13 +82,13 @@ static bool contains(const std::string & text, const char * part) {
 // transaction.
 struct rig {
     struct rule {
-        moe_swap_move_kind    kind;
-        int                   block;
-        int                   expert;
-        moe_swap_move_outcome outcome;
-        const char *          reason;
-        int                   times;
-        bool                  latch;
+        moe_swap_move_kind             kind;
+        int                            block;
+        int                            expert;
+        moe_swap_move_outcome          outcome;
+        const char *                   reason;
+        int                            times;
+        bool                           latch;
         ggml_sycl::moe_swap_busy_cause cause;
     };
 
@@ -100,15 +100,15 @@ struct rig {
     size_t                                  room = static_cast<size_t>(-1);
     std::vector<rule>                       rules;
     std::vector<std::vector<moe_swap_move>> calls;  // every batch the transaction got, with its answers
-    int                                     counts_reads     = 0;
-    int                                     room_reads       = 0;
-    int                                     throw_after      = -1;
-    int                                     throws           = 0;
-    uint64_t                                room_epoch       = 0;
+    int                                     counts_reads      = 0;
+    int                                     room_reads        = 0;
+    int                                     throw_after       = -1;
+    int                                     throws            = 0;
+    uint64_t                                room_epoch        = 0;
     uint64_t                                txn_self_moves    = 0;
     uint64_t                                txn_outside_moves = 0;
-    const uint64_t *                        counts_decode_at = nullptr;  // the arrays the counts callback was handed
-    const uint64_t *                        counts_prompt_at = nullptr;
+    const uint64_t *                        counts_decode_at  = nullptr;  // the arrays the counts callback was handed
+    const uint64_t *                        counts_prompt_at  = nullptr;
     moe_swap_driver_state                   d;
 
     rig(int n_blocks, int n_experts, int resident_per_block, const moe_swap_params & p = moe_swap_params{}) :
