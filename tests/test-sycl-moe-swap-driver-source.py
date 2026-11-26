@@ -118,6 +118,7 @@ is the loan test's.
 
 from __future__ import annotations
 
+import functools
 import re
 import sys
 from pathlib import Path
@@ -146,6 +147,7 @@ CORE_TXN = "ggml_sycl_expert_move_transaction_run(device, request, resolver, &re
 CLAIM_SIG = "struct ggml_sycl_moe_swap_claim {"
 CLAIM_DECL = "ggml_sycl_moe_swap_claim claim{ inst.claimed };"
 CLAIM_LOST = "if (!claim.held) {"
+CLAIM_DECL_RE = re.compile(r"ggml_sycl_moe_swap_claim\s+claim\s*\{\s*inst\.claimed\s*\}\s*;")
 CLAIM_TAKE = "return flag.compare_exchange_strong(expected, true, std::memory_order_acq_rel);"
 REPORT_AT_FREE_SIG = "static void ggml_sycl_moe_swap_report_at_free("
 REPORT_IF_HELD = "if (claim.held) { ggml_sycl_moe_swap_report(inst, device); }"
@@ -337,6 +339,14 @@ def fail(pin: str, what: str) -> None:
     raise ContractError(f"FAIL [pin {pin}]: {what}")
 
 
+# The self-test runs the gate on a hundred mutants of the same four sources, each a copy of the real text with one edit,
+# so the pure text functions below are cached by content: the files a mutant leaves alone, and the bodies cut from
+# them, are read once. A cache hit returns what the same text gave before, so every mutant is still judged on its own
+# text and the pins are shown to catch it.
+_CACHE = 64
+
+
+@functools.lru_cache(maxsize=_CACHE)
 def strip_comments(src: str) -> str:
     """Comments blanked to spaces with their newlines kept, literals kept. The length is kept too, so an offset in the
     stripped text is the same offset in the source: a mutant finds its body in the stripped text, where an apostrophe in
@@ -346,16 +356,32 @@ def strip_comments(src: str) -> str:
         tok = m.group(0)
         if tok[0] in "\"'":
             return tok
-        return re.sub(r"[^\n]", " ", tok)
+        # A line comment holds no newline: its blanks are as many as its characters.
+        return " " * len(tok) if "\n" not in tok else re.sub(r"[^\n]", " ", tok)
 
     return _LEXEME_RE.sub(repl, src)
 
 
+@functools.lru_cache(maxsize=4096)
 def norm(text: str) -> str:
     """Whitespace runs collapsed to one space, and none just inside parentheses, so a re-wrap cannot turn a pin red."""
-    t = re.sub(r"\s+", " ", text)
-    t = re.sub(r"\( ", "(", t)
-    return re.sub(r" \)", ")", t)
+    words = text.split()  # the same whitespace as \s, and far faster on the 7 MB backend source
+    if not words:
+        return " " if text else ""
+    t = (" " if text[0].isspace() else "") + " ".join(words) + (" " if text[-1].isspace() else "")
+    return t.replace("( ", "(").replace(" )", ")")
+
+
+@functools.lru_cache(maxsize=None)
+def _word_re(pattern: str) -> re.Pattern:
+    return re.compile(pattern)
+
+
+def word_matches(pattern: str, text: str) -> list:
+    """The matches of `\\b` + `pattern` in `text`, for a pattern that starts with a word character. The regex engine
+    finds a leading literal far faster than a leading word boundary, so the boundary is checked on the match."""
+    return [m for m in _word_re(pattern).finditer(text)
+            if m.start() == 0 or not (text[m.start() - 1].isalnum() or text[m.start() - 1] == "_")]
 
 
 def block_span(text: str, open_at: int) -> tuple[int, int]:
@@ -383,6 +409,7 @@ def block_span(text: str, open_at: int) -> tuple[int, int]:
     return -1, -1
 
 
+@functools.lru_cache(maxsize=4096)
 def body_span(text: str, signature: str) -> tuple[int, int]:
     """[start, end) of the body of the first definition starting with `signature`; a declaration (its parameter list
     closes on a semicolon) is passed over. (-1, -1) when there is none."""
@@ -403,6 +430,7 @@ def body_span(text: str, signature: str) -> tuple[int, int]:
     return -1, -1
 
 
+@functools.lru_cache(maxsize=4096)
 def body(text: str, signature: str) -> str:
     start, end = body_span(text, signature)
     return text[start:end] if start >= 0 else ""
@@ -523,7 +551,7 @@ def check(raw: dict[str, str]) -> None:
                    "the graphs in flight and the claim of its instance before the step")
     claim_n = norm(body(sycl, CLAIM_SIG))
     if (claim_n.count(CLAIM_TAKE) != 1 or claim_n.count(CLAIM_GIVE_BACK) != 1 or "claimed.compare_exchange" in sycl
-            or norm(sycl).count(CLAIM_DECL) != 4
+            or len(CLAIM_DECL_RE.findall(sycl)) != 4
             or norm(body(sycl, REPORT_AT_FREE_SIG)).count(REPORT_IF_HELD) != 1):
         fail("D5", "an instance is not claimed through the one guard that takes it with a strong compare-exchange at "
                    "acq_rel and gives a held claim back with a release store, at the boundary, the backend free's "
@@ -532,7 +560,7 @@ def check(raw: dict[str, str]) -> None:
     # D22 --------------------------------------------------------------------------------------------------------------
     outer_n, core_n = norm(outer), norm(core)
     hook_n = norm(body(sycl, HOOK_SIG))
-    if CORE_DECL not in norm(sycl):
+    if CORE_DECL not in norm(sycl[sycl.find(CORE_SIG):][:400]):
         fail("D22", "the claimed body does not take (device, decodes, graphs, resolver)")
     if re.search(r"\bctx\b", core):
         fail("D22", "the claimed body reads the backend context, so a test cannot run it without one")
@@ -549,7 +577,7 @@ def check(raw: dict[str, str]) -> None:
 
     # D6 ---------------------------------------------------------------------------------------------------------------
     accessor = body(sycl, ACCESSOR_SIG)
-    getenvs = [m.start() for m in re.finditer(r"\bgetenv\s*\(\s*ggml_sycl::MOE_SWAP_ENV\s*\)", sycl)]
+    getenvs = [m.start() for m in word_matches(r"getenv\s*\(\s*ggml_sycl::MOE_SWAP_ENV\s*\)", sycl)]
     if len(ENV_SPELLING.findall(driver)) != 1 or '"GGML_SYCL_MOE_SWAP"' in sycl:
         fail("D6", "GGML_SYCL_MOE_SWAP is not spelled once, as the header's MOE_SWAP_ENV")
     if (len(getenvs) != 1 or not accessor or "getenv(ggml_sycl::MOE_SWAP_ENV)" not in norm(accessor)
@@ -564,7 +592,7 @@ def check(raw: dict[str, str]) -> None:
 
     # D7 ---------------------------------------------------------------------------------------------------------------
     warn_spans = []
-    for w in re.finditer(r"\bGGML_LOG_WARN\s*\(", sycl):
+    for w in word_matches(r"GGML_LOG_WARN\s*\(", sycl):
         warn_spans.append(call_arguments(sycl, w.end() - 1))
     for summary in SUMMARIES:
         calls = [m.start() for m in re.finditer(re.escape(summary), sycl)]
@@ -723,11 +751,11 @@ def check(raw: dict[str, str]) -> None:
     if norm(callback).count(BUSY_CAUSE_SET) != 1 or sycl.count("busy_cause") != 1:
         fail("D18", "the transaction callback does not give each answered move its busy cause from the outcome's "
                     "zone_room, in one place")
-    if norm(prep).count(ZONE_ROOM_MINT) != 1 or len(re.findall(r"\bmint_refused_bytes\s*=(?!=)", sycl)) != 2:
+    if norm(prep).count(ZONE_ROOM_MINT) != 1 or len(word_matches(r"mint_refused_bytes\s*=(?!=)", sycl)) != 2:
         fail("D18", "the preparation does not leave the size of a refused device mint on the prepared triplet, set "
                     "where the device mint fails and nowhere else")
     if (norm(body(sycl, TXN_SIG)).count(ZONE_ROOM_OUTCOME) != 1
-            or len(re.findall(r"\bzone_room_bytes\s*=(?!=)", sycl)) != 2):
+            or len(word_matches(r"zone_room_bytes\s*=(?!=)", sycl)) != 2):
         fail("D18", "the transaction does not mark the named triplet's outcome exactly when a device mint was refused "
                     "transiently")
 
@@ -751,7 +779,7 @@ def check(raw: dict[str, str]) -> None:
         fail("D20", "the room meter does not read the WEIGHT zone's room epoch right before and right after a "
                     "give-back and sum the move")
     if (not all(give_back.count(f) == 1 for f in GIVE_BACK_FIELDS)
-            or len(re.findall(r"\broom_self_delta\s*=(?!=)", sycl)) != 4):
+            or len(word_matches(r"room_self_delta\s*=(?!=)", sycl)) != 4):
         fail("D20", "the prepared list is not given back measured by a guard that then writes the answer's "
                     "room_self_delta, the one place it is written besides the entry's copy")
     if txn.count(GIVE_BACK_DECL) != 1 or not ordered(txn, "prepared.reserve(n_selected);", GIVE_BACK_DECL, PREPARE_CALL):
@@ -763,7 +791,7 @@ def check(raw: dict[str, str]) -> None:
                     "branch")
     entry = norm(body(sycl, ENTRY_SIG))
     if (entry.count(ENTRY_SELF_DELTA) != 1 or any(entry.count(c) != 1 for c in ENTRY_COST)
-            or entry.count(ENTRY_CLOCK) != 1 or re.search(r"\btxn_start\b", sycl)):
+            or entry.count(ENTRY_CLOCK) != 1 or word_matches(r"txn_start\b", sycl)):
         fail("D20", "the named move's entry does not carry the measured sum to its caller, or does not time the whole "
                     "call from before the transaction runs")
     if (norm(callback).count(EPOCH_AFTER_READ) != 1 or norm(callback).count(TXN_ROOM_RETURN) != 1
@@ -800,6 +828,7 @@ def check(raw: dict[str, str]) -> None:
         fail("D21", "arena_note_room_grew does not add one to the group's room epoch")
 
 
+@functools.lru_cache(maxsize=4096)
 def _helper_body(sycl: str, name: str) -> str:
     for m in HELPER_DEF.finditer(sycl):
         if m.group(1) == name:

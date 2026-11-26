@@ -101,6 +101,7 @@ served from its old table and that an evict's room comes back only after the rea
 
 from __future__ import annotations
 
+import functools
 import re
 import sys
 from pathlib import Path
@@ -127,6 +128,10 @@ class MutantNotApplied(Exception):
     pass
 
 
+# The self-test runs the gate on a mutant of each source in turn; a mutant changes one file, so the pure text functions
+# below are cached by content and the other files are read once. A hit returns what the same text gave before, so each
+# mutant is still judged on its own text.
+@functools.lru_cache(maxsize=64)
 def strip_comments(src: str) -> str:
     """Comments blanked to their newlines, literals kept."""
 
@@ -139,6 +144,7 @@ def strip_comments(src: str) -> str:
     return _LEXEME_RE.sub(repl, src)
 
 
+@functools.lru_cache(maxsize=64)
 def norm(text: str) -> str:
     """Comment-stripped, whitespace-canonical text with adjacent string literals joined, and every guard on
     g_tensor_inventory_mutex in its deduced spelling, so a clang-format re-wrap cannot turn a pin red."""
@@ -442,7 +448,8 @@ ENTRY_SPLIT = ("for (ggml_sycl_expert_move_outcome & m : moves) { if (m.moved) {
                "++(m.to_device ? r.n_admitted : r.n_evicted); } (m.to_device ? r.admitted : r.evicted).push_back(m); }")
 
 
-def _private_testing_lines(raw: str) -> list[bool]:
+@functools.lru_cache(maxsize=8)
+def _private_testing_lines(raw: str) -> tuple[bool, ...]:
     """Per line of comment-stripped `raw`, whether it sits inside a `#if defined(GGML_SYCL_PRIVATE_TESTING)` block
     (not its #else). Nested conditionals keep the outer block's answer."""
     stack: list[bool] = []
@@ -456,7 +463,7 @@ def _private_testing_lines(raw: str) -> list[bool]:
         elif re.match(r"#\s*endif", s) and stack:
             stack.pop()
         out.append(any(stack))
-    return out
+    return tuple(out)
 
 
 def check(raw: dict[str, str]) -> None:

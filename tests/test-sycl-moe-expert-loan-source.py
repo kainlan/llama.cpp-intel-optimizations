@@ -138,6 +138,7 @@ it fail.
 Pytest-style (module-level test_* functions): register with llama_test_pytest.
 """
 
+import functools
 import re
 from pathlib import Path
 
@@ -149,6 +150,10 @@ _LEXEME_RE = re.compile(
 )
 
 
+# The mutant tests below each rebuild the claims on a copy of one source with one edit; the other sources, and a
+# claim's repeated reads of the same text, are served from a cache keyed by content, so a mutant is still judged on its
+# own text.
+@functools.lru_cache(maxsize=64)
 def strip_comments(src: str) -> str:
     def repl(m: re.Match) -> str:
         tok = m.group(0)
@@ -169,6 +174,7 @@ def strip_cmake_comments(src: str) -> str:
 _INVENTORY_GUARD_RE = re.compile(r"std::(lock_guard|unique_lock) ?<[^<>;]*> ?(\w+)\(g_tensor_inventory_mutex\)")
 
 
+@functools.lru_cache(maxsize=256)
 def norm(text: str) -> str:
     """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so neither a clang-format
     re-wrap nor a re-split format string can turn a claim red, and every guard on g_tensor_inventory_mutex in its

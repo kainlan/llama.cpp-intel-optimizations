@@ -52,6 +52,7 @@ device; that the increments cost little is the lead's before/after decode readin
 
 from __future__ import annotations
 
+import functools
 import re
 import sys
 from pathlib import Path
@@ -131,11 +132,15 @@ _COMMENT_OR_LITERAL = re.compile(
 )
 
 
+# The self-test runs the gate on a mutant of each source in turn; a mutant changes one file, so the pure text functions
+# below are cached by content and the other files are read once. A hit returns what the same text gave before, so each
+# mutant is still judged on its own text.
+@functools.lru_cache(maxsize=64)
 def _blank(text: str, keep_literals: bool) -> str:
     def repl(m: re.Match) -> str:
         t = m.group(0)
         if t.startswith("//") or t.startswith("/*"):
-            return "".join("\n" if c == "\n" else " " for c in t)
+            return " " * len(t) if "\n" not in t else re.sub(r"[^\n]", " ", t)
         if keep_literals:
             return t
         return t[0] + " " * (len(t) - 2) + t[-1] if len(t) >= 2 else t
@@ -207,12 +212,14 @@ def brace_text(text: str, open_at: int, pin: str) -> str:
     raise ContractError(f"FAIL [pin {pin}]: unbalanced block")
 
 
+@functools.lru_cache(maxsize=4096)
 def squash(text: str) -> str:
     t = re.sub(r"\s+", " ", text)
     t = re.sub(r"\( ", "(", t)
     return re.sub(r" \)", ")", t)
 
 
+@functools.lru_cache(maxsize=8)
 def without_private_testing(text: str) -> str:
     """`text` with the PRIVATE_TESTING arm of each `#if defined(GGML_SYCL_PRIVATE_TESTING)` blanked, newlines kept, so
     the pins read what production runs: the private device tests count into a table and take it from the registry on
