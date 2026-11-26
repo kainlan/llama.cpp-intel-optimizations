@@ -757,13 +757,13 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
             // before their stores. Rows at or past kv_count are zero-padded,
             // as in the scalar copy.
             //
-            // SLM is written as dwords. K_OFFSET and V_OFFSET (asserted below),
-            // a row (D halves, D % 8 == 0) and a chunk (8 halves) are all even
-            // numbers of halves, so every store is dword-aligned if the SLM
-            // base is. The base is the leaf launcher's local_accessor<half>,
-            // one declaration for every leaf, and the leaves with a float S
-            // region read it through a float pointer (tile_S_f); the element
-            // type alone promises 2 bytes, and nothing promises more than 4.
+            // SLM is written as dwords. The SLM base is dword-aligned: for a
+            // kv_v8 leaf the launcher declares its local_accessor with a
+            // uint32_t element (launch_fattn_xmx_v2_f16_leaf), and an accessor
+            // provides storage for its element type. K_OFFSET and V_OFFSET
+            // (asserted below), a row (D halves, D % 8 == 0) and a chunk (8
+            // halves) are all even numbers of halves, so every store is
+            // dword-aligned.
             static_assert(slm_layout::K_OFFSET % 2 == 0 && slm_layout::V_OFFSET % 2 == 0,
                           "tile_K and tile_V start on a dword of the SLM base");
             constexpr int ROW_CHUNKS = D / 8;
@@ -1269,11 +1269,22 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
     const int      nb31 = params.nb31, nb32 = params.nb32;
     const int64_t  nb33 = params.nb33;
 
+    // The kv_v8 leaf stores K and V to SLM as dwords, so its accessor holds
+    // uint32_t: an accessor provides storage for its element type, which makes
+    // the base 4-byte aligned by type. It is the same bytes (TOTAL halves, an
+    // even count), and the leaf reads them as half. Every other leaf, the TM=16
+    // reproducer included, keeps a half accessor of TOTAL elements as before
+    // (slm_elems == TOTAL, and the cast to sycl::half * is the identity).
+    using slm_elem_t           = std::conditional_t<kv_v8, uint32_t, sycl::half>;
+    constexpr size_t slm_bytes = (size_t) slm_layout::TOTAL * sizeof(sycl::half);
+    static_assert(slm_bytes % sizeof(slm_elem_t) == 0, "the SLM layout fills whole accessor elements");
+    constexpr size_t slm_elems = slm_bytes / sizeof(slm_elem_t);
+
     ggml_sycl_profile_label profile_label =
         fattn_xmx_v2_profile_label(*stream, "fattn.compute.xmx_v2", "role=compute;path=xmx-v2");
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
-            sycl::local_accessor<sycl::half, 1> slm(sycl::range<1>(slm_layout::TOTAL), cgh);
+            sycl::local_accessor<slm_elem_t, 1> slm(sycl::range<1>(slm_elems), cgh);
 
             cgh.parallel_for(sycl::nd_range<3>(grid * block, block),
                              [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(XMX_V2_SG)]] {
@@ -1282,7 +1293,8 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
                                      Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, dst_ptr, scale_v, max_bias, m0, m1,
                                      n_head_log2, logit_sc, ne01, ne02, nb01, nb02, nb03, ne11, ne12, nb11, nb12, nb13,
                                      nb21, nb22, nb23, ne30, ne32, ne33, nb31, nb32, nb33, item,
-                                     slm.get_multi_ptr<sycl::access::decorated::no>().get());
+                                     reinterpret_cast<sycl::half *>(
+                                         slm.template get_multi_ptr<sycl::access::decorated::no>().get()));
                              });
         });
     });
