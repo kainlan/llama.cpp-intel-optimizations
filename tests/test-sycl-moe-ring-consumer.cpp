@@ -554,8 +554,8 @@ int main() {
     // Qwen3.6 NVFP4 on the B50, one load's two passes through the stage's functions. The early pass reads a RUNTIME
     // zone another consumer sizes, as large without the ring: no room, so the arena is not asked, the ring is kept and
     // the keep leaves no mark. The late pass's zone holds the ring's room: dropped, and the drop holds for the load.
-    // The dry run's answer for the late pass, the WEIGHT zone taking the whole RUNTIME room, is what the stage
-    // measured.
+    // The dry run's answer for the late pass, the WEIGHT zone taking the whole RUNTIME room, is the WEIGHT growth the
+    // stage reads.
     {
         using ggml_sycl::moe_pp_ring_runtime_room;
         using ggml_sycl::moe_pp_ring_runtime_with_ring;

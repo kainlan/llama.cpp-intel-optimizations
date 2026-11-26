@@ -4342,7 +4342,8 @@ int main() {
         using ggml_sycl::zone_arena_runtime_surplus;
         using ggml_sycl::zone_arena_sizes;
 
-        // The B50 shape: the ring raised the RUNTIME zone to 1258 MB over a 700 MB plan without it.
+        // A ring that raised the RUNTIME zone well over the plan made without it (the B50's own figures are in
+        // docs/backend/sycl-memory-design.md).
         const zone_arena_sizes have = { 512 * MiB, 256 * MiB, 1258 * MiB };
         const zone_arena_sizes need = { 512 * MiB, 256 * MiB, 700 * MiB };
         CHECK(zone_arena_runtime_surplus(have, need), "a RUNTIME zone above the plan's had no surplus");
