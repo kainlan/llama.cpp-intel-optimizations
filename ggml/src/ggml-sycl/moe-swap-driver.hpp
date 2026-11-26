@@ -24,9 +24,10 @@
 //     (moe_swap_txn_room): they neither keep the refused admit from being held nor send a held one again. A boundary
 //     it is held at does not count toward its drop streak, and the policy stays in flight. An epoch that moved for
 //     any other reason sends it again, and that answer counts toward the streak like any other. It is given up at the
-//     MOE_SWAP_PENDING_HOLD_BOUND-th settled boundary with the epoch unchanged, as a dropped admit is (a restore,
-//     which goes at that boundary, or an open slot), so room that never comes does not hold the policy in flight for
-//     the rest of the generation. An unsettled boundary neither counts nor resets the hold.
+//     MOE_SWAP_PENDING_HOLD_BOUND-th settled boundary at which no outside room arrived (the epoch moved by no more
+//     than the boundary's own give-backs), as a dropped admit is (a restore, which goes at that boundary, or an open
+//     slot), so room that never comes does not hold the policy in flight for the rest of the generation. An unsettled
+//     boundary neither counts nor resets the hold.
 //   - An evict refused finally latches its block only when the transaction marks the refusal as one every evict of
 //     the block would meet (moe_swap_move::latches_block: the caller sets it for a device copy that shares a bulk
 //     tensor's storage). Any other final refusal drops that proposal alone, counted by its reason.
@@ -72,13 +73,14 @@ constexpr const char MOE_SWAP_ENV[] = "GGML_SYCL_MOE_SWAP";
 // bounds how long an admit that will not land holds the policy in flight. It is a chosen bound, not a measured one.
 constexpr int MOE_SWAP_PENDING_DROP_STREAK = 4;
 
-// A pending admit held for zone room is given up at the 16th settled boundary with its device zone's room epoch
-// unchanged: it is held at the fifteen before it, and an unsettled boundary neither counts nor resets the hold. An
-// admit refused for zone room is not sent again until the epoch says the zone could have gained room; when no room
-// ever comes, the hold alone would keep the policy in flight for the rest of the generation. Sixteen is above the
-// case the hold exists for, the few boundaries until a deferred-free pass hands an evict's room back, and at 43 ms a
-// decode token it is about 0.7 s. A held boundary costs the admit nothing and a sent one a lookup in the zone's
-// allocator, so the bound trades only how long the policy waits. It is a chosen bound, not a measured one.
+// A pending admit held for zone room is given up at the 16th settled boundary at which no outside room arrived (the
+// epoch moved by no more than the boundary's own give-backs); an unsettled boundary neither counts nor resets the
+// hold. It is held at the fifteen before it. An admit refused for zone room is not sent again until the epoch says
+// the zone could have gained room; when no room ever comes, the hold alone would keep the policy in flight for the
+// rest of the generation. Sixteen is above the case the hold exists for, the few boundaries until a deferred-free
+// pass hands an evict's room back, and at 43 ms a decode token it is about 0.7 s. A held boundary costs the admit
+// nothing and a sent one a lookup in the zone's allocator, so the bound trades only how long the policy waits. It is
+// a chosen bound, not a measured one.
 constexpr int MOE_SWAP_PENDING_HOLD_BOUND = 16;
 
 // The BUSY reason under which an evict of a batch whose transaction threw, still resident by the next view, is counted.
@@ -705,8 +707,8 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
             } else if (m.outcome == MOE_SWAP_MOVE_BUSY) {
                 moe_swap_detail::moe_swap_count_reason(st.busy, m.reason);
                 moe_swap_detail::moe_swap_pending_note_busy(p, m.reason, c.cache_settled);
-                // Refused for zone room with none gained while the transaction ran: held from the next boundary on, under
-                // the epoch the transaction left. Room gained meanwhile may be room for it, so it is sent again.
+                // Refused for zone room with none gained while the transaction ran: held from the next boundary on,
+                // under the epoch the transaction left. Room gained meanwhile may be room for it, so it is sent again.
                 p.room_held   = m.busy_cause == MOE_SWAP_BUSY_CAUSE_ZONE_ROOM && room_stood;
                 p.room_epoch  = room.epoch_after;
                 p.held_streak = 0;

@@ -1038,9 +1038,10 @@ static void test_a_zone_full_admit_is_held_while_the_room_epoch_is_unchanged() {
     CHECK(r.d.stats.dropped.empty());
 }
 
-// A held admit is given up at the MOE_SWAP_PENDING_HOLD_BOUND-th settled boundary with the epoch unchanged: it becomes
-// a restore, which goes at that boundary. The restore meets the full zone too, is held the same way and sent only that
-// once, and leaves its slot open; the policy then proposes again. An unsettled boundary holds without counting.
+// A held admit is given up at the MOE_SWAP_PENDING_HOLD_BOUND-th settled boundary at which no outside room arrived
+// (the epoch moved by no more than the boundary's own give-backs): it becomes a restore, which goes at that boundary.
+// The restore meets the full zone too, is held the same way and sent only that once, and leaves its slot open; the
+// policy then proposes again. An unsettled boundary holds without counting.
 static void test_a_held_admit_is_given_up_at_the_hold_bound() {
     const int bound = ggml_sycl::MOE_SWAP_PENDING_HOLD_BOUND;
     rig       r(2, 8, 4);
