@@ -1,7 +1,11 @@
+#include "ggml-backend.h"
 #include "llama-kv-cache.h"
 #include "llama-model.h"
 
+#include <cstdio>
+#include <memory>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -173,6 +177,64 @@ int main() {
         add(0, 5, 1);
         GGML_ASSERT(kv.seq_rm(0, 5, 6));
         GGML_ASSERT(kv.seq_pos_max(0) == 4);
+    }
+
+    // a KV type no backend can write into the layer's buffer is refused when the cache is built, by name, instead of
+    // reaching the scheduler's pre-allocated-tensor abort at the first graph (llama.cpp-ol6a)
+    {
+        ggml_backend_dev_t         cpu      = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+        GGML_ASSERT(cpu != nullptr);
+
+        // the CPU writes every cache type it has a from_float for; the IQ2/IQ3/IQ1 types it does not
+        for (ggml_backend_dev_t dev : { cpu, (ggml_backend_dev_t) nullptr }) {
+            for (ggml_type type :
+                 { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F8_E4M3, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,
+                   GGML_TYPE_Q4_1, GGML_TYPE_IQ4_NL, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1 }) {
+                GGML_ASSERT(llama_kv_cache_type_writable(dev, cpu_buft, type));
+            }
+            GGML_ASSERT(!llama_kv_cache_type_writable(dev, cpu_buft, GGML_TYPE_IQ2_XXS));
+        }
+
+        std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+        init_model(*model, 1);
+
+        // K alone, V alone, and both: one refusal that names every unwritable cache and, since the CPU writes F16,
+        // the F16 hint for each in both of its spellings
+        const std::string hint_k = "-ctk f16 (type_k = GGML_TYPE_F16)";
+        const std::string hint_v = "-ctv f16 (type_v = GGML_TYPE_F16)";
+        for (int bad = 1; bad <= 3; ++bad) {
+            const bool      bad_k  = bad & 1;
+            const bool      bad_v  = bad & 2;
+            const ggml_type type_k = bad_k ? GGML_TYPE_IQ2_XXS : GGML_TYPE_F16;
+            const ggml_type type_v = bad_v ? GGML_TYPE_IQ2_XXS : GGML_TYPE_F16;
+            std::string     what;
+            try {
+                llama_kv_cache kv(*model, false, model->hparams, type_k, type_v, false, false, true, 32, 1, 0,
+                                  LLAMA_SWA_TYPE_NONE, nullptr, nullptr, nullptr, nullptr);
+            } catch (const std::runtime_error & err) {
+                what = err.what();
+            }
+            std::string named;
+            std::string hints;
+            if (bad_k) {
+                named = "iq2_xxs for K";
+                hints = hint_k;
+            }
+            if (bad_v) {
+                named += std::string(bad_k ? " and " : "") + "iq2_xxs for V";
+                hints += std::string(bad_k ? " and " : "") + hint_v;
+            }
+            const std::string expected = "KV cache type " + named +
+                                         " cannot be written on CPU (buffer CPU): no backend runs SET_ROWS into " +
+                                         (bad_k && bad_v ? "those types" : "that type") + " there; use " + hints;
+            if (what != expected) {
+                fprintf(stderr, "refusal mismatch:\n  got:      %s\n  expected: %s\n", what.c_str(), expected.c_str());
+                GGML_ABORT("KV cache type refusal text");
+            }
+        }
+        // The branch that drops the "; use ..." hint when F16 itself is not writable is not reachable here, since
+        // the CPU always writes F16; it is untested.
     }
 
     llama_backend_free();

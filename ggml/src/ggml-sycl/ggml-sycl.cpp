@@ -131652,9 +131652,10 @@ static bool ggml_sycl_device_supports_op_impl(ggml_backend_dev_t dev, const ggml
                 // declined here and fall back to CPU; adding the instantiation is a separate capability
                 // change (llama.cpp-9vm3), not part of making this predicate agree with the op.
                 //
-                // ggml_sycl_type_is_fp8_e4m3() is unconditionally false today (common.hpp:6304). Should
-                // an FP8 E4M3 ggml type ever appear, the dst-type switch needs an FP8 case first -- its
-                // kernel exists but has no caller (set_rows.cpp:765-856).
+                // ggml_sycl_type_is_fp8_e4m3() is a stub that returns false for every type (common.hpp),
+                // so a GGML_TYPE_F8_E4M3 dst is declined here. Before that stub may return true, the
+                // dst-type switch needs an FP8 case -- its kernel exists but has no caller
+                // (k_set_rows_fp8 / set_rows_sycl_fp8 in set_rows.cpp).
                 if (op->src[0] == nullptr || op->src[1] == nullptr) {
                     return false;
                 }
