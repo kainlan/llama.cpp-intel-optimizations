@@ -22,6 +22,7 @@ using ggml_sycl::moe_swap_move_kind;
 using ggml_sycl::moe_swap_move_outcome;
 using ggml_sycl::moe_swap_params;
 using ggml_sycl::moe_swap_plan_view;
+using ggml_sycl::moe_swap_txn_cost;
 
 using ggml_sycl::MOE_SWAP_DRIVER_HELD;
 using ggml_sycl::MOE_SWAP_DRIVER_IDLE;
@@ -115,6 +116,7 @@ struct rig {
     uint64_t                                room_epoch        = 0;
     uint64_t                                txn_self_moves    = 0;
     uint64_t                                txn_outside_moves = 0;
+    moe_swap_txn_cost                       txn_cost;                     // what the next transaction reports it cost
     const uint64_t *                        counts_decode_at  = nullptr;  // the arrays the counts callback was handed
     const uint64_t *                        counts_prompt_at  = nullptr;
     moe_swap_driver_state                   d;
@@ -247,7 +249,7 @@ struct rig {
                     }
                     room_epoch += txn_self_moves + txn_outside_moves;
                     txn_outside_moves = 0;
-                    return ggml_sycl::moe_swap_txn_room{ room_epoch, txn_self_moves };
+                    return ggml_sycl::moe_swap_txn_room{ room_epoch, txn_self_moves, txn_cost };
                 });
         } catch (const std::runtime_error &) {
             ++throws;  // the step rethrew; what the moves answered before it is published below, as the move does
@@ -688,6 +690,28 @@ static void test_decode_graphs_after_a_move_are_counted() {
     CHECK(r.d.stats.transactions_evict == 1 && r.d.stats.transactions_admit == 1);
     const std::string faults = ggml_sycl::moe_swap_driver_summary_faults(r.d.stats, 0);
     CHECK(contains(faults, "accepted transactions 2 (evict 1, admit 1) over 14 decode graphs"));
+}
+
+// What each transaction cost the boundary thread is summed in the stats and printed in the second summary line, so the
+// named move's per-move line can stay at DEBUG: every transaction the driver sends adds its copy submission, id
+// remap, metadata lookup and whole time, an accepted one or not, and the line says over how many it summed.
+static void test_the_summary_sums_what_the_transactions_cost() {
+    rig r(1, 8, 4);
+    r.decode[r.index(0, 5)] = 10;
+    r.txn_cost              = moe_swap_txn_cost{ 10, 20, 30, 100 };
+    r.to_period();  // the evict
+    r.txn_cost = moe_swap_txn_cost{ 1, 2, 3, 4 };
+    r.boundary();   // the admit
+    CHECK(r.d.stats.txn_sent == 2);
+    CHECK(r.d.stats.txn_copy_us == 11);
+    CHECK(r.d.stats.txn_remap_us == 22);
+    CHECK(r.d.stats.txn_meta_us == 33);
+    CHECK(r.d.stats.txn_total_us == 104);
+    const std::string faults = ggml_sycl::moe_swap_driver_summary_faults(r.d.stats, 0);
+    CHECK(contains(faults,
+                   "transaction cost over 2: copy submit 11 us, id remap 22 us, meta lookup 33 us, total 104 us"));
+    rig quiet(1, 8, 4);
+    CHECK(contains(ggml_sycl::moe_swap_driver_summary_faults(quiet.d.stats, 0), "transaction cost over 0: "));
 }
 
 // The two summary lines carry every figure: moves, prompt boundaries, K, open slots, deferrals, file-mapped triplets,
@@ -1338,6 +1362,7 @@ int main() {
     test_no_admissible_host_expert_proposes_nothing_and_says_so();
     test_decode_graphs_after_a_move_are_counted();
     test_the_summary_lines_name_every_figure();
+    test_the_summary_sums_what_the_transactions_cost();
     test_a_boundary_with_nothing_to_do_does_not_allocate();
     test_the_prompt_gate_is_zero_unless_both_rates_are_positive();
     test_the_counts_go_into_the_drivers_own_arrays();

@@ -21903,6 +21903,11 @@ struct ggml_sycl_expert_loan_result {
     uint32_t     n_remaining      = 0;  // a refill's: the lent triplets its armed cursor still holds after it ran
     uint32_t     n_dropped        = 0;  // a refill's: the lent triplets it dropped from the ledger, to stay on the host
     uint64_t     room_self_delta  = 0;  // a named move's: how far its own give-backs moved the WEIGHT zone's room epoch
+    // A named move's cost to the boundary thread, in microseconds (ggml_sycl_expert_prepared_give_back).
+    uint64_t     meta_us          = 0;
+    uint64_t     copy_us          = 0;
+    uint64_t     remap_us         = 0;
+    uint64_t     total_us         = 0;
     const char * reason           = "none";
 };
 
@@ -22339,11 +22344,22 @@ struct ggml_sycl_expert_prepared_give_back {
     std::vector<ggml_sycl_expert_prepared_triplet> & prepared;
     ggml_sycl_expert_room_meter &                    meter;
     ggml_sycl_expert_loan_result *                   answer;
+    // A named move's cost to the boundary thread, written with the room figure on every exit: the batch's host time
+    // the transaction counts (the members' metadata lookups, the cache's copy submissions and id handovers) and the
+    // time since `start`, which includes this release of the leases.
+    const uint64_t &                                 meta_us;
+    const uint64_t &                                 copy_us;
+    const uint64_t &                                 remap_us;
+    std::chrono::steady_clock::time_point            start;
 
     ~ggml_sycl_expert_prepared_give_back() {
         meter.give_back([this] { prepared.clear(); });
         if (answer) {
             answer->room_self_delta = meter.moved;
+            answer->meta_us         = meta_us;
+            answer->copy_us         = copy_us;
+            answer->remap_us        = remap_us;
+            answer->total_us        = ggml_sycl::expert_move_us_since(start);
         }
     }
 };
@@ -22568,7 +22584,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     ggml_sycl_expert_loan_result *               out,
     bool                                         warn_busy,
     std::vector<ggml_sycl_expert_move_outcome> * named_moves = nullptr) {
-    // For the named move's result line: its total runs from here, so the time outside its timed parts shows.
+    // For the named move's cost: its total runs from here, so the time outside its timed parts shows.
     const auto txn_start = std::chrono::steady_clock::now();
 
     const bool                   refill = direction == ggml_sycl_expert_txn_direction::REFILL;
@@ -22693,17 +22709,18 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
 
     std::vector<ggml_sycl_expert_prepared_triplet> prepared;
     prepared.reserve(n_selected);
+    // The batch's host time, in microseconds, for the named move's cost: the members' metadata lookups in the
+    // preparation, and the cache's copy submissions and id handovers (expert_move_record).
+    uint64_t                            meta_us  = 0;
+    uint64_t                            copy_us  = 0;
+    uint64_t                            remap_us = 0;
     // A named move measures what its own give-backs do to the zone's room epoch, for the swap driver's hold.
     ggml_sycl_expert_room_meter         room_meter{ named ? cache : nullptr };
-    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr };
+    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, meta_us, copy_us,
+                                                   remap_us, txn_start };
 
     const char * stop      = nullptr;
     bool         transient = false;
-    // The batch's host time, in microseconds, for the named move's result line: the members' metadata lookups in the
-    // preparation, and the cache's copy submissions and id handovers (expert_move_record).
-    uint64_t     meta_us   = 0;
-    uint64_t     copy_us   = 0;
-    uint64_t     remap_us  = 0;
 
     // A lent triplet no later boundary could prepare either (a member no tensor resolves, or no WEIGHT arena on the
     // device to mint its storage from) leaves the ledger under the lock below, if it is the back by then. Left there,
@@ -23073,15 +23090,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
                 ++n_evicted;
             }
         }
-        // A WARN, since every tool drops INFO: the line is where a run shows what its moves cost the boundary thread,
-        // the copy steps' submission and the id handovers' time in the cache and the metadata lookups', summed over
-        // the batch, and the transaction's whole time from its start to this line, which shows what they leave out.
-        GGML_LOG_WARN(
-            "[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s); "
-            "copy submit %llu us, id remap %llu us, meta lookup %llu us, total %llu us\n",
-            device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason,
-            (unsigned long long) copy_us, (unsigned long long) remap_us, (unsigned long long) meta_us,
-            (unsigned long long) ggml_sycl::expert_move_us_since(txn_start));
+        // A DEBUG line, one per boundary that moves: what the moves cost the boundary thread is the answer's, summed
+        // by the swap driver and printed once in its summary, so a run's log does not carry a line per move.
+        GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s)\n",
+                       device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason);
     } else {
         if (stop) {
             GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s\n", device, stop);
@@ -23129,6 +23141,11 @@ struct ggml_sycl_expert_move_result {
     size_t                                     bytes_admitted  = 0;  // device storage the admitted triplets took
     // How far the call's own give-backs moved the device WEIGHT zone's room epoch (ggml_sycl_expert_room_meter).
     uint64_t                                   room_self_delta = 0;
+    // The call's cost to the boundary thread, in microseconds, as a call that was refused or threw reports it too.
+    uint64_t                                   meta_us         = 0;
+    uint64_t                                   copy_us         = 0;
+    uint64_t                                   remap_us        = 0;
+    uint64_t                                   total_us        = 0;
     const char *                               reason          = "none";
     std::vector<ggml_sycl_expert_move_outcome> evicted;
     std::vector<ggml_sycl_expert_move_outcome> admitted;
@@ -23177,6 +23194,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int           
         r.bytes_evicted   = answer.bytes_freed;
         r.bytes_admitted  = answer.bytes_readmitted;
         r.room_self_delta = answer.room_self_delta;
+        r.meta_us         = answer.meta_us;
+        r.copy_us         = answer.copy_us;
+        r.remap_us        = answer.remap_us;
+        r.total_us        = answer.total_us;
         for (ggml_sycl_expert_move_outcome & m : moves) {
             if (m.moved) {
                 ++(m.to_device ? r.n_admitted : r.n_evicted);
@@ -23942,7 +23963,8 @@ static void ggml_sycl_run_expert_swap_claimed(int                               
                 ggml_sycl_moe_swap_warn_zone_refusal(cache, device, zone_refused, request.admit.size(),
                                                      zone_refused_max);
             }
-            return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta };
+            const ggml_sycl::moe_swap_txn_cost cost{ result.copy_us, result.remap_us, result.meta_us, result.total_us };
+            return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };
         });
 }
 

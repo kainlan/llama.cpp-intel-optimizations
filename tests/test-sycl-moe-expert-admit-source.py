@@ -76,10 +76,12 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
   E5  each moved outcome records the device storage it took or gives back; the body sums the bytes once per
       direction, as each triplet moves, writes them once the plan is published and names both directions in its
       result line, and the entry takes those sums, counts each outcome in its direction and returns it in its own list;
-  M1  a named move's one result line is a WARN (every tool drops INFO) that carries, summed over the batch, the
-      microseconds the cache spent in each move's copy step and in its id handover and retire, and the transaction in
-      the members' metadata lookups: each cache body, the loan's and the copy to the device, records its two times in
-      the move record, the preparation times its resolver call, and the body sums all three as each call returns.
+  M1  a named move's one result line is a DEBUG line with no timings; what the move cost the boundary thread is the
+      answer's instead, written on every exit, a throw included, by the guard that also writes the room figure: the
+      microseconds the cache spent in each move's copy step and in its id handover and retire, the transaction in the
+      members' metadata lookups, and the call's whole time from its first statement. Each cache body, the loan's and
+      the copy to the device, records its two times in the move record, the preparation times its resolver call, and
+      the body sums all three as each call returns, into counters declared before the guard.
 
 Checks run on comment-stripped, whitespace-normalized text. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it and is reported if it survives, if another pin
@@ -334,9 +336,8 @@ PINNED_CHECK = ("if (e.location != cache_location::HOST_PINNED || !e.host_reside
                 '{ refusal = admit ? "host copy not pinned" : "not a lent copy"; break; }')
 
 REFUSE_GATE = "if (!probe_mode && !refill && !named && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {"
-NAMED_FORMAT = ('"[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) '
-                '(%s); copy submit %llu us, id remap %llu us, meta lookup %llu us, total %llu us\\n"')
-NAMED_LINE = "GGML_LOG_WARN(" + NAMED_FORMAT
+NAMED_FORMAT = ('"[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s)\\n"')
+NAMED_LINE = "GGML_LOG_DEBUG(" + NAMED_FORMAT
 ENTRY_NAME = "ggml_sycl_expert_move_transaction_run("
 # The entry's one production caller: the swap driver's claimed body, which the synchronize boundary runs.
 DRIVER_SIG = "static void ggml_sycl_run_expert_swap_claimed("
@@ -420,13 +421,16 @@ STAMP_COMPARES = "s.expert_storage_generation == expert_storage_generation"
 BODY_SUM = "++lent; (to_device ? taken : freed) += record.device_bytes;"
 BODY_RESULT = "result.bytes_freed = freed; result.bytes_readmitted = taken;"
 BODY_COUNT = "if (!m.to_device) { ++n_evicted; }"
-NAMED_LINE_ARGS = ("device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason, "
-                   "(unsigned long long) copy_us, (unsigned long long) remap_us, (unsigned long long) meta_us, "
-                   "(unsigned long long) ggml_sycl::expert_move_us_since(txn_start));")
+NAMED_LINE_ARGS = "device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason);"
 # M1: what the body sums into the line, and where each figure is measured.
 SUM_META = "meta_us += triplet.resolve_us;"
-# The line's total runs from the transaction's first statement, before the lock and the preparation.
+# The cost's total runs from the transaction's first statement, before the lock and the preparation.
 TXN_START = "const auto txn_start = std::chrono::steady_clock::now();"
+COST_GUARD = ("ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, meta_us, "
+              "copy_us, remap_us, txn_start };")
+COST_COUNTERS = "uint64_t meta_us = 0; uint64_t copy_us = 0; uint64_t remap_us = 0;"
+COST_WRITE = ("answer->meta_us = meta_us; answer->copy_us = copy_us; answer->remap_us = remap_us; "
+              "answer->total_us = ggml_sycl::expert_move_us_since(start);")
 SUM_CACHE = "copy_us += record.copy_us; remap_us += record.remap_us;"
 CACHE_TIMES = ("out.copy_us = copy_took;", "out.remap_us = remap_took;")
 PREP_TIMED = "const bool resolved = resolver(*e, target); out.resolve_us += ggml_sycl::expert_move_us_since(resolve_from);"
@@ -675,9 +679,15 @@ def check(raw: dict[str, str]) -> None:
             or not ordered(txn, "loaned = cache->refill_lent_triplet(triplet.members, record); break; }", SUM_CACHE,
                            "if (!loaned && (admit || evict)) {")
             or not ordered(txn, SUM_CACHE, NAMED_LINE)
+            or "GGML_LOG_WARN(\"[MOE-EXEC] named move" in txn
             or txn.count(TXN_START) != 1 or not txn.startswith("{ " + TXN_START)):
-        fail("M1", "the named move's result line is not one WARN carrying the batch's copy submission, id remap and "
-                   "meta lookup times, each summed as its call returns, and the transaction's total from its start")
+        fail("M1", "the named move's result line is not one DEBUG line, or the batch's copy submission, id remap and "
+                   "meta lookup times are not each summed as its call returns, with the transaction's total from its "
+                   "start")
+    if (txn.count(COST_GUARD) != 1 or txn.count(COST_COUNTERS) != 1 or not ordered(txn, COST_COUNTERS, COST_GUARD)
+            or sycl.count(COST_WRITE) != 1):
+        fail("M1", "the named move's cost is not written to its answer by the guard that writes the room figure, on "
+                   "every exit, from counters declared before it")
     if (not all(loan.count(t) == 1 and copy.count(t) == 1 for t in CACHE_TIMES) or prep.count(PREP_TIMED) != 1
             or "resolver(*e, target)" in prep.replace(PREP_TIMED, "")):
         fail("M1", "a cache body does not record its copy and handover times, or the preparation does not time its "
@@ -728,8 +738,18 @@ def self_test(raw: dict[str, str]) -> int:
         failures.append(name)
         print(f"  self-test: {name}: SURVIVED (pin {pin} did not catch it)")
 
-    expect_fail("named-line-debug", "M1", [("sycl", TXN_SIG, 'GGML_LOG_WARN(\n            "[MOE-EXEC] named move',
-                                            'GGML_LOG_DEBUG(\n            "[MOE-EXEC] named move')])
+    expect_fail("named-line-warns", "M1", [("sycl", TXN_SIG, 'GGML_LOG_DEBUG("[MOE-EXEC] named move',
+                                            'GGML_LOG_WARN("[MOE-EXEC] named move')])
+    expect_fail("named-line-carries-timings", "E5", [("sycl", TXN_SIG, "taken / (1024 * 1024), reason);",
+                                                      "taken / (1024 * 1024), reason, (unsigned long long) copy_us);")])
+    expect_fail("cost-not-written", "M1", [("sycl", "", "answer->remap_us        = remap_us;", "")])
+    PAD = " " * 27
+    expect_fail("cost-guard-before-its-counters", "M1",
+                [("sycl", TXN_SIG, "    uint64_t%s meta_us  = 0;\n    uint64_t%s copy_us  = 0;\n    uint64_t%s remap_us = 0;\n"
+                   % (PAD, PAD, PAD), ""),
+                 ("sycl", TXN_SIG, "    const char * stop      = nullptr;\n",
+                  "    const char * stop      = nullptr;\n    uint64_t meta_us = 0;\n    uint64_t copy_us = 0;\n"
+                  "    uint64_t remap_us = 0;\n")])
     expect_fail("meta-lookup-unsummed", "M1", [("sycl", TXN_SIG, "meta_us += triplet.resolve_us;", "")])
     start_line = "    " + TXN_START + "\n"
     lock_line = "    std::unique_lock lock(g_tensor_inventory_mutex);\n"

@@ -251,18 +251,24 @@ ENTRY_SIG = "static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run("
 ROOM_STOOD_SIG = "inline bool moe_swap_room_stood("
 METER_MEASURE = ("const uint64_t before = cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT); release(); "
                  "moved += cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) - before;")
-GIVE_BACK_FIELDS = ("meter.give_back([this] { prepared.clear(); });", "answer->room_self_delta = meter.moved;")
+GIVE_BACK_FIELDS = ("meter.give_back([this] { prepared.clear(); });", "answer->room_self_delta = meter.moved;",
+                    "answer->total_us = ggml_sycl::expert_move_us_since(start);")
 GIVE_BACK_DECL = ("ggml_sycl_expert_room_meter room_meter{ named ? cache : nullptr }; "
-                  "ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr };")
+                  "ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, meta_us, "
+                  "copy_us, remap_us, txn_start };")
 PREPARE_CALL = "stop = ggml_sycl_expert_prepare_triplet("
 REFUSED_GIVE_BACK = ("room_meter.give_back([&triplet] { for (ggml_sycl::expert_move_member & m : triplet.members) { "
                      "m.owner = ggml_sycl::mem_handle{}; } });")
 REFILL_BRANCH = "} else if (refill && !transient) {"
 ENTRY_SELF_DELTA = "r.room_self_delta = answer.room_self_delta;"
+ENTRY_COST = "r.total_us = answer.total_us;"
+COUNT_COST = ("moe_swap_detail::moe_swap_count_cost(st, room.cost);",
+              "moe_swap_detail::moe_swap_count_cost(st, answer.cost);")
 # The read comes right after the transaction's call, with nothing between them.
 EPOCH_AFTER_READ = ("ggml_sycl_expert_move_transaction_run(device, request, resolver, &result); "
                     "const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;")
-TXN_ROOM_RETURN = "return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta };"
+TXN_ROOM_RETURN = ("const ggml_sycl::moe_swap_txn_cost cost{ result.copy_us, result.remap_us, result.meta_us, "
+                   "result.total_us }; return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };")
 ROOM_STOOD_BODY = "return room.epoch_after - before == room.self_delta;"
 ADMIT_TXN = "const moe_swap_txn_room room = txn(d.batch);"
 ROOM_STOOD_USE = "const bool room_stood = moe_swap_detail::moe_swap_room_stood(c.room_epoch, room);"
@@ -735,12 +741,15 @@ def check(raw: dict[str, str]) -> None:
             or sycl.count(".give_back(") != 2):
         fail("D20", "a refused named triplet's minted members are not given back measured, in the named-refusal "
                     "branch")
-    if norm(body(sycl, ENTRY_SIG)).count(ENTRY_SELF_DELTA) != 1:
+    if norm(body(sycl, ENTRY_SIG)).count(ENTRY_SELF_DELTA) != 1 or norm(body(sycl, ENTRY_SIG)).count(ENTRY_COST) != 1:
         fail("D20", "the named move's entry does not carry the measured sum to its caller")
     if (norm(callback).count(EPOCH_AFTER_READ) != 1 or norm(callback).count(TXN_ROOM_RETURN) != 1
             or sycl.count("moe_swap_txn_room{") != 1):
         fail("D20", "the transaction callback does not read the room epoch right after the transaction returns and "
                     "return it with the transaction's own sum")
+    if any(norm(driver).count(c) != 1 for c in COUNT_COST) or norm(driver).count("inline void moe_swap_count_cost(") != 1:
+        fail("D20", "the step does not sum each transaction's cost into the stats once, at the admit transaction and at "
+                    "the evict one")
     if norm(body(driver, ROOM_STOOD_SIG)).count(ROOM_STOOD_BODY) != 1:
         fail("D20", "moe_swap_room_stood does not compare the epoch's move since the boundary's read with the "
                     "transaction's own sum")
@@ -1054,7 +1063,9 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", TXN_SIG, "room_meter.give_back([&triplet] {", "std::invoke([&triplet] {")])
     expect_fail("prepared-list-given-back-unmeasured", "D20",
                 [("sycl", GIVE_BACK_SIG, "meter.give_back([this] { prepared.clear(); });", "prepared.clear();")])
-    guard_decl = "    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr };\n"
+    guard_decl = ("    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, meta_us, "
+                  "copy_us,\n"
+                  "                                                   remap_us, txn_start };\n")
     after_preparation = "    if (named && prepared.empty()) {\n"
     expect_fail("give-back-guard-declared-after-the-preparation", "D20",
                 [("sycl", TXN_SIG, guard_decl, ""), ("sycl", TXN_SIG, after_preparation, guard_decl + after_preparation)])
@@ -1067,7 +1078,17 @@ def self_test(raw: dict[str, str]) -> int:
                   "const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;",
                   "const uint64_t epoch_after = 0;")])
     expect_fail("self-delta-not-returned", "D20",
-                [("sycl", CORE_SIG, "{ epoch_after, result.room_self_delta }", "{ epoch_after, 0 }")])
+                [("sycl", CORE_SIG, "{ epoch_after, result.room_self_delta, cost }", "{ epoch_after, 0, cost }")])
+    expect_fail("admit-cost-not-counted", "D20", [("driver", "", "        " + COUNT_COST[0] + "\n", "")])
+    expect_fail("evict-cost-not-counted", "D20", [("driver", "", "    " + COUNT_COST[1] + "\n    for (size_t i = 0; i < keep",
+                                                    "    for (size_t i = 0; i < keep")])
+    expect_fail("cost-not-returned", "D20",
+                [("sycl", CORE_SIG, "{ epoch_after, result.room_self_delta, cost }",
+                  "{ epoch_after, result.room_self_delta, {} }")])
+    expect_fail("cost-not-carried-by-the-entry", "D20",
+                [("sycl", ENTRY_SIG, "r.total_us        = answer.total_us;", "")])
+    expect_fail("cost-not-written-to-the-answer", "D20",
+                [("sycl", GIVE_BACK_SIG, "answer->total_us        = ggml_sycl::expert_move_us_since(start);", "")])
     used = "arena_zones_[static_cast<int>(record_zone)].used);\n"
     bump = "arena_note_room_grew(arena_allocator_group_index(zone));\n"
     for name, call, indent in (("kv-zone-arm", "zone_used_free(*z.allocator, zone_offset, ", " " * 16),

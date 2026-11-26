@@ -1,8 +1,8 @@
 // The decode-boundary expert swap driver (GGML_SYCL_MOE_SWAP=1): what one synchronize boundary does with the swap
 // policy's answer, as a pure function of a plan view, the route counters and the policy state. No SYCL, no ggml, no
 // cache, no logging, no environment and no state outside moe_swap_driver_state, which the caller owns, one per route
-// table. The caller (ggml_sycl_run_expert_swap_at_boundary in ggml-sycl.cpp) gates the boundary, builds the view from
-// the published plan (moe_swap_plan_view_build, moe-stream-plan.hpp), and passes three callables: one that copies
+// table. The caller (ggml_sycl_run_expert_swap_at_boundary in ggml-sycl.cpp gates the boundary; its claimed body
+// ggml_sycl_run_expert_swap_claimed) builds the view from the published plan (moe_swap_plan_view_build, moe-stream-plan.hpp), and passes three callables: one that copies
 // the route counters, one that reads the host room, one that runs the named move.
 //
 // One boundary sends one transaction at most, never both directions:
@@ -154,6 +154,17 @@ struct moe_swap_move {
     moe_swap_busy_cause   busy_cause    = MOE_SWAP_BUSY_CAUSE_TRANSIENT;
 };
 
+// What one transaction cost the boundary thread, in microseconds: the copy steps' submission, the id handovers' time in
+// the cache, the metadata lookups, and the call's whole time from its start, which shows what the three leave out. The
+// driver sums them over the transactions it sends (moe_swap_driver_stats), so the move's own per-move line can stay a
+// DEBUG line and the run's cost is still in the summary.
+struct moe_swap_txn_cost {
+    uint64_t copy_us  = 0;
+    uint64_t remap_us = 0;
+    uint64_t meta_us  = 0;
+    uint64_t total_us = 0;
+};
+
 // What a transaction says of the device zone's room epoch once it has returned. A transaction moves the epoch itself
 // when it gives back blocks it took: the members a triplet minted before the zone refused a later one, and whatever a
 // prepared triplet held when the move did not take it. That is room the zone had before the transaction, not room it
@@ -165,8 +176,9 @@ struct moe_swap_move {
 // is taken for the transaction's own, and the admit it would have sent is then held, at most to
 // MOE_SWAP_PENDING_HOLD_BOUND.
 struct moe_swap_txn_room {
-    uint64_t epoch_after = 0;
-    uint64_t self_delta  = 0;
+    uint64_t          epoch_after = 0;
+    uint64_t          self_delta  = 0;
+    moe_swap_txn_cost cost;
 };
 
 // An admit waiting for the boundary after its evict. A restore admits evict_expert back.
@@ -267,6 +279,11 @@ struct moe_swap_driver_stats {
     uint64_t                           settled_moved            = 0;  // their moves the next view showed had moved
     uint64_t                           unsettled_moves          = 0;  // moves of a thrown batch not settled yet
     uint32_t                           pending_high_water       = 0;
+    uint64_t                           txn_sent                 = 0;  // transactions sent, accepted or not
+    uint64_t                           txn_copy_us              = 0;  // their cost to the boundary thread
+    uint64_t                           txn_remap_us             = 0;
+    uint64_t                           txn_meta_us              = 0;
+    uint64_t                           txn_total_us             = 0;
     const char *                       off_reason               = nullptr;
     std::vector<moe_swap_reason_count> refused;
     std::vector<moe_swap_reason_count> busy;
@@ -350,6 +367,15 @@ inline void moe_swap_driver_note_off(moe_swap_driver_state & d, const char * rea
 }
 
 namespace moe_swap_detail {
+
+// One transaction's cost, summed into the stats whatever its answer was: a refused one still took the time.
+inline void moe_swap_count_cost(moe_swap_driver_stats & st, const moe_swap_txn_cost & c) {
+    ++st.txn_sent;
+    st.txn_copy_us += c.copy_us;
+    st.txn_remap_us += c.remap_us;
+    st.txn_meta_us += c.meta_us;
+    st.txn_total_us += c.total_us;
+}
 
 inline bool moe_swap_view_fits(const moe_swap_driver_state & d, const moe_swap_plan_view & v) {
     const size_t nb    = static_cast<size_t>(d.policy.n_blocks);
@@ -678,6 +704,7 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
         });
         const moe_swap_txn_room                room = txn(d.batch);
         admit_throw.dismiss();
+        moe_swap_detail::moe_swap_count_cost(st, room.cost);
         // The transaction leaves the epoch somewhere else whenever it gave storage back. Only when that is all that
         // moved it has the zone gained no room, and only then is an admit held under the epoch the transaction left:
         // one it just refused for room, and one this boundary held and did not send.
@@ -808,9 +835,11 @@ moe_swap_driver_status moe_swap_driver_step(moe_swap_driver_state &      d,
         }
         st.unsettled_moves = d.unsettled.size();
     });
-    // No admit is pending at a boundary that sends evicts, so what the transaction says of the room has no reader.
-    (void) txn(d.batch);
+    // No admit is pending at a boundary that sends evicts, so what the transaction says of the room has no reader;
+    // its cost is counted.
+    const moe_swap_txn_room                answer = txn(d.batch);
     evict_throw.dismiss();
+    moe_swap_detail::moe_swap_count_cost(st, answer.cost);
     for (size_t i = 0; i < keep; ++i) {
         const moe_swap_move &     m = d.batch[i];
         const moe_swap_proposal & q = d.proposals[i];
@@ -916,7 +945,14 @@ inline std::string moe_swap_driver_summary_faults(const moe_swap_driver_stats & 
                   "; settled from the plan after a throw: %llu batches (%llu moves moved); unsettled at report: %llu "
                   "moves",
                   (ull) st.settled_batches, (ull) st.settled_moved, (ull) st.unsettled_moves);
-    std::string out = std::string(head) + tail + "; refused: " + moe_swap_detail::moe_swap_reason_list(st.refused) +
+    char cost[192];
+    std::snprintf(cost, sizeof(cost),
+                  "; transaction cost over %llu: copy submit %llu us, id remap %llu us, meta lookup %llu us, total "
+                  "%llu us",
+                  (ull) st.txn_sent, (ull) st.txn_copy_us, (ull) st.txn_remap_us, (ull) st.txn_meta_us,
+                  (ull) st.txn_total_us);
+    std::string out = std::string(head) + tail + cost +
+                      "; refused: " + moe_swap_detail::moe_swap_reason_list(st.refused) +
                       "; busy: " + moe_swap_detail::moe_swap_reason_list(st.busy) +
                       "; dropped pending: " + moe_swap_detail::moe_swap_reason_list(st.dropped);
     // The backend counts a graph as decode only when it is one row, so parallel sequences or speculative decoding
