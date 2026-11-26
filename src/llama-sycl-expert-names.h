@@ -20,7 +20,7 @@ static inline bool llama_sycl_is_moe_expert_weight_name(const char * name) {
     if (name == nullptr) {
         return false;
     }
-    static const char * kinds[] = { "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps" };
+    static const char * const kinds[] = { "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps" };
     for (const char * kind : kinds) {
         if (std::strstr(name, kind) != nullptr) {
             return true;

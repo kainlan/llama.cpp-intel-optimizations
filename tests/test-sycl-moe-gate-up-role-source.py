@@ -106,7 +106,9 @@ GLU_OP = "if (node->op != GGML_OP_GLU || !node->src[0] || !node->src[1]) { conti
 RING_FN = "static bool ggml_sycl_inventory_ring_has_consumer(const ggml_sycl_tensor_inventory * inventory) {"
 RING_SKIP = "if (moe_classify_tensor(t.name) == MOE_TENSOR_UNKNOWN || t.ne[0] <= 0 || t.ne[1] <= 0) { continue; }"
 NAMES_FN = "static inline bool llama_sycl_is_moe_expert_weight_name(const char * name) {"
-NAMES_KINDS = 'static const char * kinds[] = { "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps" };'
+NAMES_KINDS = (
+    'static const char * const kinds[] = { "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps" };'
+)
 LOADER_CALL = "if (!llama_sycl_is_moe_expert_weight_name(tensor.name)) { continue; }"
 LOADER_INCLUDE = '#include "llama-sycl-expert-names.h"'
 SEAM_FN = ("inline bool moe_mmid_direct_defers_to_executor(bool prompt, bool executor_claims, "
