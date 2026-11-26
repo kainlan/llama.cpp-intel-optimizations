@@ -48,7 +48,7 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
       pinned" otherwise), while a refill's owner need only hold the entry, as the loan that lent it requires;
   A9  a named move WARNs no refusal (its refusals skip the loan's WARN; its caller reads each answer from the
       outcomes), and outside the private test fixtures the entry has exactly one caller, the decode-boundary swap driver
-      (ggml_sycl_run_expert_swap_at_boundary), which calls it once;
+      (ggml_sycl_run_expert_swap_claimed, which the boundary and the private tests' hook call), which calls it once;
   A10 the named selection takes the published plan's verdict (moe_expert_move_validate) and moves only the triplets it
       lets through;
   A11 every refusal either cache body assigns, the copy to the device and the loan's copy to the host, is classed
@@ -76,10 +76,18 @@ unified_cache::loan_expert_triplet, the loan's body. What this gate pins:
   E5  each moved outcome records the device storage it took or gives back; the body sums the bytes once per
       direction, as each triplet moves, writes them once the plan is published and names both directions in its
       result line, and the entry takes those sums, counts each outcome in its direction and returns it in its own list;
-  M1  a named move's one result line is a WARN (every tool drops INFO) that carries, summed over the batch, the
-      microseconds the cache spent in each move's copy step and in its id handover and retire, and the transaction in
-      the members' metadata lookups: each cache body, the loan's and the copy to the device, records its two times in
-      the move record, the preparation times its resolver call, and the body sums all three as each call returns.
+  M2  an admit's retires of its host copies carry no latch mark: the cache's eviction latch already leaves a
+      host-resident entry out, so retired_by_expert_move is set only on the device entries an evict retires, and the
+      copy to the device never names it;
+  M1  a named move's one result line is a DEBUG line with no timings; what the move cost the boundary thread is the
+      answer's instead, written to the body's answer on every exit by the guard that also writes the room figure (a
+      transaction that threw is neither reported, since the entry rethrows before it copies the answer, nor counted
+      by the swap driver): the
+      microseconds the cache spent in each move's copy step and in its id handover and retire, the transaction in the
+      members' metadata lookups. The call's whole time is the entry's, taken on every exit that returns (a refusal
+      before any preparation included, whose three parts stay 0). Each cache body, the loan's and
+      the copy to the device, records its two times in the move record, the preparation times its resolver call, and
+      the body sums all three as each call returns, into counters declared before the guard.
 
 Checks run on comment-stripped, whitespace-normalized text. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it and is reported if it survives, if another pin
@@ -93,6 +101,7 @@ served from its old table and that an evict's room comes back only after the rea
 
 from __future__ import annotations
 
+import functools
 import re
 import sys
 from pathlib import Path
@@ -119,6 +128,27 @@ class MutantNotApplied(Exception):
     pass
 
 
+# The self-test runs the gate on a mutant of each source in turn. The unmutated sources, and what is cut from them,
+# stay cached because every mutant reads them; a mutated text is used for its one check and evicted. The caches are
+# small on purpose: a key holds a whole 7 MB source, so a large cache would keep hundreds of dead mutants in memory. A
+# cache hit returns what the same text gave before, so each mutant is still judged on its own text.
+_WHOLE_SOURCE = 1 << 20  # a text this long is a whole source or a whole stripped copy of one, not a body cut from it
+
+
+def content_cache(fn):
+    """Cache `fn` by its text argument in two tiers: the few whole-source texts stay hot, and the many short texts cut
+    from them are held in a larger cache whose keys are each under a megabyte."""
+    short = functools.lru_cache(maxsize=256)(fn)
+    whole = functools.lru_cache(maxsize=8)(fn)
+
+    @functools.wraps(fn)
+    def cached(text):
+        return (whole if len(text) >= _WHOLE_SOURCE else short)(text)
+
+    return cached
+
+
+@functools.lru_cache(maxsize=8)
 def strip_comments(src: str) -> str:
     """Comments blanked to their newlines, literals kept."""
 
@@ -131,6 +161,7 @@ def strip_comments(src: str) -> str:
     return _LEXEME_RE.sub(repl, src)
 
 
+@content_cache
 def norm(text: str) -> str:
     """Comment-stripped, whitespace-canonical text with adjacent string literals joined, and every guard on
     g_tensor_inventory_mutex in its deduced spelling, so a clang-format re-wrap cannot turn a pin red."""
@@ -334,12 +365,11 @@ PINNED_CHECK = ("if (e.location != cache_location::HOST_PINNED || !e.host_reside
                 '{ refusal = admit ? "host copy not pinned" : "not a lent copy"; break; }')
 
 REFUSE_GATE = "if (!probe_mode && !refill && !named && (warn_busy || code != ggml_sycl_txn_result::BUSY)) {"
-NAMED_FORMAT = ('"[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) '
-                '(%s); copy submit %llu us, id remap %llu us, meta lookup %llu us, total %llu us\\n"')
-NAMED_LINE = "GGML_LOG_WARN(" + NAMED_FORMAT
+NAMED_FORMAT = ('"[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s)\\n"')
+NAMED_LINE = "GGML_LOG_DEBUG(" + NAMED_FORMAT
 ENTRY_NAME = "ggml_sycl_expert_move_transaction_run("
-# The entry's one production caller: the swap driver at the synchronize boundary.
-DRIVER_SIG = "static void ggml_sycl_run_expert_swap_at_boundary("
+# The entry's one production caller: the swap driver's claimed body, which the synchronize boundary runs.
+DRIVER_SIG = "static void ggml_sycl_run_expert_swap_claimed("
 
 VALIDATE = ("const ggml_sycl::moe_expert_move_check check = ggml_sycl::moe_expert_move_validate(plan, device, evict, "
             "admit);")
@@ -420,13 +450,13 @@ STAMP_COMPARES = "s.expert_storage_generation == expert_storage_generation"
 BODY_SUM = "++lent; (to_device ? taken : freed) += record.device_bytes;"
 BODY_RESULT = "result.bytes_freed = freed; result.bytes_readmitted = taken;"
 BODY_COUNT = "if (!m.to_device) { ++n_evicted; }"
-NAMED_LINE_ARGS = ("device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason, "
-                   "(unsigned long long) copy_us, (unsigned long long) remap_us, (unsigned long long) meta_us, "
-                   "(unsigned long long) ggml_sycl::expert_move_us_since(txn_start));")
+NAMED_LINE_ARGS = "device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason);"
 # M1: what the body sums into the line, and where each figure is measured.
 SUM_META = "meta_us += triplet.resolve_us;"
-# The line's total runs from the transaction's first statement, before the lock and the preparation.
-TXN_START = "const auto txn_start = std::chrono::steady_clock::now();"
+COST_GUARD = ("ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, meta_us, "
+              "copy_us, remap_us };")
+COST_COUNTERS = "uint64_t meta_us = 0; uint64_t copy_us = 0; uint64_t remap_us = 0;"
+COST_WRITE = "answer->meta_us = meta_us; answer->copy_us = copy_us; answer->remap_us = remap_us;"
 SUM_CACHE = "copy_us += record.copy_us; remap_us += record.remap_us;"
 CACHE_TIMES = ("out.copy_us = copy_took;", "out.remap_us = remap_took;")
 PREP_TIMED = "const bool resolved = resolver(*e, target); out.resolve_us += ggml_sycl::expert_move_us_since(resolve_from);"
@@ -435,7 +465,8 @@ ENTRY_SPLIT = ("for (ggml_sycl_expert_move_outcome & m : moves) { if (m.moved) {
                "++(m.to_device ? r.n_admitted : r.n_evicted); } (m.to_device ? r.admitted : r.evicted).push_back(m); }")
 
 
-def _private_testing_lines(raw: str) -> list[bool]:
+@functools.lru_cache(maxsize=8)
+def _private_testing_lines(raw: str) -> tuple[bool, ...]:
     """Per line of comment-stripped `raw`, whether it sits inside a `#if defined(GGML_SYCL_PRIVATE_TESTING)` block
     (not its #else). Nested conditionals keep the outer block's answer."""
     stack: list[bool] = []
@@ -449,7 +480,7 @@ def _private_testing_lines(raw: str) -> list[bool]:
         elif re.match(r"#\s*endif", s) and stack:
             stack.pop()
         out.append(any(stack))
-    return out
+    return tuple(out)
 
 
 def check(raw: dict[str, str]) -> None:
@@ -669,15 +700,24 @@ def check(raw: dict[str, str]) -> None:
         fail("E5", "the entry does not take the body's bytes, or does not count each outcome in its direction and "
                    "return it in its own list")
 
+    # M2 ---------------------------------------------------------------------------------------------------------------
+    if "retired_by_expert_move" in copy:
+        fail("M2", "the copy to the device marks a host copy's retire as an expert move's, which the eviction latch "
+                   "never reads for a host-resident entry")
+
     # M1 ---------------------------------------------------------------------------------------------------------------
     if (txn.count(NAMED_LINE) != 1 or txn.count(SUM_META) != 1 or txn.count(SUM_CACHE) != 1
             or not ordered(txn, "stop = ggml_sycl_expert_prepare_triplet(", SUM_META, "std::unique_lock lock(")
             or not ordered(txn, "loaned = cache->refill_lent_triplet(triplet.members, record); break; }", SUM_CACHE,
                            "if (!loaned && (admit || evict)) {")
             or not ordered(txn, SUM_CACHE, NAMED_LINE)
-            or txn.count(TXN_START) != 1 or not txn.startswith("{ " + TXN_START)):
-        fail("M1", "the named move's result line is not one WARN carrying the batch's copy submission, id remap and "
-                   "meta lookup times, each summed as its call returns, and the transaction's total from its start")
+            or "GGML_LOG_WARN(\"[MOE-EXEC] named move" in txn):
+        fail("M1", "the named move's result line is not one DEBUG line, or the batch's copy submission, id remap and "
+                   "meta lookup times are not each summed as its call returns")
+    if (txn.count(COST_GUARD) != 1 or txn.count(COST_COUNTERS) != 1 or not ordered(txn, COST_COUNTERS, COST_GUARD)
+            or sycl.count(COST_WRITE) != 1):
+        fail("M1", "the named move's cost is not written to its answer by the guard that writes the room figure, on "
+                   "every exit, from counters declared before it")
     if (not all(loan.count(t) == 1 and copy.count(t) == 1 for t in CACHE_TIMES) or prep.count(PREP_TIMED) != 1
             or "resolver(*e, target)" in prep.replace(PREP_TIMED, "")):
         fail("M1", "a cache body does not record its copy and handover times, or the preparation does not time its "
@@ -728,13 +768,26 @@ def self_test(raw: dict[str, str]) -> int:
         failures.append(name)
         print(f"  self-test: {name}: SURVIVED (pin {pin} did not catch it)")
 
-    expect_fail("named-line-debug", "M1", [("sycl", TXN_SIG, 'GGML_LOG_WARN(\n            "[MOE-EXEC] named move',
-                                            'GGML_LOG_DEBUG(\n            "[MOE-EXEC] named move')])
+    expect_fail("admit-marks-the-host-copy", "M2",
+                [("cache", COPY_SIG, "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);",
+                  "host->second.retired_by_expert_move = true;\n"
+                  "                        (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);")])
+    expect_fail("named-line-warns", "M1", [("sycl", TXN_SIG, 'GGML_LOG_DEBUG("[MOE-EXEC] named move',
+                                            'GGML_LOG_WARN("[MOE-EXEC] named move')])
+    expect_fail("named-line-carries-timings", "E5", [("sycl", TXN_SIG, "taken / (1024 * 1024), reason);",
+                                                      "taken / (1024 * 1024), reason, (unsigned long long) copy_us);")])
+    expect_fail("cost-not-written", "M1", [("sycl", "", "answer->remap_us        = remap_us;", "")])
+    PAD = " " * 27
+    expect_fail("cost-guard-before-its-counters", "M1",
+                [("sycl", TXN_SIG,
+                  "    uint64_t%s meta_us  = 0;\n    uint64_t%s copy_us  = 0;\n    uint64_t%s remap_us = 0;\n"
+                  % (PAD, PAD, PAD), ""),
+                 ("sycl", TXN_SIG, "    const char * stop      = nullptr;\n",
+                  "    const char * stop      = nullptr;\n    uint64_t meta_us = 0;\n    uint64_t copy_us = 0;\n"
+                  "    uint64_t remap_us = 0;\n")])
     expect_fail("meta-lookup-unsummed", "M1", [("sycl", TXN_SIG, "meta_us += triplet.resolve_us;", "")])
-    start_line = "    " + TXN_START + "\n"
-    lock_line = "    std::unique_lock lock(g_tensor_inventory_mutex);\n"
-    expect_fail("total-from-the-lock", "M1", [("sycl", TXN_SIG, start_line, ""),
-                                             ("sycl", TXN_SIG, lock_line, lock_line + start_line)])
+    expect_fail("copy-cost-not-written", "M1", [("sycl", "", "answer->copy_us         = copy_us;", "")])
+    expect_fail("meta-cost-not-written", "M1", [("sycl", "", "answer->meta_us         = meta_us;", "")])
     expect_fail("loan-copy-untimed", "M1", [("cache", LOAN_SIG, "out.copy_us  = copy_took;", "")])
     expect_fail("entry-renamed", "A0", [("sycl", "", "ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int ",
                                          "ggml_sycl_txn_result ggml_sycl_expert_move_run(int ")])
@@ -869,7 +922,7 @@ def self_test(raw: dict[str, str]) -> int:
                                              "static void ggml_sycl_admit_everything(int d) {\n"
                                              "    (void) ggml_sycl_expert_move_transaction_run(d, {}, nullptr, nullptr);"
                                              "\n}\n\n" + ENTRY_SIG)])
-    driver_call = "ggml_sycl_expert_move_transaction_run(device, request, nullptr, &result)"
+    driver_call = "ggml_sycl_expert_move_transaction_run(device, request, resolver, &result)"
     expect_fail("driver-calls-twice", "A9", [("sycl", DRIVER_SIG, driver_call + ";",
                                               driver_call + ";\n        (void) " + driver_call + ";")])
     expect_fail("driver-drops-its-call", "A9", [("sycl", DRIVER_SIG, driver_call, "ggml_sycl_txn_result::BUSY")])

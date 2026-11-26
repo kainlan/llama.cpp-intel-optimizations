@@ -138,6 +138,7 @@ it fail.
 Pytest-style (module-level test_* functions): register with llama_test_pytest.
 """
 
+import functools
 import re
 from pathlib import Path
 
@@ -149,6 +150,27 @@ _LEXEME_RE = re.compile(
 )
 
 
+# The mutant tests below each rebuild the claims on a copy of one source with one edit. The unmutated sources stay
+# cached because every mutant reads them; a mutated text is used for its one claim and evicted. The caches are small on
+# purpose: a key holds a whole source, so a large cache would keep hundreds of dead mutants in memory. A hit returns
+# what the same text gave before, so each mutant is still judged on its own text.
+_WHOLE_SOURCE = 1 << 20  # a text this long is a whole source or a whole stripped copy of one, not a body cut from it
+
+
+def content_cache(fn):
+    """Cache `fn` by its text argument in two tiers: the few whole-source texts stay hot, and the many short texts cut
+    from them are held in a larger cache whose keys are each under a megabyte."""
+    short = functools.lru_cache(maxsize=256)(fn)
+    whole = functools.lru_cache(maxsize=8)(fn)
+
+    @functools.wraps(fn)
+    def cached(text):
+        return (whole if len(text) >= _WHOLE_SOURCE else short)(text)
+
+    return cached
+
+
+@functools.lru_cache(maxsize=8)
 def strip_comments(src: str) -> str:
     def repl(m: re.Match) -> str:
         tok = m.group(0)
@@ -169,6 +191,7 @@ def strip_cmake_comments(src: str) -> str:
 _INVENTORY_GUARD_RE = re.compile(r"std::(lock_guard|unique_lock) ?<[^<>;]*> ?(\w+)\(g_tensor_inventory_mutex\)")
 
 
+@content_cache
 def norm(text: str) -> str:
     """Comment-stripped, whitespace-canonical text with adjacent string literals joined, so neither a clang-format
     re-wrap nor a re-split format string can turn a claim red, and every guard on g_tensor_inventory_mutex in its
@@ -329,8 +352,7 @@ MIRROR_BACK = ("if (!released.mirror.empty() && direct_expert_entries_.find(exac
                "{ direct_expert_entries_.insert(std::move(released.mirror)); }")
 HOST_WITHDRAW = ("if (host != entries_.end() && host->second.direct_alloc_owner.owner_control_id() == host_control) "
                  "{ (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
-RESTORE_CALL = ("restore_expert_entry_at_locked(make_direct_stage_key(cache_entry_type::MOE_EXPERT, members[i].key, "
-                "GGML_LAYOUT_AOS), device_nodes[i]);")
+RESTORE_CALL = "restore_expert_entry_at_locked(expert_device_key(members[i].key), device_nodes[i]);"
 REGISTRATION_REFUSED = 'out.reason = "host registration failed";'
 RELEASED_SIZED = ("std::vector<expert_retire_nodes> host_nodes(members[0].host_keys.size() + "
                   "members[1].host_keys.size() + members[2].host_keys.size());")
@@ -385,7 +407,7 @@ def claim_registration_catches_everything(cache: str) -> bool:
 LOAD_EFFECT = 'if (acquire_bound_load_effect().failed()) { out.reason = "load effect unavailable"; return false; }'
 COHERENCE = ("if (cache_placement_coherence(this).coherence == placement_cache_coherence::TRANSIENT_MISMATCH) "
              '{ out.reason = "plan not coherent"; return false; }')
-HOST_EXISTS = ("const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }); "
+HOST_EXISTS = ("const auto host = entries_.find(expert_host_key(host_id)); "
                "if (host != entries_.end()) { "
                'refusal = host->second.retired ? "host entry retiring" : "host entry exists"; break; }')
 REFUSE_EARLY = "if (refusal) { out.reason = refusal; return false; }"
@@ -913,11 +935,10 @@ MINT_MIRROR = ("device_mirror[i].handle = make_direct_entry_handle(device_key, c
 MINT_OUT = ("out.handles[i] = mem_handle::from_weight_lease_locked(device_key, cache_device, stored.device_ptr, "
             "stored.layout, true, &stored);")
 SWAP_MIRROR = "std::swap(direct_expert_entries_.find(key)->second, device_mirror[i]);"
-REMAP_ID = "id_to_key_.find(key)->second = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS);"
+REMAP_ID = "id_to_key_.find(key)->second = expert_device_key(key);"
 HOST_RETIRE = ("if (host != entries_.end() && !host->second.retired && "
                "host->second.direct_alloc_owner.owner_control_id() == src_control[i]) "
-               "{ host->second.retired_by_expert_move = true; "
-               "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
+               "{ (void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]); }")
 PUBLICATION_FAILED = 'refusal = "publication failed";'
 WITHDRAW_INSERTED = "for (int i = 0; i < inserted; ++i) { (void) transition_to_retired_locked("
 REFILL_CATCH = "} catch (const ggml_sycl_fallback_error &) { throw; } catch (...) { " + WITHDRAW_INSERTED
@@ -1533,8 +1554,7 @@ SOURCE_SIG = "bool unified_cache::has_expert_source(ggml_sycl_cache_id key, bool
 SHARED_CACHE_LOCKS = ("std::shared_lock<std::shared_mutex> direct_lock(direct_stage_mutex_, std::defer_lock); "
                       "std::shared_lock<std::shared_mutex> cache_lock(rw_mutex_, std::defer_lock); "
                       "std::lock(direct_lock, cache_lock);")
-SOURCE_FIND = ("const auto it = entries_.find(to_device ? unified_cache_key{ cache_entry_type::MOE_EXPERT, key, -1, "
-               "-1 } : make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, GGML_LAYOUT_AOS));")
+SOURCE_FIND = "const auto it = entries_.find(to_device ? expert_host_key(key) : expert_device_key(key));"
 SOURCE_RETURN = "return it != entries_.end() && !it->second.retired;"
 # A loan copies the expert's own bytes from offset 0 of the device entry, which must hold them, into a host copy that
 # holds them too; the entry's padded tail stays on the device.
@@ -1645,10 +1665,23 @@ def claim_a_missing_source_refuses_before_the_insert(cache: str) -> bool:
 # key is another registrant's live entry, which keeps it. A registration that fails after it named its copy under the
 # id hands the id back to the entry it was to replace, which its mover puts back, so the rollback finds the id to hand
 # back without building a mapping. The remap counts each walk, which the device test reads across an evict.
-LOAN_HOST_KEY = "const unified_cache_key host_key{ cache_entry_type::MOE_EXPERT, members[i].key, -1, -1 };"
-LOAN_REPOINT = "if (mapped != id_to_key_.end() && mapped->second == device_key) { mapped->second = host_key; }"
-LOAN_HAND_BACK = ("if (mapped != id_to_key_.end() && mapped->second == host_key && !held_by_another) "
-                  "{ mapped->second = device_key; }")
+LOAN_HOST_KEY = "const unified_cache_key host_key = expert_host_key(members[i].key);"
+LOAN_REPOINT = "expert_id_hand_over(id_to_key_, members[i].key, device_key, host_key);"
+LOAN_HAND_BACK = ("expert_id_hand_back(id_to_key_, members[i].key, host_key, device_key, held_by_another, "
+                  "spare_mapping[i]);")
+# The three helpers the loan and its rollback call, which hold the mapping edits; the key helpers name the two keys.
+HAND_OVER_SIG = "static void expert_id_hand_over("
+HAND_BACK_SIG = "static void expert_id_hand_back("
+SPARE_SIG = "static typename Map::node_type expert_spare_mapping("
+HAND_OVER_BODY = ("const auto mapped = ids.find(id); if (mapped != ids.end() && mapped->second == device_key) "
+                  "{ mapped->second = host_key; }")
+HAND_BACK_BODY = ("const auto mapped = ids.find(id); if (mapped != ids.end() && mapped->second == host_key && "
+                  "!held_by_another) { mapped->second = device_key; } else if (mapped == ids.end() && !spare.empty()) "
+                  "{ ids.insert(std::move(spare)); }")
+SPARE_BODY = ("const auto mapped = ids.find(id); if (mapped == ids.end() || !(mapped->second == device_key)) "
+              "{ return {}; } Map spare; return spare.extract(spare.emplace(id, device_key).first);")
+DEVICE_KEY_BODY = "return make_direct_stage_key(cache_entry_type::MOE_EXPERT, id, GGML_LAYOUT_AOS);"
+HOST_KEY_BODY = "return unified_cache_key{ cache_entry_type::MOE_EXPERT, id, -1, -1 };"
 LOAN_HELD_BY_ANOTHER = ("const bool held_by_another = host != entries_.end() && !host->second.retired && "
                         "host->second.direct_alloc_owner.owner_control_id() != members[i].owner.owner_control_id();")
 REGISTER_HAND_BACK = ("if (id != id_to_key_.end() && id->second == cache_key) { if (moved_from && "
@@ -1665,6 +1698,9 @@ def claim_the_evict_hands_the_id_over_before_it_retires(cache: str) -> bool:
     reg = body(c, REGISTER_BODY_SIG)
     remap = body(c, REMAP_SIG)
     return (loan.count(LOAN_REPOINT) == 1 and loan.count(LOAN_HAND_BACK) == 1 and loan.count(LOAN_HELD_BY_ANOTHER) == 1
+            and body(c, HAND_OVER_SIG).count(HAND_OVER_BODY) == 1 and body(c, HAND_BACK_SIG).count(HAND_BACK_BODY) == 1
+            and body(c, "static unified_cache_key expert_device_key(").count(DEVICE_KEY_BODY) == 1
+            and body(c, "static unified_cache_key expert_host_key(").count(HOST_KEY_BODY) == 1
             and ordered(loan, STAMP_FLAG, LOAN_HOST_KEY, LOAN_REPOINT, DEVICE_RETIRE, REGISTER)
             and ordered(loan, REGISTER_CATCH, LOAN_HELD_BY_ANOTHER, LOAN_HAND_BACK, HOST_WITHDRAW, RESTORE_CALL)
             and reg.count(REGISTER_HAND_BACK) == 1
@@ -1693,7 +1729,67 @@ def test_mutant_rollback_leaves_the_id_on_the_host_key_fails():
 
 def test_mutant_rollback_takes_the_id_from_another_registrant_fails():
     assert not claim_the_evict_hands_the_id_over_before_it_retires(
-        _once_in(CACHE, LOAN_SIG, LOAN_HAND_BACK, LOAN_HAND_BACK.replace(" && !held_by_another", "")))
+        _once_in(CACHE, HAND_BACK_SIG, " && !held_by_another", ""))
+
+
+# The functions that look an expert's entries up by key, and the least number of times each names the two keys through
+# the helpers (the loan's checks, hand-over, rollback and restore; the copy to the device's checks, its device entries
+# and the host copies it retires; the source probe's one lookup).
+KEY_HELPER_USERS = ((LOAN_SIG, 4, 3), (REFILL_BODY_SIG, 6, 3), (SOURCE_SIG, 1, 1))
+HAND_BUILT_HOST_KEY = re.compile(r"\{\s*cache_entry_type::MOE_EXPERT\s*,")
+
+
+def claim_the_loan_names_its_keys_through_the_helpers(cache: str) -> bool:
+    """The loan, the copy to the device and the source probe build no key by hand: a second spelling of the device
+    entry's layout or of the host key's sentinels is one a helper edit would leave behind."""
+    for signature, device_uses, host_uses in KEY_HELPER_USERS:
+        text = body(norm(cache), signature)
+        if (not text or "make_direct_stage_key(" in text or HAND_BUILT_HOST_KEY.search(text)
+                or text.count("expert_device_key(") < device_uses or text.count("expert_host_key(") < host_uses):
+            return False
+    return True
+
+
+def test_the_loan_names_its_keys_through_the_helpers():
+    assert claim_the_loan_names_its_keys_through_the_helpers(CACHE)
+
+
+DEVICE_KEY_BY_HAND = "make_direct_stage_key(cache_entry_type::MOE_EXPERT, {0}, GGML_LAYOUT_AOS)"
+HOST_KEY_BY_HAND = "unified_cache_key{{ cache_entry_type::MOE_EXPERT, {0}, -1, -1 }}"
+
+
+KEY_BY_HAND_MUTANTS = (
+    ("loan-device", LOAN_SIG, "entries_.find(expert_device_key(members[i].key))",
+     "entries_.find(" + DEVICE_KEY_BY_HAND.format("members[i].key") + ")"),
+    ("loan-host", LOAN_SIG, "entries_.find(expert_host_key(host_id))",
+     "entries_.find(" + HOST_KEY_BY_HAND.format("host_id") + ")"),
+    ("copy-device", REFILL_BODY_SIG, "entries_.find(expert_device_key(key)) != entries_.end()) { refusal = "
+     "\"device entry exists\";",
+     "entries_.find(" + DEVICE_KEY_BY_HAND.format("key") + ") != entries_.end()) { refusal = "
+     "\"device entry exists\";"),
+    ("copy-host", REFILL_BODY_SIG, "const unified_cache_key host_key = expert_host_key(id);",
+     "const unified_cache_key host_key = " + HOST_KEY_BY_HAND.format("id") + ";"),
+    ("source-host", SOURCE_SIG, "entries_.find(to_device ? expert_host_key(key) : expert_device_key(key))",
+     "entries_.find(to_device ? " + HOST_KEY_BY_HAND.format("key") + " : expert_device_key(key))"),
+    ("source-device", SOURCE_SIG, "entries_.find(to_device ? expert_host_key(key) : expert_device_key(key))",
+     "entries_.find(to_device ? expert_host_key(key) : " + DEVICE_KEY_BY_HAND.format("key") + ")"),
+)
+
+
+def test_mutant_a_key_spelled_by_hand_fails():
+    for name, signature, old, new in KEY_BY_HAND_MUTANTS:
+        assert not claim_the_loan_names_its_keys_through_the_helpers(_once_in(CACHE, signature, old, new)), name
+
+
+def test_mutant_hand_over_moves_whatever_the_id_names_fails():
+    """The id handed over from an entry it no longer names would point a reader at the host key of a stale copy."""
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, HAND_OVER_SIG, " && mapped->second == device_key", ""))
+
+
+def test_mutant_device_key_names_another_layout_fails():
+    assert not claim_the_evict_hands_the_id_over_before_it_retires(
+        _once_in(CACHE, "static unified_cache_key expert_device_key(", "GGML_LAYOUT_AOS", "GGML_LAYOUT_SOA"))
 
 
 def test_mutant_failed_registration_drops_the_moved_id_fails():
@@ -1714,20 +1810,21 @@ def test_mutant_remap_walks_uncounted_fails():
 # check loop, where minting may still throw and nothing has changed, and the rollback inserts it when the id maps to
 # nothing: no node is built in the rollback.
 SPARE_DECL = "id_map::node_type spare_mapping[3];"
-SPARE_MINT = ("if (handed != id_to_key_.end() && handed->second == device_key) { id_map spare; "
-              "spare_mapping[i] = spare.extract(spare.emplace(members[i].key, device_key).first); }")
-SPARE_INSERT = ("else if (mapped == id_to_key_.end() && !spare_mapping[i].empty()) { "
-                "id_to_key_.insert(std::move(spare_mapping[i])); }")
+SPARE_MINT = "spare_mapping[i] = expert_spare_mapping(id_to_key_, members[i].key, device_key);"
+SPARE_INSERT = "ids.insert(std::move(spare));"
 
 
 def claim_a_rollback_restores_a_lost_id(cache: str) -> bool:
     loan = body(norm(cache), LOAN_SIG)
     at = loan.find("if (failed) {")
     rollback = loan[at:loan.find(REGISTRATION_REFUSED, at)] if at >= 0 else ""
-    return (loan.count(SPARE_DECL) == 1 and loan.count(SPARE_MINT) == 1 and loan.count(SPARE_INSERT) == 1
+    hand_back = body(norm(cache), HAND_BACK_SIG)
+    return (loan.count(SPARE_DECL) == 1 and loan.count(SPARE_MINT) == 1
+            and body(norm(cache), SPARE_SIG).count(SPARE_BODY) == 1 and hand_back.count(SPARE_INSERT) == 1
             and ordered(loan, SPARE_DECL, HOLD, SPARE_MINT, LOAN_REPOINT)
-            and ordered(rollback, LOAN_HAND_BACK, SPARE_INSERT, HOST_WITHDRAW, RESTORE_CALL)
-            and bool(rollback) and not any(x in rollback for x in NODE_BUILDERS))
+            and ordered(rollback, LOAN_HAND_BACK, HOST_WITHDRAW, RESTORE_CALL)
+            and bool(rollback) and not any(x in rollback for x in NODE_BUILDERS)
+            and not any(x in hand_back for x in NODE_BUILDERS))
 
 
 def test_a_rollback_restores_a_lost_id():
@@ -1736,14 +1833,13 @@ def test_a_rollback_restores_a_lost_id():
 
 def test_mutant_rollback_leaves_a_lost_id_lost_fails():
     """The device entry goes back with no id mapping: every reader that resolves the expert through its id misses."""
-    assert not claim_a_rollback_restores_a_lost_id(_once_in(CACHE, LOAN_SIG, SPARE_INSERT, ""))
+    assert not claim_a_rollback_restores_a_lost_id(_once_in(CACHE, HAND_BACK_SIG, SPARE_INSERT, ""))
 
 
 def test_mutant_rollback_builds_the_mapping_fails():
     """Emplaced in the rollback, the mapping allocates where nothing may throw."""
     assert not claim_a_rollback_restores_a_lost_id(
-        _once_in(CACHE, LOAN_SIG, SPARE_INSERT,
-                 "else if (mapped == id_to_key_.end()) { id_to_key_.emplace(members[i].key, device_key); }"))
+        _once_in(CACHE, HAND_BACK_SIG, SPARE_INSERT, "ids.emplace(id, device_key);"))
 
 
 def test_mutant_spare_minted_after_the_hand_over_fails():
@@ -2105,7 +2201,7 @@ def test_mutant_existing_host_entry_unchecked_fails():
 def test_mutant_idle_host_entry_let_through_fails():
     """Refusing only a retired or leased host entry lets an idle one through to be replaced, storage and all, by a
     registration the loan could not undo."""
-    busy_only = ("const auto host = entries_.find({ cache_entry_type::MOE_EXPERT, host_key, -1, -1 }); "
+    busy_only = ("const auto host = entries_.find(expert_host_key(host_id)); "
                  "if (host != entries_.end() && (host->second.retired || host->second.in_use_count.load() != 0)) { "
                  'refusal = host->second.retired ? "host entry retiring" : "host entry exists"; break; }')
     assert not claim_existing_host_entry_never_replaced(_once(CACHE, HOST_EXISTS, busy_only), SYCL)
@@ -2647,8 +2743,7 @@ def test_mutant_refill_mints_after_the_swap_fails():
 
 
 def test_mutant_refill_builds_a_mapping_node_after_the_swap_fails():
-    mutant = _once(CACHE, REMAP_ID, "id_to_key_[key] = make_direct_stage_key(cache_entry_type::MOE_EXPERT, key, "
-                                    "GGML_LAYOUT_AOS);")
+    mutant = _once(CACHE, REMAP_ID, "id_to_key_[key] = expert_device_key(key);")
     assert not claim_refill_allocates_before_it_changes_anything(mutant)
 
 
@@ -3124,7 +3219,7 @@ def test_mutant_source_query_finds_a_retired_entry_fails():
 
 def test_mutant_source_query_reads_one_side_fails():
     """Both directions looking up the same key: a refill would ask for the device entry, a loan for the host's."""
-    mutant = _once_in(CACHE, SOURCE_SIG, "to_device ? unified_cache_key{", "!to_device ? unified_cache_key{")
+    mutant = _once_in(CACHE, SOURCE_SIG, "to_device ? expert_host_key(key)", "!to_device ? expert_host_key(key)")
     assert not claim_copies_are_sized_from_the_tensor(mutant, SYCL)
 
 
@@ -3762,9 +3857,10 @@ def test_mutant_seeded_row_leaves_the_index_behind_fails():
 # has_evictions_ turns off graph replay and persistent TG for the whole process until the next model load, so a decode
 # run that evicted once ran every later graph by direct dispatch. An expert move's retires do not need it: its
 # publication bumps the exec-graph epoch, which drops every exec graph that may bake a moved copy's pointer, and
-# persistent TG never takes a graph with a MUL_MAT_ID. So (b) the cache marks the retires the move makes, the loan's
-# device entries and the copy to the device's host copies, finalize leaves only marked entries out of the latch, and a
-# restore clears the mark; any other retire of the same entry still latches. And (c) the exemption holds only once the
+# persistent TG never takes a graph with a MUL_MAT_ID. So (b) the cache marks the retires the move makes that the latch
+# would otherwise count, the loan's device entries (a host copy is host-resident, which the latch never counts, so the
+# copy to the device marks nothing), finalize leaves only marked entries out of the latch, and a restore clears the
+# mark; any other retire of the same entry still latches. And (c) the exemption holds only once the
 # epoch has moved: the transaction arms a guard before each cache move, disarms it again for a move the cache refused
 # whole, and dismisses it only after the epoch bump in the won swap; on every other exit (a lost swap, a throw) its
 # destructor sets the latch through the cache's one public setter.
@@ -3773,9 +3869,8 @@ FINALIZE_SIG = "size_t unified_cache::finalize_retired_entries_locked() {"
 FINALIZE_LATCH = re.compile(r"if \(([^{]*)\) \{ has_evictions_\.store\(true")
 MOVE_MARK_FIELD = "!entry.retired_by_expert_move"
 LOAN_MARK = "device_entry[i]->retired_by_expert_move = true;"
-ADMIT_MARK = "host->second.retired_by_expert_move = true;"
-ADMIT_RETIRE = "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);"
 RESTORE_CLEAR = "it->second.retired_by_expert_move = false;"
+HOST_RETIRE_CALL = "(void) retire_expert_entry_at_locked(host_key, &host_nodes[r++]);"
 LATCH_SETTER = "void latch_evictions() noexcept { has_evictions_.store(true, std::memory_order_release); }"
 GUARD_DTOR = "~ggml_sycl_expert_move_latch_guard() { if (armed && cache) { cache->latch_evictions(); } }"
 GUARD_DECL = "ggml_sycl_expert_move_latch_guard latch{ cache };"
@@ -3791,9 +3886,9 @@ def claim_a_move_marks_its_retires_and_only_they_skip_the_latch(cache: str, hpp:
     loan = body(c, LOAN_SIG)
     copy = body(c, REFILL_BODY_SIG)
     return (latch is not None and MOVE_MARK_FIELD in latch.group(1) and "!entry.optional_layout" in latch.group(1)
-            and c.count("retired_by_expert_move = true;") == 2
+            and c.count("retired_by_expert_move = true;") == 1
             and loan.count(LOAN_MARK) == 1 and ordered(loan, LOAN_MARK, DEVICE_RETIRE)
-            and copy.count(ADMIT_MARK) == 1 and ordered(copy, ADMIT_MARK, ADMIT_RETIRE)
+            and "retired_by_expert_move" not in copy
             and body(c, RESTORE_SIG).count(RESTORE_CLEAR) == 1
             and "bool retired_by_expert_move = false;" in norm(hpp))
 
@@ -3812,6 +3907,14 @@ def test_mutant_finalize_latches_a_moves_retire_fails():
 def test_mutant_loan_retire_left_unmarked_fails():
     assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(_once_in(CACHE, LOAN_SIG, LOAN_MARK, ""),
                                                                            CACHE_HPP)
+
+
+def test_mutant_admit_marks_its_host_retire_fails():
+    """A host copy is host-resident, so the latch never counted it: the mark there is dead code that reads as a rule."""
+    assert not claim_a_move_marks_its_retires_and_only_they_skip_the_latch(
+        _once_in(CACHE, REFILL_BODY_SIG, HOST_RETIRE_CALL,
+                 "host->second.retired_by_expert_move = true; " + HOST_RETIRE_CALL),
+        CACHE_HPP)
 
 
 def test_mutant_restore_keeps_the_mark_fails():

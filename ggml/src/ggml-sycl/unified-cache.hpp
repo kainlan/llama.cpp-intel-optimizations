@@ -4524,9 +4524,10 @@ struct unified_cache_entry {
     // cache's own direct-stage mirror holds a lease. Never set on a primary.
     bool                  optional_layout       = false;
 
-    // Retired by an expert move (loan_expert_triplet(), copy_host_triplet_to_device()), which sets it at its retire
-    // and nowhere else; a restore clears it. The move's publication bumps the exec-graph epoch, so its reap need not
-    // set has_evictions_ (see there). Any other retire of the same entry leaves it false, and its reap latches.
+    // Retired by an expert move: loan_expert_triplet() sets it on the device entries it retires, and nowhere else; a
+    // restore clears it. The move's publication bumps the exec-graph epoch, so its reap need not set has_evictions_
+    // (see there). Any other retire of the same entry leaves it false, and its reap latches. A host copy needs no
+    // mark, because the latch skips host-resident entries.
     bool                  retired_by_expert_move = false;
     // Debug-only (llama.cpp-2wv5): which site most recently took a lease on this
     // entry -- a distinct string literal stamped at each of the ~16 sites that
@@ -6884,7 +6885,9 @@ class unified_cache {
     id_map    id_to_key_;
     // How often remap_or_extract_id_mapping_locked() walked entries_ for an entry to hand an id to: a retire whose
     // id still named it. Each walk visits every entry under both locks, so a move hands its ids over before it
-    // retires and makes none; the device tests read the count across one.
+    // retires and makes none; the device tests read the count across one. The count is kept in every build, not only
+    // under GGML_SYCL_PRIVATE_TESTING: one relaxed add costs nothing beside the walk it counts, and a member that one
+    // build variant has and another lacks would give the class two layouts.
     std::atomic<uint64_t> id_remap_walks_{ 0 };
 
     // Slots held by llama_model objects that are still alive (llama.cpp-0qlw).

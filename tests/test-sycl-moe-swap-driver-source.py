@@ -11,6 +11,9 @@ decisions and the bookkeeping are right; the loan test's device case shows an ev
 a unit test cannot show is where the driver runs and what it does not do there. This gate holds that by text:
 
   D1  one call site: ggml_backend_sycl_synchronize() calls the driver once, after the refill, and nothing else does;
+      the driver is two functions, the gated boundary (ggml_sycl_run_expert_swap_at_boundary: the gates, the claim and
+      the graph counts) and the claimed body it calls once after the claim (ggml_sycl_run_expert_swap_claimed), which
+      reads the world and runs the step. D2 to D20 read the pair as one function;
   D2  the policy step runs once, inside the driver;
   D3  no host wait and no event status query in the driver, its helpers (every ggml_sycl_moe_swap_* function), the
       driver header or the plan-view builder: no wait() or wait_and_throw(), no retained-handle drain, no event
@@ -60,7 +63,11 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       transaction twice (admits, evicts), and before each call it reserves the unsettled list, and the busy reasons
       when the guard counts one, each past its size (size() + n, never a bare count), then declares a guard whose
       body sets the unsettled count; the line right after the call dismisses that guard. The guard's body runs while
-      a throw unwinds, where a throw ends the process, so the reserves are what make its pushes safe;
+      a throw unwinds, where a throw ends the process, so the reserves are what make its pushes safe. The same
+      reserves cover what the step records once the transaction has answered, since a moved triplet cannot be taken
+      back and an allocation that failed in the middle of the recording would leave the driver not knowing what
+      moved: before the admit call the busy, refused and dropped reason lists, and before the evict call the pending
+      list and the busy and refused reason lists;
   D18 the hold of an admit refused for device room has its two inputs: the caller hands the step the device WEIGHT
       zone's room epoch (unified_cache::zone_room_epoch), read before the step; and the refusal's cause reaches the
       move typed, not as text: the preparation leaves the size of a refused device mint on the prepared triplet,
@@ -92,6 +99,12 @@ a unit test cannot show is where the driver runs and what it does not do there. 
       one to the group's epoch. zone_alloc's own zone_used_free calls undo an allocation that could not be recorded:
       no room is gained there, and none is pinned.
 
+  D22 the claimed body has a test hook: it takes (device, decodes, graphs, resolver) and reads nothing of the backend
+      context, so the private device tests run it without a context; the gated boundary calls it once, after the
+      claim, with no resolver; the call the driver is handed is built by ggml_sycl_moe_swap_make_call, which the tests
+      read as well; the named move is sent through the resolver the body was given; and the one other caller, the
+      private tests' hook, claims the device's instance before the call and releases it after.
+
 Checks run on comment-stripped text, string literals kept. NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if a different pin
 catches it, or if its anchor no longer matches exactly once (NOT APPLIED). The self-test also proves that last report
@@ -105,6 +118,7 @@ is the loan test's.
 
 from __future__ import annotations
 
+import functools
 import re
 import sys
 from pathlib import Path
@@ -120,6 +134,24 @@ FILES = {
 SYNC_SIG = "static void ggml_backend_sycl_synchronize(ggml_backend_t backend) {"
 CALLER_SIG = "static void ggml_sycl_run_expert_swap_at_boundary("
 CALLER_NAME = "ggml_sycl_run_expert_swap_at_boundary("
+CORE_SIG = "static void ggml_sycl_run_expert_swap_claimed("
+CORE_CALL = "ggml_sycl_run_expert_swap_claimed("
+CALL_SIG = "static ggml_sycl::moe_swap_driver_call ggml_sycl_moe_swap_make_call("
+HOOK_SIG = "bool test_swap_boundary("
+CORE_DECL = ("static void ggml_sycl_run_expert_swap_claimed(int device, uint64_t decodes, uint64_t graphs, "
+             "const ggml_sycl_expert_loan_resolver * resolver) {")
+CORE_OUTER_CALL = "ggml_sycl_run_expert_swap_claimed(device, decodes, graphs, nullptr);"
+CORE_MAKE_CALL = "ggml_sycl_moe_swap_make_call(inst, cache, device, decodes, graphs);"
+CORE_TXN = "ggml_sycl_expert_move_transaction_run(device, request, resolver, &result);"
+# The one way an instance is claimed: a guard that tries on construction and releases on every way out.
+CLAIM_SIG = "struct ggml_sycl_moe_swap_claim {"
+CLAIM_DECL = "ggml_sycl_moe_swap_claim claim{ inst.claimed };"
+CLAIM_LOST = "if (!claim.held) {"
+CLAIM_DECL_RE = re.compile(r"ggml_sycl_moe_swap_claim\s+claim\s*\{\s*inst\.claimed\s*\}\s*;")
+CLAIM_TAKE = "return flag.compare_exchange_strong(expected, true, std::memory_order_acq_rel);"
+REPORT_AT_FREE_SIG = "static void ggml_sycl_moe_swap_report_at_free("
+REPORT_IF_HELD = "if (claim.held) { ggml_sycl_moe_swap_report(inst, device); }"
+CLAIM_GIVE_BACK = "if (held) { claimed.store(false, std::memory_order_release); }"
 CALLER_CALL = "ggml_sycl_run_expert_swap_at_boundary(backend);"
 REFILL_CALL = "ggml_sycl_run_expert_refill_at_boundary(backend);"
 STEP_CALL = "moe_swap_driver_step("
@@ -140,7 +172,7 @@ NO_GROWTH_ROOM_SIG = "size_t unified_cache::host_zone_no_growth_room("
 HELPER_DEF = re.compile(r"^static\s+[\w:<>,\s\*&]*?\b(ggml_sycl_moe_swap_\w+)\s*\(", re.MULTILINE)
 
 GATES = ("ggml_sycl_moe_swap_enabled()", "g_sycl_graph_multithreaded", "unified_cache_is_graph_compute_active()",
-         "ggml_sycl_graph_inflight_count()", "compare_exchange_strong(")
+         "ggml_sycl_graph_inflight_count()", CLAIM_DECL)
 TABLE_ROW = re.compile(r"\{\s*ggml_sycl::MOE_SWAP_ENV\s*,\s*&g_ggml_sycl_moe_swap\s*,\s*0\s*\}")
 ROW_OVERWRITE = re.compile(r"g_ggml_sycl_moe_swap\s*=\s*ggml_sycl_moe_swap_enabled\(\)\s*\?\s*1\s*:\s*0\s*;")
 PARSE_LOOP = "*setting.dest = get_sycl_env(setting.name, setting.default_value);"
@@ -158,6 +190,15 @@ GUARD_DECL = re.compile(r"\bmoe_swap_detail::moe_swap_unwind_guard\s+(\w+)\s*\("
 # Each reserve grows its list past what it already holds: a bare count can be below the size, and reserves nothing.
 UNSETTLED_RESERVE = re.compile(r"\bd\.unsettled\.reserve\(\s*d\.unsettled\.size\(\)\s*\+\s*\w")
 BUSY_RESERVE = re.compile(r"\bst\.busy\.reserve\(\s*st\.busy\.size\(\)\s*\+\s*\w")
+
+
+def _reserve_past_size(name: str) -> re.Pattern:
+    return re.compile(r"\b" + re.escape(name) + r"\.reserve\(\s*" + re.escape(name) + r"\.size\(\)\s*\+\s*\w")
+
+
+# What each transaction call's answers are recorded into, which the step reserves before the call: the admits' call
+# (the first) counts reasons, the evicts' call (the second) also pushes the pending admits.
+RECORDING_RESERVES = (("st.busy", "st.refused", "st.dropped"), ("d.pending", "st.busy", "st.refused"))
 HANDLER = re.compile(r"\b(?:try|catch)\b")
 LITERAL = re.compile(r"\"(?:\\.|[^\"\\\n])*\"")
 SAME_LOAD = "const bool same_load = snap && snap->model_id == inst.model_id && snap->load_txn_id == inst.load_txn_id;"
@@ -221,16 +262,29 @@ METER_MEASURE = ("const uint64_t before = cache->zone_room_epoch(ggml_sycl::vram
                  "moved += cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) - before;")
 GIVE_BACK_FIELDS = ("meter.give_back([this] { prepared.clear(); });", "answer->room_self_delta = meter.moved;")
 GIVE_BACK_DECL = ("ggml_sycl_expert_room_meter room_meter{ named ? cache : nullptr }; "
-                  "ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr };")
+                  "ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr, "
+                  "meta_us, copy_us, remap_us };")
 PREPARE_CALL = "stop = ggml_sycl_expert_prepare_triplet("
 REFUSED_GIVE_BACK = ("room_meter.give_back([&triplet] { for (ggml_sycl::expert_move_member & m : triplet.members) { "
                      "m.owner = ggml_sycl::mem_handle{}; } });")
 REFILL_BRANCH = "} else if (refill && !transient) {"
 ENTRY_SELF_DELTA = "r.room_self_delta = answer.room_self_delta;"
+# The entry carries the body's three parts and times the whole call itself, so a refusal before any preparation has a
+# total too.
+ENTRY_COST = ("r.meta_us = answer.meta_us;", "r.copy_us = answer.copy_us;", "r.remap_us = answer.remap_us;",
+              "r.total_us = ggml_sycl::expert_move_us_since(call_start);")
+ENTRY_CLOCK = ("ggml_sycl_expert_loan_result answer; const auto call_start = std::chrono::steady_clock::now(); "
+               "const ggml_sycl_txn_result code = ggml_sycl_expert_txn_run(")
+COUNT_COST = ("moe_swap_detail::moe_swap_count_cost(st, room.cost);",
+              "moe_swap_detail::moe_swap_count_cost(st, answer.cost);")
 # The read comes right after the transaction's call, with nothing between them.
-EPOCH_AFTER_READ = ("ggml_sycl_expert_move_transaction_run(device, request, nullptr, &result); "
+EPOCH_AFTER_READ = ("ggml_sycl_expert_move_transaction_run(device, request, resolver, &result); "
                     "const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;")
-TXN_ROOM_RETURN = "return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta };"
+# The cost is built field by field: the result orders its parts meta, copy, remap and the cost copy, remap, meta.
+TXN_COST_FIELDS = ("ggml_sycl::moe_swap_txn_cost cost; cost.copy_us = result.copy_us; cost.remap_us = result.remap_us; "
+                   "cost.meta_us = result.meta_us; cost.total_us = result.total_us; ")
+TXN_ROOM_RETURN = (TXN_COST_FIELDS +
+                   "return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };")
 ROOM_STOOD_BODY = "return room.epoch_after - before == room.self_delta;"
 ADMIT_TXN = "const moe_swap_txn_room room = txn(d.batch);"
 ROOM_STOOD_USE = "const bool room_stood = moe_swap_detail::moe_swap_room_stood(c.room_epoch, room);"
@@ -285,6 +339,15 @@ def fail(pin: str, what: str) -> None:
     raise ContractError(f"FAIL [pin {pin}]: {what}")
 
 
+# The self-test runs the gate on a mutant of each source in turn. The unmutated sources, and what is cut from them,
+# stay cached because every mutant reads them; a mutated text is used for its one check and evicted. The caches are
+# small on purpose: a key holds a whole 7 MB source, so a large cache would keep hundreds of dead mutants in memory. A
+# cache hit returns what the same text gave before, so each mutant is still judged on its own text.
+_BIG = 8  # entries holding a whole source or its stripped copy
+_SMALL = 256  # entries cut from one
+
+
+@functools.lru_cache(maxsize=_BIG)
 def strip_comments(src: str) -> str:
     """Comments blanked to spaces with their newlines kept, literals kept. The length is kept too, so an offset in the
     stripped text is the same offset in the source: a mutant finds its body in the stripped text, where an apostrophe in
@@ -294,16 +357,32 @@ def strip_comments(src: str) -> str:
         tok = m.group(0)
         if tok[0] in "\"'":
             return tok
-        return re.sub(r"[^\n]", " ", tok)
+        # A line comment holds no newline: its blanks are as many as its characters.
+        return " " * len(tok) if "\n" not in tok else re.sub(r"[^\n]", " ", tok)
 
     return _LEXEME_RE.sub(repl, src)
 
 
+@functools.lru_cache(maxsize=_SMALL)
 def norm(text: str) -> str:
     """Whitespace runs collapsed to one space, and none just inside parentheses, so a re-wrap cannot turn a pin red."""
-    t = re.sub(r"\s+", " ", text)
-    t = re.sub(r"\( ", "(", t)
-    return re.sub(r" \)", ")", t)
+    words = text.split()  # the same whitespace as \s, and far faster on the 7 MB backend source
+    if not words:
+        return " " if text else ""
+    t = (" " if text[0].isspace() else "") + " ".join(words) + (" " if text[-1].isspace() else "")
+    return t.replace("( ", "(").replace(" )", ")")
+
+
+@functools.lru_cache(maxsize=None)
+def _word_re(pattern: str) -> re.Pattern:
+    return re.compile(pattern)
+
+
+def word_matches(pattern: str, text: str) -> list:
+    """The matches of `\\b` + `pattern` in `text`, for a pattern that starts with a word character. The regex engine
+    finds a leading literal far faster than a leading word boundary, so the boundary is checked on the match."""
+    return [m for m in _word_re(pattern).finditer(text)
+            if m.start() == 0 or not (text[m.start() - 1].isalnum() or text[m.start() - 1] == "_")]
 
 
 def block_span(text: str, open_at: int) -> tuple[int, int]:
@@ -331,6 +410,7 @@ def block_span(text: str, open_at: int) -> tuple[int, int]:
     return -1, -1
 
 
+@functools.lru_cache(maxsize=_SMALL)
 def body_span(text: str, signature: str) -> tuple[int, int]:
     """[start, end) of the body of the first definition starting with `signature`; a declaration (its parameter list
     closes on a semicolon) is passed over. (-1, -1) when there is none."""
@@ -351,6 +431,7 @@ def body_span(text: str, signature: str) -> tuple[int, int]:
     return -1, -1
 
 
+@functools.lru_cache(maxsize=_SMALL)
 def body(text: str, signature: str) -> str:
     start, end = body_span(text, signature)
     return text[start:end] if start >= 0 else ""
@@ -418,12 +499,19 @@ def check(raw: dict[str, str]) -> None:
     plan = strip_comments(raw["plan"])
     cache = strip_comments(raw["cache"])
     sync = body(sycl, SYNC_SIG)
-    caller = body(sycl, CALLER_SIG)
+    outer = body(sycl, CALLER_SIG)
+    core = body(sycl, CORE_SIG)
+    make_call = body(sycl, CALL_SIG)
     builder = body(plan, BUILDER_SIG)
     if not sync:
         fail("D1", "ggml_backend_sycl_synchronize has no body the pin can read")
-    if not caller:
+    if not outer:
         fail("D1", "the swap driver ggml_sycl_run_expert_swap_at_boundary has no definition")
+    if not core or not make_call:
+        fail("D22", "the claimed body ggml_sycl_run_expert_swap_claimed or ggml_sycl_moe_swap_make_call has no "
+                    "definition")
+    # The driver as one text, in the order its parts run: the gated boundary, the call it builds, the claimed body.
+    caller = outer + "\n" + make_call + "\n" + core
 
     # D1 ---------------------------------------------------------------------------------------------------------------
     if sync.count(CALLER_CALL) != 1 or not ordered(sync, REFILL_CALL, CALLER_CALL):
@@ -446,22 +534,52 @@ def check(raw: dict[str, str]) -> None:
             fail("D3", f"{where} waits or asks an event's status: `{m.group(0).strip()}`")
 
     # D4 ---------------------------------------------------------------------------------------------------------------
+    # The step runs inside the claimed body, which the gated boundary calls: a lock taken in either text is held across
+    # the step when its block reaches the claimed body's call, or the step itself.
+    for text, mark in ((outer, CORE_CALL), (core, STEP_CALL), (make_call, "\x00")):
+        mark_at = text.find(mark)
+        m = BARE_LOCK.search(text)
+        if m:
+            fail("D4", f"the swap driver takes a lock by a bare call: `{m.group(0)}`")
+        for lk in LOCK_DECL.finditer(text):
+            if mark_at >= 0 and lk.start() < mark_at < enclosing_block_end(text, lk.start()):
+                fail("D4", "the swap driver holds a lock across the policy step")
     step_at = caller.find(STEP_CALL)
-    m = BARE_LOCK.search(caller)
-    if m:
-        fail("D4", f"the swap driver takes a lock by a bare call: `{m.group(0)}`")
-    for lk in LOCK_DECL.finditer(caller):
-        if lk.start() < step_at < enclosing_block_end(caller, lk.start()):
-            fail("D4", "the swap driver holds a lock across the policy step")
 
     # D5 ---------------------------------------------------------------------------------------------------------------
     if not ordered(caller[:step_at], *GATES):
         fail("D5", "the swap driver is not gated, in order, by the switch, the multithreaded latch, the compute flag, "
                    "the graphs in flight and the claim of its instance before the step")
+    claim_n = norm(body(sycl, CLAIM_SIG))
+    if (claim_n.count(CLAIM_TAKE) != 1 or claim_n.count(CLAIM_GIVE_BACK) != 1 or "claimed.compare_exchange" in sycl
+            or len(CLAIM_DECL_RE.findall(sycl)) != 4
+            or norm(body(sycl, REPORT_AT_FREE_SIG)).count(REPORT_IF_HELD) != 1):
+        fail("D5", "an instance is not claimed through the one guard that takes it with a strong compare-exchange at "
+                   "acq_rel and gives a held claim back with a release store, at the boundary, the backend free's "
+                   "report (which reports only a claim it holds) and the private tests' boundary and report hooks")
+
+    # D22 --------------------------------------------------------------------------------------------------------------
+    outer_n, core_n = norm(outer), norm(core)
+    hook_n = norm(body(sycl, HOOK_SIG))
+    core_at = sycl.find(CORE_SIG)
+    if core_at < 0 or CORE_DECL not in norm(sycl[core_at:sycl.find("{", core_at) + 1]):
+        fail("D22", "the claimed body does not take (device, decodes, graphs, resolver)")
+    if re.search(r"\bctx\b", core):
+        fail("D22", "the claimed body reads the backend context, so a test cannot run it without one")
+    if (outer_n.count(CORE_CALL) != 1 or outer_n.count(CORE_OUTER_CALL) != 1
+            or not ordered(outer_n, CLAIM_DECL, CLAIM_LOST, CORE_CALL)):
+        fail("D22", "the gated boundary does not call the claimed body once, after the claim, with no resolver")
+    if core_n.count(CORE_MAKE_CALL) != 1 or "moe_swap_driver_call call;" in core_n:
+        fail("D22", "the claimed body does not take the driver's call from ggml_sycl_moe_swap_make_call")
+    if core_n.count(CORE_TXN) != 1 or norm(core).count("nullptr, &result") != 0:
+        fail("D22", "the claimed body does not send the named move through the resolver it was given")
+    if sycl.count(CORE_CALL) != 3 or not hook_n or not ordered(hook_n, CLAIM_DECL, CLAIM_LOST, CORE_CALL):
+        fail("D22", "the private tests' hook is not the one other caller of the claimed body, claiming the device's "
+                    "instance before it")
 
     # D6 ---------------------------------------------------------------------------------------------------------------
     accessor = body(sycl, ACCESSOR_SIG)
-    getenvs = [m.start() for m in re.finditer(r"\bgetenv\s*\(\s*ggml_sycl::MOE_SWAP_ENV\s*\)", sycl)]
+    getenvs = [m.start() for m in word_matches(r"getenv\s*\(\s*ggml_sycl::MOE_SWAP_ENV\s*\)", sycl)]
     if len(ENV_SPELLING.findall(driver)) != 1 or '"GGML_SYCL_MOE_SWAP"' in sycl:
         fail("D6", "GGML_SYCL_MOE_SWAP is not spelled once, as the header's MOE_SWAP_ENV")
     if (len(getenvs) != 1 or not accessor or "getenv(ggml_sycl::MOE_SWAP_ENV)" not in norm(accessor)
@@ -476,7 +594,7 @@ def check(raw: dict[str, str]) -> None:
 
     # D7 ---------------------------------------------------------------------------------------------------------------
     warn_spans = []
-    for w in re.finditer(r"\bGGML_LOG_WARN\s*\(", sycl):
+    for w in word_matches(r"GGML_LOG_WARN\s*\(", sycl):
         warn_spans.append(call_arguments(sycl, w.end() - 1))
     for summary in SUMMARIES:
         calls = [m.start() for m in re.finditer(re.escape(summary), sycl)]
@@ -620,6 +738,10 @@ def check(raw: dict[str, str]) -> None:
         if "moe_swap_count_reason(st.busy," in guarded and not BUSY_RESERVE.search(before):
             fail("D17", f"the busy reasons are not reserved past their size before guard `{guard.group(1)}`, which "
                         "counts one")
+        for name in RECORDING_RESERVES[calls.index(at)]:
+            if not _reserve_past_size(name).search(seg):
+                fail("D17", f"`{name}` is not reserved past its size before the transaction call that sends its "
+                            "batch, so recording what moved can throw after it moved")
         if not step[at + len(TXN_CALL):].startswith(f" {guard.group(1)}.dismiss();"):
             fail("D17", f"guard `{guard.group(1)}` is not dismissed on the line right after the transaction returns")
         prev = at + len(TXN_CALL)
@@ -631,11 +753,11 @@ def check(raw: dict[str, str]) -> None:
     if norm(callback).count(BUSY_CAUSE_SET) != 1 or sycl.count("busy_cause") != 1:
         fail("D18", "the transaction callback does not give each answered move its busy cause from the outcome's "
                     "zone_room, in one place")
-    if norm(prep).count(ZONE_ROOM_MINT) != 1 or len(re.findall(r"\bmint_refused_bytes\s*=(?!=)", sycl)) != 2:
+    if norm(prep).count(ZONE_ROOM_MINT) != 1 or len(word_matches(r"mint_refused_bytes\s*=(?!=)", sycl)) != 2:
         fail("D18", "the preparation does not leave the size of a refused device mint on the prepared triplet, set "
                     "where the device mint fails and nowhere else")
     if (norm(body(sycl, TXN_SIG)).count(ZONE_ROOM_OUTCOME) != 1
-            or len(re.findall(r"\bzone_room_bytes\s*=(?!=)", sycl)) != 2):
+            or len(word_matches(r"zone_room_bytes\s*=(?!=)", sycl)) != 2):
         fail("D18", "the transaction does not mark the named triplet's outcome exactly when a device mint was refused "
                     "transiently")
 
@@ -659,7 +781,7 @@ def check(raw: dict[str, str]) -> None:
         fail("D20", "the room meter does not read the WEIGHT zone's room epoch right before and right after a "
                     "give-back and sum the move")
     if (not all(give_back.count(f) == 1 for f in GIVE_BACK_FIELDS)
-            or len(re.findall(r"\broom_self_delta\s*=(?!=)", sycl)) != 4):
+            or len(word_matches(r"room_self_delta\s*=(?!=)", sycl)) != 4):
         fail("D20", "the prepared list is not given back measured by a guard that then writes the answer's "
                     "room_self_delta, the one place it is written besides the entry's copy")
     if txn.count(GIVE_BACK_DECL) != 1 or not ordered(txn, "prepared.reserve(n_selected);", GIVE_BACK_DECL, PREPARE_CALL):
@@ -669,12 +791,19 @@ def check(raw: dict[str, str]) -> None:
             or sycl.count(".give_back(") != 2):
         fail("D20", "a refused named triplet's minted members are not given back measured, in the named-refusal "
                     "branch")
-    if norm(body(sycl, ENTRY_SIG)).count(ENTRY_SELF_DELTA) != 1:
-        fail("D20", "the named move's entry does not carry the measured sum to its caller")
+    entry = norm(body(sycl, ENTRY_SIG))
+    if (entry.count(ENTRY_SELF_DELTA) != 1 or any(entry.count(c) != 1 for c in ENTRY_COST)
+            or entry.count(ENTRY_CLOCK) != 1 or word_matches(r"txn_start\b", sycl)):
+        fail("D20", "the named move's entry does not carry the measured sum to its caller, or does not time the whole "
+                    "call from before the transaction runs")
     if (norm(callback).count(EPOCH_AFTER_READ) != 1 or norm(callback).count(TXN_ROOM_RETURN) != 1
             or sycl.count("moe_swap_txn_room{") != 1):
         fail("D20", "the transaction callback does not read the room epoch right after the transaction returns and "
                     "return it with the transaction's own sum")
+    if (any(norm(driver).count(c) != 1 for c in COUNT_COST)
+            or norm(driver).count("inline void moe_swap_count_cost(") != 1):
+        fail("D20", "the step does not sum each transaction's cost into the stats once, at the admit transaction "
+                    "and at the evict one")
     if norm(body(driver, ROOM_STOOD_SIG)).count(ROOM_STOOD_BODY) != 1:
         fail("D20", "moe_swap_room_stood does not compare the epoch's move since the boundary's read with the "
                     "transaction's own sum")
@@ -701,6 +830,7 @@ def check(raw: dict[str, str]) -> None:
         fail("D21", "arena_note_room_grew does not add one to the group's room epoch")
 
 
+@functools.lru_cache(maxsize=_SMALL)
 def _helper_body(sycl: str, name: str) -> str:
     for m in HELPER_DEF.finditer(sycl):
         if m.group(1) == name:
@@ -762,7 +892,7 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("driver-called-from-elsewhere", "D1",
                 [("sycl", "", SYNC_SIG, "static void ggml_sycl_swap_twice(ggml_backend_t backend) {\n    "
                   + CALLER_CALL + "\n}\n\n" + SYNC_SIG)])
-    expect_fail("step-run-twice", "D2", [("sycl", CALLER_SIG, STEP_CALL, STEP_CALL + "d, inst.view, call, c, r, t);\n"
+    expect_fail("step-run-twice", "D2", [("sycl", CORE_SIG, STEP_CALL, STEP_CALL + "d, inst.view, call, c, r, t);\n"
                                           "    (void) ggml_sycl::" + STEP_CALL)])
     expect_fail("driver-waits-on-the-queue", "D3",
                 [("sycl", CALLER_SIG, "if (!ggml_sycl_moe_swap_enabled()) {",
@@ -779,6 +909,11 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("lock-across-the-step", "D4",
                 [("sycl", CALLER_SIG, "if (!ggml_sycl_moe_swap_enabled()) {",
                   "std::lock_guard held(g_tensor_inventory_mutex);\n    if (!ggml_sycl_moe_swap_enabled()) {")])
+    expect_fail("lock-across-the-step-in-the-claimed-body", "D4",
+                [("sycl", CORE_SIG,
+                  "ggml_sycl_moe_swap_instance &                      inst  = g_sycl_moe_swap[device];",
+                  "std::lock_guard held(g_tensor_inventory_mutex);\n    "
+                  "ggml_sycl_moe_swap_instance &                      inst  = g_sycl_moe_swap[device];")])
     expect_fail("bare-lock", "D4",
                 [("sycl", CALLER_SIG, "if (!ggml_sycl_moe_swap_enabled()) {",
                   "g_tensor_inventory_mutex.lock();\n    if (!ggml_sycl_moe_swap_enabled()) {")])
@@ -787,14 +922,40 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("graphs-in-flight-ignored", "D5",
                 [("sycl", CALLER_SIG, "ggml_sycl_graph_inflight_count()", "0")])
     expect_fail("instance-not-claimed", "D5",
-                [("sycl", CALLER_SIG, "compare_exchange_strong(", "compare_exchange_weak(")])
+                [("sycl", CLAIM_SIG, "compare_exchange_strong(", "compare_exchange_weak(")])
+    expect_fail("claim-weaker-than-acq-rel", "D5",
+                [("sycl", CLAIM_SIG, "std::memory_order_acq_rel", "std::memory_order_relaxed")])
+    expect_fail("claim-never-released", "D5",
+                [("sycl", CLAIM_SIG, "claimed.store(false, std::memory_order_release);", "")])
+    expect_fail("claim-released-though-not-held", "D5", [("sycl", CLAIM_SIG, "if (held) {", "if (true) {")])
+    expect_fail("claim-taken-by-hand", "D5",
+                [("sycl", CALLER_SIG, "if (!claim.held) {",
+                  "bool expected = false;\n    if (!inst.claimed.compare_exchange_strong(expected, true)) {")])
     expect_fail("claim-deleted", "D5",
                 [("sycl", CALLER_SIG,
-                  "    bool expected = false;\n"
-                  "    if (!inst.claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {\n"
+                  "    const ggml_sycl_moe_swap_claim claim{ inst.claimed };\n"
+                  "    if (!claim.held) {\n"
                   "        inst.skipped.fetch_add(1, std::memory_order_relaxed);\n"
                   "        return;\n"
                   "    }\n", "")])
+    expect_fail("claim-lost-ignored", "D22", [("sycl", CALLER_SIG, "if (!claim.held) {", "if (false) {")])
+    expect_fail("report-at-free-unclaimed", "D5",
+                [("sycl", REPORT_AT_FREE_SIG, "if (claim.held) {", "if (true) {")])
+    expect_fail("claimed-body-reads-the-context", "D22",
+                [("sycl", CORE_SIG, "const int                             nb    = d.policy.n_blocks;",
+                  "(void) ctx->device;\n    const int                             nb    = d.policy.n_blocks;")])
+    expect_fail("claimed-body-ignores-the-resolver", "D22",
+                [("sycl", CORE_SIG, "request, resolver, &result", "request, nullptr, &result")])
+    expect_fail("claimed-body-builds-its-own-call", "D22",
+                [("sycl", CORE_SIG, CORE_MAKE_CALL, CORE_MAKE_CALL + "\n    ggml_sycl::moe_swap_driver_call call;")])
+    expect_fail("boundary-hands-a-resolver", "D22",
+                [("sycl", CALLER_SIG, "/*resolver=*/nullptr", "/*resolver=*/&fixture")])
+    expect_fail("hook-does-not-claim", "D5",
+                [("sycl", HOOK_SIG, "const ::ggml_sycl_moe_swap_claim claim{ inst.claimed };", "")])
+    call = "    ::ggml_sycl_run_expert_swap_claimed(device, decodes, graphs, resolver);\n"
+    expect_fail("hook-claims-after-the-call", "D22",
+                [("sycl", HOOK_SIG, call, ""),
+                 ("sycl", HOOK_SIG, "    if (!claim.held) {", call + "    if (!claim.held) {")])
     expect_fail("env-spelled-in-the-backend", "D6",
                 [("sycl", "", "ggml_sycl::MOE_SWAP_ENV)", "\"GGML_SYCL_MOE_SWAP\")")])
     expect_fail("env-read-at-every-boundary", "D6",
@@ -826,19 +987,32 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("evict-guard-never-dismissed", "D17", [("driver", STEP_SIG, "evict_throw.dismiss();", "")])
     expect_fail("evict-guard-pushes-unreserved", "D17",
                 [("driver", STEP_SIG, "d.unsettled.reserve(d.unsettled.size() + keep);", "")])
-    expect_fail("admit-guard-counts-unreserved", "D17", [("driver", STEP_SIG, "st.busy.reserve(st.busy.size() + 1);", "")])
+    expect_fail("admit-guard-counts-unreserved", "D17",
+                [("driver", STEP_SIG, "st.busy.reserve(st.busy.size() + d.batch.size());", "")])
+    expect_fail("admit-batch-records-refusals-unreserved", "D17",
+                [("driver", STEP_SIG, "st.refused.reserve(st.refused.size() + d.batch.size());", "")])
+    expect_fail("admit-batch-records-drops-unreserved", "D17",
+                [("driver", STEP_SIG, "st.dropped.reserve(st.dropped.size() + d.batch.size());", "")])
+    expect_fail("evict-batch-pushes-pending-unreserved", "D17",
+                [("driver", STEP_SIG, "d.pending.reserve(d.pending.size() + keep);", "")])
+    expect_fail("evict-batch-records-busy-unreserved", "D17",
+                [("driver", STEP_SIG, "st.busy.reserve(st.busy.size() + keep);", "")])
+    expect_fail("evict-batch-records-refusals-unreserved", "D17",
+                [("driver", STEP_SIG, "st.refused.reserve(st.refused.size() + keep);", "")])
+    expect_fail("evict-batch-reserves-a-bare-count", "D17",
+                [("driver", STEP_SIG, "d.pending.reserve(d.pending.size() + keep);", "d.pending.reserve(keep);")])
     expect_fail("evict-guard-reserves-a-bare-count", "D17",
                 [("driver", STEP_SIG, "d.unsettled.reserve(d.unsettled.size() + keep);", "d.unsettled.reserve(keep);")])
     expect_fail("evict-sent-without-a-guard", "D17",
                 [("driver", STEP_SIG, "moe_swap_detail::moe_swap_unwind_guard evict_throw(",
                   "auto evict_throw = (")])
     expect_fail("carry-ignores-the-load", "D16",
-                [("sycl", CALLER_SIG, "snap->model_id == inst.model_id && snap->load_txn_id == inst.load_txn_id",
+                [("sycl", CORE_SIG, "snap->model_id == inst.model_id && snap->load_txn_id == inst.load_txn_id",
                   "snap->model_id == inst.model_id")])
     expect_fail("carry-without-the-gate", "D16",
-                [("sycl", CALLER_SIG, "if (!same_load || !ggml_sycl::moe_swap_driver_carry(",
+                [("sycl", CORE_SIG, "if (!same_load || !ggml_sycl::moe_swap_driver_carry(",
                   "if (!ggml_sycl::moe_swap_driver_carry(")])
-    expect_fail("drop-report-not-forced", "D16", [("sycl", CALLER_SIG, "/*force=*/dropped != 0", "/*force=*/false")])
+    expect_fail("drop-report-not-forced", "D16", [("sycl", CORE_SIG, "/*force=*/dropped != 0", "/*force=*/false")])
     expect_fail("report-ignores-force", "D16", [("sycl", REPORT_SIG, "if (!force && inst.driver", "if (inst.driver")])
     expect_fail("header-includes-the-cache", "D8",
                 [("driver", "", "#include \"moe-swap-policy.hpp\"",
@@ -879,7 +1053,8 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", WARN_SIG, "if (m.outcome != ggml_sycl::MOE_SWAP_MOVE_REFUSED) {", "if (false) {")])
     expect_fail("refusal-at-info", "D12",
                 [("sycl", WARN_SIG, "GGML_LOG_WARN(", "GGML_LOG_INFO(")])
-    expect_fail("refusal-not-logged", "D12", [("sycl", CALLER_SIG, "ggml_sycl_moe_swap_warn_refusal(inst, device, m);", "")])
+    expect_fail("refusal-not-logged", "D12",
+                [("sycl", CORE_SIG, "ggml_sycl_moe_swap_warn_refusal(inst, device, m);", "")])
     expect_fail("warned-set-cleared-elsewhere", "D12",
                 [("sycl", REPORT_SIG, "ggml_sycl_moe_swap_fold(inst);",
                   "inst.refusals_warned_evict.clear();\n    ggml_sycl_moe_swap_fold(inst);")])
@@ -890,7 +1065,7 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("latch-on-any-refused-move", "D13",
                 [("sycl", LATCH_SIG, "m.kind == ggml_sycl::MOE_SWAP_MOVE_EVICT && ", "")])
     expect_fail("latch-not-set", "D13",
-                [("sycl", CALLER_SIG, "m.latches_block = ggml_sycl_moe_swap_refusal_latches_block(m);", "")])
+                [("sycl", CORE_SIG, "m.latches_block = ggml_sycl_moe_swap_refusal_latches_block(m);", "")])
     expect_fail("step-latches-every-refusal", "D13", [("driver", STEP_SIG, "if (m.latches_block) {", "if (true) {")])
     expect_fail("no-driver-line-drops-skipped", "D14",
                 [("sycl", REPORT_SIG, "if (off != 0 || skipped != 0) {", "if (off != 0) {")])
@@ -908,14 +1083,14 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("no-growth-room-unbounded-zone-is-zero", "D15",
                 [("cache", NO_GROWTH_ROOM_SIG, "bound > 0 ? bound : capacity", "bound")])
     expect_fail("room-epoch-not-read", "D18",
-                [("sycl", CALLER_SIG,
+                [("sycl", CALL_SIG,
                   "call.room_epoch        = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;",
                   "call.room_epoch        = 0;")])
     expect_fail("room-epoch-read-in-the-callback", "D18",
-                [("sycl", CALLER_SIG, "ggml_sycl_expert_move_request request;",
+                [("sycl", CORE_SIG, "ggml_sycl_expert_move_request request;",
                   "call.room_epoch = 0;\n            ggml_sycl_expert_move_request request;")])
     expect_fail("busy-cause-not-mapped", "D18",
-                [("sycl", CALLER_SIG, "o.zone_room_bytes != 0 ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM",
+                [("sycl", CORE_SIG, "o.zone_room_bytes != 0 ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM",
                   "false ? ggml_sycl::MOE_SWAP_BUSY_CAUSE_ZONE_ROOM")])
     expect_fail("refused-mint-not-recorded", "D18",
                 [("sycl", PREP_SIG, "out.mint_refused_bytes = staged;", "")])
@@ -931,15 +1106,15 @@ def self_test(raw: dict[str, str]) -> int:
                   "triplet.mint_refused_bytes : 0;", "")])
     after_loop = ("ggml_sycl_moe_swap_warn_refusal(inst, device, m);\n            }\n")
     expect_fail("zone-refusal-line-per-admit", "D19",
-                [("sycl", CALLER_SIG, after_loop,
+                [("sycl", CORE_SIG, after_loop,
                   "ggml_sycl_moe_swap_warn_refusal(inst, device, m);\n                if (zone_refused != 0) {\n"
                   "                    ggml_sycl_moe_swap_warn_zone_refusal(cache, device, zone_refused, "
                   "request.admit.size(), zone_refused_max);\n                }\n            }\n")])
     expect_fail("zone-refusal-line-only-when-accepted", "D19",
-                [("sycl", CALLER_SIG, "if (zone_refused != 0) {", "if (zone_refused != 0 && result.accepted) {")])
+                [("sycl", CORE_SIG, "if (zone_refused != 0) {", "if (zone_refused != 0 && result.accepted) {")])
     expect_fail("zone-refusal-line-dropped", "D19",
-                [("sycl", CALLER_SIG, "if (zone_refused != 0) {", "if (false) {")])
-    expect_fail("zone-refusals-not-counted", "D19", [("sycl", CALLER_SIG, "++zone_refused;", "")])
+                [("sycl", CORE_SIG, "if (zone_refused != 0) {", "if (false) {")])
+    expect_fail("zone-refusals-not-counted", "D19", [("sycl", CORE_SIG, "++zone_refused;", "")])
     expect_fail("zone-refusal-line-at-info", "D19", [("sycl", ZONE_WARN_SIG, "GGML_LOG_WARN(", "GGML_LOG_INFO(")])
     expect_fail("zone-refusal-figures-of-another-zone", "D19",
                 [("sycl", ZONE_WARN_SIG, "ggml_sycl::vram_zone_id::WEIGHT", "ggml_sycl::vram_zone_id::KV")])
@@ -960,20 +1135,51 @@ def self_test(raw: dict[str, str]) -> int:
                 [("sycl", TXN_SIG, "room_meter.give_back([&triplet] {", "std::invoke([&triplet] {")])
     expect_fail("prepared-list-given-back-unmeasured", "D20",
                 [("sycl", GIVE_BACK_SIG, "meter.give_back([this] { prepared.clear(); });", "prepared.clear();")])
-    guard_decl = "    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr };\n"
+    guard_decl = ("    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr,\n"
+                  "                                                   meta_us,  copy_us,    remap_us };\n")
     after_preparation = "    if (named && prepared.empty()) {\n"
     expect_fail("give-back-guard-declared-after-the-preparation", "D20",
-                [("sycl", TXN_SIG, guard_decl, ""), ("sycl", TXN_SIG, after_preparation, guard_decl + after_preparation)])
+                [("sycl", TXN_SIG, guard_decl, ""),
+                 ("sycl", TXN_SIG, after_preparation, guard_decl + after_preparation)])
     expect_fail("self-delta-not-written-to-the-answer", "D20",
                 [("sycl", GIVE_BACK_SIG, "answer->room_self_delta = meter.moved;", "(void) answer;")])
     expect_fail("self-delta-not-carried-by-the-entry", "D20",
                 [("sycl", ENTRY_SIG, "r.room_self_delta = answer.room_self_delta;", "")])
     expect_fail("epoch-after-not-read", "D20",
-                [("sycl", CALLER_SIG,
+                [("sycl", CORE_SIG,
                   "const uint64_t epoch_after = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;",
                   "const uint64_t epoch_after = 0;")])
     expect_fail("self-delta-not-returned", "D20",
-                [("sycl", CALLER_SIG, "{ epoch_after, result.room_self_delta }", "{ epoch_after, 0 }")])
+                [("sycl", CORE_SIG, "{ epoch_after, result.room_self_delta, cost }", "{ epoch_after, 0, cost }")])
+    for field, wrong in (("copy", "meta"), ("remap", "copy"), ("meta", "remap")):
+        pad = " " * (len("remap") - len(field))
+        expect_fail(f"{field}-cost-from-the-wrong-part", "D20",
+                    [("sycl", CORE_SIG, f"cost.{field}_us {pad}= result.{field}_us;",
+                      f"cost.{field}_us {pad}= result.{wrong}_us;")])
+    expect_fail("cost-built-positionally", "D20",
+                [("sycl", CORE_SIG, "cost.copy_us  = result.copy_us;\n", ""),
+                 ("sycl", CORE_SIG, "ggml_sycl::moe_swap_txn_cost cost;", "ggml_sycl::moe_swap_txn_cost cost{ 0, 0, "
+                  "result.meta_us, 0 };")])
+    expect_fail("admit-cost-not-counted", "D20", [("driver", "", "        " + COUNT_COST[0] + "\n", "")])
+    expect_fail("evict-cost-not-counted", "D20",
+                [("driver", "", "    " + COUNT_COST[1] + "\n    for (size_t i = 0; i < keep",
+                  "    for (size_t i = 0; i < keep")])
+    expect_fail("cost-not-returned", "D20",
+                [("sycl", CORE_SIG, "{ epoch_after, result.room_self_delta, cost }",
+                  "{ epoch_after, result.room_self_delta, {} }")])
+    for field, anchor in (("meta", "r.meta_us         = answer.meta_us;"),
+                          ("copy", "r.copy_us         = answer.copy_us;"),
+                          ("remap", "r.remap_us        = answer.remap_us;"),
+                          ("total", "r.total_us        = ggml_sycl::expert_move_us_since(call_start);")):
+        expect_fail(f"{field}-cost-not-carried-by-the-entry", "D20", [("sycl", ENTRY_SIG, anchor, "")])
+    clock = "    const auto                   call_start = std::chrono::steady_clock::now();\n"
+    expect_fail("entry-clock-after-the-run", "D20",
+                [("sycl", ENTRY_SIG, clock, ""),
+                 ("sycl", ENTRY_SIG, "    // Each outcome goes back to its own list",
+                  clock + "    // Each outcome goes back to its own list")])
+    expect_fail("entry-total-from-the-body", "D20",
+                [("sycl", ENTRY_SIG, "r.total_us        = ggml_sycl::expert_move_us_since(call_start);",
+                  "r.total_us        = answer.meta_us + answer.copy_us + answer.remap_us;")])
     used = "arena_zones_[static_cast<int>(record_zone)].used);\n"
     bump = "arena_note_room_grew(arena_allocator_group_index(zone));\n"
     for name, call, indent in (("kv-zone-arm", "zone_used_free(*z.allocator, zone_offset, ", " " * 16),
@@ -991,6 +1197,23 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("room-grew-moves-nothing", "D21",
                 [("cache", ROOM_GREW_SIG, "room_epoch.fetch_add(1, std::memory_order_release);",
                   "room_epoch.load(std::memory_order_acquire);")])
+
+    # The signature is compared up to its opening brace, wherever that falls: a comment inside the parameter list is
+    # blanked, not removed, so it lengthens the text between the name and the brace and must not fail the pin.
+    graphs_param = "uint64_t                               graphs,\n"
+    expect_fail("claimed-body-drops-a-parameter", "D22",
+                [("sycl", "", "                                              " + graphs_param, "")])
+    expect_fail("claimed-body-renames-the-resolver", "D22",
+                [("sycl", "", "* resolver) {\n    ggml_sycl_moe_swap_instance &",
+                  "* res) {\n    ggml_sycl_moe_swap_instance &")])
+    try:
+        check(mutate(raw, [("sycl", "", graphs_param, graphs_param + "// a long note on the boundary's decode count, "
+                            "so that the parameter list is longer than any fixed window of the signature\n"
+                            + " " * 46)]))
+        print("  self-test: a comment inside the parameter list passes")
+    except ContractError as e:
+        print(f"  self-test: a comment inside the parameter list FAILS: {e}")
+        failures.append("comment-in-parameter-list")
 
     try:
         mutate(raw, [("sycl", "", "this anchor is in no source", "x")])

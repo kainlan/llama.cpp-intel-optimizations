@@ -185,12 +185,12 @@ ROW_WRITE_ALLOWLIST = {
     ("offload_stats_note_host_alloc", "entry.second += bytes;"): (1, "offload host-alloc stats, keyed by tag"),
     ("remap_or_extract_id_mapping_locked", "mapped->second = replacement;"): (1, "the id_to_key_ map"),
     # An expert move points each id at the copy that now holds the expert: id_to_key_ map writes, not registry rows.
-    ("loan_expert_triplet", "mapped->second = host_key;"): (1, "id_to_key_: the loan hands the id to its host copy"),
-    ("loan_expert_triplet", "mapped->second = device_key;"): (
+    ("expert_id_hand_over", "mapped->second = host_key;"): (1, "id_to_key_: the loan hands the id to its host copy"),
+    ("expert_id_hand_back", "mapped->second = device_key;"): (
         1,
         "id_to_key_: the loan's rollback hands the id back to the restored device entry",
     ),
-    ("copy_host_triplet_to_device", "id_to_key_.find(key)->second ="): (
+    ("copy_host_triplet_to_device", "id_to_key_.find(key)->second = expert_device_key(key);"): (
         1,
         "id_to_key_: the copy to the device hands the id to the new device entry",
     ),
@@ -777,6 +777,50 @@ def test_the_allowlist_names_the_enclosing_function_of_each_entry():
 def mutate(code: str, old: str, new: str) -> str:
     assert code.count(old) == 1, f"{old!r} must appear exactly once to be mutated"
     return code.replace(old, new)
+
+
+# The two allowlist entries above are keyed by the helper's name, so any other function that called a helper would
+# inherit the permission to rewrite an id_to_key_ row. The helpers have one caller each, the loan, and nothing else
+# may name them (a call, a pointer to one, a second definition).
+HAND_OVER_USERS = {
+    ("expert_id_hand_over", "loan_expert_triplet"): 1,
+    ("expert_id_hand_back", "loan_expert_triplet"): 1,
+}
+
+
+def id_hand_users(code: str):
+    users = {}
+    for m in re.finditer(r"\bexpert_id_hand_(?:over|back)\b", code):
+        if re.search(r"\bvoid\s+$", code[: m.start()]):
+            continue  # the helper's own definition
+        key = (m.group(0), enclosing_function(code, m.start()))
+        users[key] = users.get(key, 0) + 1
+    return users
+
+
+def test_the_id_hand_helpers_have_only_the_loan_as_a_caller():
+    assert id_hand_users(CODE) == HAND_OVER_USERS
+
+
+def test_the_caller_pin_sees_a_second_call_in_the_loan():
+    call = "expert_id_hand_over(id_to_key_, members[i].key, device_key, host_key);"
+    assert id_hand_users(mutate(CODE, call, call + "\n            " + call)) != HAND_OVER_USERS
+
+
+@pytest.mark.parametrize(
+    "helper",
+    ["expert_id_hand_over", "expert_id_hand_back"],
+)
+def test_the_caller_pin_sees_a_call_planted_in_another_function(helper):
+    planted = CODE + f"\nvoid planted_other_caller(Map & ids) {{\n    {helper}(ids, k, a, b);\n}}\n"
+    users = id_hand_users(planted)
+    assert users != HAND_OVER_USERS
+    assert users.get((helper, "planted_other_caller")) == 1
+
+
+def test_the_caller_pin_sees_a_pointer_to_a_helper():
+    planted = CODE + "\nvoid planted_pointer() {\n    auto f = &expert_id_hand_back<Map>;\n}\n"
+    assert id_hand_users(planted) != HAND_OVER_USERS
 
 
 @pytest.mark.parametrize(

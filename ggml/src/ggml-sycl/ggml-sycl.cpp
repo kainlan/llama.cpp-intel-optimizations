@@ -21912,6 +21912,11 @@ struct ggml_sycl_expert_loan_result {
     uint32_t     n_remaining      = 0;  // a refill's: the lent triplets its armed cursor still holds after it ran
     uint32_t     n_dropped        = 0;  // a refill's: the lent triplets it dropped from the ledger, to stay on the host
     uint64_t     room_self_delta  = 0;  // a named move's: how far its own give-backs moved the WEIGHT zone's room epoch
+    // The parts of a named move's cost to the boundary thread that the body times, in microseconds
+    // (ggml_sycl_expert_prepared_give_back). A call refused before its preparation leaves them 0.
+    uint64_t     meta_us          = 0;
+    uint64_t     copy_us          = 0;
+    uint64_t     remap_us         = 0;
     const char * reason           = "none";
 };
 
@@ -22348,11 +22353,21 @@ struct ggml_sycl_expert_prepared_give_back {
     std::vector<ggml_sycl_expert_prepared_triplet> & prepared;
     ggml_sycl_expert_room_meter &                    meter;
     ggml_sycl_expert_loan_result *                   answer;
+    // A named move's cost to the boundary thread, written to the body's answer with the room figure on every exit: the
+    // batch's host time the transaction counts (the members' metadata lookups, the cache's copy submissions and id
+    // handovers). The whole call's time is the entry's (ggml_sycl_expert_move_transaction_run). On a throw the entry
+    // never copies that answer on, so a transaction that threw is neither reported nor counted.
+    const uint64_t &                                 meta_us;
+    const uint64_t &                                 copy_us;
+    const uint64_t &                                 remap_us;
 
     ~ggml_sycl_expert_prepared_give_back() {
         meter.give_back([this] { prepared.clear(); });
         if (answer) {
             answer->room_self_delta = meter.moved;
+            answer->meta_us         = meta_us;
+            answer->copy_us         = copy_us;
+            answer->remap_us        = remap_us;
         }
     }
 };
@@ -22577,9 +22592,6 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     ggml_sycl_expert_loan_result *               out,
     bool                                         warn_busy,
     std::vector<ggml_sycl_expert_move_outcome> * named_moves = nullptr) {
-    // For the named move's result line: its total runs from here, so the time outside its timed parts shows.
-    const auto txn_start = std::chrono::steady_clock::now();
-
     const bool                   refill = direction == ggml_sycl_expert_txn_direction::REFILL;
     const bool                   named  = direction == ggml_sycl_expert_txn_direction::NAMED;
     ggml_sycl_expert_loan_result result{};
@@ -22702,17 +22714,18 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
 
     std::vector<ggml_sycl_expert_prepared_triplet> prepared;
     prepared.reserve(n_selected);
+    // The batch's host time, in microseconds, for the named move's cost: the members' metadata lookups in the
+    // preparation, and the cache's copy submissions and id handovers (expert_move_record).
+    uint64_t                            meta_us  = 0;
+    uint64_t                            copy_us  = 0;
+    uint64_t                            remap_us = 0;
     // A named move measures what its own give-backs do to the zone's room epoch, for the swap driver's hold.
     ggml_sycl_expert_room_meter         room_meter{ named ? cache : nullptr };
-    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr };
+    ggml_sycl_expert_prepared_give_back give_back{ prepared, room_meter, named ? out : nullptr,
+                                                   meta_us,  copy_us,    remap_us };
 
     const char * stop      = nullptr;
     bool         transient = false;
-    // The batch's host time, in microseconds, for the named move's result line: the members' metadata lookups in the
-    // preparation, and the cache's copy submissions and id handovers (expert_move_record).
-    uint64_t     meta_us   = 0;
-    uint64_t     copy_us   = 0;
-    uint64_t     remap_us  = 0;
 
     // A lent triplet no later boundary could prepare either (a member no tensor resolves, or no WEIGHT arena on the
     // device to mint its storage from) leaves the ledger under the lock below, if it is the back by then. Left there,
@@ -23082,15 +23095,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
                 ++n_evicted;
             }
         }
-        // A WARN, since every tool drops INFO: the line is where a run shows what its moves cost the boundary thread,
-        // the copy steps' submission and the id handovers' time in the cache and the metadata lookups', summed over
-        // the batch, and the transaction's whole time from its start to this line, which shows what they leave out.
-        GGML_LOG_WARN(
-            "[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s); "
-            "copy submit %llu us, id remap %llu us, meta lookup %llu us, total %llu us\n",
-            device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason,
-            (unsigned long long) copy_us, (unsigned long long) remap_us, (unsigned long long) meta_us,
-            (unsigned long long) ggml_sycl::expert_move_us_since(txn_start));
+        // A DEBUG line, one per boundary that moves: what the moves cost the boundary thread is the answer's, summed
+        // by the swap driver and printed once in its summary, so a run's log does not carry a line per move.
+        GGML_LOG_DEBUG("[MOE-EXEC] named move device %d: %u evicted (%zu MiB off), %u admitted (%zu MiB on) (%s)\n",
+                       device, n_evicted, freed / (1024 * 1024), lent - n_evicted, taken / (1024 * 1024), reason);
     } else {
         if (stop) {
             GGML_LOG_WARN("[MOE-EXEC] loan device %d refused: %s\n", device, stop);
@@ -23138,6 +23146,16 @@ struct ggml_sycl_expert_move_result {
     size_t                                     bytes_admitted  = 0;  // device storage the admitted triplets took
     // How far the call's own give-backs moved the device WEIGHT zone's room epoch (ggml_sycl_expert_room_meter).
     uint64_t                                   room_self_delta = 0;
+    // The call's cost to the boundary thread, in microseconds, which a refused call reports too. total_us is the
+    // transaction's run and the settling of its outcomes, on every exit that returns, a refusal before any preparation
+    // included; building the list of moves is not timed. meta_us, copy_us and
+    // remap_us are the parts the body times, so a call refused before its preparation leaves them 0. A call that
+    // threw reports none of it: the entry rethrows before it copies the answer, and the swap driver counts a
+    // transaction only once it has returned.
+    uint64_t                                   meta_us         = 0;
+    uint64_t                                   copy_us         = 0;
+    uint64_t                                   remap_us        = 0;
+    uint64_t                                   total_us        = 0;
     const char *                               reason          = "none";
     std::vector<ggml_sycl_expert_move_outcome> evicted;
     std::vector<ggml_sycl_expert_move_outcome> admitted;
@@ -23164,7 +23182,9 @@ static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int           
         moves[i].triplet   = i < n_evict ? request.evict[i] : request.admit[i - n_evict];
     }
     ggml_sycl_expert_loan_result answer;
-    const ggml_sycl_txn_result   code = ggml_sycl_expert_txn_run(
+    // total_us runs from here to the answer copy below: the transaction run and the settle of its outcomes.
+    const auto                   call_start = std::chrono::steady_clock::now();
+    const ggml_sycl_txn_result   code       = ggml_sycl_expert_txn_run(
         ggml_sycl_expert_txn_direction::NAMED, device, moves.size(), 0, false, resolver, &answer, false, &moves);
     // A triplet the body never decided takes the call's answer: a refusal of the whole call refuses each, and a triplet
     // the cache moved under a plan that was never published (a lost swap) has not moved. An accepted call decided every
@@ -23186,6 +23206,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int           
         r.bytes_evicted   = answer.bytes_freed;
         r.bytes_admitted  = answer.bytes_readmitted;
         r.room_self_delta = answer.room_self_delta;
+        r.meta_us         = answer.meta_us;
+        r.copy_us         = answer.copy_us;
+        r.remap_us        = answer.remap_us;
+        r.total_us        = ggml_sycl::expert_move_us_since(call_start);
         for (ggml_sycl_expert_move_outcome & m : moves) {
             if (m.moved) {
                 ++(m.to_device ? r.n_admitted : r.n_evicted);
@@ -23661,11 +23685,29 @@ struct ggml_sycl_moe_swap_instance {
 // the caches are gone.
 static auto * const g_sycl_moe_swap = new ggml_sycl_moe_swap_instance[GGML_SYCL_MAX_DEVICES];
 
-// Releases an instance's claim on every way out, an exception's included.
-struct ggml_sycl_moe_swap_claim_release {
+// An instance's claim: constructing it tries to take the claim, `held` says whether it did, and destroying it gives a
+// held claim back on every way out, an exception's included. The boundary, the report at backend free and the private
+// tests' hook all claim through it.
+struct ggml_sycl_moe_swap_claim {
     std::atomic<bool> & claimed;
+    const bool          held;
 
-    ~ggml_sycl_moe_swap_claim_release() { claimed.store(false, std::memory_order_release); }
+    explicit ggml_sycl_moe_swap_claim(std::atomic<bool> & flag) : claimed(flag), held(try_take(flag)) {}
+
+    ~ggml_sycl_moe_swap_claim() {
+        if (held) {
+            claimed.store(false, std::memory_order_release);
+        }
+    }
+
+    ggml_sycl_moe_swap_claim(const ggml_sycl_moe_swap_claim &)             = delete;
+    ggml_sycl_moe_swap_claim & operator=(const ggml_sycl_moe_swap_claim &) = delete;
+
+  private:
+    static bool try_take(std::atomic<bool> & flag) {
+        bool expected = false;
+        return flag.compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+    }
 };
 
 // The boundaries counted before a claim, into the driver's figures. Under the claim.
@@ -23710,10 +23752,9 @@ static void ggml_sycl_moe_swap_report_at_free(int device) {
     if (!ggml_sycl_moe_swap_enabled() || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
         return;
     }
-    ggml_sycl_moe_swap_instance & inst     = g_sycl_moe_swap[device];
-    bool                          expected = false;
-    if (inst.claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        const ggml_sycl_moe_swap_claim_release release{ inst.claimed };
+    ggml_sycl_moe_swap_instance &  inst = g_sycl_moe_swap[device];
+    const ggml_sycl_moe_swap_claim claim{ inst.claimed };
+    if (claim.held) {
         ggml_sycl_moe_swap_report(inst, device);
     }
 }
@@ -23810,45 +23851,36 @@ static size_t ggml_sycl_moe_swap_host_room(const ggml_sycl::unified_cache * cach
     return cache->host_zone_no_growth_room(ggml_sycl::host_zone_id::WEIGHT);
 }
 
-// ggml_backend_sycl_synchronize() calls this after the refill: the graph's work is done, its compute flag is cleared,
-// and the loan's boundary and the deferred-free pass have run. On entry it checks once that no graph computes on any
-// device and that no graph is in flight; the named move checks "graph active" again only on its own entry. Once two
-// graph computes have overlapped (g_sycl_graph_multithreaded, a latch nothing clears), every later boundary is off.
-static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
-    if (!ggml_sycl_moe_swap_enabled()) {
-        return;
-    }
-    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
-    if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES ||
-        ctx->graph_compute_seq == ctx->swap_seen_seq) {
-        return;  // no graph since this context's last boundary: the synchronize of a copy or a load
-    }
-    ctx->swap_seen_seq                   = ctx->graph_compute_seq;  // a boundary is counted once, run or not
-    const int                     device = ctx->device;
-    ggml_sycl_moe_swap_instance & inst   = g_sycl_moe_swap[device];
-    if (g_sycl_graph_multithreaded.load(std::memory_order_relaxed)) {
-        inst.off_multithreaded.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    if (ggml_sycl::unified_cache_is_graph_compute_active() || ggml_sycl_graph_inflight_count() != 0) {
-        inst.skipped.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    bool expected = false;
-    if (!inst.claimed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        inst.skipped.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    const ggml_sycl_moe_swap_claim_release release{ inst.claimed };
+// What the driver is told of this boundary: whether a prompt ran since the last one (more graphs than decode graphs),
+// how many decode graphs, whether triplets are lent and whether the cache is settled (nothing lent and no deferred
+// free pending), the prompt gate, and the device WEIGHT zone's room epoch.
+static ggml_sycl::moe_swap_driver_call ggml_sycl_moe_swap_make_call(const ggml_sycl_moe_swap_instance & inst,
+                                                                    ggml_sycl::unified_cache *          cache,
+                                                                    int                                 device,
+                                                                    uint64_t                            decodes,
+                                                                    uint64_t                            graphs) {
+    ggml_sycl::moe_swap_driver_call call;
+    call.after_prompt      = graphs > decodes;
+    call.n_tokens          = static_cast<int>(std::min<uint64_t>(decodes, std::numeric_limits<int>::max()));
+    call.loans_outstanding = g_sycl_expert_lent_count[device].load(std::memory_order_acquire) != 0;
+    call.cache_settled     = !call.loans_outstanding && !(cache && cache->has_pending_deferred_frees());
+    call.prompt_gate       = inst.prompt_gate;
+    // Read before the transaction, and again right after it in the callback of the boundary: the epoch's move between
+    // the two, less what the transaction's own give-backs moved it by, is room the zone gained while it ran.
+    call.room_epoch        = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;
+    return call;
+}
 
-    // The graphs this boundary stands for: every one since the driver last ran for this context, so a skipped
-    // boundary's graphs count at the next one that runs.
-    const uint64_t decode_now = ctx->decode_graph_count.load(std::memory_order_relaxed);
-    const uint64_t decodes    = decode_now - ctx->swap_decode_graph;
-    const uint64_t graphs     = ctx->graph_compute_seq - ctx->swap_graph_seq;
-    ctx->swap_decode_graph    = decode_now;
-    ctx->swap_graph_seq       = ctx->graph_compute_seq;
-
+// One boundary of the driver, from the route table on, for the device's instance, which the caller has claimed
+// (ggml_sycl_run_expert_swap_at_boundary, and the private tests' hook): `decodes` decode graphs and `graphs` graphs of
+// any kind ran since this context's last boundary. Reads the device's route table, the published plan and its
+// cache, and runs the named move through `resolver`, which a null one leaves to the registered tensors; the private
+// tests pass a fixture's.
+static void ggml_sycl_run_expert_swap_claimed(int                                    device,
+                                              uint64_t                               decodes,
+                                              uint64_t                               graphs,
+                                              const ggml_sycl_expert_loan_resolver * resolver) {
+    ggml_sycl_moe_swap_instance &                      inst  = g_sycl_moe_swap[device];
     const std::shared_ptr<ggml_sycl::moe_route_counts> table = ggml_sycl::moe_route_counts_current(device);
     if (!table || table->n_blocks() == 0) {
         return;  // no MoE model on this device, or a table that refuses every count
@@ -23897,18 +23929,10 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
         inst.snapshot = snap;
     }
 
-    ggml_sycl::unified_cache *      cache = ggml_sycl::get_existing_unified_cache_for_device(device);
-    ggml_sycl::moe_swap_driver_call call;
-    call.after_prompt      = graphs > decodes;
-    call.n_tokens          = static_cast<int>(std::min<uint64_t>(decodes, std::numeric_limits<int>::max()));
-    call.loans_outstanding = g_sycl_expert_lent_count[device].load(std::memory_order_acquire) != 0;
-    call.cache_settled     = !call.loans_outstanding && !(cache && cache->has_pending_deferred_frees());
-    call.prompt_gate       = inst.prompt_gate;
-    // Read before the transaction, and again right after it in the callback below: the epoch's move between the two,
-    // less what the transaction's own give-backs moved it by, is room the zone gained while it ran.
-    call.room_epoch        = cache ? cache->zone_room_epoch(ggml_sycl::vram_zone_id::WEIGHT) : 0;
-    const int nb           = d.policy.n_blocks;
-    const int ne           = d.policy.n_experts;
+    ggml_sycl::unified_cache *            cache = ggml_sycl::get_existing_unified_cache_for_device(device);
+    const ggml_sycl::moe_swap_driver_call call  = ggml_sycl_moe_swap_make_call(inst, cache, device, decodes, graphs);
+    const int                             nb    = d.policy.n_blocks;
+    const int                             ne    = d.policy.n_experts;
     (void) ggml_sycl::moe_swap_driver_step(
         d, inst.view, call,
         [&](uint64_t * decode, uint64_t * prompt) {
@@ -23928,7 +23952,7 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
                 list.push_back({ m.block, m.expert });
             }
             ggml_sycl_expert_move_result result;
-            const ggml_sycl_txn_result code = ggml_sycl_expert_move_transaction_run(device, request, nullptr, &result);
+            const ggml_sycl_txn_result code = ggml_sycl_expert_move_transaction_run(device, request, resolver, &result);
 
             // Read as soon as the transaction has returned, with nothing of the transaction's own storage given back
             // in between: with how far the transaction's own give-backs moved it, it tells the step whether the zone
@@ -23968,8 +23992,54 @@ static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
                 ggml_sycl_moe_swap_warn_zone_refusal(cache, device, zone_refused, request.admit.size(),
                                                      zone_refused_max);
             }
-            return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta };
+            ggml_sycl::moe_swap_txn_cost cost;
+            cost.copy_us  = result.copy_us;
+            cost.remap_us = result.remap_us;
+            cost.meta_us  = result.meta_us;
+            cost.total_us = result.total_us;
+            return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };
         });
+}
+
+// ggml_backend_sycl_synchronize() calls this after the refill: the graph's work is done, its compute flag is cleared,
+// and the loan's boundary and the deferred-free pass have run. On entry it checks once that no graph computes on any
+// device and that no graph is in flight; the named move checks "graph active" again only on its own entry. Once two
+// graph computes have overlapped (g_sycl_graph_multithreaded, a latch nothing clears), every later boundary is off.
+static void ggml_sycl_run_expert_swap_at_boundary(ggml_backend_t backend) {
+    if (!ggml_sycl_moe_swap_enabled()) {
+        return;
+    }
+    auto * ctx = backend ? static_cast<ggml_backend_sycl_context *>(backend->context) : nullptr;
+    if (!ctx || ctx->device < 0 || ctx->device >= GGML_SYCL_MAX_DEVICES ||
+        ctx->graph_compute_seq == ctx->swap_seen_seq) {
+        return;  // no graph since this context's last boundary: the synchronize of a copy or a load
+    }
+    ctx->swap_seen_seq                   = ctx->graph_compute_seq;  // a boundary is counted once, run or not
+    const int                     device = ctx->device;
+    ggml_sycl_moe_swap_instance & inst   = g_sycl_moe_swap[device];
+    if (g_sycl_graph_multithreaded.load(std::memory_order_relaxed)) {
+        inst.off_multithreaded.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (ggml_sycl::unified_cache_is_graph_compute_active() || ggml_sycl_graph_inflight_count() != 0) {
+        inst.skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const ggml_sycl_moe_swap_claim claim{ inst.claimed };
+    if (!claim.held) {
+        inst.skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    // The graphs this boundary stands for: every one since the driver last ran for this context, so a skipped
+    // boundary's graphs count at the next one that runs.
+    const uint64_t decode_now = ctx->decode_graph_count.load(std::memory_order_relaxed);
+    const uint64_t decodes    = decode_now - ctx->swap_decode_graph;
+    const uint64_t graphs     = ctx->graph_compute_seq - ctx->swap_graph_seq;
+    ctx->swap_decode_graph    = decode_now;
+    ctx->swap_graph_seq       = ctx->graph_compute_seq;
+
+    ggml_sycl_run_expert_swap_claimed(device, decodes, graphs, /*resolver=*/nullptr);
 }
 
 // The refill's teardown line, beside the [MOE-EXEC] summary: per device that lent or re-admitted triplets since it
@@ -29096,10 +29166,10 @@ std::string test_expert_loan_rollback_hands_the_id_back_to_the_device_entry() {
 std::string test_expert_moves_leave_the_eviction_latch_clear() {
     // The cache's eviction latch turns off graph replay and persistent TG until the next model load. An expert move's
     // retires stay out of it, since the move's publication bumps the exec-graph epoch, so a named evict and the reap of
-    // its device entries leave it clear, and so do an admit and the reap of its host copies. The control: another
-    // retire of an expert's device entry, here a drop of expert 1's entries outside any move, latches on its reap, so
-    // the exemption is the move's mark, not the entry's kind. The case reads this device's cache, which no other case
-    // shares the latch of while it runs.
+    // its device entries leave it clear. An admit's host copies never latch, mark or none (the latch leaves a host-
+    // resident entry out), so the admit is not asserted here. The control: another retire of an expert's device entry,
+    // here a drop of expert 1's entries outside any move, latches on its reap, so the exemption is the move's mark, not
+    // the entry's kind. The case reads this device's cache, which no other case shares the latch of while it runs.
     test_loan_fixture fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637412ull);
     if (!fx.cache) {
         return "no unified cache for device 0";
@@ -29131,18 +29201,6 @@ std::string test_expert_moves_leave_the_eviction_latch_clear() {
     }
     if (fx.cache->has_evictions()) {
         return "the reap of the evicted triplet's device entries set the eviction latch";
-    }
-
-    ::ggml_sycl_expert_move_result admitted;
-    code = test_named_move(fx, test_no_triplet, { 0, 0 }, admitted);
-    if (code != ::ggml_sycl_txn_result::ACCEPTED || admitted.n_admitted != 1) {
-        return "the admit answered " + test_admit_answer(code, admitted);
-    }
-    if (!fx.reclaim_until([&] { return test_evict_host_entries(fx, 0, 0) == 0; })) {
-        return test_loan_fail("2 s after the admit %d of its host copies remain", test_evict_host_entries(fx, 0, 0));
-    }
-    if (fx.cache->has_evictions()) {
-        return "the admit or the reap of its host copies set the eviction latch";
     }
 
     // The control: expert 1's device entries dropped outside any move, each extra's record of them first, so the
@@ -29251,6 +29309,402 @@ static void test_fail_next_cache_allocation_once(void * context) {
         *armed = true;
         unified_cache_fail_expert_allocation_after_for_test(1);
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The swap driver's boundary against the loan fixture: ggml_sycl_run_expert_swap_claimed reads the device's route
+// table, the published plan and its cache, and sends its transaction through the fixture's resolver, so the glue
+// between the driver and the named move runs on a real cache. The driver's own decisions are
+// tests/test-sycl-moe-swap-driver.cpp's.
+
+namespace {
+
+// One boundary as the backend's synchronize runs it once the instance is claimed: `decodes` decode graphs and `graphs`
+// graphs of any kind since the last one. False when the instance was claimed already.
+bool test_swap_boundary(int                                      device,
+                        uint64_t                                 decodes,
+                        uint64_t                                 graphs,
+                        const ::ggml_sycl_expert_loan_resolver * resolver) {
+    ::ggml_sycl_moe_swap_instance &  inst = ::g_sycl_moe_swap[device];
+    const ::ggml_sycl_moe_swap_claim claim{ inst.claimed };
+    if (!claim.held) {
+        return false;
+    }
+    ::ggml_sycl_run_expert_swap_claimed(device, decodes, graphs, resolver);
+    return true;
+}
+
+// The report the backend's free prints, as a boundary leaves it: nothing when every boundary was reported already.
+// False when the instance was claimed already.
+bool test_swap_report(int device) {
+    ::ggml_sycl_moe_swap_instance &  inst = ::g_sycl_moe_swap[device];
+    const ::ggml_sycl_moe_swap_claim claim{ inst.claimed };
+    if (!claim.held) {
+        return false;
+    }
+    ::ggml_sycl_moe_swap_report(inst, device);
+    return true;
+}
+
+// The call the driver is handed for the boundary, with what the cache says now.
+moe_swap_driver_call test_swap_call(int device, uint64_t decodes, uint64_t graphs) {
+    return ::ggml_sycl_moe_swap_make_call(::g_sycl_moe_swap[device], get_existing_unified_cache_for_device(device),
+                                          device, decodes, graphs);
+}
+
+// The device's instance as a process that never ran the driver has it, bar the sets of refusal reasons already logged,
+// which only decide whether a line prints; a case starts and ends with it so, since the instance is process-wide and
+// keeps its driver, view and the plan it was built from between boundaries.
+void test_swap_forget(int device) {
+    ::ggml_sycl_moe_swap_instance & inst = ::g_sycl_moe_swap[device];
+    inst.driver.reset();
+    inst.counts.reset();
+    inst.snapshot.reset();
+    inst.view        = moe_swap_plan_view{};
+    inst.model_id    = 0;
+    inst.load_txn_id = 0;
+    inst.bulk_memo.clear();
+    inst.prompt_gate = 0.0;
+    inst.reported    = 0;
+    inst.skipped.store(0, std::memory_order_relaxed);
+    inst.off_multithreaded.store(0, std::memory_order_relaxed);
+}
+
+struct test_swap_scope {
+    int device;
+
+    explicit test_swap_scope(int d) : device(d) { test_swap_forget(device); }
+
+    ~test_swap_scope() { test_swap_forget(device); }
+};
+
+// A route table of one block and `n_experts` experts installed for `device`, and read back as the device's current
+// one: false when it is not (the device has no route table slot, which installs without replacing anything).
+bool test_swap_install_table(int device, int n_experts) {
+    const std::shared_ptr<moe_route_counts> table = moe_route_counts_install(device, 1, n_experts);
+    return table && moe_route_counts_current(device) == table;
+}
+
+// The fixture's plan with a dense weight on the card, which the driver needs to run: a plan that holds the card only
+// through experts is one it stays off.
+placement_plan test_swap_plan(const test_loan_fixture & fx, int host_expert) {
+    placement_plan plan = fx.plan(host_expert);
+    plan.entries.emplace_back("blk.0.attn_q.weight", 8192, 8192, 0, placement_priority::MOE_UP, 0, -1,
+                              expert_tensor_role::UNKNOWN, true, fx.device);
+    plan.build_index();
+    return plan;
+}
+
+// One layer of three experts, expert `host_expert` on the host in pinned storage and the other two on the card, the
+// plan published with a dense weight, and the route table of one block and `n_experts` experts installed.
+std::string test_swap_prepare(test_loan_fixture & fx, int host_expert, int n_table_experts) {
+    if (!fx.cache) {
+        return "no unified cache for device 0";
+    }
+    // A case starts with no triplet lent: a loan an earlier case leaked is its failure to report, not a count to wipe.
+    if (g_sycl_expert_lent_count[fx.device].load(std::memory_order_acquire) != 0) {
+        return "a triplet is still lent on the device from an earlier case";
+    }
+    if (!test_ensure_weight_zone(fx.cache, *fx.queue, 12 * test_loan_expert_bytes())) {
+        return "no WEIGHT zone could be reserved";
+    }
+    if (std::string why = fx.stage_per_expert(host_expert); !why.empty()) {
+        return why;
+    }
+    ::ggml_sycl_publish_test_plan(test_swap_plan(fx, host_expert));
+    if (std::string why = fx.pin_host_triplet(0, host_expert); !why.empty()) {
+        return why;
+    }
+    if (!drain_retained_handles(true, 5000)) {
+        return "the retained store did not drain before the boundaries";
+    }
+    fx.cache->process_deferred_frees_public();
+    if (!test_swap_install_table(fx.device, n_table_experts)) {
+        return "the route table installed is not the device's current one";
+    }
+    return {};
+}
+
+// `pairs` routed decode pairs of block 0's `expert`, counted into the device's current route table.
+void test_swap_route(int device, int expert, int pairs) {
+    const std::shared_ptr<moe_route_counts> table = moe_route_counts_current(device);
+    for (int i = 0; i < pairs && table; ++i) {
+        table->add_decode(0, expert, /*on_device=*/true);
+    }
+}
+
+}  // namespace
+
+std::string test_expert_swap_boundary_maps_an_evict_then_an_admit() {
+    // The driver's boundary on a real cache: the first boundary reaches the policy's period and sends the evict of the
+    // coldest resident expert for the hottest host one, the next sends the admit it left pending. What the glue
+    // does between the driver and the named move shows in the driver's figures: the evict's outcome (the first list of
+    // the call's answer) is a moved evict, its bytes counted, its admit pending and the triplet on the host in the
+    // published plan; the admit's outcome (the second list) is a moved admit and the triplet back on the card. The
+    // call the glue hands the driver says whether a prompt ran since the last boundary (more graphs than decode
+    // graphs), the decode graphs, and whether the cache is settled: not while the evicted device entries wait for the
+    // deferred-free pass, nor while triplets are lent, and settled once the pass has run. A boundary after a prompt
+    // seeds the policy and moves nothing.
+    constexpr int         device = 0;
+    const test_swap_scope scope(device);
+    test_loan_fixture     fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637420ull);
+    if (std::string why = test_swap_prepare(fx, /*host_expert=*/2, /*n_table_experts=*/3); !why.empty()) {
+        return why;
+    }
+    test_swap_route(device, 2, 10);  // the host expert is hot
+    test_swap_route(device, 1, 5);   // one resident expert is used, the other never
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+
+    // The call's own fields, before anything moves: nothing lent and nothing pending, a prompt when more graphs ran
+    // than decode graphs.
+    {
+        const moe_swap_driver_call decode = test_swap_call(device, 4, 4);
+        const moe_swap_driver_call prompt = test_swap_call(device, 0, 1);
+        if (decode.after_prompt || decode.n_tokens != 4 || decode.loans_outstanding || !decode.cache_settled) {
+            return test_loan_fail("four decode graphs read as after_prompt=%d n_tokens=%d loans=%d settled=%d",
+                                  (int) decode.after_prompt, decode.n_tokens, (int) decode.loans_outstanding,
+                                  (int) decode.cache_settled);
+        }
+        if (!prompt.after_prompt || prompt.n_tokens != 0) {
+            return test_loan_fail("one prompt graph read as after_prompt=%d n_tokens=%d", (int) prompt.after_prompt,
+                                  prompt.n_tokens);
+        }
+    }
+
+    // The evict.
+    if (!test_swap_boundary(device, 4, 4, &resolver)) {
+        return "the device's swap instance was claimed";
+    }
+    const moe_swap_driver_state * d = ::g_sycl_moe_swap[device].driver.get();
+    if (!d) {
+        return "the first boundary made no driver: no table or no plan reached it";
+    }
+    if (d->stats.boundaries_off != 0 || d->stats.evicts != 1 || d->stats.transactions_evict != 1 ||
+        d->stats.decode_graphs != 4 || d->stats.boundaries_after_prompt != 0 || d->stats.evict_bytes == 0 ||
+        !d->stats.refused.empty() || !d->stats.busy.empty() || d->pending.size() != 1) {
+        return test_loan_fail(
+            "after the evict boundary: off=%llu evicts=%llu transactions=%llu decode_graphs=%llu after_prompt=%llu "
+            "evict_bytes=%llu refused=%zu busy=%zu pending=%zu (want 0, 1, 1, 4, 0, >0, 0, 0, 1; off reason %s)",
+            (unsigned long long) d->stats.boundaries_off, (unsigned long long) d->stats.evicts,
+            (unsigned long long) d->stats.transactions_evict, (unsigned long long) d->stats.decode_graphs,
+            (unsigned long long) d->stats.boundaries_after_prompt, (unsigned long long) d->stats.evict_bytes,
+            d->stats.refused.size(), d->stats.busy.size(), d->pending.size(),
+            d->stats.off_reason ? d->stats.off_reason : "none");
+    }
+    // The transaction's cost reached the driver's figures: one transaction sent, its copies submitted and its whole
+    // call timed.
+    if (d->stats.txn_sent != 1 || d->stats.txn_total_us == 0 || d->stats.txn_copy_us == 0) {
+        return test_loan_fail(
+            "after the evict boundary: txn_sent=%llu txn_total_us=%llu txn_copy_us=%llu (want 1, >0, >0)",
+            (unsigned long long) d->stats.txn_sent, (unsigned long long) d->stats.txn_total_us,
+            (unsigned long long) d->stats.txn_copy_us);
+    }
+    const uint64_t total_after_evict = d->stats.txn_total_us;
+    const uint64_t copy_after_evict  = d->stats.txn_copy_us;
+    if (d->pending[0].block != 0 || d->pending[0].admit_expert != 2 || d->pending[0].evict_expert != 0 ||
+        d->pending[0].restore) {
+        return test_loan_fail("the pending admit is block %d expert %d for evicted expert %d (restore=%d), not 0, 2, 0",
+                              d->pending[0].block, d->pending[0].admit_expert, d->pending[0].evict_expert,
+                              (int) d->pending[0].restore);
+    }
+    if (std::string why = test_evict_landed(fx, 0, 0); !why.empty()) {
+        return "the driver's evict: " + why;
+    }
+
+    // Right after the evict the cache is not settled: the evicted device entries wait for the deferred-free pass. A
+    // lent triplet is not settled either, and says so.
+    if (!fx.cache->has_pending_deferred_frees()) {
+        return "the evict left no deferred free pending, so the unsettled control reads nothing";
+    }
+    const moe_swap_driver_call unsettled = test_swap_call(device, 1, 1);
+    if (unsettled.cache_settled || unsettled.loans_outstanding) {
+        return test_loan_fail("right after the evict the call reads settled=%d loans=%d, not 0 and 0",
+                              (int) unsettled.cache_settled, (int) unsettled.loans_outstanding);
+    }
+    if (!fx.reclaim_until(
+            [&] { return test_evict_device_entries(fx, 0, 0) == 0 && !fx.cache->has_pending_deferred_frees(); })) {
+        return test_loan_fail("2 s after the evict %d of its device entries remain and deferred frees are %s",
+                              test_evict_device_entries(fx, 0, 0),
+                              fx.cache->has_pending_deferred_frees() ? "pending" : "done");
+    }
+    if (!test_swap_call(device, 1, 1).cache_settled) {
+        return "the call reads the cache unsettled after the deferred-free pass ran";
+    }
+    g_sycl_expert_lent_count[device].store(1, std::memory_order_release);
+    const moe_swap_driver_call lent = test_swap_call(device, 1, 1);
+    g_sycl_expert_lent_count[device].store(0, std::memory_order_release);
+    if (!lent.loans_outstanding || lent.cache_settled) {
+        return test_loan_fail("with a triplet lent the call reads loans=%d settled=%d, not 1 and 0",
+                              (int) lent.loans_outstanding, (int) lent.cache_settled);
+    }
+
+    // The admit, at the next boundary.
+    if (!test_swap_boundary(device, 1, 1, &resolver)) {
+        return "the device's swap instance was claimed";
+    }
+    if (d != ::g_sycl_moe_swap[device].driver.get()) {
+        return "the admit boundary replaced the driver, though the route table did not change";
+    }
+    if (d->stats.admits != 1 || d->stats.transactions_admit != 1 || d->stats.admit_bytes == 0 ||
+        d->stats.restores != 0 || !d->pending.empty() || !d->stats.refused.empty() || !d->stats.busy.empty() ||
+        d->stats.boundaries != 2 || d->stats.decode_graphs != 5) {
+        return test_loan_fail(
+            "after the admit boundary: admits=%llu transactions=%llu admit_bytes=%llu restores=%llu pending=%zu "
+            "refused=%zu busy=%zu boundaries=%llu decode_graphs=%llu (want 1, 1, >0, 0, 0, 0, 0, 2, 5)",
+            (unsigned long long) d->stats.admits, (unsigned long long) d->stats.transactions_admit,
+            (unsigned long long) d->stats.admit_bytes, (unsigned long long) d->stats.restores, d->pending.size(),
+            d->stats.refused.size(), d->stats.busy.size(), (unsigned long long) d->stats.boundaries,
+            (unsigned long long) d->stats.decode_graphs);
+    }
+    // The figures add up over transactions, so the admit's own cost is what they grew by.
+    if (d->stats.txn_sent != 2 || d->stats.txn_total_us <= total_after_evict ||
+        d->stats.txn_copy_us <= copy_after_evict) {
+        return test_loan_fail(
+            "after the admit boundary: txn_sent=%llu txn_total_us=%llu (was %llu) txn_copy_us=%llu (was %llu) (want 2, "
+            "more, more)",
+            (unsigned long long) d->stats.txn_sent, (unsigned long long) d->stats.txn_total_us,
+            (unsigned long long) total_after_evict, (unsigned long long) d->stats.txn_copy_us,
+            (unsigned long long) copy_after_evict);
+    }
+    if (std::string why = fx.readmitted(0, 2); !why.empty()) {
+        return "the driver's admit: " + why;
+    }
+
+    // A boundary after a prompt: counted as one, seeds the policy, moves nothing.
+    const uint64_t evicts_before = d->stats.evicts;
+    if (!test_swap_boundary(device, 0, 1, &resolver)) {
+        return "the device's swap instance was claimed";
+    }
+    if (d->stats.boundaries_after_prompt != 1 || !d->policy.prompt_pending || d->stats.evicts != evicts_before ||
+        d->stats.admits != 1 || !d->pending.empty()) {
+        return test_loan_fail(
+            "after the prompt boundary: after_prompt=%llu prompt_pending=%d evicts=%llu admits=%llu pending=%zu "
+            "(want 1, 1, %llu, 1, 0)",
+            (unsigned long long) d->stats.boundaries_after_prompt, (int) d->policy.prompt_pending,
+            (unsigned long long) d->stats.evicts, (unsigned long long) d->stats.admits, d->pending.size(),
+            (unsigned long long) evicts_before);
+    }
+    return {};
+}
+
+std::string test_expert_swap_boundary_carries_or_drops_what_is_in_flight() {
+    // A route table replaced under the same load, with the same shape, hands the old driver's pending admit to the new
+    // one, which sends it: the new driver's figures show the admit and no evict. A table of another shape cannot take
+    // it: the in-flight admit counts as an open slot of the replaced driver, and the second summary line the replaced
+    // driver prints names that slot. The case sends its evicts through the glue, so each pending admit is a real one.
+    constexpr int         device = 0;
+    const test_swap_scope scope(device);
+    test_loan_fixture     fx(/*layers=*/1, /*experts=*/3, /*model_id=*/0x6576637421ull);
+    if (std::string why = test_swap_prepare(fx, /*host_expert=*/2, /*n_table_experts=*/3); !why.empty()) {
+        return why;
+    }
+    test_swap_route(device, 2, 10);
+    test_swap_route(device, 1, 5);
+    const ::ggml_sycl_expert_loan_resolver resolver = fx.resolver();
+    auto                                   settle   = [&](int layer, int expert) {
+        return fx.reclaim_until([&] {
+            return test_evict_device_entries(fx, layer, expert) == 0 && !fx.cache->has_pending_deferred_frees();
+        });
+    };
+
+    if (!test_swap_boundary(device, 4, 4, &resolver)) {
+        return "the device's swap instance was claimed";
+    }
+    const moe_swap_driver_state * first = ::g_sycl_moe_swap[device].driver.get();
+    if (!first || first->pending.size() != 1 || first->stats.evicts != 1) {
+        return "the first boundary did not leave one admit pending after its evict";
+    }
+    if (!settle(0, 0)) {
+        return "the evicted triplet's device entries were not reaped";
+    }
+
+    // The carry: a fresh table of the same shape.
+    if (!test_swap_install_table(device, 3)) {
+        return "the route table of the same shape installed is not the device's current one";
+    }
+    test_swap_route(device, 0, 100);  // the evicted expert is now the hot one
+    test_swap_route(device, 1, 5);
+    if (!test_swap_boundary(device, 1, 1, &resolver)) {
+        return "the device's swap instance was claimed";
+    }
+    const moe_swap_driver_state * second = ::g_sycl_moe_swap[device].driver.get();
+    if (!second) {
+        return "the boundary after a new route table has no driver";
+    }
+    if (second->stats.admits != 1 || second->stats.evicts != 0 || !second->pending.empty() ||
+        second->stats.boundaries != 1 || second->stats.open_slots != 0) {
+        return test_loan_fail(
+            "after the carry boundary the new driver has admits=%llu evicts=%llu pending=%zu boundaries=%llu "
+            "open_slots=%llu, not 1, 0, 0, 1, 0",
+            (unsigned long long) second->stats.admits, (unsigned long long) second->stats.evicts,
+            second->pending.size(), (unsigned long long) second->stats.boundaries,
+            (unsigned long long) second->stats.open_slots);
+    }
+    if (std::string why = fx.readmitted(0, 2); !why.empty()) {
+        return "the carried admit: " + why;
+    }
+    if (!fx.reclaim_until(
+            [&] { return test_evict_host_entries(fx, 0, 2) == 0 && !fx.cache->has_pending_deferred_frees(); })) {
+        return "the admitted triplet's host copies were not reaped";
+    }
+
+    // A second pending admit: the hot expert 0 is on the host, so the next period boundary evicts the cold resident
+    // expert 2 for it.
+    if (!test_swap_boundary(device, 3, 3, &resolver)) {
+        return "the device's swap instance was claimed";
+    }
+    if (second->stats.evicts != 1 || second->pending.size() != 1 || second->pending[0].admit_expert != 0) {
+        return test_loan_fail("the second evict boundary left evicts=%llu pending=%zu (admit expert %d), not 1, 1, 0",
+                              (unsigned long long) second->stats.evicts, second->pending.size(),
+                              second->pending.empty() ? -1 : second->pending[0].admit_expert);
+    }
+
+    // The drop: a table of another shape. The old driver's pending admit is counted as an open slot and the old driver
+    // reports, though it has no unreported boundary left to force the print: its boundaries are all reported first,
+    // so only the forced report can print. The control is a report with nothing new to say, which prints nothing.
+    test_loan_warn_capture capture;
+    auto                   summaries = [&capture]() {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        size_t                      n = 0;
+        for (const std::string & line : capture.lines) {
+            n += line.find("[MOE-SWAP] device 0: accepted transactions") != std::string::npos ? 1 : 0;
+        }
+        return n;
+    };
+    if (!test_swap_report(device) || summaries() != 1) {
+        return "the report of the driver about to be replaced did not print its summary once";
+    }
+    if (!test_swap_report(device) || summaries() != 1) {
+        return "a report with every boundary already reported printed its summary again";
+    }
+    if (!test_swap_install_table(device, 4)) {
+        return "the route table of another shape installed is not the device's current one";
+    }
+    if (!test_swap_boundary(device, 1, 1, &resolver)) {
+        return "the device's swap instance was claimed";
+    }
+    const moe_swap_driver_state * third = ::g_sycl_moe_swap[device].driver.get();
+    if (!third) {
+        return "the boundary after a table of another shape has no driver";
+    }
+    if (!third->pending.empty() || third->stats.admits != 0 || third->stats.boundaries != 1) {
+        return test_loan_fail("the new driver after the drop has pending=%zu admits=%llu boundaries=%llu, not 0, 0, 1",
+                              third->pending.size(), (unsigned long long) third->stats.admits,
+                              (unsigned long long) third->stats.boundaries);
+    }
+    bool printed = false;
+    {
+        std::lock_guard<std::mutex> lock(capture.mutex);
+        for (const std::string & line : capture.lines) {
+            printed = printed || (line.find("[MOE-SWAP] device 0: accepted transactions") != std::string::npos &&
+                                  line.find("open slots 1;") != std::string::npos);
+        }
+    }
+    if (summaries() != 2 || !printed) {
+        return "the replaced driver did not print its summary again, forced, with the dropped admit counted as one "
+               "open slot";
+    }
+    return {};
 }
 
 std::string test_expert_failed_moved_copy_hands_its_id_back() {

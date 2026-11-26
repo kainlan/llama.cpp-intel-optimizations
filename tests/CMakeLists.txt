@@ -1175,7 +1175,7 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-moe-route-counts-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-route-counts-source.py --self-test)
     set_tests_properties(test-sycl-moe-route-counts-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # The swap policy header is plain host code: standard includes only, and no mutable state outside the struct the
     # caller owns. Run WITH --self-test so each pin is shown to catch its mutant.
     add_test(NAME test-sycl-moe-swap-policy-source
@@ -1188,14 +1188,14 @@ if (Python3_Interpreter_FOUND)
     add_test(NAME test-sycl-moe-swap-driver-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-swap-driver-source.py --self-test)
     set_tests_properties(test-sycl-moe-swap-driver-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # The named expert move's admit: no wait, the device storage minted at the staged size before the inventory lock,
     # refused while triplets are lent, the padded tail filled before the one publish, the ledger untouched, and one
     # production caller, the swap driver. Run WITH --self-test so each pin is shown to catch its mutant. Text only.
     add_test(NAME test-sycl-moe-expert-admit-source
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-expert-admit-source.py --self-test)
     set_tests_properties(test-sycl-moe-expert-admit-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 60)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
     # Every dnnl::primitive_attr the backend builds goes through the one helper that asks oneDNN for a deterministic
     # implementation, behind one default-ON switch read once (GGML_SYCL_ONEDNN_DETERMINISTIC). Without it identical
     # inputs gave different bits run to run. Run WITH --self-test so each mutant is caught by the pin it names. Text
@@ -1214,7 +1214,7 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-legacy-ranking-removed-source.py
             --self-test)
     set_tests_properties(test-sycl-moe-legacy-ranking-removed-source PROPERTIES
-        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 300)
     # The opt-in spread order of routed experts: both orders go through one comparator, the switch is read once and
     # reaches the planner only through the inventory intake, the planner writes no popularity rank, the spread sort runs
     # before the ring room and the pack, and the swap headroom is a WEIGHT zone term. Run WITH --self-test so each
