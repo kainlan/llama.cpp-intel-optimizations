@@ -99,6 +99,20 @@
 // The XMX v2 decode kernels are reachable only through their force paths and
 // only at D=64 with one query row, which is the d64_sinks_decode shape.
 //
+// TWO INKLING-SHAPED CASES guard the XMX v2 prompt kernel that multiplies the
+// softmax weights by V on the matrix engine (xmx_v2_f16_ncols16_large_f32sv):
+//   d128_sinks_window  an Inkling-2-Mini prompt layer: GQA 3, one mask per query
+//                      head (a sliding window plus a finite per-head relative
+//                      bias, FA_MASK_WINDOW_BIAS), attention sinks and a ragged
+//                      179-row micro-batch. The window leaves the 32-key tiles
+//                      before it dead for every row of a query block. All
+//                      variants.
+//   d128_tail_mass     a long tail of keys whose softmax weight is a half
+//                      subnormal (FA_MASK_TAIL_MASS, see TAIL_MASS_MASK). Clean
+//                      only.
+// Both run under noonednn (XMX v2) and force-tile (the tile kernel, which keeps
+// its weights in float: the control).
+//
 // NOT COVERED, by construction: the FP8 K/V branches of XMX v1/v2 and ESIMD.
 // This tree has no FP8 ggml type (ggml_sycl_type_is_fp8_e4m3() returns false
 // for every type), so no FLASH_ATTN_EXT graph can reach them and the CPU
@@ -149,6 +163,18 @@ enum poison_kind {
 // enough that exp(score - max) is exactly 0 in f32, still representable in f16.
 static constexpr float UNDERFLOW_MASK = -60000.0f;
 
+// FA_MASK_TAIL_MASS: Q is zero, so every score is its mask value. Cell 0 has
+// mask 0 and V = 0; cells 1 .. n_used-1 have this mask and V = 1. Their weight
+// exp(-10) = 4.54e-5 is below the smallest normal half (6.10e-5), and 4096 of
+// them carry 0.186 of cell 0's weight, so every output element is 0.05-0.12
+// (the head's sink sets where).
+// A kernel that stores the weight as a half and has the conversion or the
+// matrix engine flush subnormals loses the whole tail: an all-zero row and an
+// NMSE of 1. Rounding a kept subnormal costs at most 2^-25 / 4.54e-5 = 6.6e-4
+// of the tail, an NMSE far below the bound, so the case separates a flush from
+// a kept weight and nothing else.
+static constexpr float TAIL_MASS_MASK = -10.0f;
+
 static const char * poison_name(poison_kind p) {
     switch (p) {
         case POISON_NONE:
@@ -169,6 +195,19 @@ static const char * poison_name(poison_kind p) {
     return "?";
 }
 
+// How build_mask fills a case's mask.
+enum fa_mask_kind {
+    // One mask for every head: row r sees the live cells up to its own position,
+    // except the interleaved dead cells.
+    FA_MASK_CAUSAL,
+    // One mask per query head (ne32 = H_q), Inkling-shaped: row r sees the last
+    // `window` cells up to its own position, except the interleaved dead cells,
+    // each with a finite per-head relative-position bias (window_bias).
+    FA_MASK_WINDOW_BIAS,
+    // The subnormal-weight tail of TAIL_MASS_MASK, one mask for every head.
+    FA_MASK_TAIL_MASS,
+};
+
 struct fa_case {
     const char * name;
     int          D;
@@ -180,7 +219,22 @@ struct fa_case {
     bool         sinks;
     bool         q_f32;             // D=512 routes require F32 Q; elsewhere F16 matches production
     bool         fully_masked_row;  // row 1 (or the only row) masked everywhere
+    fa_mask_kind mask_kind = FA_MASK_CAUSAL;
+    int          window    = 0;     // FA_MASK_WINDOW_BIAS: cells each row sees, ending at its own position
 };
+
+// The mask's head count: per query head for FA_MASK_WINDOW_BIAS, else one
+// broadcast over all heads.
+static int mask_heads(const fa_case & c) {
+    return c.mask_kind == FA_MASK_WINDOW_BIAS ? c.H_q : 1;
+}
+
+// A finite relative-position bias that differs per head, the way Inkling adds
+// its per-head bias table to the window mask: 0 at distance 0, down to
+// -(0.5 + 0.25 * head).
+static float window_bias(int head, int distance) {
+    return -(0.5f + 0.25f * (float) head) * (float) (distance % 37) / 37.0f;
+}
 
 // Interleaved dead cells inside the live window: masked for every query row, the
 // way another sequence's cells or a freed cell look to this ubatch.
@@ -241,19 +295,34 @@ static float poison_value(size_t i) {
 }
 
 // Query row r is the r-th of the last ne01 positions of the live window and sees
-// every live cell up to and including its own position, except the interleaved
-// dead cells. With fully_masked_row, one row sees nothing at all.
+// every live cell up to and including its own position (only the last `window`
+// of them for FA_MASK_WINDOW_BIAS), except the interleaved dead cells. With
+// fully_masked_row, one row sees nothing at all. The mask is [mask_heads][ne01]
+// [n_kv]; a visible cell holds 0, or the head's window_bias.
 static void build_mask(const fa_case & c, std::vector<ggml_fp16_t> & mask) {
-    mask.assign((size_t) c.n_kv * c.ne01, ggml_fp32_to_fp16(-INFINITY));
-    const int fully_masked = c.fully_masked_row ? (c.ne01 > 1 ? 1 : 0) : -1;
-    for (int r = 0; r < c.ne01; ++r) {
-        if (r == fully_masked) {
-            continue;
+    const int heads = mask_heads(c);
+    mask.assign((size_t) heads * c.ne01 * c.n_kv, ggml_fp32_to_fp16(-INFINITY));
+    if (c.mask_kind == FA_MASK_TAIL_MASS) {
+        for (int r = 0; r < c.ne01; ++r) {
+            for (int t = 0; t < c.n_used; ++t) {
+                mask[(size_t) r * c.n_kv + t] = ggml_fp32_to_fp16(t == 0 ? 0.0f : TAIL_MASS_MASK);
+            }
         }
-        const int last_visible = c.n_used - c.ne01 + r;
-        for (int t = 0; t <= last_visible; ++t) {
-            if (!is_interleaved_dead(t, c.n_used)) {
-                mask[(size_t) r * c.n_kv + t] = ggml_fp32_to_fp16(0.0f);
+        return;
+    }
+    const int fully_masked = c.fully_masked_row ? (c.ne01 > 1 ? 1 : 0) : -1;
+    for (int h = 0; h < heads; ++h) {
+        for (int r = 0; r < c.ne01; ++r) {
+            if (r == fully_masked) {
+                continue;
+            }
+            const int last_visible  = c.n_used - c.ne01 + r;
+            const int first_visible = c.window > 0 ? std::max(0, last_visible - c.window + 1) : 0;
+            for (int t = first_visible; t <= last_visible; ++t) {
+                if (!is_interleaved_dead(t, c.n_used)) {
+                    const float m = c.mask_kind == FA_MASK_WINDOW_BIAS ? window_bias(h, last_visible - t) : 0.0f;
+                    mask[((size_t) h * c.ne01 + r) * c.n_kv + t] = ggml_fp32_to_fp16(m);
+                }
             }
         }
     }
@@ -301,6 +370,19 @@ static fa_inputs make_inputs(const fa_case & c, poison_kind poison) {
     if (c.sinks) {
         fill_f32(in.sinks, (size_t) c.H_q, rng, -1.0f, 1.0f);
     }
+    if (c.mask_kind == FA_MASK_TAIL_MASS) {
+        // Zero Q makes every score its mask value; V is 0 at cell 0 and 1 in the
+        // live tail, so the tail's weight is the whole output (see TAIL_MASS_MASK).
+        std::fill(in.q_f16.begin(), in.q_f16.end(), ggml_fp32_to_fp16(0.0f));
+        std::fill(in.q_f32.begin(), in.q_f32.end(), 0.0f);
+        for (int h = 0; h < c.H_kv; ++h) {
+            for (int t = 0; t < c.n_used; ++t) {
+                for (int d = 0; d < c.D; ++d) {
+                    in.v[((size_t) h * c.n_kv + t) * c.D + d] = ggml_fp32_to_fp16(t == 0 ? 0.0f : 1.0f);
+                }
+            }
+        }
+    }
 
     if (poison != POISON_NONE) {
         const bool                 is_k    = poison == POISON_K || poison == POISON_K_PARTIAL;
@@ -308,10 +390,13 @@ static fa_inputs make_inputs(const fa_case & c, poison_kind poison) {
         std::vector<ggml_fp16_t> & dst     = is_k ? in.k : in.v;
         const std::vector<int> cells = rowwise ? std::vector<int>{ partial_cell(c) } : poison_cells(c.n_kv, c.n_used);
         if (poison == POISON_V_UNDERFLOW) {
-            for (int r = 0; r < c.ne01; ++r) {
-                ggml_fp16_t & m = in.mask[(size_t) r * c.n_kv + cells[0]];
-                if (ggml_fp16_to_fp32(m) == 0.0f) {
-                    m = ggml_fp32_to_fp16(UNDERFLOW_MASK);
+            // Every visible entry of the cell (0, or a head's finite bias).
+            for (int h = 0; h < mask_heads(c); ++h) {
+                for (int r = 0; r < c.ne01; ++r) {
+                    ggml_fp16_t & m = in.mask[((size_t) h * c.ne01 + r) * c.n_kv + cells[0]];
+                    if (std::isfinite(ggml_fp16_to_fp32(m))) {
+                        m = ggml_fp32_to_fp16(UNDERFLOW_MASK);
+                    }
                 }
             }
         }
@@ -362,7 +447,7 @@ static bool build_graph(const fa_case & c, fa_graph & g) {
     g.q    = ggml_new_tensor_4d(g.ctx, c.q_f32 ? GGML_TYPE_F32 : GGML_TYPE_F16, c.D, c.ne01, c.H_q, 1);
     g.k    = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.D, c.n_kv, c.H_kv, 1);
     g.v    = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.D, c.n_kv, c.H_kv, 1);
-    g.mask = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.n_kv, c.ne01, 1, 1);
+    g.mask = ggml_new_tensor_4d(g.ctx, GGML_TYPE_F16, c.n_kv, c.ne01, mask_heads(c), 1);
     ggml_set_name(g.q, "masked_nonfinite_q");
     ggml_set_name(g.k, "masked_nonfinite_k");
     ggml_set_name(g.v, "masked_nonfinite_v");
@@ -599,8 +684,13 @@ static const expect_kernel expected_kernels[] = {
     { "default",                   "d64_sinks_mq4_row1_masked",   "esimd_f16_batched"                    },
     { "default",                   "d64_sinks_pp72_row1_masked",  "xmx_v2_f16_pp_ncols32"                },
 
-    { "noonednn",                  "d128_pp72",                   "xmx_v2_f16_ncols16_large"             },
-    { "noonednn",                  "d128_pp72_row1_masked",       "xmx_v2_f16_ncols16_large"             },
+    // ne01 > 16 under PREC_F32: the F32-accumulator leaf with S*V on the matrix
+    // engine (Task 23). The two d128 Inkling-shaped rows are predicted from the
+    // dispatcher, not yet observed on a card.
+    { "noonednn",                  "d128_pp72",                   "xmx_v2_f16_ncols16_large_f32sv"       },
+    { "noonednn",                  "d128_pp72_row1_masked",       "xmx_v2_f16_ncols16_large_f32sv"       },
+    { "noonednn",                  "d128_sinks_window",           "xmx_v2_f16_ncols16_large_f32sv"       },
+    { "noonednn",                  "d128_tail_mass",              "xmx_v2_f16_ncols16_large_f32sv"       },
     { "noonednn",                  "d256_pp16",                   "xmx_v2_f16_ncols16"                   },
 
     { "v1pp",                      "d128_pp72",                   "xmx_v1_f16_ncols8_large_kv"           },
@@ -647,6 +737,8 @@ static const expect_kernel expected_kernels[] = {
     { "force-tile",                "d128_mq4_row1_masked",        "force_tile_f16"                       },
     { "force-tile",                "d64_sinks_mq4_row1_masked",   "force_tile_f16"                       },
     { "force-tile",                "d64_sinks_pp72_row1_masked",  "force_tile_f16"                       },
+    { "force-tile",                "d128_sinks_window",           "force_tile_f16"                       },
+    { "force-tile",                "d128_tail_mass",              "force_tile_f16"                       },
 };
 
 static const char * lookup_expected(const char * arm, const char * case_name) {
@@ -966,23 +1058,27 @@ int main(int, char ** argv) {
     }
     int n_run = 0;
 
-    // name, D, H_q, H_kv, ne01, n_kv, n_used, sinks, q_f32, fully_masked_row
+    // name, D, H_q, H_kv, ne01, n_kv, n_used, sinks, q_f32, fully_masked_row, mask_kind, window
     const fa_case cases[] = {
         // Decode on a Mistral-shaped layer (ESIMD by default, VEC under GGML_SYCL_FA_ESIMD=0).
-        { "d128_decode",      128, 32, 8, 1,  256, 72, false, false, false },
+        { "d128_decode",       128, 32, 8, 1,   256,  72,   false, false, false, FA_MASK_CAUSAL,      0   },
         // Prefill of a 72-token prompt into a 256-cell window (oneDNN by default,
         // XMX v2 under GGML_SYCL_FA_ONEDNN=0, XMX v1 with GGML_SYCL_FA_XMX_V1_PP=1).
-        { "d128_pp72",        128, 32, 8, 72, 256, 72, false, false, false },
+        { "d128_pp72",         128, 32, 8, 72,  256,  72,   false, false, false, FA_MASK_CAUSAL,      0   },
         // Small multi-query batch: the D=128 guard sends it to the tile kernel.
-        { "d128_mq4",         128, 32, 8, 4,  256, 72, false, false, false },
+        { "d128_mq4",          128, 32, 8, 4,   256,  72,   false, false, false, FA_MASK_CAUSAL,      0   },
         // GPT-OSS-shaped layers with attention sinks.
-        { "d64_sinks_decode", 64,  64, 8, 1,  256, 72, true,  false, false },
-        { "d64_sinks_mq4",    64,  64, 8, 4,  256, 72, true,  false, false },
-        { "d64_sinks_pp72",   64,  64, 8, 72, 256, 72, true,  false, false },
-        { "d256_pp16",        256, 16, 4, 16, 256, 72, false, false, false },
+        { "d64_sinks_decode",  64,  64, 8, 1,   256,  72,   true,  false, false, FA_MASK_CAUSAL,      0   },
+        { "d64_sinks_mq4",     64,  64, 8, 4,   256,  72,   true,  false, false, FA_MASK_CAUSAL,      0   },
+        { "d64_sinks_pp72",    64,  64, 8, 72,  256,  72,   true,  false, false, FA_MASK_CAUSAL,      0   },
+        { "d256_pp16",         256, 16, 4, 16,  256,  72,   false, false, false, FA_MASK_CAUSAL,      0   },
         // gemma4-shaped global layers (ESIMD decode by default, tile_d512 otherwise).
-        { "d512_decode",      512, 8,  2, 1,  256, 72, false, true,  false },
-        { "d512_mq4",         512, 8,  2, 4,  256, 72, false, true,  false },
+        { "d512_decode",       512, 8,  2, 1,   256,  72,   false, true,  false, FA_MASK_CAUSAL,      0   },
+        { "d512_mq4",          512, 8,  2, 4,   256,  72,   false, true,  false, FA_MASK_CAUSAL,      0   },
+        // Inkling-2-Mini-shaped prompt layer (GQA 3, per-head window-plus-bias
+        // mask, sinks, ragged 179 rows). Row r sees cells 810+r .. 1321+r, so
+        // the 25 tiles below cell 800 are dead for every row; 1500..1535 is pad.
+        { "d128_sinks_window", 128, 6,  2, 179, 1536, 1500, true,  false, false, FA_MASK_WINDOW_BIAS, 512 },
     };
     const poison_kind variants[] = { POISON_NONE,      POISON_K,           POISON_V,        POISON_K_PARTIAL,
                                      POISON_V_PARTIAL, POISON_V_UNDERFLOW, POISON_NEGINF_QK };
@@ -1016,6 +1112,22 @@ int main(int, char ** argv) {
         { "d64_sinks_pp72_row1_masked",  64,  64, 8, 72, 256, 72, true,  false, true  },
     };
     for (const fa_case & c : fully_masked) {
+        const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
+        if (g_arm && !expected) {
+            std::printf("-- %s (not covered by arm %s)\n", c.name, g_arm->name);
+            continue;
+        }
+        ++n_run;
+        run_case(sycl, cpu, c, POISON_NONE, expected);
+    }
+
+    // Softmax weights that are half subnormals (see TAIL_MASS_MASK). Clean K/V
+    // only: the case is about precision, not about dead cells.
+    std::printf("== subnormal-weight tail ==\n");
+    const fa_case tail_mass[] = {
+        { "d128_tail_mass", 128, 4, 2, 32, 4160, 4097, true, false, false, FA_MASK_TAIL_MASS, 0 },
+    };
+    for (const fa_case & c : tail_mass) {
         const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
         if (g_arm && !expected) {
             std::printf("-- %s (not covered by arm %s)\n", c.name, g_arm->name);
