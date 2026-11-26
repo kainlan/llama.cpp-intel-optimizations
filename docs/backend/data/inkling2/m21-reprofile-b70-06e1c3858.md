@@ -43,8 +43,26 @@ nodes per micro-batch (24 blocks, the loop of blocks 6-17 run three times). The 
 layers to one full layer (blocks 5, 11, 17 and 23 are full). Per call: min 5.4 ms, p50 16.4, p95 33.1, max 50.0. The
 median sits on a plateau while the prompt grows, and the max matches a full layer at 4,737 keys: 512 queries x 4,737
 keys x 24 heads x 128 x 4 = 2.98e10 flop in 50 ms is 0.6 TFLOPS, and a sliding layer at 512 x 1,536 keys in 16 ms
-is also 0.6 TFLOPS. So the window looks honoured and the kernel is slow per (query, key) pair; the 691-token profile
-did 512 x 512 in 3.3 ms (1 TFLOPS). Not verified per layer: the profiler aggregates all 480 calls in one row.
+is also 0.6 TFLOPS. So the window looks honoured and the kernel is slow per (query, key) pair. Not verified per layer: the profiler
+aggregates all 480 calls in one row.
+
+**Explorer's read of the attention path (2026-11-26, read-only, on `185b44aa8e`; the S·V branch checked by the
+lead).** The window is honoured only through the cache size: sliding layers see 1,536 keys, full layers grow in
+steps of 256, and the kernel computes every key it is given (no masked-tile skip). A model of time as query blocks x
+heads x keys/32 gives 455 ns per work-group batch on this prompt and 469 ns on the 691-token one, a flat ~0.58 TFLOPS.
+(Correction: the 691-token profile's 3.2 ms call is the 179-query x 768-key micro-batch; a 512 x 512 call is about
+5.6 ms, the same rate.) Causes, in the order they cost:
+- `src/llama-graph.cpp` pins `GGML_PREC_F32` on every attention node, so `xmx_v2` takes its float-accumulator
+  branch, which does S·V as a scalar loop over local memory (`fattn-xmx-f16-v2.hpp:850-870`); only the half branch
+  (`:871-906`) uses XMX for it. An in-tree comment (`fattn.cpp:3437-3441`) measured the same move on a GPT-OSS shape
+  at 7.8 -> 1.9 ms per layer.
+- 16 queries and two sub-groups per work-group, element-wise K/V loads without double buffering, and the three
+  query heads that share a KV head each reload it.
+- No skip of fully masked key tiles (a third of a sliding layer's 1,536 keys; the causal triangle of a full layer).
+- The per-head bias is materialised as an [n_kv, 512, 24] F16 mask by get_rows, two copies, an add and two casts
+  (about 250 GB of traffic over the prompt, mostly untimed).
+- oneDNN attention declines the node because it carries sinks (`fattn-onednn.cpp:116`); its planner also does not
+  check the mask's head stride (owed separately).
 
 ## Host time by stage (stage profiler run)
 
