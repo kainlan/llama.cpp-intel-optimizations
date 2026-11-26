@@ -38,8 +38,9 @@ Tests". The "guard" is `scripts/check-ctest-safety-net.sh`.
   a skip that is visible as a skip. Skipping itself is allowed.
 - The SYCL test targets in `ggml/src/ggml-sycl/CMakeLists.txt` follow `BUILD_TESTING`
   (`LLAMA_BUILD_TESTS`) since llama.cpp-9goq. A `-DLLAMA_BUILD_TESTS=OFF` build configures none of
-  them. Host-only tests that link ggml-sycl directly are disabled placeholders under `GGML_BACKEND_DL=ON`
-  (labels include `hostonly;not-built`); the newest is `sycl-queue-profiling-resolver` (labels `sycl;queue-profiling;hostonly`).
+  them. Host-only tests that link ggml-sycl directly are disabled placeholders under
+  `GGML_BACKEND_DL=ON` (labels include `hostonly;not-built`); for example
+  `sycl-queue-profiling-resolver` (labels `sycl;queue-profiling;hostonly`).
 - A registration supplies things a direct run of the binary does not: `LD_LIBRARY_PATH` through the
   `ENVIRONMENT` property, and the model through the `test-download-model` fixture.
 - The model loaders that upstream registers under `main` pin no selector, so on this host they
