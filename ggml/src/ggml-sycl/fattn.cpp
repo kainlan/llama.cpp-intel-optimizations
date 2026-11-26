@@ -3587,10 +3587,14 @@ static void ggml_sycl_flash_attn_ext_dispatch_ncols(ggml_backend_sycl_context & 
                     // Prompt micro-batches: the float leaf with S@V on the matrix
                     // engine (P as a half, float accumulator, float softmax state;
                     // see the f32_sv kernel leaf). The ne01 <= 16 arms above and the
-                    // forced path keep the scalar-S@V float leaf.
+                    // forced path keep the scalar-S@V float leaf. Under
+                    // GGML_SYCL_FA_XMX_V2_VARIANT=tm16 the launcher runs the
+                    // original TM=16 leaf instead, and the name says so.
+                    const bool f32sv_leaf = fattn_xmx_v2_f32sv_leaf_runs(dev, D, 16, ne01);
                     DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16_f32sv, float);
-                    dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_ncols16_large_f32sv" :
-                                                          "xmx_v2_f16_ncols16_large_f32sv_rejected");
+                    dispatch_debug_kernel(!v2_dispatched ? "xmx_v2_f16_ncols16_large_f32sv_rejected" :
+                                          f32sv_leaf     ? "xmx_v2_f16_ncols16_large_f32sv" :
+                                                           "xmx_v2_f16_ncols16_large");
                 } else {
                     DISPATCH_NCOLS_CTX_ACC(16, launch_fattn_xmx_v2_f16, afloat);
                     dispatch_debug_kernel(v2_dispatched ? "xmx_v2_f16_ncols16_large" :

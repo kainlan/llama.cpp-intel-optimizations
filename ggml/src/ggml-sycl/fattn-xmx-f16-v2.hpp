@@ -565,7 +565,7 @@ inline sycl::half fp8_e4m3_to_half_v2(uint8_t bits) {
 // the float VKQ. Without it the float leaf does S@V as a scalar loop over float
 // P in SLM. GGML_PREC_F32 asks for F32 accumulation (ggml.h), not for F32
 // operands; the f32_sv leaf keeps the accumulator, the running max and the sum in
-// float, as the CPU-equivalent backends do with a half P (Vulkan
+// float, as the CUDA and Vulkan backends do with a half P (Vulkan
 // flash_attn_cm1.comp, CUDA fattn-mma-f16.cuh) and as this backend's oneDNN SDPA
 // (F16 probabilities) and DPAS (fattn-dpas.cpp) paths already do.
 // =============================================================================
@@ -882,6 +882,13 @@ static void flash_attn_xmx_v2_f16_kernel_leaf(const char * __restrict__ Q_base,
                 // float accumulator added to the float VKQ. Unrolled so that the
                 // d_tile index into VKQ is a compile-time constant, which keeps
                 // VKQ in registers rather than in private memory.
+                //
+                // In the last query block the tile_S rows past ne01 are never
+                // written (Phase 4 skips them), so mat_S loads whatever an
+                // earlier tile, or uninitialised SLM, left there, NaN included.
+                // That is harmless: row r of the product depends only on row r
+                // of mat_S, and VKQ, KQ_sum and KQ_max of a row past ne01 are
+                // never written out (the output loop skips q_abs >= ne01).
 #    pragma unroll
                 for (int d_tile = 0; d_tile < D_TILES; ++d_tile) {
                     const int d_start = d_tile * TN;
@@ -1096,17 +1103,17 @@ static void launch_fattn_xmx_v2_f16_leaf(const fattn_params & params, dpct::queu
         fattn_xmx_v2_profile_label(*stream, "fattn.compute.xmx_v2", "role=compute;path=xmx-v2");
     (void) ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & profiled_queue) {
         return profiled_queue.submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<sycl::half, 1> slm(sycl::range<1>(slm_layout::TOTAL), cgh);
+            sycl::local_accessor<sycl::half, 1> slm(sycl::range<1>(slm_layout::TOTAL), cgh);
 
-        cgh.parallel_for(
-            sycl::nd_range<3>(grid * block, block),
-            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(XMX_V2_SG)]] {
-                flash_attn_xmx_v2_f16_kernel_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8, TM, TK, TN,
-                                                  f32_sv>(
-                    Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, dst_ptr, scale_v, max_bias, m0, m1, n_head_log2, logit_sc,
-                    ne01, ne02, nb01, nb02, nb03, ne11, ne12, nb11, nb12, nb13, nb21, nb22, nb23, ne30, ne32, ne33,
-                    nb31, nb32, nb33, item, slm.get_multi_ptr<sycl::access::decorated::no>().get());
-            });
+            cgh.parallel_for(sycl::nd_range<3>(grid * block, block),
+                             [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(XMX_V2_SG)]] {
+                                 flash_attn_xmx_v2_f16_kernel_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t,
+                                                                   kv_is_fp8, TM, TK, TN, f32_sv>(
+                                     Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, dst_ptr, scale_v, max_bias, m0, m1,
+                                     n_head_log2, logit_sc, ne01, ne02, nb01, nb02, nb03, ne11, ne12, nb11, nb12, nb13,
+                                     nb21, nb22, nb23, ne30, ne32, ne33, nb31, nb32, nb33, item,
+                                     slm.get_multi_ptr<sycl::access::decorated::no>().get());
+                             });
         });
     });
 }
@@ -2636,10 +2643,13 @@ bool launch_fattn_xmx_v2_f16_variant(ggml_backend_sycl_context & ctx,
 
     switch (variant_idx) {
         // variant 1: (16, 16, 16) — larger tile for better XMX utilization.
-        // Only GGML_SYCL_FA_XMX_V2_VARIANT=tm16 selects it (the hang reproducer
-        // in fattn_xmx_v2_pick_variant_for_shape). It keeps the original leaf
-        // body, so f32_sv has no TM=16 instantiation and that reproducer runs
-        // the same kernel it always did.
+        // Two overrides select it, and nothing else: GGML_SYCL_FA_XMX_V2_VARIANT=tm16
+        // (the hang reproducer in fattn_xmx_v2_pick_variant_for_shape, reached
+        // with forced_variant < 0) and GGML_SYCL_FA_FORCE_PATH=xmx-v2-tm16
+        // (forced_variant 1, fattn.cpp's forced XMX-v2 path). It keeps the
+        // original leaf body, so f32_sv has no TM=16 instantiation and both
+        // overrides run the same kernel they always did; fattn.cpp names that
+        // leaf, not the f32_sv one, when the override is set.
         case 1:
             launch_fattn_xmx_v2_f16_leaf<D, ncols, use_logit_softcap, Q_type, Acc_t, kv_is_fp8,
                                          /*TM=*/16, /*TK=*/16, /*TN=*/16>(params, stream);
@@ -2668,6 +2678,14 @@ bool launch_fattn_xmx_v2_f16_f32sv(ggml_backend_sycl_context & ctx,
     static_assert(std::is_same_v<Acc_t, float>, "the f32_sv leaf accumulates in float");
     return launch_fattn_xmx_v2_f16_variant<D, ncols, use_logit_softcap, Q_type, Acc_t, /*kv_is_fp8=*/false,
                                            /*f32_sv=*/true>(ctx, params, stream, -1);
+}
+
+// Whether launch_fattn_xmx_v2_f16_f32sv runs the f32_sv leaf for this shape:
+// false when GGML_SYCL_FA_XMX_V2_VARIANT=tm16 picks variant 1, which has no
+// f32_sv body and runs the original TM=16 leaf. fattn.cpp names the kernel
+// from it, so the dispatch name reports the leaf that runs.
+inline bool fattn_xmx_v2_f32sv_leaf_runs(const sycl::device & dev, int D, int ncols, int ne01) noexcept {
+    return fattn_xmx_v2_pick_variant_for_shape(dev, D, ncols, ne01) != 1;
 }
 
 // =============================================================================
@@ -2701,6 +2719,10 @@ bool launch_fattn_xmx_v2_f16(ggml_backend_sycl_context &, const fattn_params &, 
 template <int D, int ncols, bool use_logit_softcap, typename Q_type, typename Acc_t>
 bool launch_fattn_xmx_v2_f16_f32sv(ggml_backend_sycl_context &, const fattn_params &, dpct::queue_ptr) {
     GGML_ABORT("XMX v2 not available at compile time");
+    return false;
+}
+
+inline bool fattn_xmx_v2_f32sv_leaf_runs(const sycl::device &, int, int, int) noexcept {
     return false;
 }
 

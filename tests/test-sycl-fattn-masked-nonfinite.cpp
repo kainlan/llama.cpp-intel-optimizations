@@ -104,19 +104,27 @@
 // _v8 when the K/V rows are 16-byte aligned and it copies them in vectors):
 //   d128_sinks_window  an Inkling-2-Mini prompt layer: GQA 3, one mask per query
 //                      head (a sliding window plus a finite per-head relative
-//                      bias, FA_MASK_WINDOW_BIAS), attention sinks and a ragged
+//                      bias, FA_MASK_KIND_WINDOW_BIAS), attention sinks and a ragged
 //                      179-row micro-batch. The window leaves the 32-key tiles
 //                      before it dead for every row of a query block. All
 //                      variants.
 //   d128_tail_mass     a long tail of keys whose softmax weight is a half
-//                      subnormal (FA_MASK_TAIL_MASS, see TAIL_MASS_MASK). Clean
-//                      only.
+//                      subnormal (FA_MASK_KIND_TAIL_MASS). Clean only. It
+//                      guards the kernel's 2^15 pre-scale of those weights; it
+//                      cannot fail on the shipped kernel and has no positive
+//                      control on Xe2 (see TAIL_MASS_MASK).
 // Both run under noonednn (XMX v2) and force-tile (the tile kernel, which keeps
 // its weights in float: the control).
 //   d128_pp72_kv_unaligned  d128_pp72 with K and V views that start 8 bytes
 //                      into their buffers, so no row is 16-byte aligned and the
 //                      same kernel takes its scalar copy (no _v8). All variants,
 //                      under the same two arms.
+// LEAF COVERAGE of that kernel, clean only: d256_pp72, d128_pp72_softcap and
+// d256_pp72_softcap under noonednn, d64_sinks_pp32 and d64_sinks_pp32_softcap
+// under noesimd (D=64 reaches it only below the 64-row XMX-v2 PP batch with
+// ESIMD off), all with F16 Q, and each under force-tile as the control. The
+// kernel's F32-Q leaves are test-backend-ops' FLASH_ATTN_EXT cases, which
+// build Q as F32 and cannot make it F16.
 //
 // NOT COVERED, by construction: the FP8 K/V branches of XMX v1/v2 and ESIMD.
 // This tree has no FP8 ggml type (ggml_sycl_type_is_fp8_e4m3() returns false
@@ -168,16 +176,22 @@ enum poison_kind {
 // enough that exp(score - max) is exactly 0 in f32, still representable in f16.
 static constexpr float UNDERFLOW_MASK = -60000.0f;
 
-// FA_MASK_TAIL_MASS: Q is zero, so every score is its mask value. Cell 0 has
-// mask 0 and V = 0; cells 1 .. n_used-1 have this mask and V = 1. Their weight
-// exp(-10) = 4.54e-5 is below the smallest normal half (6.10e-5), and 4096 of
-// them carry 0.186 of cell 0's weight, so every output element is 0.05-0.12
-// (the head's sink sets where).
-// A kernel that stores the weight as a half and has the conversion or the
-// matrix engine flush subnormals loses the whole tail: an all-zero row and an
-// NMSE of 1. Rounding a kept subnormal costs at most 2^-25 / 4.54e-5 = 6.6e-4
-// of the tail, an NMSE far below the bound, so the case separates a flush from
-// a kept weight and nothing else.
+// FA_MASK_KIND_TAIL_MASS: Q is zero, so every score is its mask value. Cell 0
+// has mask 0 and V = 0; cells 1 .. n_used-1 have this mask and V = 1. Their
+// weight exp(-10) = 4.54e-5 is below the smallest normal half (6.10e-5), and
+// 4096 of them carry 0.186 of cell 0's weight, so every output element is
+// 0.05-0.12 (the head's sink sets where).
+// What it guards: removing the XMX-v2 prompt kernel's 2^15 pre-scale of the
+// weights it hands to the matrix engine as halves (XMX_V2_F32SV_P_SCALE), on
+// hardware whose half conversion or matrix engine flushes half subnormals.
+// Such a kernel loses the whole tail: an all-zero row and an NMSE of 1.
+// Rounding a kept subnormal costs at most 2^-25 / 4.54e-5 = 6.6e-4 of the
+// tail, an NMSE far below the bound.
+// What it cannot do: fail on the shipped kernel, whose pre-scale makes this
+// weight 1.49, a normal half; or show the flush on Xe2. Whether the B50 and
+// B70 flush half subnormals in that conversion or in DPAS has not been
+// measured, so on these cards the case has no positive control: a kernel
+// without the pre-scale may pass it too.
 static constexpr float TAIL_MASS_MASK = -10.0f;
 
 static const char * poison_name(poison_kind p) {
@@ -204,13 +218,13 @@ static const char * poison_name(poison_kind p) {
 enum fa_mask_kind {
     // One mask for every head: row r sees the live cells up to its own position,
     // except the interleaved dead cells.
-    FA_MASK_CAUSAL,
+    FA_MASK_KIND_CAUSAL,
     // One mask per query head (ne32 = H_q), Inkling-shaped: row r sees the last
     // `window` cells up to its own position, except the interleaved dead cells,
     // each with a finite per-head relative-position bias (window_bias).
-    FA_MASK_WINDOW_BIAS,
+    FA_MASK_KIND_WINDOW_BIAS,
     // The subnormal-weight tail of TAIL_MASS_MASK, one mask for every head.
-    FA_MASK_TAIL_MASS,
+    FA_MASK_KIND_TAIL_MASS,
 };
 
 struct fa_case {
@@ -224,15 +238,16 @@ struct fa_case {
     bool         sinks;
     bool         q_f32;             // D=512 routes require F32 Q; elsewhere F16 matches production
     bool         fully_masked_row;  // row 1 (or the only row) masked everywhere
-    fa_mask_kind mask_kind = FA_MASK_CAUSAL;
-    int          window    = 0;     // FA_MASK_WINDOW_BIAS: cells each row sees, ending at its own position
+    fa_mask_kind mask_kind = FA_MASK_KIND_CAUSAL;
+    int          window    = 0;     // FA_MASK_KIND_WINDOW_BIAS: cells each row sees, ending at its own position
     int          kv_offset = 0;     // halves the K and V views start into their buffers (0: plain tensors)
+    float        softcap   = 0.0f;  // logit softcap (0: none)
 };
 
-// The mask's head count: per query head for FA_MASK_WINDOW_BIAS, else one
+// The mask's head count: per query head for FA_MASK_KIND_WINDOW_BIAS, else one
 // broadcast over all heads.
 static int mask_heads(const fa_case & c) {
-    return c.mask_kind == FA_MASK_WINDOW_BIAS ? c.H_q : 1;
+    return c.mask_kind == FA_MASK_KIND_WINDOW_BIAS ? c.H_q : 1;
 }
 
 // A finite relative-position bias that differs per head, the way Inkling adds
@@ -302,13 +317,13 @@ static float poison_value(size_t i) {
 
 // Query row r is the r-th of the last ne01 positions of the live window and sees
 // every live cell up to and including its own position (only the last `window`
-// of them for FA_MASK_WINDOW_BIAS), except the interleaved dead cells. With
+// of them for FA_MASK_KIND_WINDOW_BIAS), except the interleaved dead cells. With
 // fully_masked_row, one row sees nothing at all. The mask is [mask_heads][ne01]
 // [n_kv]; a visible cell holds 0, or the head's window_bias.
 static void build_mask(const fa_case & c, std::vector<ggml_fp16_t> & mask) {
     const int heads = mask_heads(c);
     mask.assign((size_t) heads * c.ne01 * c.n_kv, ggml_fp32_to_fp16(-INFINITY));
-    if (c.mask_kind == FA_MASK_TAIL_MASS) {
+    if (c.mask_kind == FA_MASK_KIND_TAIL_MASS) {
         for (int r = 0; r < c.ne01; ++r) {
             for (int t = 0; t < c.n_used; ++t) {
                 mask[(size_t) r * c.n_kv + t] = ggml_fp32_to_fp16(t == 0 ? 0.0f : TAIL_MASS_MASK);
@@ -326,7 +341,7 @@ static void build_mask(const fa_case & c, std::vector<ggml_fp16_t> & mask) {
             const int first_visible = c.window > 0 ? std::max(0, last_visible - c.window + 1) : 0;
             for (int t = first_visible; t <= last_visible; ++t) {
                 if (!is_interleaved_dead(t, c.n_used)) {
-                    const float m = c.mask_kind == FA_MASK_WINDOW_BIAS ? window_bias(h, last_visible - t) : 0.0f;
+                    const float m = c.mask_kind == FA_MASK_KIND_WINDOW_BIAS ? window_bias(h, last_visible - t) : 0.0f;
                     mask[((size_t) h * c.ne01 + r) * c.n_kv + t] = ggml_fp32_to_fp16(m);
                 }
             }
@@ -376,7 +391,7 @@ static fa_inputs make_inputs(const fa_case & c, poison_kind poison) {
     if (c.sinks) {
         fill_f32(in.sinks, (size_t) c.H_q, rng, -1.0f, 1.0f);
     }
-    if (c.mask_kind == FA_MASK_TAIL_MASS) {
+    if (c.mask_kind == FA_MASK_KIND_TAIL_MASS) {
         // Zero Q makes every score its mask value; V is 0 at cell 0 and 1 in the
         // live tail, so the tail's weight is the whole output (see TAIL_MASS_MASK).
         std::fill(in.q_f16.begin(), in.q_f16.end(), ggml_fp32_to_fp16(0.0f));
@@ -472,8 +487,7 @@ static bool build_graph(const fa_case & c, fa_graph & g) {
     ggml_set_name(g.mask, "masked_nonfinite_mask");
 
     const float scale = 1.0f / std::sqrt((float) c.D);
-    g.out             = ggml_flash_attn_ext(g.ctx, g.q, g.k, g.v, g.mask, scale, /*max_bias=*/0.0f,
-                                            /*logit_softcap=*/0.0f);
+    g.out             = ggml_flash_attn_ext(g.ctx, g.q, g.k, g.v, g.mask, scale, /*max_bias=*/0.0f, c.softcap);
     if (c.sinks) {
         g.sinks = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, c.H_q);
         ggml_set_name(g.sinks, "masked_nonfinite_sinks");
@@ -682,8 +696,12 @@ struct expect_kernel {
     const char * kernel;
 };
 
-// The kernel each arm must reach per case, as observed on the B50 and B70. A
-// case missing from an arm (after inheritance) is not run under that arm.
+// The kernel each arm must reach per case. A case missing from an arm (after
+// inheritance) is not run under that arm. Where each row comes from: a row
+// under a "Predicted" comment was read from the dispatcher and has not run on a
+// card yet. The other noonednn and force-tile rows were observed on the B50 and
+// B70 at d135812c1; the other arms' rows were observed on the B50 and B70 when
+// they were written.
 static const expect_kernel expected_kernels[] = {
     { "default",                   "d128_decode",                 "esimd_f16"                            },
     { "default",                   "d128_pp72",                   "onednn"                               },
@@ -703,14 +721,19 @@ static const expect_kernel expected_kernels[] = {
     { "default",                   "d64_sinks_pp72_row1_masked",  "xmx_v2_f16_pp_ncols32"                },
 
     // ne01 > 16 under PREC_F32: the F32-accumulator leaf with S*V on the matrix
-    // engine (Task 23), whose K/V rows are 16-byte aligned here, so it copies
-    // them to SLM in 16-byte vectors (_v8).
+    // engine (Task 23). Predicted: these four ran as _f32sv at d135812c1; their
+    // K/V rows are 16-byte aligned, so from S2 on the leaf copies them to SLM
+    // in 16-byte vectors (_v8).
     { "noonednn",                  "d128_pp72",                   "xmx_v2_f16_ncols16_large_f32sv_v8"    },
     { "noonednn",                  "d128_pp72_row1_masked",       "xmx_v2_f16_ncols16_large_f32sv_v8"    },
     { "noonednn",                  "d128_sinks_window",           "xmx_v2_f16_ncols16_large_f32sv_v8"    },
     { "noonednn",                  "d128_tail_mass",              "xmx_v2_f16_ncols16_large_f32sv_v8"    },
-    // Rows that start 8 bytes off a 16-byte bound: the scalar copy.
+    // Predicted: rows that start 8 bytes off a 16-byte bound take the scalar copy.
     { "noonednn",                  "d128_pp72_kv_unaligned",      "xmx_v2_f16_ncols16_large_f32sv"       },
+    // Predicted: the same leaf at D=256 and with a logit softcap (F16 Q).
+    { "noonednn",                  "d256_pp72",                   "xmx_v2_f16_ncols16_large_f32sv_v8"    },
+    { "noonednn",                  "d128_pp72_softcap",           "xmx_v2_f16_ncols16_large_f32sv_v8"    },
+    { "noonednn",                  "d256_pp72_softcap",           "xmx_v2_f16_ncols16_large_f32sv_v8"    },
     { "noonednn",                  "d256_pp16",                   "xmx_v2_f16_ncols16"                   },
 
     { "v1pp",                      "d128_pp72",                   "xmx_v1_f16_ncols8_large_kv"           },
@@ -733,6 +756,10 @@ static const expect_kernel expected_kernels[] = {
     { "noesimd",                   "d64_sinks_pp72",              "xmx_v2_f16_pp_ncols32"                },
     { "noesimd",                   "d64_sinks_pp72_row1_masked",  "xmx_v2_f16_pp_ncols32"                },
     { "noesimd",                   "d512_mq4",                    "tile_d512"                            },
+    // Predicted: D=64 below the 64-row XMX-v2 PP batch, with ESIMD off and the
+    // sinks keeping oneDNN out, reaches the F32-accumulator leaf of Task 23.
+    { "noesimd",                   "d64_sinks_pp32",              "xmx_v2_f16_ncols16_large_f32sv_v8"    },
+    { "noesimd",                   "d64_sinks_pp32_softcap",      "xmx_v2_f16_ncols16_large_f32sv_v8"    },
 
     { "force-v2-decode",           "d64_sinks_decode",            "force_xmx_v2_decode_m1n64"            },
     { "force-v2-decode",           "d64_sinks_decode_all_masked", "force_xmx_v2_decode_m1n64"            },
@@ -759,7 +786,13 @@ static const expect_kernel expected_kernels[] = {
     { "force-tile",                "d64_sinks_pp72_row1_masked",  "force_tile_f16"                       },
     { "force-tile",                "d128_sinks_window",           "force_tile_f16"                       },
     { "force-tile",                "d128_tail_mass",              "force_tile_f16"                       },
+    // Predicted: the controls of the cases added after d135812c1.
     { "force-tile",                "d128_pp72_kv_unaligned",      "force_tile_f16"                       },
+    { "force-tile",                "d256_pp72",                   "force_tile_f16"                       },
+    { "force-tile",                "d128_pp72_softcap",           "force_tile_f16"                       },
+    { "force-tile",                "d256_pp72_softcap",           "force_tile_f16"                       },
+    { "force-tile",                "d64_sinks_pp32",              "force_tile_f16"                       },
+    { "force-tile",                "d64_sinks_pp32_softcap",      "force_tile_f16"                       },
 };
 
 static const char * lookup_expected(const char * arm, const char * case_name) {
@@ -1079,27 +1112,28 @@ int main(int, char ** argv) {
     }
     int n_run = 0;
 
-    // name, D, H_q, H_kv, ne01, n_kv, n_used, sinks, q_f32, fully_masked_row, mask_kind, window
+    // name, D, H_q, H_kv, ne01, n_kv, n_used, sinks, q_f32, fully_masked_row, mask_kind, window,
+    // kv_offset, softcap (the last four default to the causal mask, 0, 0 and 0)
     const fa_case cases[] = {
         // Decode on a Mistral-shaped layer (ESIMD by default, VEC under GGML_SYCL_FA_ESIMD=0).
-        { "d128_decode",       128, 32, 8, 1,   256,  72,   false, false, false, FA_MASK_CAUSAL,      0   },
+        { "d128_decode",       128, 32, 8, 1,   256,  72,   false, false, false, FA_MASK_KIND_CAUSAL,      0   },
         // Prefill of a 72-token prompt into a 256-cell window (oneDNN by default,
         // XMX v2 under GGML_SYCL_FA_ONEDNN=0, XMX v1 with GGML_SYCL_FA_XMX_V1_PP=1).
-        { "d128_pp72",         128, 32, 8, 72,  256,  72,   false, false, false, FA_MASK_CAUSAL,      0   },
+        { "d128_pp72",         128, 32, 8, 72,  256,  72,   false, false, false, FA_MASK_KIND_CAUSAL,      0   },
         // Small multi-query batch: the D=128 guard sends it to the tile kernel.
-        { "d128_mq4",          128, 32, 8, 4,   256,  72,   false, false, false, FA_MASK_CAUSAL,      0   },
+        { "d128_mq4",          128, 32, 8, 4,   256,  72,   false, false, false, FA_MASK_KIND_CAUSAL,      0   },
         // GPT-OSS-shaped layers with attention sinks.
-        { "d64_sinks_decode",  64,  64, 8, 1,   256,  72,   true,  false, false, FA_MASK_CAUSAL,      0   },
-        { "d64_sinks_mq4",     64,  64, 8, 4,   256,  72,   true,  false, false, FA_MASK_CAUSAL,      0   },
-        { "d64_sinks_pp72",    64,  64, 8, 72,  256,  72,   true,  false, false, FA_MASK_CAUSAL,      0   },
-        { "d256_pp16",         256, 16, 4, 16,  256,  72,   false, false, false, FA_MASK_CAUSAL,      0   },
+        { "d64_sinks_decode",  64,  64, 8, 1,   256,  72,   true,  false, false, FA_MASK_KIND_CAUSAL,      0   },
+        { "d64_sinks_mq4",     64,  64, 8, 4,   256,  72,   true,  false, false, FA_MASK_KIND_CAUSAL,      0   },
+        { "d64_sinks_pp72",    64,  64, 8, 72,  256,  72,   true,  false, false, FA_MASK_KIND_CAUSAL,      0   },
+        { "d256_pp16",         256, 16, 4, 16,  256,  72,   false, false, false, FA_MASK_KIND_CAUSAL,      0   },
         // gemma4-shaped global layers (ESIMD decode by default, tile_d512 otherwise).
-        { "d512_decode",       512, 8,  2, 1,   256,  72,   false, true,  false, FA_MASK_CAUSAL,      0   },
-        { "d512_mq4",          512, 8,  2, 4,   256,  72,   false, true,  false, FA_MASK_CAUSAL,      0   },
+        { "d512_decode",       512, 8,  2, 1,   256,  72,   false, true,  false, FA_MASK_KIND_CAUSAL,      0   },
+        { "d512_mq4",          512, 8,  2, 4,   256,  72,   false, true,  false, FA_MASK_KIND_CAUSAL,      0   },
         // Inkling-2-Mini-shaped prompt layer (GQA 3, per-head window-plus-bias
         // mask, sinks, ragged 179 rows). Row r sees cells 810+r .. 1321+r, so
         // the 25 tiles below cell 800 are dead for every row; 1500..1535 is pad.
-        { "d128_sinks_window", 128, 6,  2, 179, 1536, 1500, true,  false, false, FA_MASK_WINDOW_BIAS, 512 },
+        { "d128_sinks_window", 128, 6,  2, 179, 1536, 1500, true,  false, false, FA_MASK_KIND_WINDOW_BIAS, 512 },
     };
     const poison_kind variants[] = { POISON_NONE,      POISON_K,           POISON_V,        POISON_K_PARTIAL,
                                      POISON_V_PARTIAL, POISON_V_UNDERFLOW, POISON_NEGINF_QK };
@@ -1146,7 +1180,7 @@ int main(int, char ** argv) {
     // only: the case is about precision, not about dead cells.
     std::printf("== subnormal-weight tail ==\n");
     const fa_case tail_mass[] = {
-        { "d128_tail_mass", 128, 4, 2, 32, 4160, 4097, true, false, false, FA_MASK_TAIL_MASS, 0 },
+        { "d128_tail_mass", 128, 4, 2, 32, 4160, 4097, true, false, false, FA_MASK_KIND_TAIL_MASS, 0 },
     };
     for (const fa_case & c : tail_mass) {
         const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
@@ -1162,7 +1196,7 @@ int main(int, char ** argv) {
     // must take its scalar copy instead. Every variant, as for d128_pp72.
     std::printf("== unaligned K/V rows ==\n");
     const fa_case unaligned[] = {
-        { "d128_pp72_kv_unaligned", 128, 32, 8, 72, 256, 72, false, false, false, FA_MASK_CAUSAL, 0, 4 },
+        { "d128_pp72_kv_unaligned", 128, 32, 8, 72, 256, 72, false, false, false, FA_MASK_KIND_CAUSAL, 0, 4 },
     };
     for (const fa_case & c : unaligned) {
         const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
@@ -1174,6 +1208,30 @@ int main(int, char ** argv) {
         for (poison_kind p : variants) {
             run_case(sycl, cpu, c, p, expected);
         }
+    }
+
+    // More leaves of the F32-accumulator XMX-v2 prompt kernel (see LEAF
+    // COVERAGE above). Clean K/V only: the poison variants exercise the copy
+    // and the mask, which these leaves share with d128_pp72. A softcap of 0.5
+    // keeps the tanh out of its linear range: with Q and K uniform in [-1, 1],
+    // x = q.k * scale / softcap has a standard deviation of about 0.67 at every
+    // D here, where tanh(x) is already 13% below x.
+    std::printf("== leaf coverage ==\n");
+    const fa_case leaves[] = {
+        { "d256_pp72",              256, 16, 4, 72, 256, 72, false, false, false, FA_MASK_KIND_CAUSAL, 0, 0, 0.0f },
+        { "d128_pp72_softcap",      128, 32, 8, 72, 256, 72, false, false, false, FA_MASK_KIND_CAUSAL, 0, 0, 0.5f },
+        { "d256_pp72_softcap",      256, 16, 4, 72, 256, 72, false, false, false, FA_MASK_KIND_CAUSAL, 0, 0, 0.5f },
+        { "d64_sinks_pp32",         64,  64, 8, 32, 256, 72, true,  false, false, FA_MASK_KIND_CAUSAL, 0, 0, 0.0f },
+        { "d64_sinks_pp32_softcap", 64,  64, 8, 32, 256, 72, true,  false, false, FA_MASK_KIND_CAUSAL, 0, 0, 0.5f },
+    };
+    for (const fa_case & c : leaves) {
+        const char * expected = g_arm ? expected_kernel_for(c.name) : nullptr;
+        if (g_arm && !expected) {
+            std::printf("-- %s (not covered by arm %s)\n", c.name, g_arm->name);
+            continue;
+        }
+        ++n_run;
+        run_case(sycl, cpu, c, POISON_NONE, expected);
     }
 
     ggml_backend_free(cpu);
