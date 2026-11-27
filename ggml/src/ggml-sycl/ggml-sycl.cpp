@@ -10372,9 +10372,12 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_cpp_token(ggml_sycl_model_toke
     };
 }
 
-// Both switches below list every enumerator and have no `default:` label, and -Wswitch is an error across them: a
-// new ggml_sycl::execution::error value that reaches the C API unmapped would otherwise take the trailing return,
-// and an allocation failure reported as BUSY is one a caller retries. Do not "tidy" a default in.
+// ggml_sycl_execution_c_result is the C API mapping of ggml_sycl::execution::error and
+// ggml_sycl_execution_error_name its diagnostic name. Both switches list every enumerator and have no `default:`
+// label, so a new error value must be mapped on purpose: an unmapped value would fall to the trailing return, and an
+// allocation failure misreported there as BUSY, which a caller retries, is what this layout fixed. The pragma turns
+// a missing case into a build error under clang/icpx, the only compilers of this translation unit; GCC ignores
+// clang pragmas. Do not "tidy" a default in.
 #pragma clang diagnostic push
 #pragma clang diagnostic error "-Wswitch"
 
