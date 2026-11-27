@@ -239,9 +239,10 @@ template <typename T, size_t CHUNK = 32> class cow_chunked_vector {
 
     void push_back(T && value) { emplace_back(std::move(value)); }
 
-    // The element is constructed before the store changes, so a constructor that throws leaves the store as it was.
-    // At a chunk boundary it goes into the fresh chunk, which joins the store only once it holds the element; inside a
-    // chunk it goes into the reserved room, which a failed construction leaves untouched.
+    // A constructor that throws leaves the store's elements and size as they were (a shared last chunk may already have
+    // been cloned, and counted in chunks_cloned()). At a chunk boundary the element goes into the fresh chunk, which
+    // joins the store only once it holds the element; inside a chunk it goes into the last chunk's reserved room, made
+    // the store's own first, which a failed construction leaves untouched.
     template <typename... Args> T & emplace_back(Args &&... args) {
         if (size_ % CHUNK == 0) {
             auto fresh = std::make_shared<chunk_type>();

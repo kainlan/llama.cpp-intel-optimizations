@@ -272,6 +272,29 @@ static int test_throwing_append_leaves_the_store() {
     const auto & cs = s;
     CHECK(threw && s.size() == 6 && s.chunk_count() == 2, "a throw inside a chunk leaves the store's size");
     CHECK(cs[4].value == 5 && cs[5].value == 6, "the elements after the failed append are where they belong");
+
+    // Inside a shared last chunk the append clones that chunk before it constructs, so a throw there leaves the copy's
+    // elements and size and the source as they were, with the clone already taken and counted.
+    ggml_sycl::cow_chunked_vector<throwing_element, 4> copy          = s;
+    const size_t                                       source_cloned = s.chunks_cloned();
+    const auto &                                       ccopy         = copy;
+    CHECK(copy.chunks_cloned() == 0 && copy.shared_chunks_with(s) == 2, "the copy shares both chunks");
+    g_throw_on = 8;
+    threw      = false;
+    try {
+        copy.emplace_back(8);
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    g_throw_on = -1;
+    CHECK(threw && copy.size() == 6 && copy.chunk_count() == 2, "a throw in a shared chunk leaves the copy's size");
+    for (size_t i = 0; i < 6; ++i) {
+        CHECK(ccopy[i].value == cs[i].value, "a throw in a shared chunk leaves the copy's elements");
+    }
+    CHECK(copy.chunks_cloned() == 1 && copy.shared_chunks_with(s) == 1,
+          "the failed append cloned the shared last chunk first, and counted it");
+    CHECK(s.size() == 6 && s.chunks_cloned() == source_cloned && cs[4].value == 5 && cs[5].value == 6,
+          "the source is unchanged");
     return 0;
 }
 
