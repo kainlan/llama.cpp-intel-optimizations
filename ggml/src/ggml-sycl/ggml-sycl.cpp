@@ -6938,8 +6938,8 @@ static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * 
         // Two strategies, selected by unified cache planner availability:
         //
         // PLANNER-DRIVEN (preferred): When (*ggml_sycl_global_plan_owner()) has multi_device=true
-        // and expert_device map is populated, each expert's target device comes
-        // from the planner.  The planner considers ALL model weights (dense + KV
+        // and planned entries, each expert's target device comes from its role's
+        // planned entry (lookup_expert_placement).  The planner considers ALL model weights (dense + KV
         // + MoE) holistically, avoiding the greedy trap where Phase 2 fills a
         // secondary GPU with experts and leaves no room for dense weights.
         //
@@ -8493,7 +8493,6 @@ bool test_moe_storage_handle_first_route_and_negatives() {
     plan.entries.push_back({ "blk.31.ffn_gate_exps.weight", expert_size, expert_size, 0,
                              placement_priority::MOE_GATE_PROJ, 31, expert_id, expert_tensor_role::GATE,
                              false, -1 });
-    plan.expert_device[31][expert_id] = -1;
     plan.build_index();
     ggml_sycl_publish_test_plan(std::move(plan));
     moe_expert_route mismatch = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
@@ -8578,7 +8577,6 @@ bool test_moe_ptr_table_retains_route_lease_until_event() {
         plan.entries.push_back({ "blk.7.ffn_gate_exps.weight", data.size(), data.size(), 0,
                                  ggml_sycl::placement_priority::MOE_GATE_PROJ, 7, e,
                                  ggml_sycl::expert_tensor_role::GATE, true, 0 });
-        plan.expert_device[7][e] = 0;
     }
     plan.build_index();
     ggml_sycl_publish_test_plan(std::move(plan));
@@ -8663,7 +8661,6 @@ bool test_moe_ptr_table_cached_reuse_retains_lease_and_ready_event() {
         plan.entries.push_back({ "blk.11.ffn_gate_exps.weight", data.size(), data.size(), 0,
                                  ggml_sycl::placement_priority::MOE_GATE_PROJ, 11, e,
                                  ggml_sycl::expert_tensor_role::GATE, true, 0 });
-        plan.expert_device[11][e] = 0;
     }
     plan.build_index();
     ggml_sycl_publish_test_plan(std::move(plan));
@@ -8824,7 +8821,6 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
         plan.entries.push_back({ "blk.12.ffn_down_exps.weight", down_data.size(), down_data.size(), 0,
                                  ggml_sycl::placement_priority::MOE_DOWN, 12, e,
                                  ggml_sycl::expert_tensor_role::DOWN, true, 0 });
-        plan.expert_device[12][e] = 0;
     }
     plan.build_index();
     ggml_sycl_publish_test_plan(std::move(plan));
@@ -32111,7 +32107,6 @@ bool test_moe_ptr_table_does_not_persist_pointer_cache() {
         plan.entries.push_back({ "blk.13.ffn_gate_exps.weight", data.size(), data.size(), 0,
                                  ggml_sycl::placement_priority::MOE_GATE_PROJ, 13, e,
                                  ggml_sycl::expert_tensor_role::GATE, true, 0 });
-        plan.expert_device[13][e] = 0;
     }
     plan.build_index();
     ggml_sycl_publish_test_plan(std::move(plan));
@@ -32229,7 +32224,6 @@ bool test_moe_ptr_table_lease_covers_populated_slots() {
         plan.entries.push_back({ "blk.17.ffn_gate_exps.weight", data.size(), data.size(), 0,
                                  ggml_sycl::placement_priority::MOE_GATE_PROJ, 17, e,
                                  ggml_sycl::expert_tensor_role::GATE, true, 0 });
-        plan.expert_device[17][e] = 0;
     }
     plan.build_index();
     ggml_sycl_publish_test_plan(std::move(plan));
@@ -32345,7 +32339,6 @@ bool test_moe_ptr_table_dispatch_bundle_retains_table_compact_missing() {
         plan.entries.push_back({ "blk.23.ffn_gate_exps.weight", data.size(), data.size(), 0,
                                  ggml_sycl::placement_priority::MOE_GATE_PROJ, 23, e,
                                  ggml_sycl::expert_tensor_role::GATE, true, 0 });
-        plan.expert_device[23][e] = 0;
     }
     plan.build_index();
     ggml_sycl_publish_test_plan(std::move(plan));

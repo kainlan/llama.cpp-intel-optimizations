@@ -4704,6 +4704,10 @@ TXN_PLAN_MEMBERS = {"unshare_expert_entry", "update_expert_placement", "set_expe
 TXN_PLAN_WHOLE = ("ggml_sycl::moe_expert_triplet_dst_bytes(*next_plan, placed)",
                   "ggml_sycl::moe_mmid_same_workspace_plan(*current->plan, *next_plan)")
 ENTRIES_WORD_RE = re.compile(r"\bentries\b")
+# A per-(layer, expert) map on the plan is copied whole by HOIST_PLAN, node by node, and a flip that writes it can
+# allocate. The plan held one (expert_device, a collapsed summary nothing read); the entries and their shared index are
+# the one per-expert record.
+PER_EXPERT_MAP = "std::unordered_map<int, std::unordered_map<int, int>>"
 ENTRY_POINTER_ARITH_RE = re.compile(r"entries\s*\.\s*data\s*\(|-\s*&\s*\w+(\.|->)entries\s*\[")
 
 
@@ -4715,7 +4719,10 @@ def claim_the_plan_copy_shares_its_entries(cache_hpp: str, cache: str, sycl: str
     whole = b.count("*next_plan")
     flips = [body(h, UPDATE_SIG), body(h, BACKING_SIG)]
     unshare = body(h, UNSHARE_SIG)
+    plan_struct = body(h, "struct placement_plan ")
     return (h.count(ENTRY_STORE) == 1 and h.count(ENTRY_MEMBER) == 1 and b.count(HOIST_PLAN) == 1
+            and ENTRY_MEMBER in plan_struct and PER_EXPERT_MAP not in plan_struct
+            and not re.search(r"\bexpert_device\b", h)
             and b.count(UNSHARE_LOOP) == 1 and lend_at >= 0 and ordered(b, HOIST_PLAN, UNSHARE_LOOP, LEND)
             and members == TXN_PLAN_MEMBERS and b.count("next_plan->entries") == 1 and b.count(COUNT_CLONES) == 1
             and whole == len(TXN_PLAN_WHOLE) and all(b.count(x) == 1 for x in TXN_PLAN_WHOLE)
@@ -4731,6 +4738,12 @@ def test_the_plan_copy_shares_its_entries():
 def test_mutant_plan_entries_in_a_plain_vector_fails():
     """A plain vector makes HOIST_PLAN copy every entry per transaction."""
     mutant = _once(CACHE_HPP, ENTRY_STORE, "using placement_entry_store = std::vector<placement_entry>;")
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_plan_keeps_a_per_expert_map_fails():
+    """The collapsed per-expert device summary, back on the plan: HOIST_PLAN copies it node by node."""
+    mutant = _once(CACHE_HPP, ENTRY_MEMBER, ENTRY_MEMBER + " " + PER_EXPERT_MAP + " expert_device;")
     assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
 
 

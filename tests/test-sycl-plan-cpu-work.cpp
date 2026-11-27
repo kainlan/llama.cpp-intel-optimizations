@@ -89,7 +89,6 @@ void add_experts(placement_plan & plan, int layer, int n_experts, int n_on_devic
         const bool on_device = e < n_on_device;
         plan.entries.push_back({ name, kBytes, kBytes, 0, placement_priority::MOE_GATE_PROJ, layer, e,
                                  expert_tensor_role::GATE, on_device, on_device ? 0 : -1 });
-        plan.expert_device[layer][e] = on_device ? 0 : -1;
     }
 }
 

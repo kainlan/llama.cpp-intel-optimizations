@@ -1571,11 +1571,6 @@ struct placement_plan {
     int                                  fastest_dense_device = -1;
     double                               fastest_dense_score  = 0.0;
 
-    // Compatibility summary: expert_device[layer_id][expert_id] = device_id (-1 = host/CPU).
-    // This collapses gate/up/down and is not authoritative for role-specific MoE placement.
-    // Use lookup_expert_placement(layer, expert, role) for planner decisions.
-    std::unordered_map<int, std::unordered_map<int, int>> expert_device;
-
     // kv_device[slot] = device_id (-1 = host tier) of each KV cache slot. A slot's KV lives on the device of the weight
     // layer that executes it (layer_phys), so a looped model's later slots go where their layer's weights are.
     std::unordered_map<int, int> kv_device;
@@ -2005,12 +2000,6 @@ struct placement_plan {
 
         e.on_device     = on_device;
         e.target_device = target;
-
-        if (!on_device) {
-            expert_device[layer_id][expert_id] = -1;
-        } else {
-            expert_device[layer_id][expert_id] = target;
-        }
         return true;
     }
 

@@ -41926,21 +41926,6 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         }
     }
 
-    // expert_device: per-layer per-expert device assignment (from entry target_device).
-    // With per-expert splitting (n_experts > 0), each expert has its own entry
-    // and can be assigned to a different device.  Without splitting, the whole
-    // MoE tensor goes to one device and all experts share that target.
-    for (const auto & entry : plan.entries) {
-        if (!placement_priority_is_moe_weight(entry.priority)) {
-            continue;
-        }
-        if (entry.layer_id < 0) {
-            continue;
-        }
-        const int eid                           = (entry.expert_id >= 0) ? entry.expert_id : 0;
-        plan.expert_device[entry.layer_id][eid] = entry.target_device;
-    }
-
     const int64_t  activation_hidden_dim = planner_infer_activation_hidden_dim(tensor_inventory);
     const uint32_t boundary_batch_tokens = planner_boundary_batch_tokens(kv_info, envelope);
     populate_multi_device_layer_blocks(plan, n_layers, device_budgets, layer_weight_bytes, layer_weight_charge_bytes,
