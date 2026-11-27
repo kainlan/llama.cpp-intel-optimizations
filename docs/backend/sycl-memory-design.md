@@ -469,6 +469,26 @@ the graph: while a graph records, the direct route's upload chains no ready
 event; it asks each slot's event for its status and refuses the table while a
 slot's copy is still in flight.
 
+The event-chained hybrid decode route's per-tensor record
+(`ggml_sycl_moe_hybrid_decode_record_current`) is kept per storage generation
+too, but a generation that only expert moves advanced does not rebuild it over
+every expert. Every generation move goes through the extra's
+`note_moe_storage_change()`, which also logs the expert it changed in a bounded
+per-weight change log (`moe_storage_change_log`, 64 moves; a cleared store logs
+every expert). On such a miss the lookup patches a copy of the held record over
+the experts the log names since the held decision
+(`ggml_sycl_moe_hybrid_decode_record_patch`): it resolves those alone, each
+takes its slot from the build's own slot rule, so a moved expert runs where its
+data now is, and the copy gets a host-pinned table of its own, because a table
+copy still on the queue reads the held table when it runs. The replaced slots'
+leases and the held table are kept until the queue passes a barrier behind the
+copy's publication (`retain_handles_until_event`); nothing waits on the host. A
+log that no longer holds every move, a replan, another selected-row count, or a
+moved expert that no longer fits the record (another layout, a device expert in
+an all-host record, no host expert left) builds the record again over every
+expert. An evict's view drop withdraws the record whole, so the lookup after an
+evict builds it again.
+
 The named move bounds memory as follows. An evict mints its pinned host copy
 before it retires the device copy, and mints it without growing the pinned host
 WEIGHT zone (`ggml_sycl_host_expert_alloc_no_growth`): a decode boundary must not

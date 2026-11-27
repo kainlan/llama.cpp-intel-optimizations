@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -133,13 +134,18 @@ static int test_trace_line() {
     c.builds                                                  = 6;
     c.built_experts                                           = 3072;
     c.outcomes[ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE] = 6;
+    c.patches                                                 = 4;
+    c.patch_experts                                           = 9;
+    c.patch_declined                                          = 1;
+    c.patch_unlogged                                          = 0;
 
-    char      line[512];
+    char      line[768];
     const int n = ggml_sycl::moe_hybrid_record_line(line, sizeof(line), 41, c);
     CHECK(n > 0 && static_cast<size_t>(n) < sizeof(line), "the line fits its buffer");
     const std::string want =
         "token=41 lookups=144 current=138 no_plan=0 undecided=1 retry=0 epoch=0 rows=0 generation=5 "
-        "generation_steps=15 builds=6 built_experts=3072 eligible=6 refused=0 retried=0";
+        "generation_steps=15 builds=6 built_experts=3072 eligible=6 refused=0 retried=0 patches=4 patch_experts=9 "
+        "patch_declined=1 patch_unlogged=0";
     if (want != line) {
         std::printf("FAILED: line\n  got:  %s\n  want: %s\n", line, want.c_str());
         return 1;
@@ -148,6 +154,7 @@ static int test_trace_line() {
     // The widest values each field can hold still fit the buffer the backend prints from.
     moe_hybrid_record_counts wide;
     wide.lookups = wide.no_plan = wide.generation_steps = wide.builds = wide.built_experts = UINT64_MAX;
+    wide.patches = wide.patch_experts = wide.patch_declined = wide.patch_unlogged = UINT64_MAX;
     for (uint64_t & m : wide.misses) {
         m = UINT64_MAX;
     }
@@ -155,7 +162,7 @@ static int test_trace_line() {
         o = UINT64_MAX;
     }
     const int wn = ggml_sycl::moe_hybrid_record_line(line, sizeof(line), UINT64_MAX, wide);
-    CHECK(wn > 0 && static_cast<size_t>(wn) < sizeof(line), "the widest line fits the backend's 512-byte buffer");
+    CHECK(wn > 0 && static_cast<size_t>(wn) < sizeof(line), "the widest line fits the backend's 768-byte buffer");
     return 0;
 }
 
@@ -211,8 +218,187 @@ static int test_change_log() {
     return 0;
 }
 
+// A lease the tests can count: the shared count says how many holders keep its storage, so a test sees a replaced
+// lease kept by the retained list alone, and an untouched lease kept by the record.
+struct fake_lease {
+    std::shared_ptr<int> storage;
+
+    bool valid() const { return storage != nullptr; }
+};
+
+using fake_slot = ggml_sycl::moe_hybrid_record_slot<fake_lease>;
+
+static fake_lease lease_of(int id) {
+    return fake_lease{ std::make_shared<int>(id) };
+}
+
+// Which lookups a patch answers: a miss on the generation alone, over a record the decision built, when the log can
+// name the experts that moved. Every other miss, and a log that overflowed, builds the record again.
+static int test_patch_plan() {
+    using ggml_sycl::moe_storage_change_log;
+    const moe_decode_direct_stamp held = settled_stamp();  // eligible, at generation 7
+    moe_storage_change_log        log;
+    for (uint64_t g = 2; g <= 7; ++g) {
+        log.note(g, 0);
+    }
+    log.note(8, 5);
+    log.note(9, 2);
+    std::vector<int32_t> changed;
+
+    CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, held, true, log, 9,
+                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_EXPERTS &&
+              changed == std::vector<int32_t>({ 2, 5 }),
+          "a generation miss over a held record re-checks the experts the log names");
+    const moe_hybrid_record_miss full[] = { ggml_sycl::MOE_HYBRID_RECORD_MISS_EPOCH,
+                                            ggml_sycl::MOE_HYBRID_RECORD_MISS_ROWS,
+                                            ggml_sycl::MOE_HYBRID_RECORD_MISS_UNDECIDED,
+                                            ggml_sycl::MOE_HYBRID_RECORD_MISS_RETRY,
+                                            ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE };
+    for (moe_hybrid_record_miss m : full) {
+        CHECK(ggml_sycl::moe_hybrid_record_plan_patch(m, held, true, log, 9, &changed) ==
+                      ggml_sycl::MOE_HYBRID_RECORD_PATCH_NONE &&
+                  changed.empty(),
+              "a replan, a new row count or no decision builds the record again, whatever the log says");
+    }
+    CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, held, false, log, 9,
+                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_NONE,
+          "no held record: nothing to patch");
+    moe_decode_direct_stamp refused{};
+    ggml_sycl::moe_decode_direct_stamp_settle(refused, 3, 7, 8, 0, ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED);
+    CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, refused, true, log, 9,
+                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_NONE,
+          "a refusal at the old generation is decided again, not patched");
+
+    // The log overflowed: more moves since the decision than it holds.
+    moe_storage_change_log overflowed;
+    const uint64_t         now = 7 + moe_storage_change_log::capacity + 1;
+    for (uint64_t g = 8; g <= now; ++g) {
+        overflowed.note(g, 1);
+    }
+    CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, held, true, overflowed,
+                                                  now, &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_UNLOGGED &&
+              changed.empty(),
+          "an overflowed log cannot name the moved experts: the record is built again");
+    moe_storage_change_log cleared = log;
+    cleared.note(10, moe_storage_change_log::ALL);
+    CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, held, true, cleared, 10,
+                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_UNLOGGED,
+          "a move that changed every expert: the record is built again");
+    return 0;
+}
+
+// A patch installs the moved experts' slots into the copy it publishes, and nothing else.
+static int test_install() {
+    // Four experts: 0 and 2 on the device, 1 and 3 on the host.
+    int                           w[8]          = {};
+    std::vector<const void *>     device_weight = { &w[0], nullptr, &w[2], nullptr };
+    std::vector<const void *>     host_weight   = { nullptr, &w[1], nullptr, &w[3] };
+    std::vector<fake_lease>       lease         = { lease_of(0), lease_of(1), lease_of(2), lease_of(3) };
+    const std::vector<fake_lease> before        = lease;  // the held record's leases, which the copy shares
+
+    // Expert 2 is evicted to the host, expert 1 admitted to the device.
+    std::vector<fake_slot> fresh(2);
+    fresh[0].device_weight = &w[5];
+    fresh[0].lease         = lease_of(5);
+    fresh[1].host_weight   = &w[6];
+    fresh[1].lease         = lease_of(6);
+    std::vector<fake_lease> replaced;
+    CHECK(ggml_sycl::moe_hybrid_record_install(device_weight, host_weight, lease, { 1, 2 }, fresh, &replaced),
+          "the install takes in-range ids paired with their slots");
+
+    CHECK(device_weight[1] == &w[5] && host_weight[1] == nullptr && *lease[1].storage == 5,
+          "the admitted expert's slot names its device weight and lease");
+    CHECK(device_weight[2] == nullptr && host_weight[2] == &w[6] && *lease[2].storage == 6,
+          "the evicted expert's slot names its host weight and lease");
+    CHECK(device_weight[0] == &w[0] && host_weight[0] == nullptr && lease[0].storage == before[0].storage,
+          "an expert that did not move keeps its slot and its lease");
+    CHECK(device_weight[3] == nullptr && host_weight[3] == &w[3] && lease[3].storage == before[3].storage,
+          "the other unmoved expert keeps its slot and its lease");
+    CHECK(replaced.size() == 2 && replaced[0].storage == before[1].storage && replaced[1].storage == before[2].storage,
+          "each replaced lease is handed to the retained list, in slot order");
+    // The replaced leases are held by the retained list and the held record only: the copy dropped them.
+    CHECK(before[1].storage.use_count() == 2 && before[2].storage.use_count() == 2,
+          "the copy holds no replaced lease; the retained list keeps it until the queue passes");
+    CHECK(before[0].storage.use_count() == 2, "an untouched lease is shared by the held record and the copy");
+
+    // An id out of range changes nothing.
+    std::vector<fake_slot> one(1);
+    one[0].host_weight = &w[7];
+    one[0].lease       = lease_of(7);
+    std::vector<fake_lease> none;
+    CHECK(!ggml_sycl::moe_hybrid_record_install(device_weight, host_weight, lease, { 4 }, one, &none) && none.empty() &&
+              host_weight[3] == &w[3],
+          "an id past the record refuses the install and leaves every slot");
+    CHECK(!ggml_sycl::moe_hybrid_record_install(device_weight, host_weight, lease, { 0, 3 }, one, &none) &&
+              none.empty() && device_weight[0] == &w[0],
+          "slots that do not pair with the ids refuse the install");
+    return 0;
+}
+
+// The shape a record's slots make, and the build's own refusals over it, which a patch must pass too.
+static int test_shape() {
+    int                       w[4]          = {};
+    std::vector<const void *> device_weight = { &w[0], nullptr, &w[2], nullptr };
+    std::vector<const void *> host_weight   = { nullptr, &w[1], nullptr, &w[3] };
+    std::vector<fake_lease>   lease         = { lease_of(0), lease_of(1), lease_of(2), lease_of(3) };
+
+    ggml_sycl::moe_hybrid_record_shape s = ggml_sycl::moe_hybrid_record_shape_of(device_weight, host_weight, lease);
+    CHECK(s.n_device == 2 && s.n_host == 2 && s.n_empty == 0, "two device slots, two host slots");
+    CHECK(s.substitute == &w[0], "the host slots' table entries name the first device expert");
+    CHECK(ggml_sycl::moe_hybrid_record_shape_refusal(/*all_host=*/false, s) == nullptr, "a split record stands");
+    CHECK(ggml_sycl::moe_hybrid_record_shape_refusal(/*all_host=*/true, s) != nullptr,
+          "an all-host record with a device slot does not");
+
+    // Every expert moved to the host: the split record's shape is gone, so the record is built again.
+    std::vector<const void *> no_device(4, nullptr);
+    std::vector<const void *> all_on_host = { &w[0], &w[1], &w[2], &w[3] };
+
+    s = ggml_sycl::moe_hybrid_record_shape_of(no_device, all_on_host, lease);
+    CHECK(s.n_device == 0 && s.n_host == 4 && s.substitute == nullptr, "four host slots, no substitute");
+    CHECK(ggml_sycl::moe_hybrid_record_shape_refusal(/*all_host=*/false, s) != nullptr,
+          "a split record with no device slot does not stand");
+    CHECK(ggml_sycl::moe_hybrid_record_shape_refusal(/*all_host=*/true, s) == nullptr,
+          "an all-host record of host slots stands: the build admits every all-host tensor");
+
+    // Every expert on the device: no CPU work for the route.
+    s = ggml_sycl::moe_hybrid_record_shape_of(all_on_host, no_device, lease);
+    CHECK(ggml_sycl::moe_hybrid_record_shape_refusal(/*all_host=*/false, s) != nullptr,
+          "a record with no host slot does not stand");
+
+    // A slot with no lease, or naming both weights, or neither, is empty, and a record with one does not stand.
+    std::vector<fake_lease> withdrawn = lease;
+    withdrawn[2]                      = fake_lease{};
+
+    s = ggml_sycl::moe_hybrid_record_shape_of(device_weight, host_weight, withdrawn);
+    CHECK(s.n_empty == 1 && ggml_sycl::moe_hybrid_record_shape_refusal(false, s) != nullptr,
+          "a slot whose lease was withdrawn is empty");
+    std::vector<const void *> both = host_weight;
+    both[0]                        = &w[0];
+
+    s = ggml_sycl::moe_hybrid_record_shape_of(device_weight, both, lease);
+    CHECK(s.n_empty == 1 && ggml_sycl::moe_hybrid_record_shape_refusal(false, s) != nullptr,
+          "a slot naming a device and a host weight is empty");
+    s = ggml_sycl::moe_hybrid_record_shape_of(no_device, no_device, lease);
+    CHECK(s.n_empty == 4 && ggml_sycl::moe_hybrid_record_shape_refusal(true, s) != nullptr,
+          "slots naming no weight are empty");
+    return 0;
+}
+
+// The per-token counts of what the patches did.
+static int test_trace_patches() {
+    moe_hybrid_record_trace t;
+    t.patch(ggml_sycl::MOE_HYBRID_RECORD_PATCH_EXPERTS, /*patched=*/true, 2);
+    t.patch(ggml_sycl::MOE_HYBRID_RECORD_PATCH_EXPERTS, /*patched=*/false, 3);
+    t.patch(ggml_sycl::MOE_HYBRID_RECORD_PATCH_UNLOGGED, /*patched=*/false, 0);
+    CHECK(t.counts.patches == 1 && t.counts.patch_declined == 1 && t.counts.patch_unlogged == 1,
+          "one patch stood, one declined, one found the log silent");
+    CHECK(t.counts.patch_experts == 5, "the attempts asked for five experts");
+    return 0;
+}
+
 int main() {
-    if (test_miss_classify() != 0 || test_trace_tokens() != 0 || test_trace_line() != 0 || test_change_log() != 0) {
+    if (test_miss_classify() != 0 || test_trace_tokens() != 0 || test_trace_line() != 0 || test_change_log() != 0 ||
+        test_patch_plan() != 0 || test_install() != 0 || test_shape() != 0 || test_trace_patches() != 0) {
         return 1;
     }
     std::printf("OK: moe hybrid decode record bookkeeping\n");

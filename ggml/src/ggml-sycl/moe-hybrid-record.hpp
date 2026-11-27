@@ -134,6 +134,125 @@ inline const char * moe_hybrid_record_outcome_name(moe_decode_direct_outcome out
     return "?";
 }
 
+// Whether a lookup whose stamp missed can patch the held record, and over which experts.
+enum moe_hybrid_record_patch_plan : int {
+    MOE_HYBRID_RECORD_PATCH_NONE = 0,  // not a miss a patch answers: the record is built again
+    MOE_HYBRID_RECORD_PATCH_UNLOGGED,  // only the generation moved, but the log cannot name the experts that did
+    MOE_HYBRID_RECORD_PATCH_EXPERTS,   // re-check the experts the log names
+};
+
+// A patch keeps everything the held decision was made under except the moved experts' storage, so only a miss on
+// the generation alone, over a decision that built a record, qualifies. A replan, a new row count, a retry or a
+// refusal is decided again from scratch. The experts to re-check are the ones the weight's log names since the
+// decision's generation, into *changed.
+inline moe_hybrid_record_patch_plan moe_hybrid_record_plan_patch(moe_hybrid_record_miss          miss,
+                                                                 const moe_decode_direct_stamp & stamp,
+                                                                 bool                            held,
+                                                                 const moe_storage_change_log &  log,
+                                                                 uint64_t                        storage_generation,
+                                                                 std::vector<int32_t> *          changed) {
+    changed->clear();
+    if (miss != MOE_HYBRID_RECORD_MISS_GENERATION || !stamp.eligible || !held) {
+        return MOE_HYBRID_RECORD_PATCH_NONE;
+    }
+    if (!log.changed_since(stamp.expert_storage_generation, storage_generation, changed) || changed->empty()) {
+        changed->clear();
+        return MOE_HYBRID_RECORD_PATCH_UNLOGGED;
+    }
+    return MOE_HYBRID_RECORD_PATCH_EXPERTS;
+}
+
+// One expert's slot in a hybrid decode record: the weight its executor reads, on the record's device or in host
+// memory, never both, and the lease that keeps that storage while the record names it. The record keeps its slots
+// as parallel arrays (the CPU job reads host_weight as one), so a slot is this triple only on its way in.
+template <typename Lease> struct moe_hybrid_record_slot {
+    const void * device_weight = nullptr;
+    const void * host_weight   = nullptr;
+    Lease        lease;
+};
+
+// Installs fresh[i] as the slot of expert changed[i] in a record's slot arrays and moves each lease it replaces into
+// *replaced, in slot order, for the caller to keep until the queue passes the record the patch publishes. Every other
+// slot and lease stays as it was. Returns false, having changed nothing, when an id is outside the record or `fresh`
+// does not pair with `changed`.
+template <typename Lease>
+bool moe_hybrid_record_install(std::vector<const void *> &                  device_weight,
+                               std::vector<const void *> &                  host_weight,
+                               std::vector<Lease> &                         lease,
+                               const std::vector<int32_t> &                 changed,
+                               std::vector<moe_hybrid_record_slot<Lease>> & fresh,
+                               std::vector<Lease> *                         replaced) {
+    const size_t n_as = lease.size();
+    if (fresh.size() != changed.size() || device_weight.size() != n_as || host_weight.size() != n_as) {
+        return false;
+    }
+    for (int32_t e : changed) {
+        if (e < 0 || static_cast<size_t>(e) >= n_as) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < changed.size(); ++i) {
+        const size_t e = static_cast<size_t>(changed[i]);
+        if (lease[e].valid()) {
+            replaced->push_back(std::move(lease[e]));
+        }
+        device_weight[e] = fresh[i].device_weight;
+        host_weight[e]   = fresh[i].host_weight;
+        lease[e]         = std::move(fresh[i].lease);
+    }
+    return true;
+}
+
+// What a record's slots add up to. A slot stands when it names exactly one weight and holds a lease on it.
+struct moe_hybrid_record_shape {
+    size_t       n_device   = 0;
+    size_t       n_host     = 0;
+    size_t       n_empty    = 0;        // slots naming no weight or both, or holding no lease
+    const void * substitute = nullptr;  // the first device slot's weight: what a host slot's table entry names
+};
+
+template <typename Lease>
+moe_hybrid_record_shape moe_hybrid_record_shape_of(const std::vector<const void *> & device_weight,
+                                                   const std::vector<const void *> & host_weight,
+                                                   const std::vector<Lease> &        lease) {
+    moe_hybrid_record_shape s;
+    if (device_weight.size() != lease.size() || host_weight.size() != lease.size()) {
+        s.n_empty = lease.size() + 1;
+        return s;
+    }
+    for (size_t e = 0; e < lease.size(); ++e) {
+        const bool on_device = device_weight[e] != nullptr;
+        const bool on_host   = host_weight[e] != nullptr;
+        if (on_device == on_host || !lease[e].valid()) {
+            ++s.n_empty;
+        } else if (on_device) {
+            ++s.n_device;
+            s.substitute = s.substitute ? s.substitute : device_weight[e];
+        } else {
+            ++s.n_host;
+        }
+    }
+    return s;
+}
+
+// Why slots of shape `s` cannot stand as an all-host (`all_host`) or a split record, or nullptr when they can. These
+// are the build's own refusals over its slots, so a patch never publishes a record the build would refuse.
+inline const char * moe_hybrid_record_shape_refusal(bool all_host, const moe_hybrid_record_shape & s) {
+    if (s.n_empty > 0) {
+        return "an expert's slot names no weight it holds";
+    }
+    if (s.n_host == 0) {
+        return "no expert runs on the CPU";
+    }
+    if (all_host && s.n_device > 0) {
+        return "the plan puts no expert on a device, yet one resolves there";
+    }
+    if (!all_host && s.n_device == 0) {
+        return "no device expert pointer stands in for the host slots";
+    }
+    return nullptr;
+}
+
 // One token's lookups and what they cost.
 struct moe_hybrid_record_counts {
     uint64_t lookups                              = 0;   // one per op the route was asked to take
@@ -143,6 +262,10 @@ struct moe_hybrid_record_counts {
     uint64_t builds                               = 0;   // record builds, whatever they ended in
     uint64_t built_experts                        = 0;   // experts the builds resolved
     uint64_t outcomes[MOE_DECODE_DIRECT_OUTCOME_RETRY + 1] = {};  // the builds, by how each ended
+    uint64_t patches                                       = 0;   // patches published in place of a build
+    uint64_t patch_experts                                 = 0;   // experts the patch attempts asked for
+    uint64_t patch_declined                                = 0;   // patches that could not stand: a build followed
+    uint64_t patch_unlogged                                = 0;   // generation misses the log could not name: built
 };
 
 // The submitting thread's count. A token starts when a lookup's block number is lower than the last lookup's, the rule
@@ -185,15 +308,29 @@ struct moe_hybrid_record_trace {
         ++counts.builds;
         ++counts.outcomes[outcome];
     }
+
+    // What a lookup's patch plan came to: a patch over `experts` experts that stood or not, or a log that could not
+    // name them.
+    void patch(moe_hybrid_record_patch_plan plan, bool patched, size_t experts) {
+        if (plan == MOE_HYBRID_RECORD_PATCH_UNLOGGED) {
+            ++counts.patch_unlogged;
+            return;
+        }
+        if (plan != MOE_HYBRID_RECORD_PATCH_EXPERTS) {
+            return;
+        }
+        counts.patch_experts += experts;
+        ++(patched ? counts.patches : counts.patch_declined);
+    }
 };
 
-// The per-token line's fields, after its tag. Returns what snprintf returns. The widest values fit 512 bytes.
+// The per-token line's fields, after its tag. Returns what snprintf returns. The widest values fit 768 bytes.
 inline int moe_hybrid_record_line(char * buf, size_t n, uint64_t token, const moe_hybrid_record_counts & c) {
     return std::snprintf(
         buf, n,
         "token=%llu lookups=%llu current=%llu no_plan=%llu undecided=%llu retry=%llu epoch=%llu rows=%llu "
         "generation=%llu generation_steps=%llu builds=%llu built_experts=%llu eligible=%llu refused=%llu "
-        "retried=%llu",
+        "retried=%llu patches=%llu patch_experts=%llu patch_declined=%llu patch_unlogged=%llu",
         (unsigned long long) token, (unsigned long long) c.lookups,
         (unsigned long long) c.misses[MOE_HYBRID_RECORD_MISS_NONE], (unsigned long long) c.no_plan,
         (unsigned long long) c.misses[MOE_HYBRID_RECORD_MISS_UNDECIDED],
@@ -204,7 +341,9 @@ inline int moe_hybrid_record_line(char * buf, size_t n, uint64_t token, const mo
         (unsigned long long) c.builds, (unsigned long long) c.built_experts,
         (unsigned long long) c.outcomes[MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE],
         (unsigned long long) c.outcomes[MOE_DECODE_DIRECT_OUTCOME_REFUSED],
-        (unsigned long long) c.outcomes[MOE_DECODE_DIRECT_OUTCOME_RETRY]);
+        (unsigned long long) c.outcomes[MOE_DECODE_DIRECT_OUTCOME_RETRY], (unsigned long long) c.patches,
+        (unsigned long long) c.patch_experts, (unsigned long long) c.patch_declined,
+        (unsigned long long) c.patch_unlogged);
 }
 
 }  // namespace ggml_sycl
