@@ -611,6 +611,7 @@ void promotion_cleanup_questions_visit_only_pending_rows() {
     check(allocation_registry_test_has_promotion_cleanup_pending(device), "the pending row was not reported");
     check(allocation_registry_test_process_promotion_retries(device) == 0, "a retry released a leased row");
     check(allocation_registry_test_cleanup_pending(pending.ptr), "a refused retry dropped the row's pending cleanup");
+    // 2: has_pending reads the pending row once, and the retry reads it once more.
     check_rows_scanned(2, "the promotion-cleanup questions visited rows other than the one pending");
     check(allocation_registry_test_index_consistent(), "the registry counters disagree with a recount");
 
@@ -645,7 +646,7 @@ void promotion_cleanup_index_insert_failure_is_recovered() {
     auto coordinator = std::make_shared<allocation_release_coordinator>(exact.device, release_fake, &backend);
 
     check(!allocation_registry_test_promotion_index_incomplete(), "the pending-row set starts incomplete");
-    allocation_registry_test_fail_next_promotion_index_insert();
+    allocation_registry_test_fail_promotion_index_insert_at(1);
     allocation_owner_test_fail_next_control_allocations(1);
     check(allocation_registry_test_promote(exact, coordinator).error == allocation_error::RELEASE_RETAINED,
           "the leased row's refused promotion did not leave it pending");
@@ -666,6 +667,60 @@ void promotion_cleanup_index_insert_failure_is_recovered() {
     check_rows_scanned(0, "after the rebuild the promotion-cleanup questions still visit rows");
     check(coordinator->live_controls() == 0, "the index-failure promotion changed the coordinator census");
     std::cout << "PASS promotion-cleanup-index-insert-failure-is-recovered\n";
+}
+
+// The rebuild can fail too, partway through the registry. While it does, the cleanup questions must not take the
+// incomplete set at its word: has_pending answers true (the cache teardown trusts a false), and the retry releases
+// nothing, rather than release only the rows the set happens to hold. The set stays incomplete, and the first pass
+// whose rebuild succeeds releases every pending row.
+void promotion_cleanup_index_rebuild_failure_answers_pending() {
+    fake_release_backend backend;
+    const size_t         baseline_rows = allocation_registry_test_size();
+    const alloc_metadata first         = metadata(111);
+    const alloc_metadata second        = metadata(112);
+    auto coordinator = std::make_shared<allocation_release_coordinator>(first.device, release_fake, &backend);
+    for (const alloc_metadata & row : { first, second }) {
+        check(allocation_registry_test_publish(row, false), "rebuild-failure row publication failed");
+        check(allocation_registry_test_acquire_exact_lease(row), "rebuild-failure row lease acquisition failed");
+        // Neither row's key reaches the set: each promotion's insert fails.
+        allocation_registry_test_fail_promotion_index_insert_at(1);
+        allocation_owner_test_fail_next_control_allocations(1);
+        check(allocation_registry_test_promote(row, coordinator).error == allocation_error::RELEASE_RETAINED,
+              "the leased row's refused promotion did not leave it pending");
+        check(allocation_registry_test_cleanup_pending(row.ptr), "a failed index insert lost the row's pending flag");
+    }
+    for (const alloc_metadata & row : { first, second }) {
+        check(allocation_registry_test_release_exact_lease(row), "rebuild-failure row lease release failed");
+    }
+    check(allocation_registry_test_promotion_index_incomplete(), "the failed inserts left the set complete");
+
+    // The rebuild's first insert fails, so the set holds no key: only the failure itself can answer true.
+    allocation_registry_test_fail_promotion_index_insert_at(1);
+    check(allocation_registry_test_has_promotion_cleanup_pending(first.device),
+          "with the rebuild failing, has_pending answered false for two pending rows");
+    check(allocation_registry_test_promotion_index_incomplete(), "a failed rebuild marked the set complete");
+
+    // The rebuild puts one key back, then its second insert fails: two releasable rows, and the retry releases none.
+    allocation_registry_test_fail_promotion_index_insert_at(2);
+    check(allocation_registry_test_process_promotion_retries(first.device) == 0,
+          "a retry whose rebuild failed partway released rows");
+    check(allocation_registry_test_cleanup_pending(first.ptr) && allocation_registry_test_cleanup_pending(second.ptr),
+          "a retry whose rebuild failed dropped a row's pending cleanup");
+    check(allocation_registry_test_promotion_index_incomplete(), "a partial rebuild marked the set complete");
+
+    check(allocation_registry_test_process_promotion_retries(first.device) == 2,
+          "the pass whose rebuild succeeded did not release both pending rows");
+    check(!allocation_registry_test_contains(first.ptr) && !allocation_registry_test_contains(second.ptr) &&
+              allocation_registry_test_size() == baseline_rows,
+          "a released row is still registered");
+    check(!allocation_registry_test_promotion_index_incomplete(), "the successful rebuild left the set incomplete");
+    check(allocation_registry_test_index_consistent(), "the rebuilt pending-row set disagrees with a recount");
+
+    allocation_registry_test_reset_rows_scanned();
+    check(!allocation_registry_test_has_promotion_cleanup_pending(first.device), "a released row is still pending");
+    check_rows_scanned(0, "after the rebuild the promotion-cleanup questions still visit rows");
+    check(coordinator->live_controls() == 0, "the rebuild-failure promotions changed the coordinator census");
+    std::cout << "PASS promotion-cleanup-index-rebuild-failure-answers-pending\n";
 }
 
 // A retry that meets a pending row another claimant holds (RELEASING) is BUSY: the row stays pending through it and
@@ -910,6 +965,7 @@ int main() {
     promotion_cleanup_questions_visit_only_pending_rows();
     busy_pending_row_stays_pending_through_a_retry();
     promotion_cleanup_index_insert_failure_is_recovered();
+    promotion_cleanup_index_rebuild_failure_answers_pending();
     invalid_request_has_zero_coordinator_census();
     owner_use_count_has_no_owner_zero();
     owner_use_count_counts_every_reference_exactly();

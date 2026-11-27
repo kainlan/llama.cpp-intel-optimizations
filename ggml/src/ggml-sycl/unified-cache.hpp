@@ -5821,6 +5821,8 @@ class unified_cache {
     // The retired-key set names exactly the retired entries entries_ holds, as many as retired_pending_count_ counts
     // (unless an insert could not allocate). O(entries); only the tests use it.
     bool     test_retired_index_consistent() const;
+    // An insert into the retired-key set failed and no finalize has rebuilt the set since.
+    bool     test_retired_index_incomplete() const;
     // The key `id` maps to, in *out; false when the id maps to nothing.
     bool     test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const;
     // Clear has_evictions_, as reclaim_weight_entries() does, so a case starts from a clean latch.
@@ -5836,7 +5838,6 @@ class unified_cache {
     // still happens, the set is left incomplete, and the next finalize rebuilds it.
     void test_fail_next_retired_index_insert() noexcept { fail_next_retired_index_insert_ = true; }
 
-    bool test_retired_index_incomplete() const;
     bool note_model_load_abort(uint64_t load_txn_id) noexcept;
     void note_model_load_end(uint32_t slot, uint64_t load_txn_id);
 
@@ -7945,6 +7946,9 @@ class unified_cache {
     using retired_key_set = std::unordered_set<unified_cache_key, unified_cache_key_hash>;
     retired_key_set retired_keys_;
     bool            retired_index_incomplete_ = false;
+    // Keys the finalize found naming no retired entry, a bookkeeping slip it repairs; it warns on the 1st, 2nd, 4th, ...
+    // so a recurring slip stays visible without flooding the log. Guarded by rw_mutex_.
+    uint64_t        retired_index_stale_keys_ = 0;
 
     struct inflight_unpin_entry {
         ggml_sycl_cache_id key       = {};
@@ -9117,9 +9121,10 @@ size_t allocation_registry_test_process_promotion_retries(int device) noexcept;
 // What the cache teardown asks before it dismantles: is any registry row on `device` (any device when negative) still
 // waiting for its promotion cleanup.
 bool                      allocation_registry_test_has_promotion_cleanup_pending(int device) noexcept;
-// The next insert into the promotion-cleanup row set throws std::bad_alloc, as an allocation failure would: the row's
-// flag is still set, the set is left incomplete, and the next promotion-cleanup question rebuilds it.
-void                      allocation_registry_test_fail_next_promotion_index_insert() noexcept;
+// The `nth` insert into the promotion-cleanup row set from now (1 = the next) throws std::bad_alloc, as an allocation
+// failure would; 0 disarms. A failed insert from a pending-flag write leaves the flag set and the set incomplete; one
+// from the rebuild leaves the set incomplete for the next question to retry.
+void                      allocation_registry_test_fail_promotion_index_insert_at(size_t nth) noexcept;
 bool                      allocation_registry_test_promotion_index_incomplete() noexcept;
 registered_release_status allocation_registry_test_release_exact(
     const alloc_metadata & metadata, registered_release_mode mode) noexcept;

@@ -2318,6 +2318,14 @@ static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry
 // keys back.
 static std::unordered_set<void *> g_runtime_promotion_cleanup_rows;
 static bool                       g_runtime_promotion_cleanup_rows_incomplete = false;
+// Keys the promotion-cleanup walk found naming no pending row, a bookkeeping slip it repairs (its DEFENSIVE branch).
+static uint64_t                   g_runtime_promotion_cleanup_stale_keys      = 0;
+
+// A stale index key is repaired where it is found and warned on at the 1st, 2nd, 4th, 8th, ... occurrence: visible,
+// and still visible if it recurs, without a warning per synchronize.
+static bool stale_index_key_warns(uint64_t occurrences) noexcept {
+    return occurrences != 0 && (occurrences & (occurrences - 1)) == 0;
+}
 
 // Containment index over the registry's rows: [handle.ptr, handle.ptr + handle.size) -> the row's key, for every row with
 // a non-null pointer and a non-zero size. It answers "which allocation contains this address" in O(log n), where the
@@ -2394,8 +2402,9 @@ static bool runtime_registry_row_indexed(const alloc_metadata & h) noexcept {
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static size_t g_test_registry_rows_scanned = 0;  // guarded by g_runtime_alloc_mutex
-// The next insert into g_runtime_promotion_cleanup_rows throws std::bad_alloc; guarded by g_runtime_alloc_mutex.
-static bool   g_test_fail_next_promotion_index_insert = false;
+// Inserts into g_runtime_promotion_cleanup_rows until one throws std::bad_alloc (1 = the next one), 0 when disarmed;
+// guarded by g_runtime_alloc_mutex.
+static size_t g_test_fail_promotion_index_insert_at = 0;
 #endif
 
 // Registry rows visited by the settle queries and their refusal enumerations, and by the promotion-cleanup questions the
@@ -2444,44 +2453,55 @@ static void runtime_registry_count_row_locked(const void * key, const alloc_meta
     }
 }
 
-// Puts row `key` into, or takes it out of, the set of rows waiting for their promotion cleanup. The caller holds
-// g_runtime_alloc_mutex.
-static void runtime_registry_index_promotion_cleanup_locked(void * key, bool pending) noexcept {
-    if (!pending) {
-        g_runtime_promotion_cleanup_rows.erase(key);
-        return;
-    }
-    try {
+// The one insert into the set of rows waiting for their promotion cleanup; throws std::bad_alloc when it cannot
+// allocate. The caller holds g_runtime_alloc_mutex.
+static void runtime_registry_promotion_cleanup_index_insert_locked(void * key) {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
-        if (g_test_fail_next_promotion_index_insert) {
-            g_test_fail_next_promotion_index_insert = false;
-            throw std::bad_alloc();
-        }
+    if (g_test_fail_promotion_index_insert_at != 0 && --g_test_fail_promotion_index_insert_at == 0) {
+        throw std::bad_alloc();
+    }
 #endif
-        g_runtime_promotion_cleanup_rows.insert(key);
+    g_runtime_promotion_cleanup_rows.insert(key);
+}
+
+// Row `key` now waits for its promotion cleanup. The caller holds g_runtime_alloc_mutex.
+static void runtime_registry_promotion_cleanup_index_add_locked(void * key) noexcept {
+    try {
+        runtime_registry_promotion_cleanup_index_insert_locked(key);
     } catch (const std::bad_alloc &) {
         // The row's flag is the durable state; the next question walks the registry to find it.
         g_runtime_promotion_cleanup_rows_incomplete = true;
     }
 }
 
+// Row `key` no longer waits for its promotion cleanup. The caller holds g_runtime_alloc_mutex.
+static void runtime_registry_promotion_cleanup_index_remove_locked(void * key) noexcept {
+    g_runtime_promotion_cleanup_rows.erase(key);
+}
+
 // The only writer of a registered row's promotion_cleanup_pending. The caller holds g_runtime_alloc_mutex.
 static void runtime_registry_set_promotion_cleanup_pending_locked(runtime_registry_iterator it, bool pending) noexcept {
     it->second.promotion_cleanup_pending = pending;
-    runtime_registry_index_promotion_cleanup_locked(it->first, pending);
+    if (pending) {
+        runtime_registry_promotion_cleanup_index_add_locked(it->first);
+    } else {
+        runtime_registry_promotion_cleanup_index_remove_locked(it->first);
+    }
 }
 
-// After an insert into the set could not allocate: walk the registry once and put every pending row's key back. May
-// throw std::bad_alloc, leaving the set incomplete for the next question to retry. The caller holds
-// g_runtime_alloc_mutex.
-static void runtime_registry_complete_promotion_cleanup_rows_locked() {
+// After an insert into the set could not allocate: walk the registry once and put every pending row's key back. The
+// cache's complete_retired_index_locked() swallows a failure and lets its caller walk what the set holds; this one
+// propagates it, because has_pending_legacy_promotion_cleanup() must never answer false wrongly (the cache teardown
+// trusts that answer before it dismantles), and its catch answers true. The set stays incomplete, so the next question
+// retries. The caller holds g_runtime_alloc_mutex.
+static void runtime_registry_complete_promotion_cleanup_index_locked() {
     if (!g_runtime_promotion_cleanup_rows_incomplete) {
         return;
     }
     for (const auto & kv : g_runtime_alloc_registry) {
         runtime_registry_note_row_scanned_locked();
         if (kv.second.promotion_cleanup_pending) {
-            g_runtime_promotion_cleanup_rows.insert(kv.first);
+            runtime_registry_promotion_cleanup_index_insert_locked(kv.first);
         }
     }
     g_runtime_promotion_cleanup_rows_incomplete = false;
@@ -2549,7 +2569,7 @@ static std::pair<runtime_registry_iterator, bool> runtime_registry_emplace_locke
     }
     runtime_registry_count_row_locked(ptr, h, /*add=*/true);
     if (inserted.first->second.promotion_cleanup_pending) {
-        runtime_registry_index_promotion_cleanup_locked(ptr, true);
+        runtime_registry_promotion_cleanup_index_add_locked(ptr);
     }
     return inserted;
 }
@@ -2569,7 +2589,7 @@ static void runtime_registry_erase_locked(runtime_registry_iterator it) noexcept
     }
     runtime_registry_count_row_locked(it->first, h, /*add=*/false);
     if (it->second.promotion_cleanup_pending) {
-        runtime_registry_index_promotion_cleanup_locked(it->first, false);
+        runtime_registry_promotion_cleanup_index_remove_locked(it->first);
     }
     g_runtime_alloc_registry.erase(it);
 }
@@ -2620,13 +2640,14 @@ static void runtime_registry_assign_locked(void * ptr, const runtime_alloc_recor
     } else if (was) {
         g_runtime_alloc_index.erase(reinterpret_cast<uintptr_t>(old_h.ptr), ptr);
     }
+    const bool was_pending = it->second.promotion_cleanup_pending;
     runtime_registry_count_row_locked(ptr, old_h, /*add=*/false);
     runtime_registry_count_row_locked(ptr, fresh.handle, /*add=*/true);
-    const bool was_pending = it->second.promotion_cleanup_pending;
-
     it->second = std::move(fresh);
-    if (it->second.promotion_cleanup_pending != was_pending) {
-        runtime_registry_index_promotion_cleanup_locked(ptr, it->second.promotion_cleanup_pending);
+    if (it->second.promotion_cleanup_pending && !was_pending) {
+        runtime_registry_promotion_cleanup_index_add_locked(ptr);
+    } else if (!it->second.promotion_cleanup_pending && was_pending) {
+        runtime_registry_promotion_cleanup_index_remove_locked(ptr);
     }
 }
 
@@ -10134,7 +10155,11 @@ direct_stage_result unified_cache::direct_stage_weight(ggml_sycl_cache_id   key,
         entry.last_write_event   = last_event;
         entry.has_write_event    = true;
         auto old                 = entries_.find(cache_key);
-        if (old != entries_.end() && old->second.device_ptr && old->second.device_ptr != ptr) {
+        // `ptr` is a fresh allocation and a retired entry keeps its own until it finalizes, so a retired entry with a
+        // pointer already fails the pointer test; the retired test also refuses one without, since overwriting a
+        // retired entry would drop its retirement uncounted.
+        if (old != entries_.end() &&
+            (old->second.retired || (old->second.device_ptr && old->second.device_ptr != ptr))) {
             if (!can_replace_cache_entry_locked(cache_key, old->second, "direct_stage_weight")) {
                 defer_unpublished_ptr_until_event(last_event);
                 return result;
@@ -10513,7 +10538,11 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
                 // publication.  In particular, never overwrite a live or
                 // retired canonical entry merely because device allocation
                 // failed.
-                if (old->second.device_ptr != host_ptr || old->second.size != src_size ||
+                // A retired entry at this very pointer is refused too, since overwriting it would drop its retirement
+                // uncounted. It is reachable: a source published in place makes host_ptr the old entry's pointer,
+                // and the cache hit above takes only DEVICE entries, so a second host fallback for an expert retired
+                // while leased arrives here with the same pointer, size and layout.
+                if (old->second.retired || old->second.device_ptr != host_ptr || old->second.size != src_size ||
                     old->second.layout != GGML_LAYOUT_AOS) {
                     if (!can_replace_cache_entry_locked(cache_key, old->second,
                                                         "direct_stage_expert/host-fallback")) {
@@ -10675,7 +10704,11 @@ direct_stage_result unified_cache::direct_stage_expert(ggml_sycl_cache_id   key,
         entry.last_write_event   = last_event;
         entry.has_write_event    = true;
         auto old                 = entries_.find(cache_key);
-        if (old != entries_.end() && old->second.device_ptr && old->second.device_ptr != ptr) {
+        // `ptr` is a fresh allocation and a retired entry keeps its own until it finalizes, so a retired entry with a
+        // pointer already fails the pointer test; the retired test also refuses one without, since overwriting a
+        // retired entry would drop its retirement uncounted.
+        if (old != entries_.end() &&
+            (old->second.retired || (old->second.device_ptr && old->second.device_ptr != ptr))) {
             if (!can_replace_cache_entry_locked(cache_key, old->second, "direct_stage_expert")) {
                 defer_unpublished_ptr_until_event(last_event);
                 return result;
@@ -17077,7 +17110,9 @@ void unified_cache::complete_retired_index_locked() noexcept {
         return;
     }
     // An insert into the retired-key set could not allocate: put back every retired key once. If this cannot allocate
-    // either, the finalize that called it walks what the set holds and the next one tries again.
+    // either, the finalize that called it walks what the set holds and the next one tries again. A partial walk is
+    // safe here, unlike runtime_registry_complete_promotion_cleanup_index_locked(), which must propagate: an entry
+    // the walk misses only finalizes a pass later, while a teardown told nothing is pending would dismantle under it.
     try {
         for (const auto & pair : entries_) {
             retired_entry_visits_.fetch_add(1, std::memory_order_relaxed);
@@ -17101,13 +17136,24 @@ size_t unified_cache::finalize_retired_entries_locked() {
         retired_entry_visits_.fetch_add(1, std::memory_order_relaxed);
         auto it = entries_.find(*key_it);
         if (it == entries_.end() || !it->second.retired) {
-            // Nothing erases or restores a retired entry without taking its key out; a key left behind anyway names
-            // no retired entry, so it goes.
+            // DEFENSIVE: erase_entry_locked() is the only erase of entries_ and the restore the only un-retire, and both
+            // take the key out. An entries_[key] overwrite runs only on an absent key (a miss, or after
+            // erase_entry_locked()) or after refusing a retired entry (can_replace_cache_entry_locked(), or the bulk
+            // stage's own check). So no key should name a missing or unretired entry. This guards against a future
+            // path that erases, revives or overwrites a retired entry behind the set: the key is dropped and the slip
+            // reported, since aborting a process over bookkeeping that is repaired here costs more than the slip.
+            if (stale_index_key_warns(++retired_index_stale_keys_)) {
+                GGML_LOG_WARN(
+                    "[UNIFIED-CACHE] retired-key set held a key naming no retired entry (%s); dropped, "
+                    "%llu so far\n",
+                    it == entries_.end() ? "no entry" : "entry not retired",
+                    (unsigned long long) retired_index_stale_keys_);
+            }
             retired_keys_.erase(key_it);
             continue;
         }
         unified_cache_entry & entry = it->second;
-        if (!entry.retired || entry.in_use_count.load() != 0 || entry.state == cache_entry_state::EVICTING) {
+        if (entry.in_use_count.load() != 0 || entry.state == cache_entry_state::EVICTING) {
             continue;
         }
         if (entry.state == cache_entry_state::IN_PROGRESS && entry.has_ready_event) {
@@ -17165,12 +17211,12 @@ size_t unified_cache::finalize_retired_entries_locked() {
     return finalized;
 }
 
+#if defined(GGML_SYCL_PRIVATE_TESTING)
 bool unified_cache::test_retired_index_incomplete() const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     return retired_index_incomplete_;
 }
 
-#if defined(GGML_SYCL_PRIVATE_TESTING)
 bool unified_cache::test_retired_index_consistent() const {
     std::shared_lock<std::shared_mutex> lock(rw_mutex_);
     size_t                              retired = 0;
@@ -22919,20 +22965,29 @@ static size_t process_pending_legacy_promotion_cleanup(int device) noexcept {
         std::vector<alloc_metadata> pending;
         {
             std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-            runtime_registry_complete_promotion_cleanup_rows_locked();
+            runtime_registry_complete_promotion_cleanup_index_locked();
             pending.reserve(g_runtime_promotion_cleanup_rows.size());
             for (auto key = g_runtime_promotion_cleanup_rows.begin(); key != g_runtime_promotion_cleanup_rows.end();) {
                 runtime_registry_note_row_scanned_locked();
                 const auto item = g_runtime_alloc_registry.find(*key);
                 if (item == g_runtime_alloc_registry.end() || !item->second.promotion_cleanup_pending) {
-                    // Every path that clears the flag or erases the row takes its key out; one left behind anyway
-                    // names nothing pending, so it goes.
+                    // DEFENSIVE: runtime_registry_set_promotion_cleanup_pending_locked() and the erase and assign
+                    // helpers take a key out whenever its row stops being pending or goes, so no key should name a
+                    // missing or settled row. This guards against a future row write that bypasses them: the key is
+                    // dropped and the slip reported, since aborting a process over bookkeeping that is repaired here
+                    // costs more than the slip.
+                    if (stale_index_key_warns(++g_runtime_promotion_cleanup_stale_keys)) {
+                        GGML_LOG_WARN(
+                            "[UNIFIED-CACHE] promotion-cleanup set held a key naming no pending row (%s); "
+                            "dropped, %llu so far\n",
+                            item == g_runtime_alloc_registry.end() ? "no row" : "row not pending",
+                            (unsigned long long) g_runtime_promotion_cleanup_stale_keys);
+                    }
                     key = g_runtime_promotion_cleanup_rows.erase(key);
                     continue;
                 }
                 const runtime_alloc_record & row = item->second;
-                if (row.ownership == runtime_alloc_ownership::LEGACY && row.promotion_cleanup_pending &&
-                    (device < 0 || row.handle.device == device)) {
+                if (row.ownership == runtime_alloc_ownership::LEGACY && (device < 0 || row.handle.device == device)) {
                     pending.push_back(row.handle);
                 }
                 ++key;
@@ -22986,7 +23041,7 @@ size_t unified_cache_raw_device_held_bytes(int device_id, size_t * compute_live)
 static bool has_pending_legacy_promotion_cleanup(int device) noexcept {
     try {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-        runtime_registry_complete_promotion_cleanup_rows_locked();
+        runtime_registry_complete_promotion_cleanup_index_locked();
         return std::any_of(g_runtime_promotion_cleanup_rows.begin(), g_runtime_promotion_cleanup_rows.end(),
                            [device](void * key) {
                                runtime_registry_note_row_scanned_locked();
@@ -23239,9 +23294,9 @@ bool allocation_registry_test_has_promotion_cleanup_pending(int device) noexcept
     return has_pending_legacy_promotion_cleanup(device);
 }
 
-void allocation_registry_test_fail_next_promotion_index_insert() noexcept {
+void allocation_registry_test_fail_promotion_index_insert_at(size_t nth) noexcept {
     std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
-    g_test_fail_next_promotion_index_insert = true;
+    g_test_fail_promotion_index_insert_at = nth;
 }
 
 bool allocation_registry_test_promotion_index_incomplete() noexcept {

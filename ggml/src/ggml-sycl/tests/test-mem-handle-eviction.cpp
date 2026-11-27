@@ -972,6 +972,9 @@ static bool test_deferred_free_pass_visits_only_retired_entries(sycl::queue & q)
 // retires, and the next finalize walks every entry once to put the key back:
 // here the retire's own finalize. The entry then stays while leased and
 // finalizes on the pass after its lease goes, as any retired entry does.
+// A rebuild that itself fails partway is not driven here: the finalize then
+// walks what the set holds, which only delays an entry a pass, and that path
+// is covered by reading complete_retired_index_locked().
 // =============================================================================
 static bool test_retired_index_insert_failure_is_recovered(sycl::queue & q) {
     TEST_BEGIN("retired_index_insert_failure_is_recovered");
@@ -996,6 +999,8 @@ static bool test_retired_index_insert_failure_is_recovered(sycl::queue & q) {
     TEST_ASSERT(leased_staged.ok && lease.valid(), "leased expert stage did not publish a lease");
     leased_staged.event.wait_and_throw();
     TEST_ASSERT(!cache.test_retired_index_incomplete(), "the retired-key set starts incomplete");
+    TEST_ASSERT(cache.entry_count() == static_cast<size_t>(n_idle) + 1,
+                "the fixture holds entries other than the four staged");
 
     cache.test_fail_next_retired_index_insert();
     const uint64_t before = cache.test_retired_entry_visits();
@@ -1003,13 +1008,13 @@ static bool test_retired_index_insert_failure_is_recovered(sycl::queue & q) {
                     ggml_sycl::expert_retire_status::DEFERRED,
                 "a leased retire whose index insert failed did not defer");
     const uint64_t     visited        = cache.test_retired_entry_visits() - before;
-    // The rebuild walks every entry (at least the four staged), then the walk visits the retired one.
+    // The retire runs one finalize: its rebuild walks the four staged entries, then the walk visits the retired one.
     constexpr uint64_t rebuilt_visits = n_idle + 2;
-    if (visited < rebuilt_visits) {
-        fprintf(stderr, "(the retire's finalize visited %llu entries, expected at least %d) ",
-                (unsigned long long) visited, n_idle + 2);
+    if (visited != rebuilt_visits) {
+        fprintf(stderr, "(the retire's finalize visited %llu entries, expected %llu) ", (unsigned long long) visited,
+                (unsigned long long) rebuilt_visits);
     }
-    TEST_ASSERT(visited >= rebuilt_visits, "the finalize after a failed index insert did not rebuild the set");
+    TEST_ASSERT(visited == rebuilt_visits, "the finalize after a failed index insert did not rebuild the set once");
     TEST_ASSERT(!cache.test_retired_index_incomplete(), "the finalize did not mark the rebuilt set complete");
     TEST_ASSERT(cache.test_retired_index_consistent(), "the rebuilt retired-key set disagrees with a recount");
     TEST_ASSERT(cache.retired_pending_count_for_test() == 1, "the retire did not count one pending entry");
