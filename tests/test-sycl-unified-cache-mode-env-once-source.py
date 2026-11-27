@@ -7,19 +7,27 @@ accessor called std::getenv and strcmp on each call, getenv was 5.6 % of the sub
 profile. The value cannot usefully change once the cache exists, and docs/backend/sycl-env-vars.md states read-once
 as the convention for the backend's variables.
 
-THE CONTRACT.  With comments blanked, in ggml/src/ggml-sycl/unified-cache.cpp:
-  O. The one std::getenv("GGML_SYCL_UNIFIED_CACHE_MODE") of the backend sits in the initializer of a function-local
-     `static const` inside get_unified_cache_mode(), so a second call reads the held value and not the environment.
-     No other backend source calls getenv on the variable.
-  S. Only the override is held: get_unified_cache_mode() still returns g_cache_mode, outside that initializer, when
-     the variable names no mode, so set_unified_cache_mode() keeps working until the cache locks the mode.
+THE CONTRACT.  With comments blanked:
+  O. The one getenv("GGML_SYCL_UNIFIED_CACHE_MODE") of the backend (any spelling: getenv, ::getenv, std::getenv)
+     sits in the initializer of a function-local static (`static`, `static const` or `const static`; not constexpr)
+     inside get_unified_cache_mode() in unified-cache.cpp, so a second call reads the held value and not the
+     environment. No other ggml/src/ggml-sycl source calls getenv on the variable.
+  P. That initializer parses once: the getenv is the argument of unified_cache_mode_from_env(), so what is held is
+     the parsed mode, never the raw string, and get_unified_cache_mode() itself calls no strcmp.
+  M. unified_cache_mode_from_env() maps "global", "per_device" and "auto" each to its own enum value.
+  R. The held override is used: a return statement outside the initializer returns the held value (`*v`,
+     `v.value()`, `v.value_or(...)`).
+  S. Only the override is held: a return statement outside the initializer reads g_cache_mode, so with no valid
+     value set_unified_cache_mode() keeps working until the cache locks the mode.
   L. set_unified_cache_mode() still refuses a change once g_cache_mode_locked is set, and otherwise assigns
      g_cache_mode.
 
 NOT VACUOUS.  --self-test runs the gate on in-memory mutants of the real source and requires each to fail the named
-pin, then requires the unmodified tree to pass.
+pin, requires the correct alternative spellings to pass every pin, then requires the unmodified tree to pass.
+--root <dir> checks another tree (a copy of the sources before the change).
 
-RED on the tree before the change: pin O fails (the getenv ran on every call).
+RED on the tree before the change: pins O, P, M and R fail (the getenv and the parse ran on every call, and the
+parsing helper did not exist).
 """
 
 from __future__ import annotations
@@ -28,13 +36,10 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-SYCL = ROOT / "ggml" / "src" / "ggml-sycl"
-CACHE = SYCL / "unified-cache.cpp"
-OTHER_SOURCES = (SYCL / "ggml-sycl.cpp", SYCL / "unified-cache.hpp", SYCL / "common.hpp")
-
 ENV_NAME = "GGML_SYCL_UNIFIED_CACHE_MODE"
-GETENV = re.compile(r'std::getenv\(\s*"' + ENV_NAME + r'"\s*\)|(?<![\w:])getenv\(\s*"' + ENV_NAME + r'"\s*\)')
+# Every spelling of the call ends in the bare name; the word boundary keeps secure_getenv and the like out.
+GETENV = re.compile(r'\bgetenv\s*\(\s*"' + ENV_NAME + r'"\s*\)')
+FROM_ENV = "unified_cache_mode_from_env"
 
 # Comments blank to spaces, keeping offsets; strings and char literals are matched first so a comment marker inside
 # one is not taken for a comment.
@@ -87,10 +92,18 @@ def body_of(code: str, signature: str) -> str | None:
     return None if span is None else code[span[0]:span[1]]
 
 
-def static_initializer(body: str, at: int) -> bool:
-    """True when offset `at` of a function body lies inside the initializer of a function-local `static const`
-    declaration: from its `=` to the `;` that ends the declaration at the declaration's own nesting depth."""
-    for m in re.finditer(r"\bstatic\s+const\b[^=;{}]*=", body):
+# A function-local static with an initializer: `static`, `static const` or `const static`, then the type and the
+# declared name. constexpr is excluded both before and after `static`.
+_STATIC_DECL = re.compile(r"(?<![\w])(?:const\s+)?static\b(?:\s+const\b)?(?!\s+constexpr\b)([^=;{}()]*?)\b(\w+)\s*=")
+
+
+def static_initializers(body: str) -> list[tuple[str, int, int]]:
+    """(declared name, start, end) of each function-local static initializer in `body`: from after its `=` to the `;`
+    that ends the declaration at the declaration's own nesting depth."""
+    out = []
+    for m in _STATIC_DECL.finditer(body):
+        if re.search(r"\bconstexpr\s*$", body[:m.start()]):
+            continue
         start = m.end()
         depth = 0
         j = start
@@ -103,13 +116,23 @@ def static_initializer(body: str, at: int) -> bool:
             elif c == ";" and depth == 0:
                 break
             j += 1
-        if start <= at < j:
-            return True
-    return False
+        out.append((m.group(2), start, j))
+    return out
+
+
+def live_returns(body: str, inits: list[tuple[str, int, int]]) -> list[str]:
+    """The expression of each return statement in `body` that lies outside every static initializer."""
+    out = []
+    for m in re.finditer(r"\breturn\b([^;]*);", body):
+        if not any(s <= m.start() < e for _, s, e in inits):
+            out.append(m.group(1))
+    return out
 
 
 SIG_GET = r"\bunified_cache_mode\s+get_unified_cache_mode\(\s*\)\s*\{"
 SIG_SET = r"\bvoid\s+set_unified_cache_mode\(\s*unified_cache_mode\s+mode\s*\)\s*\{"
+SIG_FROM_ENV = r"\b" + FROM_ENV + r"\(\s*const\s+char\s*\*\s*\w+\s*\)\s*\{"
+MAPPING = {"global": "GLOBAL", "per_device": "PER_DEVICE", "auto": "AUTO"}
 
 
 def check(cache_src: str, others: dict[str, str]) -> list[str]:
@@ -120,33 +143,57 @@ def check(cache_src: str, others: dict[str, str]) -> list[str]:
     get_body = body_of(code, SIG_GET)
     set_body = body_of(code, SIG_SET)
     if get_body is None:
-        fails.append("O: get_unified_cache_mode() definition not found")
-        fails.append("S: get_unified_cache_mode() definition not found")
+        fails += [f"{p}: get_unified_cache_mode() definition not found" for p in "OPRS"]
         get_body = ""
     if set_body is None:
         fails.append("L: set_unified_cache_mode() definition not found")
         set_body = ""
+    inits = static_initializers(get_body)
 
-    # O: one getenv in the file, inside a static const initializer of the accessor; none in the other sources.
+    # O: one getenv in the file, inside a static initializer of the accessor; none in the other sources.
     in_file = list(GETENV.finditer(code))
     in_get = list(GETENV.finditer(get_body))
     if len(in_file) != 1:
         fails.append(f"O: unified-cache.cpp calls getenv on {ENV_NAME} {len(in_file)} times, want exactly 1")
     if len(in_get) != 1:
         fails.append(f"O: get_unified_cache_mode() calls getenv on {ENV_NAME} {len(in_get)} times, want exactly 1")
-    for m in in_get:
-        if not static_initializer(get_body, m.start()):
-            fails.append(f"O: get_unified_cache_mode() reads {ENV_NAME} on every call, outside a static const "
-                         "initializer")
+    held = [(n, s, e) for n, s, e in inits if any(s <= m.start() < e for m in in_get)]
+    if in_get and not held:
+        fails.append(f"O: get_unified_cache_mode() reads {ENV_NAME} on every call, outside a static initializer")
     for name, src in others.items():
         n = len(GETENV.findall(blank_comments(src)))
         if n:
             fails.append(f"O: {name} calls getenv on {ENV_NAME} {n} times, want 0")
 
-    # S: the setter's value is still returned, read on each call (outside any static initializer).
-    live_reads = [m for m in re.finditer(r"\bg_cache_mode\b", get_body) if not static_initializer(get_body, m.start())]
-    if not any(re.match(r"\s*;", get_body[m.end():]) and re.search(r"\breturn\s*$", get_body[:m.start()])
-               for m in live_reads):
+    # P: the held initializer parses the variable through the helper; the accessor compares no strings.
+    parse = re.compile(r"\b" + FROM_ENV + r"\s*\(\s*(?:std\s*)?(?:::\s*)?getenv\s*\(\s*\"" + ENV_NAME + r"\"\s*\)\s*\)")
+    if not any(parse.search(get_body[s:e]) for _, s, e in held):
+        fails.append(f"P: the held initializer is not {FROM_ENV}(getenv(\"{ENV_NAME}\")): a raw string would be held "
+                     "and parsed on every call")
+    if re.search(r"\bstrcmp\s*\(", get_body):
+        fails.append("P: get_unified_cache_mode() calls strcmp, so it parses on every call")
+
+    # M: each value maps to its own mode.
+    from_env = body_of(code, SIG_FROM_ENV)
+    if from_env is None:
+        fails.append(f"M: {FROM_ENV}(const char *) definition not found")
+    else:
+        for text, mode in MAPPING.items():
+            pat = (r"strcmp\s*\(\s*\w+\s*,\s*\"" + text + r"\"\s*\)\s*==\s*0\s*\)\s*\{?\s*return\s+"
+                   r"(?:unified_cache_mode::)?" + mode + r"\s*;")
+            if not re.search(pat, from_env):
+                fails.append(f"M: {FROM_ENV}() does not map \"{text}\" to unified_cache_mode::{mode}")
+
+    returns = live_returns(get_body, inits)
+
+    # R: the held override is returned.
+    names = [n for n, _, _ in held]
+    if not any(re.search(r"\*\s*" + n + r"\b|\b" + n + r"\s*\.\s*value(?:_or)?\s*\(", r) for r in returns
+               for n in names):
+        fails.append("R: get_unified_cache_mode() never returns the held override")
+
+    # S: the setter's value is still returned, read on each call.
+    if not any(re.search(r"\bg_cache_mode\b", r) for r in returns):
         fails.append("S: get_unified_cache_mode() no longer returns g_cache_mode on each call, so "
                      "set_unified_cache_mode() would stop working after the first read")
 
@@ -159,8 +206,17 @@ def check(cache_src: str, others: dict[str, str]) -> list[str]:
     return fails
 
 
-def read_sources() -> tuple[str, dict[str, str]]:
-    return CACHE.read_text(), {p.name: p.read_text() for p in OTHER_SOURCES}
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def read_sources(root: Path = ROOT) -> tuple[str, dict[str, str]]:
+    sycl = root / "ggml" / "src" / "ggml-sycl"
+    cache = sycl / "unified-cache.cpp"
+    others = {}
+    for p in sorted(sycl.rglob("*")):
+        if p.suffix in (".cpp", ".hpp") and p.is_file() and p != cache:
+            others[str(p.relative_to(sycl))] = p.read_text(errors="replace")
+    return cache.read_text(), others
 
 
 def substitute(src: str, pattern: str, repl: str) -> str:
@@ -168,6 +224,27 @@ def substitute(src: str, pattern: str, repl: str) -> str:
     if n != 1:
         raise SystemExit(f"self-test: mutant anchor missing: {pattern!r}")
     return out
+
+
+E = '"' + ENV_NAME + '"'
+
+
+def held_body(decl: str, ret: str) -> str:
+    return ("{\n    " + decl + " env_mode =\n        " + FROM_ENV + "(std::getenv(" + E + "));\n    " + ret + "\n}")
+
+
+IF_RETURN = "if (env_mode) {\n        return *env_mode;\n    }\n    return g_cache_mode;"
+
+# Correct alternative spellings: each must pass every pin.
+CORRECT = {
+    "value_or": held_body("static const std::optional<unified_cache_mode>", "return env_mode.value_or(g_cache_mode);"),
+    "ternary": held_body("static const std::optional<unified_cache_mode>",
+                         "return env_mode ? *env_mode : g_cache_mode;"),
+    "static non-const": held_body("static std::optional<unified_cache_mode>", IF_RETURN),
+    "const static": held_body("const static std::optional<unified_cache_mode>", IF_RETURN),
+    "::getenv": ("{\n    static const std::optional<unified_cache_mode> env_mode = " + FROM_ENV + "(::getenv(" + E +
+                 "));\n    " + IF_RETURN + "\n}"),
+}
 
 
 def mutants(cache_src: str, others: dict[str, str]):
@@ -181,33 +258,56 @@ def mutants(cache_src: str, others: dict[str, str]):
         return cache_src[:span[0]] + body + cache_src[span[1]:]
 
     # The shape before the change: the accessor reads and parses the variable on every call.
-    per_call = ("{\n    const char * env = std::getenv(\"" + ENV_NAME + "\");\n"
+    per_call = ("{\n    const char * env = std::getenv(" + E + ");\n"
                 "    if (env && strcmp(env, \"global\") == 0) {\n        return unified_cache_mode::GLOBAL;\n    }\n"
                 "    return g_cache_mode;\n}")
     yield "per-call getenv", "O", with_body(per_call), others
 
+    yield ("constexpr static", "O",
+           with_body(held_body("static constexpr std::optional<unified_cache_mode>", IF_RETURN)), others)
+
     # Memoizing the whole answer, setter value included, freezes set_unified_cache_mode() after the first read.
     whole = ("{\n    static const unified_cache_mode mode = [] {\n"
-             "        const char * env = std::getenv(\"" + ENV_NAME + "\");\n"
+             "        const char * env = std::getenv(" + E + ");\n"
              "        if (env && strcmp(env, \"global\") == 0) {\n            return unified_cache_mode::GLOBAL;\n"
              "        }\n        return g_cache_mode;\n    }();\n    return mode;\n}")
     yield "memoized setter value", "S", with_body(whole), others
+
+    # A held raw string still costs a strcmp per call.
+    raw = ("{\n    static const char * env = std::getenv(" + E + ");\n"
+           "    if (env && strcmp(env, \"global\") == 0) {\n        return unified_cache_mode::GLOBAL;\n    }\n"
+           "    return g_cache_mode;\n}")
+    yield "raw string held, parsed per call", "P", with_body(raw), others
+
+    yield "override ignored", "R", with_body(held_body("static const std::optional<unified_cache_mode>",
+                                                       "(void) env_mode;\n    return g_cache_mode;")), others
+
+    swapped = substitute(cache_src, r"(\"global\"\) == 0\) \{\s*return unified_cache_mode::)GLOBAL;",
+                         r"\1PER_DEVICE;")
+    yield "parser maps global to PER_DEVICE", "M", swapped, others
 
     unlocked = substitute(cache_src, r"(void set_unified_cache_mode\(unified_cache_mode mode\) \{\s*)"
                                      r"if \(g_cache_mode_locked\)", r"\1if (false)")
     yield "setter ignores the lock", "L", unlocked, others
 
-    second = "\nstatic bool g_cache_mode_probe = std::getenv(\"" + ENV_NAME + "\") != nullptr;\n"
+    second = "\nstatic bool g_cache_mode_probe = std::getenv(" + E + ") != nullptr;\n"
     yield "second getenv in unified-cache.cpp", "O", cache_src + second, others
 
-    other = dict(others)
-    other["ggml-sycl.cpp"] = others["ggml-sycl.cpp"] + second
-    yield "getenv in ggml-sycl.cpp", "O", cache_src, other
+    for name, text in (("std::getenv in ggml-sycl.cpp", second),
+                       ("::getenv in common.hpp", "\nstatic bool g_probe = ::getenv(" + E + ") != nullptr;\n")):
+        other = dict(others)
+        key = "ggml-sycl.cpp" if "ggml-sycl.cpp" in name else "common.hpp"
+        other[key] = others[key] + text
+        yield name, "O", cache_src, other
 
 
 def main() -> int:
-    cache_src, others = read_sources()
-    if "--self-test" in sys.argv[1:]:
+    args = sys.argv[1:]
+    root = ROOT
+    if "--root" in args:
+        root = Path(args[args.index("--root") + 1]).resolve()
+    cache_src, others = read_sources(root)
+    if "--self-test" in args:
         bad = []
         n = 0
         for name, pin, src, oth in mutants(cache_src, others):
@@ -216,10 +316,20 @@ def main() -> int:
             print(("PASS" if fired else "FAIL") + f": mutant '{name}' fails pin {pin}")
             if not fired:
                 bad.append(name)
+        span = body_span(blank_comments(cache_src), SIG_GET)
+        if span is None:
+            raise SystemExit("self-test: get_unified_cache_mode() not found")
+        for name, body in CORRECT.items():
+            n += 1
+            got = check(cache_src[:span[0]] + body + cache_src[span[1]:], others)
+            print(("PASS" if not got else "FAIL") + f": correct form '{name}' passes every pin" +
+                  ("" if not got else f" ({got})"))
+            if got:
+                bad.append(name)
         if bad:
-            print(f"self-test: {len(bad)} of {n} mutants not caught: {bad}")
+            print(f"self-test: {len(bad)} of {n} cases wrong: {bad}")
             return 1
-        print(f"self-test: all {n} mutants caught")
+        print(f"self-test: all {n} cases right")
 
     fails = check(cache_src, others)
     for f in fails:
