@@ -4825,6 +4825,11 @@ TXN_PLAN_MEMBERS = {"unshare_expert_entry", "update_expert_placement", "set_expe
                     "host_backing_maps_files", "entries"}
 TXN_PLAN_WHOLE = ("ggml_sycl::moe_expert_triplet_dst_bytes(*next_plan, placed)",
                   "ggml_sycl::moe_mmid_same_workspace_plan(*current->plan, *next_plan)")
+# Each of those takes the plan const, so handing it the copy reads its entries without cloning a chunk: a writable
+# parameter would make every entry read there a non-const index, which clones the chunk it lands in.
+TXN_PLAN_WHOLE_CONST = (("plan_hpp", "static inline size_t moe_expert_triplet_dst_bytes(const placement_plan & plan,"),
+                        ("cache_hpp", "bool moe_mmid_same_workspace_plan(const placement_plan & a, "
+                                      "const placement_plan & b) noexcept;"))
 ENTRIES_WORD_RE = re.compile(r"\bentries\b")
 # A per-(layer, expert) map on the plan is copied whole by HOIST_PLAN, node by node, and a flip that writes it can
 # allocate. The plan held one (expert_device, a collapsed summary nothing read); the entries and their shared index are
@@ -4833,8 +4838,9 @@ PER_EXPERT_MAP = "std::unordered_map<int, std::unordered_map<int, int>>"
 ENTRY_POINTER_ARITH_RE = re.compile(r"entries\s*\.\s*data\s*\(|-\s*&\s*\w+(\.|->)entries\s*\[")
 
 
-def claim_the_plan_copy_shares_its_entries(cache_hpp: str, cache: str, sycl: str) -> bool:
+def claim_the_plan_copy_shares_its_entries(cache_hpp: str, cache: str, sycl: str, plan_hpp: str = PLAN_HPP) -> bool:
     h = norm(cache_hpp)
+    by_file = {"plan_hpp": norm(plan_hpp), "cache_hpp": h}
     b = body(norm(sycl), TXN_SIG)
     lend_at = b.find(LEND)
     members = set(re.findall(r"next_plan->(\w+)", b))
@@ -4848,6 +4854,7 @@ def claim_the_plan_copy_shares_its_entries(cache_hpp: str, cache: str, sycl: str
             and b.count(UNSHARE_LOOP) == 1 and lend_at >= 0 and ordered(b, HOIST_PLAN, UNSHARE_LOOP, LEND)
             and members == TXN_PLAN_MEMBERS and b.count("next_plan->entries") == 1 and b.count(COUNT_CLONES) == 1
             and whole == len(TXN_PLAN_WHOLE) and all(b.count(x) == 1 for x in TXN_PLAN_WHOLE)
+            and all(by_file[f].count(sig) == 1 for f, sig in TXN_PLAN_WHOLE_CONST)
             and all(f and len(ENTRIES_WORD_RE.findall(f)) == 1 and f.count(ENTRY_WRITE) == 1 for f in flips)
             and len(ENTRIES_WORD_RE.findall(unshare)) == 1 and unshare.count(UNSHARE_BODY) == 1
             and not any(ENTRY_POINTER_ARITH_RE.search(norm(src)) for src in (cache_hpp, cache, sycl)))
@@ -4912,6 +4919,20 @@ def test_mutant_flip_walks_the_entries_fails():
 def test_mutant_backing_flip_walks_the_entries_fails():
     mutant = _once_in(CACHE_HPP, BACKING_SIG, ENTRY_WRITE,
                       "for (placement_entry & x : entries) { (void) x; } " + ENTRY_WRITE)
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_triplet_bytes_takes_the_plan_writable_fails():
+    """The transaction's triplet sizing, handed the copy writable: every entry it reads would clone its chunk."""
+    mutant = _once(PLAN_HPP, TXN_PLAN_WHOLE_CONST[0][1],
+                   "static inline size_t moe_expert_triplet_dst_bytes(placement_plan & plan,")
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, SYCL, mutant)
+
+
+def test_mutant_same_workspace_takes_the_plan_writable_fails():
+    """The workspace comparison, handed the copy writable: every entry it reads would clone its chunk."""
+    mutant = _once(CACHE_HPP, TXN_PLAN_WHOLE_CONST[1][1],
+                   "bool moe_mmid_same_workspace_plan(const placement_plan & a, placement_plan & b) noexcept;")
     assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
 
 
