@@ -7894,6 +7894,46 @@ Everything else ran at `fc66837e4b`.
     weight.
   - The RAII hold's leak-on-failure path is the one allowlisted exemption (`E-MOE-BF16-GROUPED-HOLD`).
 
+### Task 24 on master (lead, 2026-11-27)
+
+**What.**
+- `feat/inkling2` took Task 24 by fast-forward to `89fcdd14f8`.
+- It then merged `fork/master` `10329edbd1` (the 89qc deferred-free index and the ppjj execution-result switch) at
+  `d69cbe7985`. The one conflict was the generated static-storage inventory. It was regenerated on the merged tree,
+  and `--check` and `--check-classification` return 0.
+- `fork/master` and `feat/inkling2` were fast-forwarded to `d69cbe7985`.
+
+Each device run below ran once on the merged tree's full build (911/911), B70 = `level_zero:0`, B50 = `level_zero:1`,
+pp / tg in t/s.
+- *Gates:* Inkling passes on the B70, the B50 and both cards. The Mistral B70 gate passes, and the GPT-OSS count gate
+  is 1 on the B50 and on the B70.
+- *Perplexity:* Inkling B70 is 7.5957.
+- *Long arm, B70:* 313.2 / 28.17, against 251.6 / 28.2 at `2a69aea88b`. Its text is byte-equal to Task 24's run, and
+  peak host backing is 17 GiB.
+- *Long arm, B50 alone, base and merged back to back:* 18.88 / 7.42 at `2a69aea88b` against 18.84 / 7.08 merged. Both
+  texts are byte-equal to the base's.
+  - A build in another checkout was alive at the end of both arms.
+  - The quiet-host decode reading is the ABBA row below: equal.
+- *Sweeps:* the audit returns rc 0. Sweep 1 shows three reds and sweep 2 shows one, the same four as at `2a69aea88b`.
+  The new `test-sycl-execution-result-map-source` passes.
+- *Interleaved ABBA against `2a69aea88b`, 8 repetitions per arm, every arm with no builder at either end, medians
+  a / b / b2 / a2:*
+
+  | model, card | pp | tg | verdict |
+  |---|---|---|---|
+  | Mistral, B70 | 3340.7 / 3342.1 / 3346.8 / 3347.6 | 111.66 / 111.86 / 111.79 / 111.97 | noise |
+  | GPT-OSS, B50 | 863.9 / 864.5 / 862.4 / 863.5 | 39.94 / 40.07 / 40.11 / 40.08 | equal |
+  | Inkling, B70 | 402.0 / 589.1 / 588.0 / 402.9 | 30.49 / 30.50 / 30.49 / 30.55 | pp +46%, tg equal |
+  | Inkling, B50 tg | | 11.14 / 11.12 / 11.18 / 11.17 | equal |
+
+  This confirms that Task 24's flagged Mistral row was the concurrent build.
+- *What the B70 long prompt is bound by now* (profile at `992568b6f8`, in the acceptance record above):
+  - The device time is 6.2 s per pass.
+  - The wall time is host-bound: 398,636 submissions per pass, about 193,000 of them the NVFP4 executor's per-expert
+    stage kernels.
+  - The next task batches those stage submissions. `llama.cpp-uop2` (the two host waits) and `llama.cpp-ff54` (one
+    ring-claim helper) follow.
+
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
 *Left by Task 21, step 1d (2026-11-24):*
