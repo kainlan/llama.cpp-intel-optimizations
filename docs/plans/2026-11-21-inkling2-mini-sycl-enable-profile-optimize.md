@@ -7700,8 +7700,13 @@ contracts. The builds and the host tests ran after the lead's "builds GO", and t
     - `test-llama-context-cpu-only-compile` fails: `src/llama-context.cpp` uses `llama_context_sycl_device_index`
       with neither `GGML_USE_SYCL` nor `GGML_BACKEND_DL` defined. `src/` is unchanged in the range, so the failure
       is older than this task.
-  - Not run here: the remaining 22 contracts left out above, and every device test. Those are the lead's, among them
-    `test-moe-bf16-grouped-device` (11 cases) and `test-moe-pp-staging-refusal`.
+  - Not run here:
+    - The remaining 22 contracts left out above. Five are the GPU and lifecycle tests on `build/bin`, which are the
+      lead's. The other 17 were not run at all: `test-skip-policy`, `test-moe-cache-sim` and the fifteen script
+      tests.
+    - Every device test. Those are the lead's, among them `test-moe-bf16-grouped-device` (11 cases, the eleventh never
+      run yet) and `test-moe-pp-staging-refusal`.
+    - The build without oneDNN, where `src1` and the `[[maybe_unused]]` counter change what compiles.
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
