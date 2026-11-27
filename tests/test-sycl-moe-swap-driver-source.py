@@ -335,11 +335,15 @@ ENTRY_SELF_DELTA = "r.room_self_delta = answer.room_self_delta;"
 # total too.
 ENTRY_COST = ("r.meta_us = answer.meta_us;", "r.copy_us = answer.copy_us;", "r.remap_us = answer.remap_us;",
               "r.total_us = ggml_sycl::expert_move_us_since(call_start);",
-              "r.plan_chunks_cloned = answer.plan_chunks_cloned;")
-# The transaction counts the plan chunks its plan copy cloned once its moves are done, whether or not it publishes.
+              "r.plan_chunks_cloned = answer.plan_chunks_cloned;",
+              "r.view_scan_fallbacks = answer.view_scan_fallbacks;")
+# The transaction counts the plan chunks its plan copy cloned once its moves are done, whether or not it publishes, and
+# with them the lent-view drops that walked a whole table because the moved expert's own slot did not hold the entry.
 TXN_CLONES = "result.plan_chunks_cloned = next_plan->entries.chunks_cloned();"
+TXN_WALKS = "result.view_scan_fallbacks = view_scan_fallbacks;"
 COUNT_COST_FIELDS = ("st.txn_copy_us += c.copy_us;", "st.txn_remap_us += c.remap_us;", "st.txn_meta_us += c.meta_us;",
-                     "st.txn_total_us += c.total_us;", "st.txn_plan_chunks_cloned += c.plan_chunks_cloned;")
+                     "st.txn_total_us += c.total_us;", "st.txn_plan_chunks_cloned += c.plan_chunks_cloned;",
+                     "st.txn_view_scan_fallbacks += c.view_scan_fallbacks;")
 ENTRY_CLOCK = ("ggml_sycl_expert_loan_result answer; const auto call_start = std::chrono::steady_clock::now(); "
                "const ggml_sycl_txn_result code = ggml_sycl_expert_txn_run(")
 COUNT_COST = ("moe_swap_detail::moe_swap_count_cost(st, room.cost);",
@@ -350,7 +354,8 @@ EPOCH_AFTER_READ = ("ggml_sycl_expert_move_transaction_run(device, request, reso
 # The cost is built field by field: the result orders its parts meta, copy, remap and the cost copy, remap, meta.
 TXN_COST_FIELDS = ("ggml_sycl::moe_swap_txn_cost cost; cost.copy_us = result.copy_us; cost.remap_us = result.remap_us; "
                    "cost.meta_us = result.meta_us; cost.total_us = result.total_us; "
-                   "cost.plan_chunks_cloned = result.plan_chunks_cloned; ")
+                   "cost.plan_chunks_cloned = result.plan_chunks_cloned; "
+                   "cost.view_scan_fallbacks = result.view_scan_fallbacks; ")
 TXN_ROOM_RETURN = (TXN_COST_FIELDS +
                    "return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };")
 ROOM_STOOD_BODY = "return room.epoch_after - before == room.self_delta;"
@@ -913,10 +918,12 @@ def check(raw: dict[str, str]) -> None:
     if (any(norm(driver).count(c) != 1 for c in COUNT_COST)
             or norm(driver).count("inline void moe_swap_count_cost(") != 1
             or any(norm(body(driver, "inline void moe_swap_count_cost(")).count(c) != 1 for c in COUNT_COST_FIELDS)
-            or txn.count(TXN_CLONES) != 1 or sycl.count("plan_chunks_cloned = next_plan->") != 1):
+            or txn.count(TXN_CLONES) != 1 or norm(sycl).count("plan_chunks_cloned = next_plan->") != 1
+            or txn.count(TXN_WALKS) != 1 or not ordered(txn, TXN_CLONES, TXN_WALKS)):
         fail("D20", "the step does not sum each transaction's cost, every field including the plan chunks its "
-                    "plan copy cloned, into the stats once, at the admit transaction and at the evict one, or the "
-                    "transaction does not count the chunks its plan copy cloned")
+                    "plan copy cloned and the lent-view table walks, into the stats once, at the admit transaction "
+                    "and at the evict one, or the transaction does not count the chunks its plan copy cloned and "
+                    "the drops that walked a table")
     if norm(body(driver, ROOM_STOOD_SIG)).count(ROOM_STOOD_BODY) != 1:
         fail("D20", "moe_swap_room_stood does not compare the epoch's move since the boundary's read with the "
                     "transaction's own sum")
@@ -1373,10 +1380,18 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("plan-chunks-cost-not-summed", "D20",
                 [("driver", "", "st.txn_plan_chunks_cloned += c.plan_chunks_cloned;", "")])
     expect_fail("plan-chunks-not-counted-by-the-transaction", "D20",
-                [("sycl", TXN_SIG, "result.plan_chunks_cloned = next_plan->entries.chunks_cloned();", "")])
+                [("sycl", TXN_SIG, "result.plan_chunks_cloned  = next_plan->entries.chunks_cloned();", "")])
     expect_fail("plan-chunks-counted-from-a-fresh-copy", "D20",
-                [("sycl", TXN_SIG, "result.plan_chunks_cloned = next_plan->entries.chunks_cloned();",
-                  "result.plan_chunks_cloned = current->plan->entries.chunks_cloned();")])
+                [("sycl", TXN_SIG, "result.plan_chunks_cloned  = next_plan->entries.chunks_cloned();",
+                  "result.plan_chunks_cloned  = current->plan->entries.chunks_cloned();")])
+    expect_fail("view-walks-not-reported-by-the-transaction", "D20",
+                [("sycl", TXN_SIG, "    result.view_scan_fallbacks = view_scan_fallbacks;\n", "")])
+    expect_fail("view-walks-not-carried-by-the-entry", "D20",
+                [("sycl", ENTRY_SIG, "r.view_scan_fallbacks = answer.view_scan_fallbacks;", "")])
+    expect_fail("view-walks-not-built-by-the-callback", "D20",
+                [("sycl", CORE_SIG, "cost.view_scan_fallbacks = result.view_scan_fallbacks;", "")])
+    expect_fail("view-walks-not-summed", "D20",
+                [("driver", "", "st.txn_view_scan_fallbacks += c.view_scan_fallbacks;", "")])
     clock = "    const auto                   call_start = std::chrono::steady_clock::now();\n"
     for field, anchor in (("meta", "answer->meta_us         = meta_us;\n"),
                           ("copy", "answer->copy_us         = copy_us;\n"),

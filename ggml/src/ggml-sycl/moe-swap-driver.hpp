@@ -167,6 +167,9 @@ struct moe_swap_txn_cost {
     // The placement plan's entry chunks the transaction's copy of the plan cloned to record its moves: the
     // copy-on-write's cost, so a change that makes the publication clone the whole plan again shows in the summary.
     uint64_t plan_chunks_cloned = 0;
+    // The transaction's lent-view drops that walked a whole route table or hybrid decode record because the moved
+    // expert's own slot did not hold the retired entry: a view the slot rule missed is still dropped, and counted here.
+    uint64_t view_scan_fallbacks = 0;
 };
 
 // What a transaction says of the device zone's room epoch once it has returned. A transaction moves the epoch itself
@@ -291,6 +294,7 @@ struct moe_swap_driver_stats {
     uint64_t                           txn_meta_us              = 0;
     uint64_t                           txn_total_us             = 0;
     uint64_t                           txn_plan_chunks_cloned   = 0;
+    uint64_t                           txn_view_scan_fallbacks  = 0;
     const char *                       off_reason               = nullptr;
     std::vector<moe_swap_reason_count> refused;
     std::vector<moe_swap_reason_count> busy;
@@ -385,6 +389,7 @@ inline void moe_swap_count_cost(moe_swap_driver_stats & st, const moe_swap_txn_c
     st.txn_meta_us += c.meta_us;
     st.txn_total_us += c.total_us;
     st.txn_plan_chunks_cloned += c.plan_chunks_cloned;
+    st.txn_view_scan_fallbacks += c.view_scan_fallbacks;
 }
 
 inline bool moe_swap_view_fits(const moe_swap_driver_state & d, const moe_swap_plan_view & v) {
@@ -955,12 +960,12 @@ inline std::string moe_swap_driver_summary_faults(const moe_swap_driver_stats & 
                   "; settled from the plan after a throw: %llu batches (%llu moves moved); unsettled at report: %llu "
                   "moves",
                   (ull) st.settled_batches, (ull) st.settled_moved, (ull) st.unsettled_moves);
-    char cost[256];
+    char cost[320];
     std::snprintf(cost, sizeof(cost),
                   "; transaction cost over %llu: copy submit %llu us, id remap %llu us, meta lookup %llu us, total "
-                  "%llu us, plan chunks cloned %llu",
+                  "%llu us, plan chunks cloned %llu, lent-view table walks %llu",
                   (ull) st.txn_sent, (ull) st.txn_copy_us, (ull) st.txn_remap_us, (ull) st.txn_meta_us,
-                  (ull) st.txn_total_us, (ull) st.txn_plan_chunks_cloned);
+                  (ull) st.txn_total_us, (ull) st.txn_plan_chunks_cloned, (ull) st.txn_view_scan_fallbacks);
     std::string out = std::string(head) + tail + cost +
                       "; refused: " + moe_swap_detail::moe_swap_reason_list(st.refused) +
                       "; busy: " + moe_swap_detail::moe_swap_reason_list(st.busy) +

@@ -22471,6 +22471,9 @@ struct ggml_sycl_expert_loan_result {
     // The plan chunks the call's copy of the published plan cloned to record its moves (cow_chunked_vector): what the
     // publication cost beyond the copy's chunk pointers. 0 for a call that copied no plan.
     uint64_t     plan_chunks_cloned = 0;
+    // The lent-view drops that walked a whole route table or hybrid decode record because the slot of the moved expert
+    // did not hold the retired entry (ggml_sycl_drop_lent_expert_views). 0 when every drop found its view in place.
+    uint64_t     view_scan_fallbacks = 0;
     const char * reason           = "none";
 };
 
@@ -23058,12 +23061,16 @@ static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache & 
 
 // Defined with the record, whose type is incomplete here: replaces `held` with a copy of it whose slots that lease the
 // device entry `withdrawn` on `device` are empty, moving those slots' leases into `retained` and their expert ids into
-// `emptied`. Returns false, leaving `held` as it is, when no slot leases the entry.
+// `emptied`. Returns false, leaving `held` as it is, when no slot leases the entry. Expert `expert_id`'s own slot is
+// checked first; a record whose slot does not lease the entry is walked whole, and the walk is counted in
+// `scan_fallbacks`.
 static bool ggml_sycl_moe_hybrid_decode_record_withdraw(std::shared_ptr<const moe_hybrid_decode_record> & held,
                                                         int                                               device,
+                                                        int                                               expert_id,
                                                         const ggml_sycl::unified_cache_key &              withdrawn,
                                                         std::vector<ggml_sycl::mem_handle> &              retained,
-                                                        std::vector<int32_t> &                            emptied);
+                                                        std::vector<int32_t> &                            emptied,
+                                                        uint32_t & scan_fallbacks);
 
 // Take every view `extra` holds of the device entry a loan or an evict retired under `withdrawn` off the extra, keeping
 // a lease on each in `retained`. The caller keeps `retained` until the device's queue passes a barrier, so no kernel
@@ -23078,12 +23085,17 @@ static bool ggml_sycl_moe_hybrid_decode_record_withdraw(std::shared_ptr<const mo
 // it names may be lent next), and the hybrid decode record's slots that lease the entry (withdrawn from a copy, their
 // leases retained; the copy keeps the other slots). Dropping any of them marks the device table stale, so the next
 // MUL_MAT_ID or preload rebuilds it under the plan the move publishes, and moves the storage generation for each
-// expert it changed.
+// expert it changed. No view is found by a walk: the pointer table's leases are keyed by the entry they hold, and the
+// route table and the hybrid decode record name each expert at its own id, where an expert move's retired entry is
+// (the move refuses a device copy that shares another expert's storage). A route table or record whose slot for
+// `expert_id` does not hold the entry is still walked whole, so no view is missed, and each such walk is counted in
+// `scan_fallbacks`, which the swap summary prints.
 static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *              extra,
                                              int                                  device,
                                              int                                  expert_id,
                                              const ggml_sycl::unified_cache_key & withdrawn,
-                                             std::vector<ggml_sycl::mem_handle> & retained) {
+                                             std::vector<ggml_sycl::mem_handle> & retained,
+                                             uint32_t &                           scan_fallbacks) {
     // Boundary premise: a loan runs after synchronize's stream wait and an evict between graphs; the retention
     // covers work still on the queue.
     if (!extra || !extra->weight_ext || expert_id < 0 || !ggml_sycl_valid_device_index(device)) {
@@ -23127,35 +23139,31 @@ static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
         stored = true;
     }
 
-    std::vector<ggml_sycl::mem_handle> & leases = w.moe_expert_ptrs_leases[device];
-    for (const ggml_sycl::mem_handle & lease : leases) {
-        if (on_entry(lease)) {
-            retained.push_back(lease);
-        }
-    }
-    const size_t n_leases = leases.size();
-    leases.erase(std::remove_if(leases.begin(), leases.end(), on_entry), leases.end());
-    table_dropped = leases.size() != n_leases;
+    table_dropped =
+        w.moe_expert_ptrs_leases[device].take_key(ggml_sycl::moe_lease_key{ device, withdrawn }, retained) != 0;
 
-    ggml_sycl::moe_route_table & routes = w.moe_route_tables[device];
-    for (const ggml_sycl::moe_route_entry & route : routes.experts) {
-        if (on_entry(route.lease)) {
-            for (const ggml_sycl::moe_route_entry & held : routes.experts) {
-                if (held.lease.valid()) {
-                    retained.push_back(held.lease);
-                }
+    ggml_sycl::moe_route_table & routes      = w.moe_route_tables[device];
+    bool                         route_holds = slot < routes.experts.size() && on_entry(routes.experts[slot].lease);
+    if (!route_holds && !routes.experts.empty()) {
+        ++scan_fallbacks;
+        route_holds = std::any_of(routes.experts.begin(), routes.experts.end(),
+                                  [&](const ggml_sycl::moe_route_entry & route) { return on_entry(route.lease); });
+    }
+    if (route_holds) {
+        for (ggml_sycl::moe_route_entry & held : routes.experts) {
+            if (held.lease.valid()) {
+                retained.push_back(std::move(held.lease));
             }
-            routes.invalidate();
-            table_dropped = true;
-            break;
         }
+        routes.invalidate();
+        table_dropped = true;
     }
     // The hybrid decode record keeps every slot but those that lease the entry, and its stamp: the generation moves for
     // each expert the drop changed, so the next lookup is a generation miss that patches those slots from wherever the
     // experts are then, and never serves the withdrawn copy, whose table still names the retired weight.
     std::vector<int32_t> emptied;
-    if (ggml_sycl_moe_hybrid_decode_record_withdraw(w.moe_hybrid_decode[device], device, withdrawn, retained,
-                                                    emptied)) {
+    if (ggml_sycl_moe_hybrid_decode_record_withdraw(w.moe_hybrid_decode[device], device, expert_id, withdrawn, retained,
+                                                    emptied, scan_fallbacks)) {
         table_dropped = true;
     }
 
@@ -23464,6 +23472,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     std::exception_ptr                 escaped;
     // A loan's or an evict's drops keep a lease on every view they take here, retained after the loop.
     std::vector<ggml_sycl::mem_handle> lent_views;
+    // The drops that walked a whole table to find a view (ggml_sycl_expert_loan_result::view_scan_fallbacks).
+    uint32_t                           view_scan_fallbacks = 0;
 
     // The leases each move to the host hands over on the device entries it retired (expert_move_record::
     // retired_leases), held until this call returns. The deferred-free pass reaps a retired entry once its last lease
@@ -23553,7 +23563,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
                 for (int r = 0; r < 3; ++r) {
                     const ggml_sycl::expert_placement_key & k     = triplet.members[r].placement;
                     ggml_tensor_extra_gpu *                 extra = triplet.extras[r];
-                    ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views);
+                    ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views,
+                                                     view_scan_fallbacks);
                     (void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);
                 }
             }
@@ -23645,7 +23656,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
         }
     }
     // What the moves cost the plan's copy, counted whether or not the copy is published.
-    result.plan_chunks_cloned = next_plan->entries.chunks_cloned();
+    result.plan_chunks_cloned  = next_plan->entries.chunks_cloned();
+    result.view_scan_fallbacks = view_scan_fallbacks;
     // The triplet the preparation could not prepare leaves the ledger only from its back: every triplet selected before
     // it has moved, and the publication is the one it was selected under (checked above). Behind a triplet that did not
     // move, it stays, and a later boundary meets it again.
@@ -23805,6 +23817,8 @@ struct ggml_sycl_expert_move_result {
     uint64_t                                   total_us        = 0;
     // The plan chunks the publication cloned (ggml_sycl_expert_loan_result::plan_chunks_cloned).
     uint64_t                                   plan_chunks_cloned = 0;
+    // The lent-view drops that walked a whole table (ggml_sycl_expert_loan_result::view_scan_fallbacks).
+    uint64_t                                   view_scan_fallbacks = 0;
     const char *                               reason          = "none";
     std::vector<ggml_sycl_expert_move_outcome> evicted;
     std::vector<ggml_sycl_expert_move_outcome> admitted;
@@ -23860,6 +23874,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int           
         r.remap_us        = answer.remap_us;
         r.total_us        = ggml_sycl::expert_move_us_since(call_start);
         r.plan_chunks_cloned = answer.plan_chunks_cloned;
+        r.view_scan_fallbacks = answer.view_scan_fallbacks;
         for (ggml_sycl_expert_move_outcome & m : moves) {
             if (m.moved) {
                 ++(m.to_device ? r.n_admitted : r.n_evicted);
@@ -24686,6 +24701,7 @@ static void ggml_sycl_run_expert_swap_claimed(int                               
             cost.meta_us  = result.meta_us;
             cost.total_us = result.total_us;
             cost.plan_chunks_cloned = result.plan_chunks_cloned;
+            cost.view_scan_fallbacks = result.view_scan_fallbacks;
             return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };
         });
 }
@@ -73574,13 +73590,12 @@ static void ggml_sycl_set_moe_ptr_table_leases(ggml_tensor_extra_gpu *          
     }
 
     if (!active_leases.empty()) {
-        std::vector<ggml_sycl::mem_handle> old_leases = std::move(active_leases);
-        active_leases.clear();
+        std::vector<ggml_sycl::mem_handle> old_leases = active_leases.take_all();
         if (stream) {
             ggml_sycl::retain_handles_until_event(std::move(old_leases), stream->ext_oneapi_submit_barrier());
         }
     }
-    active_leases = std::move(leases);
+    active_leases.assign(std::move(leases));
 }
 
 void ggml_sycl_retain_moe_ptr_table_leases_until_event(ggml_tensor_extra_gpu * extra, int device, sycl::event event) {
@@ -73595,8 +73610,7 @@ void ggml_sycl_retain_moe_ptr_table_leases_until_event(ggml_tensor_extra_gpu * e
     if (active_leases.empty()) {
         return;
     }
-    std::vector<ggml_sycl::mem_handle> leases = std::move(active_leases);
-    active_leases.clear();
+    std::vector<ggml_sycl::mem_handle> leases = active_leases.take_all();
     ggml_sycl::retain_handles_until_event(std::move(leases), std::move(event));
 }
 
@@ -77239,15 +77253,11 @@ static bool ggml_sycl_release_moe_ptr_table_leases_for_layout(const ggml_tensor 
         return false;
     }
 
-    const size_t before = active_leases.size();
-    active_leases.erase(std::remove_if(active_leases.begin(), active_leases.end(),
-                                       [&](const ggml_sycl::mem_handle & handle) {
-                                           auto resolved = handle.resolve(device);
-                                           return resolved.ptr && resolved.layout == layout &&
-                                                  (!resolved.on_device || handle.device() == device);
-                                       }),
-                        active_leases.end());
-    const size_t removed = before - active_leases.size();
+    const size_t before  = active_leases.size();
+    const size_t removed = active_leases.remove_if([&](const ggml_sycl::mem_handle & handle) {
+        auto resolved = handle.resolve(device);
+        return resolved.ptr && resolved.layout == layout && (!resolved.on_device || handle.device() == device);
+    });
     if (removed == 0) {
         return false;
     }
@@ -91692,22 +91702,40 @@ static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_d
 
 static bool ggml_sycl_moe_hybrid_decode_record_withdraw(std::shared_ptr<const moe_hybrid_decode_record> & held,
                                                         int                                               device,
+                                                        int                                               expert_id,
                                                         const ggml_sycl::unified_cache_key &              withdrawn,
                                                         std::vector<ggml_sycl::mem_handle> &              retained,
-                                                        std::vector<int32_t> &                            emptied) {
+                                                        std::vector<int32_t> &                            emptied,
+                                                        uint32_t & scan_fallbacks) {
     // The drop's own match: by the retired entry's key, never by a resolve, which a retired entry refuses.
     const auto on_entry = [&](const ggml_sycl::mem_handle & h) {
         return h.is_weight() && h.device() == device && h.key() == withdrawn;
     };
-    // A key compare per slot, run once per loan or evict, as the drop's other lease scans beside it are.
-    if (!held || std::none_of(held->lease.begin(), held->lease.end(), on_entry)) {
+    if (!held) {
         return false;
+    }
+    // The retired entry backs only its own expert's slot (an expert move refuses shared storage), so that slot is
+    // asked first, and alone is emptied when it holds the entry. Otherwise every slot is asked, so a view the slot rule
+    // would miss is still withdrawn, and the walk is counted.
+    const bool at_slot = ggml_sycl::moe_hybrid_record_slot_matches(held->lease, expert_id, on_entry);
+    if (!at_slot) {
+        ++scan_fallbacks;
+        if (std::none_of(held->lease.begin(), held->lease.end(), on_entry)) {
+            return false;
+        }
     }
     // A published record is never written: a CPU job or a queued table copy may still read it. The copy shares every
     // other slot's lease and the table, so only the withdrawn leases need the drop's retention.
     auto copy = std::make_shared<moe_hybrid_decode_record>(*held);
-    copy->n_withdrawn += ggml_sycl::moe_hybrid_record_withdraw(copy->device_weight, copy->host_weight, copy->lease,
-                                                               on_entry, &retained, &emptied);
+    if (at_slot) {
+        copy->n_withdrawn += ggml_sycl::moe_hybrid_record_withdraw_slot(copy->device_weight, copy->host_weight,
+                                                                        copy->lease, expert_id, &retained, &emptied) ?
+                                 1 :
+                                 0;
+    } else {
+        copy->n_withdrawn += ggml_sycl::moe_hybrid_record_withdraw(copy->device_weight, copy->host_weight, copy->lease,
+                                                                   on_entry, &retained, &emptied);
+    }
     held = std::move(copy);
     return true;
 }

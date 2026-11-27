@@ -525,6 +525,43 @@ static int test_withdraw() {
     return 0;
 }
 
+// The drop's slot-direct form: an expert move's retired entry backs only its own expert's slot, so the drop empties
+// that one slot when it leases the entry, and walks every slot (the form above) only when it does not.
+static int test_withdraw_slot() {
+    int                       w[4]          = {};
+    std::vector<const void *> device_weight = { &w[0], nullptr, &w[2], nullptr };
+    std::vector<const void *> host_weight   = { nullptr, &w[1], nullptr, &w[3] };
+    std::vector<fake_lease>   lease         = { lease_of(0), lease_of(1), lease_of(2), lease_of(3) };
+    const int *               retired       = lease[2].storage.get();
+    const auto                on_entry      = [retired](const fake_lease & l) {
+        return l.storage.get() == retired;
+    };
+
+    CHECK(ggml_sycl::moe_hybrid_record_slot_matches(lease, 2, on_entry), "the retired expert's own slot matches");
+    CHECK(!ggml_sycl::moe_hybrid_record_slot_matches(lease, 1, on_entry), "another expert's slot does not");
+    CHECK(!ggml_sycl::moe_hybrid_record_slot_matches(lease, 4, on_entry) &&
+              !ggml_sycl::moe_hybrid_record_slot_matches(lease, -1, on_entry),
+          "an expert outside the record has no slot to match");
+
+    std::vector<fake_lease> retained;
+    std::vector<int32_t>    emptied;
+    CHECK(ggml_sycl::moe_hybrid_record_withdraw_slot(device_weight, host_weight, lease, 2, &retained, &emptied),
+          "the slot is emptied");
+    CHECK(retained.size() == 1 && retained[0].storage.get() == retired && emptied == std::vector<int32_t>({ 2 }),
+          "its lease is retained and its expert named");
+    CHECK(device_weight[2] == nullptr && host_weight[2] == nullptr && !lease[2].valid(),
+          "the slot names no weight and holds no lease");
+    CHECK(lease[0].valid() && lease[1].valid() && lease[3].valid() && device_weight[0] == &w[0] &&
+              host_weight[1] == &w[1] && host_weight[3] == &w[3],
+          "every other slot keeps its weight and its lease");
+    CHECK(!ggml_sycl::moe_hybrid_record_withdraw_slot(device_weight, host_weight, lease, 2, &retained, &emptied) &&
+              retained.size() == 1,
+          "an empty slot has nothing to withdraw");
+    CHECK(!ggml_sycl::moe_hybrid_record_withdraw_slot(device_weight, host_weight, lease, 9, &retained, &emptied),
+          "an expert outside the record has no slot");
+    return 0;
+}
+
 // The per-token counts of what the patches did, and of the slots loans and evicts had withdrawn from the records the
 // lookups replaced: the one sign on a device that a drop matched a record slot by the entry it retired.
 static int test_trace_patches() {
@@ -544,7 +581,7 @@ static int test_trace_patches() {
 int main() {
     if (test_miss_classify() != 0 || test_trace_tokens() != 0 || test_trace_line() != 0 || test_change_log() != 0 ||
         test_patch_plan() != 0 || test_install() != 0 || test_shape() != 0 || test_plan_frame() != 0 ||
-        test_withdraw() != 0 || test_trace_patches() != 0) {
+        test_withdraw() != 0 || test_withdraw_slot() != 0 || test_trace_patches() != 0) {
         return 1;
     }
     std::printf("OK: moe hybrid decode record bookkeeping\n");

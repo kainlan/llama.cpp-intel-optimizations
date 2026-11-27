@@ -563,6 +563,16 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-cow-chunked-vector PROPERTIES LABELS "sycl;hostonly" TIMEOUT 30)
 endif()
 
+# The keyed handle bag the MoE pointer table's per-expert leases live in: every lease on one cache entry comes out by
+# an index lookup, not a walk of the bag. ggml-sycl/keyed-handle-bag.hpp includes only the standard library, so the
+# test links nothing: no SYCL runtime is loaded and no device is opened.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-keyed-handle-bag test-sycl-keyed-handle-bag.cpp)
+    target_include_directories(test-sycl-keyed-handle-bag PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-sycl-keyed-handle-bag COMMAND test-sycl-keyed-handle-bag)
+    set_tests_properties(test-sycl-keyed-handle-bag PROPERTIES LABELS "sycl;hostonly" TIMEOUT 30)
+endif()
+
 # The CPU expert pool trace's per-job stamp sums and per-job line (llama.cpp-j6jf).
 # ggml-sycl/cpu-expert-pool-stamps.hpp includes only the standard library, so the
 # test links nothing: no SYCL runtime is loaded and no device is opened.

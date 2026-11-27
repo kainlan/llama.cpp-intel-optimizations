@@ -191,6 +191,47 @@ size_t moe_hybrid_record_withdraw(std::vector<const void *> & device_weight,
     return emptied;
 }
 
+// Whether expert `expert`'s own slot leases what `matches` names. An expert move refuses a device copy that shares
+// storage with another expert's, so the entry a loan or evict retired backs only its own expert's slot: the drop asks
+// this first and walks every slot (moe_hybrid_record_withdraw) only when it says no.
+template <typename Leases, typename Match>
+bool moe_hybrid_record_slot_matches(const Leases & lease, int64_t expert, const Match & matches) {
+    if (expert < 0 || static_cast<size_t>(expert) >= lease.size()) {
+        return false;
+    }
+    const auto & held = lease[static_cast<size_t>(expert)];
+    return held.valid() && matches(held);
+}
+
+// Empties expert `expert`'s slot alone, in a copy of a record's slot arrays: its weights and its lease, which moves
+// into *withdrawn, and appends the expert's id to *experts. Returns false, changing nothing, when the expert has no
+// slot or its slot holds no lease.
+template <typename Leases>
+bool moe_hybrid_record_withdraw_slot(std::vector<const void *> &                device_weight,
+                                     std::vector<const void *> &                host_weight,
+                                     Leases &                                   lease,
+                                     int64_t                                    expert,
+                                     std::vector<typename Leases::value_type> * withdrawn,
+                                     std::vector<int32_t> *                     experts) {
+    if (expert < 0 || static_cast<size_t>(expert) >= lease.size()) {
+        return false;
+    }
+    const size_t e = static_cast<size_t>(expert);
+    if (!std::as_const(lease)[e].valid()) {
+        return false;
+    }
+    withdrawn->push_back(std::move(lease[e]));
+    lease[e] = typename Leases::value_type{};
+    if (e < device_weight.size()) {
+        device_weight[e] = nullptr;
+    }
+    if (e < host_weight.size()) {
+        host_weight[e] = nullptr;
+    }
+    experts->push_back(static_cast<int32_t>(e));
+    return true;
+}
+
 // What a record's slots add up to. A slot stands when it names exactly one weight and holds a lease on it.
 struct moe_hybrid_record_shape {
     size_t       n_device   = 0;

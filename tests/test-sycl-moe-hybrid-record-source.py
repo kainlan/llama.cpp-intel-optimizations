@@ -57,7 +57,11 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
       GGML_SYCL_MOE_HYBRID_RECORD_PATCH is read once;
   T12 an expert loan or evict (ggml_sycl_drop_lent_expert_views) withdraws only the record's slots that lease the
       entry it retired, from a copy it publishes in the held record's place (never the held one), counting them on the
-      copy and moving their leases into the drop's retention; it keeps the stamp, and notes every expert it emptied,
+      copy and moving their leases into the drop's retention. It asks the moved expert's own slot first and empties
+      that slot alone when it holds the entry (an expert move refuses a device copy that shares storage, so the entry
+      backs only that slot); otherwise it asks every slot and counts the walk in the drop's scan_fallbacks, which the
+      swap summary prints, so a view the slot rule misses is still withdrawn and shows. It keeps the stamp, and notes
+      every expert it emptied,
       so the next lookup is a generation miss the patch serves. That lookup counts the withdrawn slots in the trace,
       once, between the held record's binding and the patch plan, and the replaced record's retained handles skip a
       withdrawn slot's empty lease;
@@ -325,8 +329,8 @@ WITHDRAW_SIG = "static bool ggml_sycl_moe_hybrid_decode_record_withdraw("
 WITHDRAW_DECL = ("static bool ggml_sycl_moe_hybrid_decode_record_withdraw("
                  "std::shared_ptr<const moe_hybrid_decode_record> "
                  "& held,")
-DROP_WITHDRAW = ("if (ggml_sycl_moe_hybrid_decode_record_withdraw(w.moe_hybrid_decode[device], device, withdrawn, "
-                 "retained, emptied)) { table_dropped = true; }")
+DROP_WITHDRAW = ("if (ggml_sycl_moe_hybrid_decode_record_withdraw(w.moe_hybrid_decode[device], device, expert_id, "
+                 "withdrawn, retained, emptied, scan_fallbacks)) { table_dropped = true; }")
 DROP_NOTES = NOTE_SITES[6][2]
 DROP_RETIRED = ("moe_hybrid_decode_stamp", "moe_hybrid_decode[device].reset()",
                 "ggml_sycl_moe_hybrid_decode_record_append_handles(")
@@ -340,12 +344,19 @@ WITHDRAWN_COUNT = ("if (trace > 0 && held && held->n_withdrawn > 0) { "
 APPEND_SIG = "static void ggml_sycl_moe_hybrid_decode_record_append_handles("
 APPEND_LEASES = "for (const ggml_sycl::mem_handle & h : record.lease) { if (h.valid()) { out.push_back(h); } }"
 WITHDRAW_STEPS = (
-    ("test that a slot leases the entry",
-     "if (!held || std::none_of(held->lease.begin(), held->lease.end(), on_entry)) { return false; }"),
+    ("return with no held record", "if (!held) { return false; }"),
+    ("test that the moved expert's own slot leases the entry",
+     "const bool at_slot = ggml_sycl::moe_hybrid_record_slot_matches(held->lease, expert_id, on_entry);"),
+    ("counted walk of every slot when it does not",
+     "if (!at_slot) { ++scan_fallbacks; if (std::none_of(held->lease.begin(), held->lease.end(), on_entry)) { "
+     "return false; } }"),
     ("copy of the held record", "auto copy = std::make_shared<moe_hybrid_decode_record>(*held);"),
-    ("withdrawal from the copy, counted on it, its leases into the drop's retention",
-     "copy->n_withdrawn += ggml_sycl::moe_hybrid_record_withdraw(copy->device_weight, copy->host_weight, copy->lease, "
-     "on_entry, &retained, &emptied);"),
+    ("withdrawal of the one slot from the copy, counted on it, its lease into the drop's retention",
+     "if (at_slot) { copy->n_withdrawn += ggml_sycl::moe_hybrid_record_withdraw_slot(copy->device_weight, "
+     "copy->host_weight, copy->lease, expert_id, &retained, &emptied) ? 1 : 0; }"),
+    ("withdrawal of every matching slot from the copy otherwise, counted on it, their leases into the retention",
+     "else { copy->n_withdrawn += ggml_sycl::moe_hybrid_record_withdraw(copy->device_weight, copy->host_weight, "
+     "copy->lease, on_entry, &retained, &emptied); }"),
     ("publication of the copy", "held = std::move(copy);"),
 )
 # The fixture's store clear, inside a lambda of a private test function: matched in the squashed file text.
@@ -1103,12 +1114,27 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("drop-withdraws-unnoted", "T12", B,
                 [("    std::vector<int32_t> emptied;\n",
                   "    std::vector<int32_t> emptied;\n    std::vector<int32_t> unnoted;\n"),
-                 ("                                                    emptied)) {",
-                  "                                                    unnoted)) {")])
+                 ("                                                    emptied, scan_fallbacks)) {",
+                  "                                                    unnoted, scan_fallbacks)) {")])
     expect_fail("withdraw-writes-held", "T12", B,
                 [("    auto copy = std::make_shared<moe_hybrid_decode_record>(*held);",
                   "    auto * copy = const_cast<moe_hybrid_decode_record *>(held.get());")])
-    expect_fail("withdraw-uncounted", "T12", B, [("    copy->n_withdrawn += ggml_sycl::", "    (void) ggml_sycl::")])
+    expect_fail("withdraw-uncounted", "T12", B,
+                [("        copy->n_withdrawn += ggml_sycl::moe_hybrid_record_withdraw(",
+                  "        (void) ggml_sycl::moe_hybrid_record_withdraw(")])
+    expect_fail("withdraw-slot-uncounted", "T12", B,
+                [("        copy->n_withdrawn += ggml_sycl::moe_hybrid_record_withdraw_slot(",
+                  "        (void) ggml_sycl::moe_hybrid_record_withdraw_slot(")])
+    expect_fail("withdraw-walks-uncounted", "T12", B, [("        ++scan_fallbacks;\n        if (std::none_of(",
+                                                         "        if (std::none_of(")])
+    expect_fail("withdraw-never-walks", "T12", B,
+                [("        if (std::none_of(held->lease.begin(), held->lease.end(), on_entry)) {\n"
+                  "            return false;\n        }\n", "        return false;\n")])
+    expect_fail("withdraw-slot-never-asked", "T12", B,
+                [("    const bool at_slot = ggml_sycl::moe_hybrid_record_slot_matches("
+                  "held->lease, expert_id, on_entry);", "    const bool at_slot = false;")])
+    expect_fail("withdraw-slot-empties-every-match", "T12", B,
+                [("    if (at_slot) {\n        copy->n_withdrawn", "    if (false) {\n        copy->n_withdrawn")])
     expect_fail("withdraw-unpublished", "T12", B, [("    held = std::move(copy);\n", "")])
     expect_fail("withdraw-matches-by-resolve", "T12", B,
                 [("    const auto on_entry = [&](const ggml_sycl::mem_handle & h) {\n        return h.is_weight() &&",
