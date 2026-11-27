@@ -7104,6 +7104,53 @@ No code change closes it: one rerun with `GGML_SYCL_FA_DISPATCH_DEBUG=1 GGML_SYC
 (the limit the masked-nonfinite harness sets for itself) prints every dispatch. Still owed at merge: that rerun, the
 Mistral B70 and GPT-OSS B50 gates (running when this was written), and the interleaved pp pair.
 
+### Tasks 22a and 23 on master (lead, 2026-11-26)
+
+**What.** `feat/inkling2` merged Task 22a (`7a0c6ad41f`) and Task 23 (`85be715449`), regenerated the inventory at
+`753da57b1b`, then merged `fork/master` `1b601f5d0b` (the Qwen line) at `2a69aea88b`. `fork/master` and
+`feat/inkling2` were fast-forwarded to `2a69aea88b`. Each device run below ran once, B70 = `level_zero:0`,
+B50 = `level_zero:1`, and pp / tg are in t/s.
+- *At `753da57b1b`.* What Task 23 left owed is closed:
+  - The full-dispatch rerun (`GGML_SYCL_FA_DISPATCH_DEBUG_LIMIT=1000000`) shows all 480 prompt attention dispatches
+    taking `xmx_v2_f16_ncols32_large_f32sv_v8`.
+  - The Mistral B70 and GPT-OSS B50 gates pass.
+  - The kernel profiler's device time on the 4,737-token prompt is 9.96 s per pass, down from 15.5 s.
+  - Perplexity on the plan's text: Inkling B70 7.5959 and B50 7.5952 (base 7.5792 and 7.5837, +/- 0.247), Qwen3.6
+    15.7615 (base 15.7422).
+  - The long arm on the B70 is 231.1 / 26.0, against 159.9 / 26.0 at `c980e74247`.
+- *At `2a69aea88b`.*
+  - Gates: Inkling passes on the B70, the B50 and both cards. Mistral B70 passes. The GPT-OSS count gate is 1 on the
+    B50 and on the B70.
+  - Inkling B70 perplexity is 7.5959.
+  - Static-storage audit `--check` and `--check-classification` rc 0.
+  - The two fixed sweeps show only reds that are red on master. `test-sycl-runtime-registry-index-source` is green
+    again.
+  - The kernel log shows no reset.
+  - The long arm on the B70 is 251.6 / 28.2, and its text is byte-equal to `753da57b1b`'s. On the B50 alone it is
+    20.6 / 7.5, against 19.0 / 7.4 at `1b601f5d0b`. Peak host backing is 17 GiB on every arm.
+- *Interleaved ABBA against `1b601f5d0b`, `llama-bench -p 512 -n 128`, 8 repetitions per arm, no builder in 256
+  samples, medians a / b / b2 / a2:*
+
+  | model, card | pp | tg | verdict |
+  |---|---|---|---|
+  | Mistral, B70 | 3338.7 / 3341.6 / 3346.4 / 3340.2 | 111.67 / 111.84 / 111.82 / 111.73 | equal |
+  | GPT-OSS, B50 | 868.0 / 863.9 / 861.6 / 863.3 | 40.19 / 40.04 / 39.91 / 39.93 | MIXED, within 0.5% |
+  | Inkling, B70 | 267.7 / 402.5 / 401.0 / 267.0 | 30.47 / 30.38 / 30.37 / 30.18 | pp +50%, tg noise |
+  | Inkling, B50 tg | | 10.99 / 11.50 / 11.38 / 11.40 | MIXED, merged faster |
+
+  None is a regression under the scoring rule: both merged medians would have to be below both base medians.
+- *What is left on the B70 long prompt (profile at `753da57b1b`).*
+  - The BF16 experts (`mulmat.moe.bf16_direct`) take 3.97 s: 88 nodes at about 45 ms, one work-group per (token,
+    expert) pair.
+  - Prompt attention takes 2.13 s.
+  - The NVFP4 executor's GEMMs take 1.83 s.
+  - The executor's per-expert stage rows (`moe.pp.stage.scatter`, `.act`, `moe.pp.dequant.nvfp4`) are about 96,500
+    each per pass.
+  - The wall time is about 18.8 s against 10 s of device time. That host share is not attributed yet: whether the
+    stage rows are separate submissions, and the host time of an unprofiled run, are read before any task is
+    written for it.
+  - Next task: the BF16 experts take a prompt GEMM (Task 24).
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
