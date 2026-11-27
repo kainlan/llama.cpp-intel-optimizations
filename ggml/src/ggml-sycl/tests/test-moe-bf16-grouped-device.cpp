@@ -11,8 +11,11 @@
 // The cases, each compared with the CPU backend on every output row (the largest per-row NMSE must be <= 5e-4, the
 // bound of the other planned-model prompt tests):
 //   * gate_up (k 2304, m 4608), one activation row broadcast to every slot: 512 tokens over all 128 experts; 512 tokens
-//     over 40 experts, so 88 are selected by no token; and 64 tokens, the arm's minimum. Each must show the arm's line,
-//     "[MOE-ROUTE] bf16 grouped tensor=<name> ... experts=<the experts its ids select>", and no direct-route line;
+//     over 40 experts, so 88 are selected by no token; 512 tokens whose slot 0 picks one expert in every token, so that
+//     expert routes 512 rows and each other expert 28 or 29, and the node's GEMMs take two widths, 512 and 64; and 64
+//     tokens, the arm's minimum. Each must show the arm's line, "[MOE-ROUTE] bf16 grouped tensor=<name> ...
+//     experts=<the experts its ids select> widths=<their distinct GEMM widths>", and no direct-route line. The widths
+//     are counted here from the ids (each active expert's rows rounded up to 64), not asked of the arm's plan;
 //   * 63 tokens on the same tensor, one below the minimum: the arm's decline line with reason=tokens and the direct
 //     route's line;
 //   * down (k 2304, m 2304), one activation row per slot: 512 tokens over all 128 experts, on the arm;
@@ -20,7 +23,7 @@
 //     gate_up 512-token case on the direct route, with the arm's decline line reason=opt_out;
 //   * the gate_up 512-token case with the private failpoint armed that throws at the arm's GEMM stage, after its gather
 //     was submitted: the compute must end GGML_STATUS_FAILED with the arm's WARN line and graph_compute's recoverable
-//     fallback line naming "BF16 grouped arm: expert GEMM failed after submission", the failpoint consumed once, and
+//     fallback line naming "BF16 grouped arm: expert GEMM failed at submission", the failpoint consumed once, and
 //     neither the arm's run line nor the direct route's; the same case then runs on the arm again in this process;
 //   * the gate_up 512-token case with the private failpoint armed that makes one expert GEMM's run return no event
 //     after the gather was submitted, as a primitive oneDNN cannot create at execute would: the arm declines the node
@@ -79,6 +82,8 @@ constexpr int      k_gate_up    = 4608;  // m of the fused gate_up tensor
 constexpr int      k_down       = 2304;  // m of the down tensor
 constexpr int      k_subset     = 40;    // the experts the subset case selects
 constexpr int      k_min_tokens = 64;    // moe_bf16_grouped_min_tokens
+constexpr int      k_row_align  = 64;    // moe_bf16_grouped_row_align
+constexpr int32_t  k_hot_expert = 5;     // slot 0 of every token in the hot-expert case
 constexpr uint32_t k_n_ctx      = 512;
 constexpr uint32_t k_n_ubatch   = 512;
 constexpr double   k_nmse_tol   = 5e-4;
@@ -180,33 +185,76 @@ struct case_data {
     int                  n_tokens;
     int                  ne11;    // 1: one activation row broadcast to every slot; k_used: one row per slot
     int                  active;  // the distinct experts the ids select
+    int                  widths;  // the distinct GEMM widths of those experts (count_routing)
     std::vector<float>   input;
     std::vector<int32_t> ids;
 };
 
-// BF16-representable activations, and k_used distinct experts per token drawn from `n_select` experts spread over all
-// k_experts: slots stride the selected experts from a moving base, as the BF16 direct device test routes.
-case_data make_case(const char * label, int n_tokens, int ne11, int n_select, std::mt19937 & rng) {
-    require(n_select % k_used == 0 && n_select <= k_experts, "the selected experts must split evenly over the slots");
-    case_data                             c{ label, n_tokens, ne11, 0, {}, {} };
+// BF16-representable activations, one row per slot of `ne11` and token.
+void fill_input(case_data & c, std::mt19937 & rng) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    c.input.resize(size_t(k_in) * ne11 * n_tokens);
+    c.input.resize(size_t(k_in) * c.ne11 * c.n_tokens);
     for (float & v : c.input) {
         v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(dist(rng)));
     }
-    const int         stride = n_select / k_used;
-    const int         spread = k_experts / n_select;
-    std::set<int32_t> selected;
+}
+
+// The case's active experts and their distinct GEMM widths, counted from its ids: each active expert's routed rows
+// rounded up to k_row_align, as the arm's plan rounds them.
+void count_routing(case_data & c) {
+    std::vector<int> rows(k_experts, 0);
+    for (const int32_t expert : c.ids) {
+        ++rows[size_t(expert)];
+    }
+    std::set<int> widths;
+    c.active = 0;
+    for (const int n : rows) {
+        if (n > 0) {
+            ++c.active;
+            widths.insert((n + k_row_align - 1) / k_row_align * k_row_align);
+        }
+    }
+    c.widths = int(widths.size());
+}
+
+// k_used distinct experts per token drawn from `n_select` experts spread over all k_experts: slots stride the selected
+// experts from a moving base, as the BF16 direct device test routes.
+case_data make_case(const char * label, int n_tokens, int ne11, int n_select, std::mt19937 & rng) {
+    require(n_select % k_used == 0 && n_select <= k_experts, "the selected experts must split evenly over the slots");
+    case_data c{ label, n_tokens, ne11, 0, 0, {}, {} };
+    fill_input(c, rng);
+    const int stride = n_select / k_used;
+    const int spread = k_experts / n_select;
     c.ids.resize(size_t(k_used) * n_tokens);
     for (int t = 0; t < n_tokens; ++t) {
         const int base = (t * 3 + t / 4) % n_select;
         for (int i = 0; i < k_used; ++i) {
-            const int32_t expert          = ((base + i * stride) % n_select) * spread;
-            c.ids[size_t(t) * k_used + i] = expert;
-            selected.insert(expert);
+            c.ids[size_t(t) * k_used + i] = ((base + i * stride) % n_select) * spread;
         }
     }
-    c.active = int(selected.size());
+    count_routing(c);
+    return c;
+}
+
+// One activation row broadcast to every slot, slot 0 of every token on k_hot_expert and the other slots striding the
+// other 127 experts from a moving base (18 apart, so a token's seven are distinct). At 512 tokens the hot expert holds
+// 512 rows (a width of 512) and every other expert 28 or 29 (a width of 64): one node, two GEMM widths, every expert
+// active, 8640 packed rows (within the 16256 the ring is planned for).
+case_data make_hot_case(const char * label, int n_tokens, std::mt19937 & rng) {
+    constexpr int others = k_experts - 1;
+    case_data     c{ label, n_tokens, 1, 0, 0, {}, {} };
+    fill_input(c, rng);
+    c.ids.resize(size_t(k_used) * n_tokens);
+    for (int t = 0; t < n_tokens; ++t) {
+        const int base            = (t * 7 + t / 4) % others;
+        c.ids[size_t(t) * k_used] = k_hot_expert;
+        for (int i = 1; i < k_used; ++i) {
+            const int32_t other           = (base + (i - 1) * 18) % others;
+            c.ids[size_t(t) * k_used + i] = other < k_hot_expert ? other : other + 1;
+        }
+    }
+    count_routing(c);
+    require(c.widths >= 2, std::string(label) + " routes its experts to fewer than two GEMM widths");
     return c;
 }
 
@@ -364,10 +412,13 @@ bool run_case(const moe_planned_fixture::planned_model & model,
     }
     const counter_moves moved         = counters_since(before, reason);
     const std::string   experts_field = "experts=" + std::to_string(c.active) + " ";
+    const std::string   widths_field  = "widths=" + std::to_string(c.widths) + " ";
     const std::string   reason_field  = std::string("reason=") + (decline ? decline : "") + " ";
     const size_t        arm_lines     = g_log.count_since(from, { "[MOE-ROUTE] bf16 grouped tensor=", name });
     const size_t        arm_experts =
         g_log.count_since(from, { "[MOE-ROUTE] bf16 grouped tensor=", name, experts_field.c_str() });
+    const size_t arm_widths = g_log.count_since(
+        from, { "[MOE-ROUTE] bf16 grouped tensor=", name, experts_field.c_str(), widths_field.c_str() });
     const size_t direct_lines = g_log.count_since(from, { "[MOE-ROUTE] bf16 direct tensor=", name });
     const size_t decline_lines =
         g_log.count_since(from, { "[MOE-ROUTE] bf16 grouped declined tensor=", name, reason_field.c_str() });
@@ -387,6 +438,8 @@ bool run_case(const moe_planned_fixture::planned_model & model,
             why += " arm-did-not-run";
         } else if (arm_experts == 0) {
             why += " arm-experts";
+        } else if (arm_widths == 0) {
+            why += " arm-widths";
         }
         if (direct_lines != 0) {
             why += " direct-route-ran";
@@ -415,14 +468,15 @@ bool run_case(const moe_planned_fixture::planned_model & model,
         why += " failpoint-consumed";
     }
     std::fprintf(stderr,
-                 "CASE %s tensor=%s k=%d m=%zu experts=%d used=%d ne11=%d tokens=%d active=%d want=%s supports_op=%d "
-                 "status=%d max_row_nmse=%.3e arm_lines=%zu arm_experts_lines=%zu direct_lines=%zu decline_lines=%zu "
-                 "refusals=%zu failpoint_consumed=%llu runs+=%llu declines+=%llu %s+=%llu -> %s%s\n",
-                 c.label, name, k_in, m, k_experts, k_used, c.ne11, c.n_tokens, c.active, decline ? decline : "arm",
-                 admitted ? 1 : 0, static_cast<int>(status), err, arm_lines, arm_experts, direct_lines, decline_lines,
-                 refusals, (unsigned long long) consumed, (unsigned long long) moved.runs,
-                 (unsigned long long) moved.declines, reason, (unsigned long long) moved.reason_declines,
-                 why.empty() ? "PASS" : "FAIL:", why.c_str());
+                 "CASE %s tensor=%s k=%d m=%zu experts=%d used=%d ne11=%d tokens=%d active=%d widths=%d want=%s "
+                 "supports_op=%d status=%d max_row_nmse=%.3e arm_lines=%zu arm_experts_lines=%zu arm_widths_lines=%zu "
+                 "direct_lines=%zu decline_lines=%zu refusals=%zu failpoint_consumed=%llu runs+=%llu declines+=%llu "
+                 "%s+=%llu -> %s%s\n",
+                 c.label, name, k_in, m, k_experts, k_used, c.ne11, c.n_tokens, c.active, c.widths,
+                 decline ? decline : "arm", admitted ? 1 : 0, static_cast<int>(status), err, arm_lines, arm_experts,
+                 arm_widths, direct_lines, decline_lines, refusals, (unsigned long long) consumed,
+                 (unsigned long long) moved.runs, (unsigned long long) moved.declines, reason,
+                 (unsigned long long) moved.reason_declines, why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
 }
 
@@ -448,12 +502,12 @@ bool run_thrown_case(const moe_planned_fixture::planned_model & model, const cas
     const counter_moves moved = counters_since(before, "submit");
 
     const std::string named_warn  = std::string("tensor=") + name + " device=0 stage=expert GEMM error=";
-    const size_t      warns       = g_log.count_since(from, { "[MoE] BF16 grouped arm failed after submission: " });
+    const size_t      warns       = g_log.count_since(from, { "[MoE] BF16 grouped arm failed at submission: " });
     const size_t      named_warns = g_log.count_since(
-        from, { "[MoE] BF16 grouped arm failed after submission: ", named_warn.c_str(), "private-testing failpoint" });
+        from, { "[MoE] BF16 grouped arm failed at submission: ", named_warn.c_str(), "private-testing failpoint" });
     const size_t fallbacks    = g_log.count_since(from, { "recoverable runtime fallback failed" });
     const size_t named_errors = g_log.count_since(
-        from, { "recoverable runtime fallback failed: BF16 grouped arm: expert GEMM failed after submission: "
+        from, { "recoverable runtime fallback failed: BF16 grouped arm: expert GEMM failed at submission: "
                 "private-testing failpoint after the gather" });
     const size_t arm_lines    = g_log.count_since(from, { "[MOE-ROUTE] bf16 grouped tensor=", name });
     const size_t direct_lines = g_log.count_since(from, { "[MOE-ROUTE] bf16 direct tensor=", name });
@@ -585,6 +639,9 @@ int main(int argc, char ** argv) {
             };
             run("gate_up-all", 512, k_experts, nullptr);
             run("gate_up-subset", 512, k_subset, nullptr);
+            // Its own generator, so every other case keeps the inputs it had before this case existed.
+            std::mt19937 hot_rng(512);
+            tally(run_case(model, cpu.get(), reference, make_hot_case("gate_up-hot-expert", 512, hot_rng), nullptr));
             run("gate_up-min-tokens", k_min_tokens, k_experts, nullptr);
             run("gate_up-below-min", k_min_tokens - 1, k_experts, "tokens");
             // A thrown submission fails the graph by name; the process and the arm go on.

@@ -90424,7 +90424,7 @@ static const char * moe_bf16_grouped_decline_name(moe_bf16_grouped_decline decli
 
 // The arm's run counter: the nodes it ran, and per reason the nodes it declined. Process-wide and relaxed, since they
 // order nothing; the route log prints them.
-static std::atomic<uint64_t> g_moe_bf16_grouped_runs{ 0 };
+[[maybe_unused]] static std::atomic<uint64_t> g_moe_bf16_grouped_runs{ 0 };
 static std::atomic<uint64_t> g_moe_bf16_grouped_declines[static_cast<size_t>(moe_bf16_grouped_decline::COUNT)] = {};
 
 // Counts a decline and names it in the route log, the first 16 times per reason (a decode node declines on every
@@ -90454,7 +90454,233 @@ static bool ggml_sycl_moe_bf16_grouped_enabled() {
     return enabled;
 }
 
+#if GGML_SYCL_DNNL
 struct moe_bf16_grouped_abandon_marker;
+
+// The arm's ring-slot claim: one slot of the ring the arm reserved at the planned sizes, whose activation and output
+// planes hold `act_bytes` and `out_bytes`. True leaves the slot bound to `claim`, with its owners, and its planes in
+// `reserved`. False is a SCRATCH_SLOT decline with nothing held: a slot that could not be bound is rolled back, and a
+// bound slot too small for the node is released unused.
+// llama.cpp-ff54: one shared helper for this claim sequence and the batched executor's two.
+static bool ggml_sycl_moe_bf16_grouped_claim_slot(int                                                    device,
+                                                  sycl::queue *                                          stream,
+                                                  ggml_sycl::unified_cache &                             cache,
+                                                  uint32_t                                               depth,
+                                                  size_t                                                 act_bytes,
+                                                  size_t                                                 out_bytes,
+                                                  pp_moe_onednn_scratch_claim &                          claim,
+                                                  ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot & reserved) {
+    uint32_t slot = std::numeric_limits<uint32_t>::max();
+    // llama.cpp-uop2: the claim waits while the slot's previous node runs, the executor's own wait, and uop2 removes it.
+    if (!pp_moe_onednn_claim_scratch_slot(device, depth, slot)) {
+        return false;
+    }
+    if (!cache.claim_pp_moe_onednn_scratch_slot(slot, reserved)) {
+        pp_moe_onednn_rollback_unbound_scratch_slot(device, depth, slot);
+        return false;
+    }
+    claim.activate(device, depth, slot, reserved.generation, stream);
+    claim.take_owners(reserved);
+    if (reserved.activation == nullptr || reserved.output == nullptr || reserved.activation_size < act_bytes ||
+        reserved.output_size < out_bytes) {
+        claim.release_unused();
+        return false;
+    }
+    return true;
+}
+
+// Asks oneDNN for each distinct GEMM width once, query_only, before anything is submitted, so a width it declines
+// declines the node with nothing to undo. The primitive is keyed on the width, so the first expert of a width stands
+// for every expert of it. False is a PRIMITIVE decline.
+template <typename expert_gemm_t>
+static bool ggml_sycl_moe_bf16_grouped_query_widths(const ggml_sycl::moe_bf16_grouped_plan & plan,
+                                                    const expert_gemm_t &                    expert_gemm) {
+    for (const size_t width : plan.gemm_widths) {
+        size_t first = 0;
+        while (plan.experts[first].gemm_rows != width) {
+            ++first;
+        }
+        if (!expert_gemm(first, true, {})) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// What the arm's submissions may still read, held from its first submission on: the record leases, the row map among
+// them, and the ring slot. hold_until(event) publishes the leases until `event` and records the slot on it: the
+// scatter's event when the node ran. hold_until_marker() does the same behind a marker submitted after everything, for
+// a submission that declines or throws. The hold happens once. The destructor holds to a marker on any exit that has
+// not held, an exception the handler passes on included, and lets nothing escape: a publication that throws leaves the
+// leases as they were (retain_handles_until_event_or_keep), so when the marker or the publication throws there the
+// leases are kept, never released (keep_handles_after_failed_wait), and the claim's own destructor settles the slot.
+// Nothing here waits.
+struct moe_bf16_grouped_hold {
+    sycl::queue &                        queue;
+    std::vector<ggml_sycl::mem_handle> & leases;
+    pp_moe_onednn_scratch_claim &        claim;
+    bool                                 held = false;
+
+    moe_bf16_grouped_hold(sycl::queue &                        submit_queue,
+                          std::vector<ggml_sycl::mem_handle> & node_leases,
+                          pp_moe_onednn_scratch_claim &        slot_claim) :
+        queue(submit_queue),
+        leases(node_leases),
+        claim(slot_claim) {
+        claim.mark_used();
+    }
+
+    moe_bf16_grouped_hold(const moe_bf16_grouped_hold &)             = delete;
+    moe_bf16_grouped_hold & operator=(const moe_bf16_grouped_hold &) = delete;
+
+    ~moe_bf16_grouped_hold() {
+        if (held) {
+            return;
+        }
+        try {
+            hold_until_marker();
+        } catch (...) {
+            // A destructor cannot rethrow without terminating, and keeping the leases is noexcept.
+            const size_t count = leases.size();
+            const bool   kept  = ggml_sycl::keep_handles_after_failed_wait(leases);
+            GGML_LOG_ERROR(
+                "[MoE] BF16 grouped arm: a node's %zu leases could not be held until a marker; they are %s\n", count,
+                kept ? "kept, not released" : "released: no memory was left to keep them");
+        }
+    }
+
+    void hold_until(sycl::event event) {
+        if (held) {
+            return;
+        }
+        ggml_sycl::retain_handles_until_event_or_keep(leases, event);
+        claim.record(std::move(event));
+        held = true;
+    }
+
+    void hold_until_marker() {
+        if (held) {
+            return;
+        }
+        hold_until(ggml_sycl_submit_marker<moe_bf16_grouped_abandon_marker>(queue));
+    }
+};
+
+// The device memory one node's submissions read and write: src1 and dst where they are, the ring slot's two planes and
+// the row map's device copy.
+struct moe_bf16_grouped_buffers {
+    const float *                     src1_dev = nullptr;
+    float *                           dst_dev  = nullptr;
+    uint16_t *                        act      = nullptr;
+    float *                           out      = nullptr;
+    ggml_sycl::moe_bf16_grouped_row * rows_dev = nullptr;
+};
+
+// The arm's submissions, in order on the in-order queue: the row map's copy, one batched gather, one GEMM per active
+// expert after the gather's event, one batched scatter after the GEMMs' events. True when every one was submitted;
+// *scatter_event is then the scatter's, which holds the leases and the slot. From the first submission on, nothing the
+// device may still read is let go before an event behind everything submitted (moe_bf16_grouped_hold, constructed
+// just before the try so that its destructor covers every exit and the handler can hold first). A submission that
+// declines (a kernel entry that refuses, a oneDNN primitive the query admitted and the execute could not create)
+// returns false after the hold to a marker: dst is written by the scatter alone, so the caller declines SUBMIT and the
+// direct route runs the node. A submission that throws fails the graph instead, with a named ggml_sycl_fallback_error:
+// the queue that threw is no queue to run the direct kernel on, and a dnnl::error or a sycl::exception left to the
+// outer handlers would end the process, or re-place the op on the CPU, while the gather and the GEMMs still read what
+// the unwind released. The executor's GEMM stage does the same (gemm_stage_failed). A queue that cannot take the
+// marker either is broken, and its throw is the one that leaves.
+template <typename expert_gemm_t>
+static bool ggml_sycl_moe_bf16_grouped_submit(int                                          device,
+                                              sycl::queue *                                stream,
+                                              const ggml_tensor *                          src0,
+                                              const ggml_sycl::moe_bf16_grouped_plan &     plan,
+                                              const ggml_sycl::moe_bf16_grouped_io_shape & io,
+                                              const moe_bf16_grouped_buffers &             buffers,
+                                              std::vector<sycl::event>                     gather_deps,
+                                              std::vector<ggml_sycl::mem_handle> &         leases,
+                                              pp_moe_onednn_scratch_claim &                claim,
+                                              const expert_gemm_t &                        expert_gemm,
+                                              sycl::event *                                scatter_event) {
+    moe_bf16_grouped_hold hold(*stream, leases, claim);
+    const auto            abandon = [&]() {
+        hold.hold_until_marker();
+        return false;
+    };
+    const char * stage = "row map copy";
+    try {
+        gather_deps.push_back(ggml_sycl_safe_memcpy(*stream, buffers.rows_dev, plan.rows.data(),
+                                                    plan.rows.size() * sizeof(ggml_sycl::moe_bf16_grouped_row), {}));
+
+        std::string profile_metadata;
+        if (ggml_sycl_kernel_profile_enabled()) {
+            profile_metadata = "ncols=" + std::to_string(io.k) + ";nrows_per_expert=" + std::to_string(io.m) +
+                               ";routed_rows=" + std::to_string(io.n_rows) +
+                               ";experts=" + std::to_string(plan.experts.size()) +
+                               ";packed_rows=" + std::to_string(plan.packed_rows);
+        }
+        ggml_sycl_profile_label profile_label{};
+        profile_label.name       = "mulmat.moe.bf16_grouped.gather";
+        profile_label.category   = "mulmat";
+        profile_label.queue_kind = "compute";
+        profile_label.metadata   = profile_metadata.c_str();
+        profile_label.device     = device;
+
+        stage                          = "gather";
+        bool              gathered     = false;
+        const sycl::event gather_event = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & queue) {
+            sycl::event event;
+            gathered = ggml_sycl::moe_bf16_grouped_gather_submit(queue, buffers.rows_dev, buffers.src1_dev, buffers.act,
+                                                                 io, gather_deps, &event);
+            return event;
+        });
+        if (!gathered) {
+            return abandon();
+        }
+
+        stage = "expert GEMM";
+#    ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+        if (ggml_sycl_q1_nvfp4_test_consume_failure(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_THROW_AFTER_GATHER)) {
+            throw std::runtime_error("private-testing failpoint after the gather");
+        }
+#    endif
+        std::vector<sycl::event> gemm_events;
+        gemm_events.reserve(plan.experts.size());
+        for (size_t i = 0; i < plan.experts.size(); ++i) {
+            const std::optional<sycl::event> gemm_event = expert_gemm(i, false, { gather_event });
+            if (!gemm_event) {
+                return abandon();
+            }
+            gemm_events.push_back(*gemm_event);
+        }
+
+        stage              = "scatter";
+        profile_label.name = "mulmat.moe.bf16_grouped.scatter";
+        bool scattered     = false;
+        *scatter_event     = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & queue) {
+            sycl::event event;
+            scattered = ggml_sycl::moe_bf16_grouped_scatter_submit(queue, buffers.rows_dev, buffers.out,
+                                                                       buffers.dst_dev, io, gemm_events, &event);
+            return event;
+        });
+        if (!scattered) {
+            return abandon();
+        }
+
+        stage = "handle retention";
+        hold.hold_until(*scatter_event);
+        return true;
+    } catch (const ggml_sycl_fallback_error &) {
+        throw;
+    } catch (const std::exception & e) {
+        hold.hold_until_marker();
+        GGML_LOG_WARN("[MoE] BF16 grouped arm failed at submission: tensor=%s device=%d stage=%s error=%s\n",
+                      src0->name, device, stage, e.what());
+        // ggml_sycl_fallback_error keeps the pointer it is given and graph_compute prints it after the unwind.
+        static thread_local std::string bf16_grouped_failure;
+        bf16_grouped_failure = std::string("BF16 grouped arm: ") + stage + " failed at submission: " + e.what();
+        throw ggml_sycl_fallback_error(bf16_grouped_failure.c_str());
+    }
+}
+#endif  // GGML_SYCL_DNNL
 
 // The BF16 grouped prompt arm of MUL_MAT_ID (Inkling 2 Mini plan, Task 24). A prompt node of at least
 // moe_bf16_grouped_min_tokens tokens that the BF16 direct route's predicate admits on this card runs as one oneDNN
@@ -90474,7 +90700,6 @@ struct moe_bf16_grouped_abandon_marker;
 // the node ran; dst's ready event is then the scatter's.
 static bool ggml_sycl_mul_mat_id_bf16_grouped(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0    = dst->src[0];
-    const ggml_tensor * src1    = dst->src[1];
     const ggml_tensor * ids     = dst->src[2];
     const auto          decline = [&](moe_bf16_grouped_decline reason) {
         return ggml_sycl_moe_bf16_grouped_note_decline(src0, ctx.device, reason);
@@ -90490,7 +90715,8 @@ static bool ggml_sycl_mul_mat_id_bf16_grouped(ggml_backend_sycl_context & ctx, g
 #if !GGML_SYCL_DNNL
     return decline(moe_bf16_grouped_decline::NO_DNNL);
 #else
-    const queue_ptr stream = ctx.stream();
+    const ggml_tensor * src1   = dst->src[1];
+    const queue_ptr     stream = ctx.stream();
     if (ggml_sycl_graph_recording_active() ||
         stream->ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) {
         return decline(moe_bf16_grouped_decline::RECORDING);
@@ -90623,28 +90849,19 @@ static bool ggml_sycl_mul_mat_id_bf16_grouped(ggml_backend_sycl_context & ctx, g
         return decline(moe_bf16_grouped_decline::SCRATCH_RESERVE);
     }
     pp_moe_onednn_scratch_claim                          claim;
-    uint32_t                                             scratch_slot = std::numeric_limits<uint32_t>::max();
     ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot reserved;
-    // llama.cpp-uop2: the claim waits while the slot's previous node runs, the executor's own wait, and uop2 removes it.
-    if (!pp_moe_onednn_claim_scratch_slot(ctx.device, ring_depth, scratch_slot)) {
-        return decline(moe_bf16_grouped_decline::SCRATCH_SLOT);
-    }
-    if (!cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved)) {
-        pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, ring_depth, scratch_slot);
-        return decline(moe_bf16_grouped_decline::SCRATCH_SLOT);
-    }
-    claim.activate(ctx.device, ring_depth, scratch_slot, reserved.generation, stream);
-    claim.take_owners(reserved);
-    if (reserved.activation == nullptr || reserved.output == nullptr || reserved.activation_size < act_bytes ||
-        reserved.output_size < out_bytes) {
-        claim.release_unused();
+    if (!ggml_sycl_moe_bf16_grouped_claim_slot(ctx.device, stream, *cache, ring_depth, act_bytes, out_bytes, claim,
+                                               reserved)) {
         return decline(moe_bf16_grouped_decline::SCRATCH_SLOT);
     }
     uint16_t * const act = static_cast<uint16_t *>(reserved.activation);
     float * const    out = static_cast<float *>(reserved.output);
 
     // One expert's GEMM: dst rows [base_row, base_row + gemm_rows) of the output plane = the expert's weight times the
-    // same rows of the activation plane. Asked once per width with query_only before anything is submitted.
+    // same rows of the activation plane. Asked once per width with query_only before anything is submitted. The rows
+    // an expert's slot pads past its routed rows may hold stale or NaN activations, and that is harmless: each output
+    // column of the GEMM (one packed row) depends only on its own activation column, and the scatter never reads a
+    // padding row's output.
     const auto       bf16        = DnnlGemmWrapper::dt::bf16;
     const auto       f32         = DnnlGemmWrapper::to_dt<float>();
     const int        mi          = static_cast<int>(m);
@@ -90667,121 +90884,23 @@ static bool ggml_sycl_mul_mat_id_bf16_grouped(ggml_backend_sycl_context & ctx, g
                                      f32, stream, 1, 1, mi, deps, "bf16_expert", query_only,
                                      GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT, GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE);
     };
-    for (const size_t width : plan.gemm_widths) {
-        size_t first = 0;
-        while (plan.experts[first].gemm_rows != width) {
-            ++first;
-        }
-        if (!expert_gemm(first, true, {})) {
-            return decline(moe_bf16_grouped_decline::PRIMITIVE);
-        }
+    if (!ggml_sycl_moe_bf16_grouped_query_widths(plan, expert_gemm)) {
+        return decline(moe_bf16_grouped_decline::PRIMITIVE);
     }
 
     scoped_unified_queue_temp<ggml_sycl::moe_bf16_grouped_row> rows_dev;
     if (rows_dev.alloc(*stream, ctx.device, plan.rows.size(), "moe_bf16_grouped_rows") == nullptr) {
         return decline(moe_bf16_grouped_decline::ROW_MAP);
     }
-
-    // From the first submission on, nothing the device may still read is let go before a marker behind everything
-    // submitted: the record leases, the row map and the slot are held until it. A submission that declines (a kernel
-    // entry that refuses, a oneDNN primitive the query admitted and the execute could not create) then declines the
-    // node: dst is written by the scatter alone, so the direct route runs it. A submission that throws fails the graph
-    // instead, with a named ggml_sycl_fallback_error: the queue that threw is no queue to run the direct kernel on, and
-    // a dnnl::error or a sycl::exception left to the outer handlers would end the process, or re-place the op on the
-    // CPU, while the gather and the GEMMs still read what the unwind released. The executor's GEMM stage does the same
-    // (gemm_stage_failed). A queue that cannot take the marker either is broken, and its throw is the one that leaves.
-    // The hold runs once: a decline whose bookkeeping throws after it reaches the handler with everything already held.
-    claim.mark_used();
-    bool       held              = false;
-    const auto hold_until_marker = [&]() {
-        if (held) {
-            return;
-        }
-        const sycl::event passed = ggml_sycl_submit_marker<moe_bf16_grouped_abandon_marker>(*stream);
-        leases.push_back(std::move(rows_dev.handle));
-        ggml_sycl::retain_handles_until_event(std::move(leases), passed);
-        claim.record(passed);
-        held = true;
-    };
-    const auto abandon = [&]() {
-        hold_until_marker();
-        return decline(moe_bf16_grouped_decline::SUBMIT);
-    };
-    const char * stage = "row map copy";
-    sycl::event  scatter_event;
-    try {
-        gather_deps.push_back(ggml_sycl_safe_memcpy(*stream, rows_dev.get(), plan.rows.data(),
-                                                    plan.rows.size() * sizeof(ggml_sycl::moe_bf16_grouped_row), {}));
-
-        std::string profile_metadata;
-        if (ggml_sycl_kernel_profile_enabled()) {
-            profile_metadata = "ncols=" + std::to_string(k) + ";nrows_per_expert=" + std::to_string(m) +
-                               ";routed_rows=" + std::to_string(io.n_rows) +
-                               ";experts=" + std::to_string(plan.experts.size()) +
-                               ";packed_rows=" + std::to_string(plan.packed_rows);
-        }
-        ggml_sycl_profile_label profile_label{};
-        profile_label.name       = "mulmat.moe.bf16_grouped.gather";
-        profile_label.category   = "mulmat";
-        profile_label.queue_kind = "compute";
-        profile_label.metadata   = profile_metadata.c_str();
-        profile_label.device     = ctx.device;
-
-        stage                          = "gather";
-        bool              gathered     = false;
-        const sycl::event gather_event = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & queue) {
-            sycl::event event;
-            gathered = ggml_sycl::moe_bf16_grouped_gather_submit(queue, rows_dev.get(), src1_dev, act, io, gather_deps,
-                                                                 &event);
-            return event;
-        });
-        if (!gathered) {
-            return abandon();
-        }
-
-        stage = "expert GEMM";
-#    ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
-        if (ggml_sycl_q1_nvfp4_test_consume_failure(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_THROW_AFTER_GATHER)) {
-            throw std::runtime_error("private-testing failpoint after the gather");
-        }
-#    endif
-        std::vector<sycl::event> gemm_events;
-        gemm_events.reserve(plan.experts.size());
-        for (size_t i = 0; i < plan.experts.size(); ++i) {
-            const std::optional<sycl::event> gemm_event = expert_gemm(i, false, { gather_event });
-            if (!gemm_event) {
-                return abandon();
-            }
-            gemm_events.push_back(*gemm_event);
-        }
-
-        stage              = "scatter";
-        profile_label.name = "mulmat.moe.bf16_grouped.scatter";
-        bool scattered     = false;
-        scatter_event      = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & queue) {
-            sycl::event event;
-            scattered = ggml_sycl::moe_bf16_grouped_scatter_submit(queue, rows_dev.get(), out, dst_dev, io, gemm_events,
-                                                                        &event);
-            return event;
-        });
-        if (!scattered) {
-            return abandon();
-        }
-    } catch (const ggml_sycl_fallback_error &) {
-        throw;
-    } catch (const std::exception & e) {
-        hold_until_marker();
-        GGML_LOG_WARN("[MoE] BF16 grouped arm failed after submission: tensor=%s device=%d stage=%s error=%s\n",
-                      src0->name, ctx.device, stage, e.what());
-        // ggml_sycl_fallback_error keeps the pointer it is given and graph_compute prints it after the unwind.
-        static thread_local std::string bf16_grouped_failure;
-        bf16_grouped_failure = std::string("BF16 grouped arm: ") + stage + " failed after submission: " + e.what();
-        throw ggml_sycl_fallback_error(bf16_grouped_failure.c_str());
-    }
-
+    // The row map joins the record leases, so the hold publishes it with them.
     leases.push_back(std::move(rows_dev.handle));
-    ggml_sycl::retain_handles_until_event(std::move(leases), scatter_event);
-    claim.record(scatter_event);
+
+    const moe_bf16_grouped_buffers buffers = { src1_dev, dst_dev, act, out, rows_dev.get() };
+    sycl::event                    scatter_event;
+    if (!ggml_sycl_moe_bf16_grouped_submit(ctx.device, stream, src0, plan, io, buffers, std::move(gather_deps), leases,
+                                           claim, expert_gemm, &scatter_event)) {
+        return decline(moe_bf16_grouped_decline::SUBMIT);
+    }
     ggml_sycl_set_tensor_ready_event(dst, ctx.device, scatter_event, stream);
     ctx.moe_graphs_disabled_once = true;
 

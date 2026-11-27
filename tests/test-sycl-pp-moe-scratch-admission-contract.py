@@ -20,15 +20,19 @@ A third site reserves the same ring: the BF16 grouped prompt arm of MUL_MAT_ID
 activation and output planes. It reads the planned sizes under the batched
 executor's names, admits through the weightless admission before it reserves and
 claims, declines (never upsizes) on a refusal, reports a ring that does not fit
-it at WARN once, stages its activations and outputs only in the claimed slot
-(its one temporary is the row map) and binds and rolls back by generation. It
+it at WARN once and stages its activations and outputs only in the claimed slot
+(its one temporary is the row map). Its claim is one helper,
+ggml_sycl_moe_bf16_grouped_claim_slot, which the arm passes its ring depth as is
+and which claims, binds and rolls back by generation at that depth and never
+writes it; its submissions are another, ggml_sycl_moe_bf16_grouped_submit. It
 precedes the batched executor in ggml-sycl.cpp and spells the same reserve call,
 admission shape and ring depth, so the mutants written for the batched executor
 are applied inside it (mutate_once).
 
-The checks that read ggml-sycl.cpp and unified-cache.cpp fail against the pre-ijla tree, and 18 of them do when run that
-way (the others read the admission module, its header and the canonical contract, which that tree never had, so they
-pass there by construction and are covered by --self-test's mutants instead):
+The checks that read ggml-sycl.cpp and unified-cache.cpp fail against the pre-ijla tree, and 24 of them do when run that
+way (counted 2026-11-27: 19 before the BF16 grouped arm, whose five checks fail there too, with its three bodies reported
+as missing anchors; the others read the admission module, its header and the canonical contract, which that tree never
+had, so they pass there by construction and are covered by --self-test's mutants instead):
 
     ./tests/test-sycl-pp-moe-scratch-admission-contract.py \\
         --sycl <(git show 745062d4e:ggml/src/ggml-sycl/ggml-sycl.cpp) \\
@@ -161,6 +165,9 @@ _COMPARISON = r"(?:==|!=|<=|>=|(?<![-<])<(?!<)|(?<!-)>(?!>))"
 ALLOWED_CALLEES = {"reserve_pp_moe_onednn_scratch", "pp_moe_onednn_admit_scratch",
                    "pp_moe_onednn_admit_weightless_scratch", "pp_moe_onednn_runtime_ring_depth",
                    "pp_moe_onednn_claim_scratch_slot", "pp_moe_onednn_rollback_unbound_scratch_slot", "activate",
+                   # The BF16 grouped arm's claim helper, which passes its depth to the claim, the rollback and activate
+                   # only (the check that the arm binds the generation it claimed pins its every use of the depth).
+                   "ggml_sycl_moe_bf16_grouped_claim_slot",
                    "GGML_LOG_WARN", "GGML_LOG_INFO", "GGML_LOG_DEBUG", "GGML_LOG_ERROR", "fprintf"}
 
 
@@ -412,6 +419,11 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
     # The BF16 grouped prompt arm of MUL_MAT_ID: the weightless third site, which declines where the ring is not
     # planned or does not fit and never grows it.
     arm = between(sycl, "static bool ggml_sycl_mul_mat_id_bf16_grouped(", "enum class moe_resident_decode_decline")
+    # Its ring-slot claim and its submissions, each a helper above it.
+    arm_claim = between(sycl, "static bool ggml_sycl_moe_bf16_grouped_claim_slot(",
+                        "static bool ggml_sycl_moe_bf16_grouped_query_widths(")
+    arm_submit = between(sycl, "static bool ggml_sycl_moe_bf16_grouped_submit(",
+                         "static bool ggml_sycl_mul_mat_id_bf16_grouped(")
     reserve = between(cache, "bool unified_cache::reserve_pp_moe_onednn_scratch(",
                       "bool unified_cache::claim_pp_moe_onednn_scratch_slot(")
 
@@ -424,6 +436,8 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
         "batched PP MoE oneDNN executor body": batched,
         "non-batched PP MXFP4 f16 staging body": staging,
         "BF16 grouped prompt arm of MUL_MAT_ID body": arm,
+        "BF16 grouped arm's ring-slot claim helper body": arm_claim,
+        "BF16 grouped arm's submit helper body": arm_submit,
         "unified_cache::reserve_pp_moe_onednn_scratch body": reserve,
         "moe-scratch-admission module": module,
         "moe-scratch-admission header": header,
@@ -490,12 +504,20 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
             and site_is_pinned(arm, PLANNED_SITES[0]),
 
         # --- the BF16 grouped arm: the planned ring's activation and output planes, or the BF16 direct route ---
+        # The arm admits, reserves, claims through its helper at the ring depth it reserved, queries and submits
+        # through its helper, in that order; the claim helper claims the ring slot, then the cache's slot; the submit
+        # helper gathers, then scatters.
         "the BF16 grouped arm admits weightless before it reserves, claims and submits":
             ordered(arm, "pp_moe_onednn_admit_weightless_scratch(planned_shape, act_bytes, out_bytes)",
                     "reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)",
-                    "pp_moe_onednn_claim_scratch_slot(ctx.device, ring_depth, scratch_slot)",
-                    "claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved)",
-                    "DnnlGemmWrapper::gemm(", "moe_bf16_grouped_gather_submit(", "moe_bf16_grouped_scatter_submit("),
+                    "ggml_sycl_moe_bf16_grouped_claim_slot(ctx.device, stream, *cache, ring_depth, act_bytes, out_bytes, "
+                    "claim,",
+                    "DnnlGemmWrapper::gemm(", "ggml_sycl_moe_bf16_grouped_query_widths(plan, expert_gemm)",
+                    "ggml_sycl_moe_bf16_grouped_submit(ctx.device, stream, src0, plan, io, buffers,")
+            and arm.count("ggml_sycl_moe_bf16_grouped_claim_slot(") == 1
+            and ordered(arm_claim, "pp_moe_onednn_claim_scratch_slot(device, depth, slot)",
+                        "claim_pp_moe_onednn_scratch_slot(slot, reserved)")
+            and ordered(arm_submit, "moe_bf16_grouped_gather_submit(", "moe_bf16_grouped_scatter_submit("),
         # One admission lambda, answering what the weightless admission answers, asked twice: for the routed rows
         # unpadded before the ids (a node the ring cannot hold pays no ids wait), then for the packed rows. Each `no` is
         # a SCRATCH_UNPLANNED decline, and both come before the arm's one reservation.
@@ -523,11 +545,16 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
             "uint16_t * const act = static_cast<uint16_t *>(reserved.activation);" in arm
             and "float * const out = static_cast<float *>(reserved.output);" in arm
             and arm.count("scoped_unified_queue_temp") == 1
-            and "scoped_unified_queue_temp<ggml_sycl::moe_bf16_grouped_row> rows_dev;" in arm,
+            and "scoped_unified_queue_temp<ggml_sycl::moe_bf16_grouped_row> rows_dev;" in arm
+            and "scoped_unified_queue_temp" not in arm_claim and "scoped_unified_queue_temp" not in arm_submit,
+        # The depth the claim helper is passed is its parameter and its three uses (the claim, the rollback and the
+        # binding), so the slot is claimed, rolled back and bound at the depth the arm reserved, and never a written one.
         "the BF16 grouped arm binds the slot generation it claimed and rolls back a slot it could not bind":
-            ordered(arm, "pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, ring_depth, scratch_slot);",
-                    "claim.activate(ctx.device, ring_depth, scratch_slot, reserved.generation",
-                    "claim.release_unused();"),
+            ordered(arm_claim, "pp_moe_onednn_claim_scratch_slot(device, depth, slot)",
+                    "pp_moe_onednn_rollback_unbound_scratch_slot(device, depth, slot);",
+                    "claim.activate(device, depth, slot, reserved.generation",
+                    "claim.release_unused();")
+            and len(re.findall(r"\bdepth\b", arm_claim)) == 4,
         "the weightless admission is the preflight with the plan's own weight slot and one slot of depth":
             ordered(module, "pp_moe_onednn_admit_weightless_scratch(",
                     "const pp_moe_onednn_scratch_shape required = { planned.weight_slot_bytes, activation_bytes, "
@@ -686,9 +713,9 @@ ABSENCE_MUTANTS = {
         "        ggml_sycl::pp_moe_onednn_admit_scratch(planned_shape, planned_shape);"),
     "the BF16 grouped arm binds the slot generation it claimed and rolls back a slot it could not bind": (
         "sycl",
-        "        pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, ring_depth, scratch_slot);\n"
-        "        return decline(moe_bf16_grouped_decline::SCRATCH_SLOT);",
-        "        return decline(moe_bf16_grouped_decline::SCRATCH_SLOT);"),
+        "        pp_moe_onednn_rollback_unbound_scratch_slot(device, depth, slot);\n"
+        "        return false;",
+        "        return false;"),
     "the weightless admission is the preflight with the plan's own weight slot and one slot of depth": (
         "module",
         "    const pp_moe_onednn_scratch_shape required = { planned.weight_slot_bytes, activation_bytes, output_bytes, 1 };",
@@ -729,6 +756,8 @@ _DECL_W = "            const size_t planned_weight =\n                " + PLANNE
 _CALL_ARM = ("    if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {\n"
              "        return decline(moe_bf16_grouped_decline::SCRATCH_RESERVE);")
 _ADMIT_ARM = "        ggml_sycl::pp_moe_onednn_admit_weightless_scratch(planned_shape, act_bytes, out_bytes);"
+_CLAIM_ARM = "    if (!ggml_sycl_moe_bf16_grouped_claim_slot(ctx.device, stream, *cache, ring_depth, act_bytes, out_bytes, claim,"
+_CLAIM_HELPER = "    if (!pp_moe_onednn_claim_scratch_slot(device, depth, slot)) {"
 # The BF16 grouped arm precedes the batched executor in ggml-sycl.cpp and spells the same reserve call, admission shape
 # and ring depth, so an edit written for the batched executor is made at the anchor's first occurrence inside that
 # executor; an anchor it does not hold is edited at its first occurrence in the file.
@@ -821,6 +850,9 @@ ESCAPES = (
                                              "ring_depth);\n" + _CALL_ARM)]),
     ("bf16-arm-admits-a-shape-of-its-own", [(_ADMIT_ARM, _ADMIT_ARM.replace("(planned_shape, act_bytes, out_bytes)",
                                                                             "({ planned_weight, act_bytes, out_bytes, 1 }, act_bytes, out_bytes)"))]),
+    # The BF16 grouped arm's claim: asked at a grown depth, or its helper growing the depth it was passed.
+    ("bf16-arm-claims-at-a-grown-depth", [(_CLAIM_ARM, _CLAIM_ARM.replace("*cache, ring_depth,", "*cache, std::max(ring_depth, 4u),"))]),
+    ("bf16-arm-claim-helper-grows-its-depth", [(_CLAIM_HELPER, "    depth = depth > 4u ? depth : 4u;\n" + _CLAIM_HELPER)]),
 )
 
 

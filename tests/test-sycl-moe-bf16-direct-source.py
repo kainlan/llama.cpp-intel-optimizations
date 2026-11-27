@@ -49,24 +49,36 @@ expert table and the device ids, with src1 and dst read and written in place. Th
   (i) the BF16 grouped prompt arm, ggml_sycl_mul_mat_id_bf16_grouped() (Task 24), is a separate arm beside the route:
       called only from the route's block, and the NVFP4 batched prompt executor names no BF16. It asks the opt-out
       first (GGML_SYCL_MOE_BF16_GROUPED, read once into a function-local static), and every way it leaves without
-      running the node is a counted decline, never a bare `return false`. Its host waits are the executor's alone: the
+      running the node is a counted decline, never a bare `return false`. Three helpers, each defined once above it
+      and called once, from it, take its steps, and their false is its counted decline: the ring-slot claim
+      (ggml_sycl_moe_bf16_grouped_claim_slot, which a `// llama.cpp-ff54:` comment directly precedes), the width
+      queries (..._query_widths) and the submissions (..._submit). Its host waits are the executor's alone: the
       graph-local ids D2H snapshot and the ring-slot claim, which a `// llama.cpp-uop2:` comment directly precedes;
-      nothing in it or in moe-bf16-grouped.{hpp,cpp} waits. In order: the weightless admission against the planned
-      ring for the routed rows unpadded (before the ids, so a node the ring cannot hold pays no ids wait), the ids, the
-      plan, the table, the same admission for the packed rows, the reservation, the claim, one batched gather (profiled
-      as mulmat.moe.bf16_grouped.gather), one oneDNN bf16 GEMM per expert after the gather's event (op context
-      bf16_expert, no f32 down-conversion, a primitive that cannot be created declining), one batched scatter after the
-      GEMMs' events (mulmat.moe.bf16_grouped.scatter), the row map joining the record leases, which are held until the
-      scatter's event, the slot recorded on it and dst's ready event set to it. Only the scatter writes dst;
-  (j) a failure after the arm's first submission lets nothing go that the device may still read: every submission, the
-      row map's copy first, is inside one try, and nothing is submitted before it. A submission that declines (a
-      kernel entry that refuses, a GEMM the execute could not create) holds the record leases, the row map and the slot
-      until a marker submitted behind everything, then declines SUBMIT (dst is still unwritten, so the direct route
-      runs). A submission that throws reaches a std::exception handler (after the rethrow clause the catch contract
-      requires) that does the same hold first, logs a WARN naming the tensor, the device and the stage, and throws a
-      ggml_sycl_fallback_error "BF16 grouped arm: <stage> failed after submission: <what>": it never returns, so a
-      thrown submission never falls through to the direct kernel. The hold runs once. The private-testing failpoint
-      that throws sits in the try after the gather and before the GEMMs.
+      nothing in the arm, its helpers, its hold or moe-bf16-grouped.{hpp,cpp} waits. In order: the weightless
+      admission against the planned ring for the routed rows unpadded (before the ids, so a node the ring cannot hold
+      pays no ids wait), the ids, the plan, the table, the same admission for the packed rows, the reservation, the
+      claim (bound to the slot's generation with its owners, rolled back when the cache cannot bind it, released
+      unused when it is too small), one query_only GEMM per width, the row map joining the record leases, then the
+      submissions: one batched gather (profiled as mulmat.moe.bf16_grouped.gather), one oneDNN bf16 GEMM per expert
+      after the gather's event (op context bf16_expert, no f32 down-conversion, a primitive that cannot be created
+      declining), one batched scatter after the GEMMs' events (mulmat.moe.bf16_grouped.scatter) and the hold on the
+      scatter's event; then dst's ready event set to it. Only the scatter writes dst;
+  (j) a failure after the arm's first submission lets nothing go that the device may still read. The submit helper
+      makes one hold (moe_bf16_grouped_hold, which marks the claim used) first, just before its one try; every
+      submission, the row map's copy first, is inside that try, and nothing is submitted before it. The hold, once,
+      publishes the record leases (the row map among them) until an event through
+      retain_handles_until_event_or_keep, which leaves them as they were when it throws, and records the slot on the
+      event; nothing else publishes them. On the run path the event is the scatter's. A submission that declines (a
+      kernel entry that refuses, a GEMM the execute could not create) holds to a marker submitted behind everything
+      and returns false, and the arm declines SUBMIT (dst is still unwritten, so the direct route runs). A submission
+      that throws reaches a std::exception handler (after the rethrow clause the catch contract requires) that does
+      the same hold first, logs a WARN naming the tensor, the device and the stage, and throws a
+      ggml_sycl_fallback_error "BF16 grouped arm: <stage> failed at submission: <what>": it never returns, so a
+      thrown submission never falls through to the direct kernel. Any other exit that has not held, the rethrown
+      fallback error included, holds in the hold's destructor, which throws nothing: when the marker or the
+      publication throws there it keeps the leases (keep_handles_after_failed_wait), never releases them. The arm
+      itself has no try. The private-testing failpoint that throws sits in the try after the gather and before the
+      GEMMs.
 """
 
 import re
@@ -160,41 +172,78 @@ ARM_ADMIT_ROUTED = ("if (!admit_planes(io.n_rows * static_cast<size_t>(k) * size
 ARM_ADMIT_PACKED = f"if (!admit_planes(act_bytes, out_bytes)) {{ {ARM_ADMIT_DECLINE}"
 ARM_PLAN = "ggml_sycl::moe_bf16_grouped_plan_build("
 ARM_RESERVE = "cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)"
-ARM_CLAIM = "if (!pp_moe_onednn_claim_scratch_slot(ctx.device, ring_depth, scratch_slot)) {"
+# The arm's three helpers, each defined once above it and called once, from it, and the hold its submissions make.
+ARM_CLAIM_FN = "ggml_sycl_moe_bf16_grouped_claim_slot"
+ARM_QUERY_FN = "ggml_sycl_moe_bf16_grouped_query_widths"
+ARM_SUBMIT_FN = "ggml_sycl_moe_bf16_grouped_submit"
+ARM_CLAIM_HEAD = f"static bool {ARM_CLAIM_FN}("
+ARM_QUERY_HEAD = f"static bool {ARM_QUERY_FN}("
+ARM_SUBMIT_HEAD = f"static bool {ARM_SUBMIT_FN}("
+ARM_HELPER_HEADS = ((ARM_CLAIM_FN, ARM_CLAIM_HEAD), (ARM_QUERY_FN, ARM_QUERY_HEAD), (ARM_SUBMIT_FN, ARM_SUBMIT_HEAD))
+ARM_HOLD_STRUCT = "struct moe_bf16_grouped_hold {"
+ARM_CLAIM_CALL = (f"if (!{ARM_CLAIM_FN}(ctx.device, stream, *cache, ring_depth, act_bytes, out_bytes, claim, reserved)) "
+                  "{ return decline(moe_bf16_grouped_decline::SCRATCH_SLOT); }")
+ARM_QUERY_CALL = f"if (!{ARM_QUERY_FN}(plan, expert_gemm)) {{ return decline(moe_bf16_grouped_decline::PRIMITIVE); }}"
+ARM_BUFFERS = "const moe_bf16_grouped_buffers buffers = { src1_dev, dst_dev, act, out, rows_dev.get() };"
+ARM_SUBMIT_CALL = (f"if (!{ARM_SUBMIT_FN}(ctx.device, stream, src0, plan, io, buffers, std::move(gather_deps), leases, "
+                   "claim, expert_gemm, &scatter_event)) { return decline(moe_bf16_grouped_decline::SUBMIT); }")
+# The claim helper, whole: the slot claim (the executor's wait, named by a comment directly before it), the cache's claim
+# of that slot, rolled back when it cannot bind, the claim bound to the slot's generation with its owners, and a slot too
+# small for the node released unused. Its depth reaches the claim, the rollback and the binding as it was passed.
+ARM_CLAIM = "if (!pp_moe_onednn_claim_scratch_slot(device, depth, slot)) {"
+ARM_CLAIM_BODY = ("uint32_tslot=std::numeric_limits<uint32_t>::max();"
+                  "if(!pp_moe_onednn_claim_scratch_slot(device,depth,slot)){returnfalse;}"
+                  "if(!cache.claim_pp_moe_onednn_scratch_slot(slot,reserved)){"
+                  "pp_moe_onednn_rollback_unbound_scratch_slot(device,depth,slot);returnfalse;}"
+                  "claim.activate(device,depth,slot,reserved.generation,stream);claim.take_owners(reserved);"
+                  "if(reserved.activation==nullptr||reserved.output==nullptr||reserved.activation_size<act_bytes||"
+                  "reserved.output_size<out_bytes){claim.release_unused();returnfalse;}returntrue;")
 ARM_UOP2 = "// llama.cpp-uop2:"
+ARM_FF54 = "// llama.cpp-ff54:"
+# The query helper, whole: each distinct width once, by its first expert, query_only; any decline is its false.
+ARM_QUERY_BODY = ("for(constsize_twidth:plan.gemm_widths){size_tfirst=0;"
+                  "while(plan.experts[first].gemm_rows!=width){++first;}"
+                  "if(!expert_gemm(first,true,{})){returnfalse;}}returntrue;")
 ARM_GEMM = "DnnlGemmWrapper::gemm("
 ARM_GEMM_ARGS = ('"bf16_expert"', "GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT", "GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE")
 ARM_GEMM_RUN = "expert_gemm(i, false, { gather_event })"
-ARM_GATHER = "ggml_sycl::moe_bf16_grouped_gather_submit(queue, rows_dev.get(), src1_dev, act, io, gather_deps, &event)"
-ARM_SCATTER = "ggml_sycl::moe_bf16_grouped_scatter_submit(queue, rows_dev.get(), out, dst_dev, io, gemm_events, &event)"
+ARM_GATHER = ("ggml_sycl::moe_bf16_grouped_gather_submit(queue, buffers.rows_dev, buffers.src1_dev, buffers.act, io, "
+              "gather_deps, &event)")
+ARM_SCATTER = ("ggml_sycl::moe_bf16_grouped_scatter_submit(queue, buffers.rows_dev, buffers.out, buffers.dst_dev, io, "
+               "gemm_events, &event)")
 ARM_GATHER_LABEL = 'profile_label.name = "mulmat.moe.bf16_grouped.gather";'
 ARM_SCATTER_LABEL = 'profile_label.name = "mulmat.moe.bf16_grouped.scatter";'
 ARM_ROWS_HELD = "leases.push_back(std::move(rows_dev.handle));"
-ARM_RETAIN = "ggml_sycl::retain_handles_until_event(std::move(leases), scatter_event);"
-ARM_RECORD = "claim.record(scatter_event);"
+ARM_HOLD_SCATTER = "hold.hold_until(*scatter_event);"
 ARM_READY = "ggml_sycl_set_tensor_ready_event(dst, ctx.device, scatter_event, stream);"
 ARM_ROUTE_LOG = "[MOE-ROUTE] bf16 grouped tensor="
-# Claim (j): the hold to a marker, the decline after a submission, the one try and its handler.
-ARM_HOLD_HEAD = "const auto hold_until_marker = [&]() {"
-ARM_HOLD_BODY = ("if(held){return;}"
-                 "constsycl::eventpassed=ggml_sycl_submit_marker<moe_bf16_grouped_abandon_marker>(*stream);"
-                 "leases.push_back(std::move(rows_dev.handle));"
-                 "ggml_sycl::retain_handles_until_event(std::move(leases),passed);claim.record(passed);held=true;")
+# Claim (j): the hold, the decline after a submission, the one try and its handler.
+ARM_HOLD_DECL = "moe_bf16_grouped_hold hold(*stream, leases, claim);"
+ARM_HOLD_MADE = "claim(slot_claim){claim.mark_used();}"
+ARM_HOLD_UNTIL_HEAD = "void hold_until(sycl::event event) {"
+ARM_HOLD_UNTIL_BODY = ("if(held){return;}ggml_sycl::retain_handles_until_event_or_keep(leases,event);"
+                       "claim.record(std::move(event));held=true;")
+ARM_HOLD_MARKER_HEAD = "void hold_until_marker() {"
+ARM_HOLD_MARKER_BODY = "if(held){return;}hold_until(ggml_sycl_submit_marker<moe_bf16_grouped_abandon_marker>(queue));"
+ARM_HOLD_DTOR = "~moe_bf16_grouped_hold() {"
+ARM_HOLD_DTOR_OPEN = "if(held){return;}try{hold_until_marker();}catch(...){"
+ARM_HOLD_KEEP = "ggml_sycl::keep_handles_after_failed_wait(leases)"
 ARM_ABANDON_HEAD = "const auto abandon = [&]() {"
-ARM_ABANDON_BODY = "hold_until_marker();returndecline(moe_bf16_grouped_decline::SUBMIT);"
+ARM_ABANDON_BODY = "hold.hold_until_marker();returnfalse;"
 ARM_TRY_RE = re.compile(r"\btry\s*\{")
 ARM_RETHROW = "catch (const ggml_sycl_fallback_error &) { throw; }"
 ARM_HANDLER_HEAD = "catch (const std::exception & e) {"
-ARM_HANDLER_HOLD = "hold_until_marker();"
-ARM_FAILURE_WARN = ('GGML_LOG_WARN("[MoE] BF16 grouped arm failed after submission: tensor=%s device=%d stage=%s '
-                    'error=%s')
-ARM_FAILURE_TEXT = ('bf16_grouped_failure = std::string("BF16 grouped arm: ") + stage + " failed after submission: " + '
+ARM_HANDLER_HOLD = "hold.hold_until_marker();"
+ARM_FAILURE_WARN = 'GGML_LOG_WARN("[MoE] BF16 grouped arm failed at submission: tensor=%s device=%d stage=%s error=%s'
+ARM_FAILURE_TEXT = ('bf16_grouped_failure = std::string("BF16 grouped arm: ") + stage + " failed at submission: " + '
                     "e.what();")
 ARM_FAILURE_THROW = "throw ggml_sycl_fallback_error(bf16_grouped_failure.c_str());"
 ARM_STAGE_FIRST = 'const char * stage = "row map copy";'
-ARM_STAGES = ('stage = "gather";', 'stage = "expert GEMM";', 'stage = "scatter";')
-ARM_FIRST_SUBMIT = "ggml_sycl_safe_memcpy(*stream, rows_dev.get(), plan.rows.data(),"
-# What submits work: none of it may come before the try. The marker inside the hold lambda is defined there, not run.
+ARM_STAGES = ('stage = "gather";', 'stage = "expert GEMM";', 'stage = "scatter";', 'stage = "handle retention";')
+ARM_FIRST_SUBMIT = "ggml_sycl_safe_memcpy(*stream, buffers.rows_dev, plan.rows.data(),"
+# The node that ran: the last stage is the hold on the scatter's event, then true.
+ARM_RAN = 'stage="handleretention";hold.hold_until(*scatter_event);returntrue;'
+# What submits work: none of it may come before the try, or in the arm. The marker in the hold is defined there, not run.
 ARM_SUBMITTERS = ("ggml_sycl_safe_memcpy(", "ggml_sycl_profile_submit(", "expert_gemm(i, false,", "_gather_submit(",
                   "_scatter_submit(", ".submit(", "->submit(")
 ARM_FAILPOINT = ("ggml_sycl_q1_nvfp4_test_consume_failure("
@@ -207,8 +256,10 @@ ARM_DECLINE_FAILPOINT = ("#ifdefGGML_SYCL_Q1_NVFP4_ROUTE_TESTING"
                          f"if(!query_only&&ggml_sycl_q1_nvfp4_test_consume_failure({ARM_DECLINE_FAILURE})){{"
                          "returnstd::optional<sycl::event>();}#endif"
                          "constggml_sycl::moe_bf16_grouped_expert&expert=plan.experts[i];")
+# Forbidden in the arm, its helpers and its hold; `return false;` only in the arm, whose every decline is counted.
 ARM_FORBIDDEN = (".wait(", "->wait(", "::wait(", "wait_and_throw", "getenv", "GGML_ABORT", "malloc_", "sycl::free(",
                  "return false;", "ggml_sycl_ensure_weight_on_device", "ids_host", "ggml_sycl_copy_ids_to_host")
+ARM_HELPER_FORBIDDEN = tuple(spelling for spelling in ARM_FORBIDDEN if spelling != "return false;")
 EXECUTOR_HEAD = "auto try_pp_onednn_f16_batched = [&]() -> bool {"
 GATE = ("if (!moe_mmvq_admission_supports_type(indexed_a_type) && !ggml_sycl_moe_pp_batched_admits_op(op, device) && "
         f"!{PREDICATE}(op, device)) {{")
@@ -580,6 +631,26 @@ def claim_h_tables(s):
     return fails
 
 
+def arm_helper_bodies(sycl):
+    """The arm's three helpers by name, each the body of its one definition, or None when any is not defined exactly
+    once or is defined after the arm that calls it."""
+    arm_at = sycl.find(ARM_FN_HEAD)
+    out = {}
+    for name, head in ARM_HELPER_HEADS:
+        if len(re.findall(rf"\bstatic bool {name}\(", sycl)) != 1 or not 0 <= sycl.find(head) < arm_at:
+            return None
+        out[name] = function_body(sycl, head)
+        if out[name] is None:
+            return None
+    return out
+
+
+def hold_struct_body(sycl):
+    if sycl.count(ARM_HOLD_STRUCT) != 1:
+        return None
+    return braced_body(sycl, ARM_HOLD_STRUCT)
+
+
 def claim_i_grouped_arm(s):
     sycl = s["sycl"]
     arm = arm_fn_body(sycl)
@@ -602,7 +673,7 @@ def claim_i_grouped_arm(s):
     if sycl.count(ARM_OPT_OUT_ENV) != 1:
         fails.append("GGML_SYCL_MOE_BF16_GROUPED is read somewhere other than the arm's one helper")
     if arm.count(ARM_ENABLED) != 1 or not tight(arm).startswith(
-            "constggml_tensor*src0=dst->src[0];constggml_tensor*src1=dst->src[1];constggml_tensor*ids=dst->src[2];"
+            "constggml_tensor*src0=dst->src[0];constggml_tensor*ids=dst->src[2];"
             "constautodecline=[&](moe_bf16_grouped_declinereason){returnggml_sycl_moe_bf16_grouped_note_decline(src0,"
             f"ctx.device,reason);}};if(!{ARM_ENABLED}){{returndecline(moe_bf16_grouped_decline::OPT_OUT);}}"):
         fails.append("the grouped arm does not ask the opt-out first, as a counted decline")
@@ -610,50 +681,87 @@ def claim_i_grouped_arm(s):
     decline = braced_body(sycl, ARM_DECLINE_HEAD) if sycl.count(ARM_DECLINE_HEAD) == 1 else None
     if decline is None or ARM_DECLINE_COUNT not in decline or not tight(decline).endswith("returnfalse;"):
         fails.append("the arm's decline helper does not count the reason and return false")
+    # Three helpers, each defined once above the arm and called once, from it; their falses are the arm's counted
+    # declines.
+    helpers = arm_helper_bodies(sycl)
+    if helpers is None:
+        return fails + ["the arm's claim, query and submit helpers are not each defined once, above the arm"]
+    claim, query, submit = helpers[ARM_CLAIM_FN], helpers[ARM_QUERY_FN], helpers[ARM_SUBMIT_FN]
+    hold = hold_struct_body(sycl)
+    if hold is None:
+        return fails + ["moe_bf16_grouped_hold is not defined exactly once"]
+    for name, call in ((ARM_CLAIM_FN, ARM_CLAIM_CALL), (ARM_QUERY_FN, ARM_QUERY_CALL), (ARM_SUBMIT_FN, ARM_SUBMIT_CALL)):
+        if len(re.findall(rf"\b{name}\(", sycl)) != 2 or arm.count(call) != 1:
+            fails.append(f"{name} is not called once, from the arm, as `{call}`")
+    # The claim helper, whole, and the query helper, whole.
+    if tight(claim) != ARM_CLAIM_BODY:
+        fails.append("the claim helper is not: the slot claim, the cache's claim rolled back when it cannot bind, the "
+                     "claim bound to the slot's generation with its owners, a slot too small released unused")
+    if tight(query) != ARM_QUERY_BODY:
+        fails.append("the query helper does not ask each width once, query_only, by its first expert, false on a no")
     for needed in (ARM_IDS, ARM_IDS_REFRESH, ARM_PLAN, TABLE_CALL, ARM_ADMIT, ARM_ADMIT_LAMBDA, ARM_ADMIT_ROUTED,
-                   ARM_ADMIT_PACKED, ARM_RESERVE, ARM_CLAIM, ARM_GEMM, *ARM_GEMM_ARGS, ARM_GEMM_RUN, ARM_GATHER,
-                   ARM_SCATTER, ARM_GATHER_LABEL, ARM_SCATTER_LABEL, ARM_ROWS_HELD, ARM_RETAIN, ARM_RECORD, ARM_READY,
+                   ARM_ADMIT_PACKED, ARM_RESERVE, ARM_GEMM, *ARM_GEMM_ARGS, ARM_ROWS_HELD, ARM_BUFFERS, ARM_READY,
                    ARM_ROUTE_LOG, *OPERAND_CALLS, GRAPH_FLAG):
         if needed not in arm:
             fails.append(f"{ARM_FN} does not contain {needed}")
-    for once in (ARM_IDS, ARM_IDS_REFRESH, ARM_PLAN, ARM_ADMIT, ARM_ADMIT_LAMBDA, ARM_ADMIT_ROUTED, ARM_ADMIT_PACKED, ARM_RESERVE,
-                 ARM_CLAIM, ARM_GEMM, ARM_GATHER, ARM_SCATTER, ARM_RETAIN, ARM_RECORD, ARM_READY,
-                 "ggml_sycl::moe_bf16_grouped_gather_submit(", "ggml_sycl::moe_bf16_grouped_scatter_submit("):
+    for needed in (ARM_GEMM_RUN, ARM_GATHER, ARM_SCATTER, ARM_GATHER_LABEL, ARM_SCATTER_LABEL, ARM_HOLD_SCATTER):
+        if needed not in submit:
+            fails.append(f"{ARM_SUBMIT_FN} does not contain {needed}")
+    for once in (ARM_IDS, ARM_IDS_REFRESH, ARM_PLAN, ARM_ADMIT, ARM_ADMIT_LAMBDA, ARM_ADMIT_ROUTED, ARM_ADMIT_PACKED,
+                 ARM_RESERVE, ARM_GEMM, ARM_READY, ARM_BUFFERS):
         if arm.count(once) > 1:
             fails.append(f"{ARM_FN} contains {once} more than once")
+    # One gather, one scatter, one hold on the scatter's event: in the submit helper, nowhere else.
+    for once in (ARM_GATHER, ARM_SCATTER, ARM_HOLD_SCATTER, "ggml_sycl::moe_bf16_grouped_gather_submit(",
+                 "ggml_sycl::moe_bf16_grouped_scatter_submit("):
+        if sycl.count(once) != 1 or submit.count(once) != 1:
+            fails.append(f"{once} is not in {ARM_SUBMIT_FN} exactly once, and nowhere else")
     # The admission asked twice through its one lambda, which answers what the weightless admission answers.
     if arm.count("admit_planes(") != 2:
         fails.append("the arm asks its admission lambda other than twice (the routed rows, then the packed rows)")
     admit = braced_body(arm, ARM_ADMIT_LAMBDA)
     if admit is None or ARM_ADMIT not in admit or not tight(admit).endswith("returnadmission.allowed;"):
         fails.append("the admission lambda does not return the weightless admission's answer")
-    # The row map joins the leases twice: in the hold to a marker (claim (j)) and on the path that ran the node.
-    if arm.count(ARM_ROWS_HELD) != 2:
-        fails.append("the row map joins the leases other than in the hold and on the path that ran the node")
-    lowered = arm.lower()
-    for forbidden in ARM_FORBIDDEN:
-        if forbidden.lower() in lowered:
-            fails.append(f"{ARM_FN} contains {forbidden!r}")
-    # dst is written by the scatter alone: resolved, null-checked, handed to the scatter.
-    if arm.count("dst_dev") != 3:
-        fails.append("dst's device pointer is used somewhere other than its resolution, its check and the scatter")
-    # The row map held on the run path is the last of its two spellings.
+    # The row map joins the leases once, in the arm, before the submissions: the hold publishes it with them.
+    if arm.count(ARM_ROWS_HELD) != 1 or any(ARM_ROWS_HELD in text for text in (claim, query, submit, hold)):
+        fails.append("the row map joins the leases other than once, in the arm, before the hold publishes them")
+    for where, text, forbidden_set in ((ARM_FN, arm, ARM_FORBIDDEN), (ARM_CLAIM_FN, claim, ARM_HELPER_FORBIDDEN),
+                                       (ARM_QUERY_FN, query, ARM_HELPER_FORBIDDEN),
+                                       (ARM_SUBMIT_FN, submit, ARM_HELPER_FORBIDDEN),
+                                       ("moe_bf16_grouped_hold", hold, ARM_HELPER_FORBIDDEN)):
+        lowered = text.lower()
+        for forbidden in forbidden_set:
+            if forbidden.lower() in lowered:
+                fails.append(f"{where} contains {forbidden!r}")
+    # dst is written by the scatter alone: resolved, null-checked and handed to the submissions in the arm, and in the
+    # submit helper read by the scatter only.
+    if arm.count("dst_dev") != 3 or submit.count("dst_dev") != 1 or any("dst_dev" in t for t in (claim, query, hold)):
+        fails.append("dst's device pointer is used somewhere other than its resolution, its check, the submissions' "
+                     "buffers and the scatter")
     order = [arm.find(text) for text in (ARM_ENABLED, ROUTE_ASK, ARM_ADMIT_LAMBDA, ARM_ADMIT_ROUTED, ARM_IDS,
-                                         ARM_IDS_REFRESH, ARM_PLAN, TABLE_CALL, ARM_ADMIT_PACKED, ARM_RESERVE, ARM_CLAIM,
-                                         ARM_GATHER_LABEL, ARM_GATHER, ARM_GEMM_RUN, ARM_SCATTER_LABEL, ARM_SCATTER)]
-    order += [arm.rfind(ARM_ROWS_HELD)] + [arm.find(text) for text in (ARM_RETAIN, ARM_RECORD, ARM_READY)]
+                                         ARM_IDS_REFRESH, ARM_PLAN, TABLE_CALL, ARM_ADMIT_PACKED, ARM_RESERVE,
+                                         ARM_CLAIM_CALL, ARM_GEMM, ARM_QUERY_CALL, ARM_ROWS_HELD, ARM_BUFFERS,
+                                         ARM_SUBMIT_CALL, ARM_READY)]
     if min(order) >= 0 and order != sorted(order):
         fails.append("the arm does not run opt-out, predicate, admission of the routed rows, ids, plan, table, "
-                     "admission of the packed rows, reservation, claim, gather, GEMMs, scatter, then hold the row map "
-                     "and leases to the scatter's event, record the slot on it and publish it as dst's ready event, in "
-                     "that order")
-    # The claim is the executor's wait, named for the task that removes it, by a comment directly before it.
+                     "admission of the packed rows, reservation, claim, the width queries, the row map joining the "
+                     "leases, the submissions, then dst's ready event, in that order")
+    order = [submit.find(text) for text in (ARM_GATHER_LABEL, ARM_GATHER, ARM_GEMM_RUN, ARM_SCATTER_LABEL, ARM_SCATTER,
+                                            ARM_HOLD_SCATTER)]
+    if min(order) >= 0 and order != sorted(order):
+        fails.append("the submit helper does not run the gather, the GEMMs, the scatter, then hold to the scatter's "
+                     "event, in that order")
+    # The claim is the executor's wait, named for the task that removes it, by a comment directly before it; the
+    # helper is named for the task that shares it with the executor's two, by a comment directly before its head.
     raw = s["sycl_raw"]
-    head = raw.find(ARM_FN_HEAD)
+    head = raw.find(ARM_CLAIM_HEAD)
     claim_at = raw.find(ARM_CLAIM, head) if head >= 0 else -1
     uop2_at = raw.rfind(ARM_UOP2, head, claim_at) if claim_at >= 0 else -1
     if uop2_at < 0 or ";" in raw[uop2_at:claim_at]:
         fails.append(f"the arm's ring-slot claim is not directly preceded by a `{ARM_UOP2}` comment")
+    ff54_at = raw.rfind(ARM_FF54, 0, head) if head >= 0 else -1
+    if ff54_at < 0 or any(mark in raw[ff54_at:head] for mark in (";", "{", "}")):
+        fails.append(f"the claim helper is not directly preceded by a `{ARM_FF54}` comment")
     # The arm's kernels: one submit each, ordered by their deps, allocating, freeing and waiting on nothing.
     arm_hpp, arm_cpp = s["arm_hpp"], s["arm_cpp"]
     if not arm_hpp or not arm_cpp:
@@ -673,29 +781,59 @@ def claim_j_failure_after_submission(s):
     arm = arm_fn_body(sycl)
     if arm is None:
         return [f"{ARM_FN} is not defined exactly once"]
+    helpers = arm_helper_bodies(sycl)
+    hold = hold_struct_body(sycl)
+    if helpers is None or hold is None:
+        return ["the arm's submit helper or its hold is not defined exactly once, above the arm"]
+    submit = helpers[ARM_SUBMIT_FN]
     fails = []
-    # The hold: once, a marker behind everything submitted, the row map joining the record leases, both held until
-    # the marker, the slot recorded on it.
-    hold = braced_body(arm, ARM_HOLD_HEAD) if arm.count(ARM_HOLD_HEAD) == 1 else None
-    if hold is None or tight(hold) != ARM_HOLD_BODY:
-        fails.append("the hold is not exactly: once, a marker, the row map joining the leases, both held until the "
-                     "marker and the slot recorded on it")
-    abandon = braced_body(arm, ARM_ABANDON_HEAD) if arm.count(ARM_ABANDON_HEAD) == 1 else None
-    if abandon is None or tight(abandon) != ARM_ABANDON_BODY:
-        fails.append("a submission that declines does not hold to the marker and then decline SUBMIT")
-    # One try, holding every submission, the row map's copy first; nothing submitted before it.
-    tries = list(ARM_TRY_RE.finditer(arm))
+    # The hold, made before the submit helper: it marks the claim used, and once publishes the record leases until an
+    # event (leaving them as they were when the publication throws) and records the slot on it.
+    if not sycl.find(ARM_HOLD_STRUCT) < sycl.find(ARM_SUBMIT_HEAD):
+        fails.append("moe_bf16_grouped_hold is defined after the submit helper that makes it")
+    if ARM_HOLD_MADE not in tight(hold):
+        fails.append("the hold does not mark the claim used when it is made")
+    until = braced_body(hold, ARM_HOLD_UNTIL_HEAD) if hold.count(ARM_HOLD_UNTIL_HEAD) == 1 else None
+    if until is None or tight(until) != ARM_HOLD_UNTIL_BODY:
+        fails.append("hold_until is not exactly: once, the leases held until the event or kept as they were, the slot "
+                     "recorded on it")
+    marker = braced_body(hold, ARM_HOLD_MARKER_HEAD) if hold.count(ARM_HOLD_MARKER_HEAD) == 1 else None
+    if marker is None or tight(marker) != ARM_HOLD_MARKER_BODY:
+        fails.append("hold_until_marker is not exactly: once, hold_until a marker submitted behind everything")
+    # The destructor: any exit that has not held holds to a marker, and nothing escapes it: the leases kept, never
+    # released, when the marker or the publication throws.
+    dtor = braced_body(hold, ARM_HOLD_DTOR) if hold.count(ARM_HOLD_DTOR) == 1 else None
+    if dtor is None or not tight(dtor).startswith(ARM_HOLD_DTOR_OPEN) or ARM_HOLD_KEEP not in dtor or "throw" in dtor:
+        fails.append("the hold's destructor does not hold to a marker on an exit that has not held, keeping the leases "
+                     "and throwing nothing when that throws")
+    # The hold is the one publication: no consuming retain, no record and no `held` outside it.
+    for where, text in ((ARM_FN, arm), (ARM_SUBMIT_FN, submit)):
+        for spelled in ("retain_handles_until_event", "claim.record(", "held"):
+            if spelled in text:
+                fails.append(f"{where} spells {spelled!r}: the hold is the one publication of the leases and the slot")
+    if "ggml_sycl::retain_handles_until_event(" in hold:
+        fails.append("the hold publishes the leases with the retain that consumes them when it throws")
+    # The arm runs no submission and catches nothing: its submissions are the submit helper's.
+    if ARM_TRY_RE.search(arm) or "catch (" in arm or "throw ggml_sycl_fallback_error(" in arm:
+        fails.append("the arm has a try, a handler or a fallback throw of its own")
+    # The hold, declared once just before the one try, so its destructor covers every exit and the handler holds.
+    tries = list(ARM_TRY_RE.finditer(submit))
     if len(tries) != 1:
-        return fails + [f"the arm has {len(tries)} try blocks; want the one around its submissions"]
-    try_head = arm[tries[0].start() : tries[0].end()]
-    body = braced_body(arm, try_head, tries[0].start())
-    end = braced_end(arm, try_head, tries[0].start())
+        return fails + [f"the submit helper has {len(tries)} try blocks; want the one around its submissions"]
+    try_head = submit[tries[0].start() : tries[0].end()]
+    body = braced_body(submit, try_head, tries[0].start())
+    end = braced_end(submit, try_head, tries[0].start())
     if body is None or end < 0:
-        return fails + ["the arm's try block does not close"]
-    before = arm[: tries[0].start()]
+        return fails + ["the submit helper's try block does not close"]
+    before = submit[: tries[0].start()]
+    if submit.count(ARM_HOLD_DECL) != 1 or not tight(before).startswith(tight(ARM_HOLD_DECL)):
+        fails.append("the submit helper does not make its one hold first, before its try")
+    abandon = braced_body(submit, ARM_ABANDON_HEAD) if submit.count(ARM_ABANDON_HEAD) == 1 else None
+    if abandon is None or tight(abandon) != ARM_ABANDON_BODY or submit.find(ARM_ABANDON_HEAD) > tries[0].start():
+        fails.append("a submission that declines does not hold to the marker and then return false")
     for submitter in ARM_SUBMITTERS:
         if submitter in before:
-            fails.append(f"the arm submits work ({submitter!r}) before its try")
+            fails.append(f"the submit helper submits work ({submitter!r}) before its try")
     if not tight(body).startswith(tight("gather_deps.push_back(" + ARM_FIRST_SUBMIT)):
         fails.append("the try does not begin with the arm's first submission, the row map's copy")
     for needed in (ARM_GATHER, ARM_GEMM_RUN, ARM_SCATTER, *ARM_STAGES):
@@ -704,11 +842,15 @@ def claim_j_failure_after_submission(s):
     if ARM_STAGE_FIRST not in before:
         fails.append("the stage the handler names is not the row map's copy until the gather")
     stages = [body.find(text) for text in (ARM_STAGES[0], ARM_GATHER, ARM_STAGES[1], ARM_GEMM_RUN, ARM_STAGES[2],
-                                           ARM_SCATTER)]
+                                           ARM_SCATTER, ARM_STAGES[3], ARM_HOLD_SCATTER)]
     if min(stages) >= 0 and stages != sorted(stages):
-        fails.append("the stage the handler names is not set before the gather, the GEMMs and the scatter")
-    if body.count("return abandon();") != 3 or "return decline(" in body or "return true;" in body:
-        fails.append("a submission inside the try leaves other than by the hold and a SUBMIT decline")
+        fails.append("the stage the handler names is not set before the gather, the GEMMs, the scatter and the hold")
+    # The node that ran leaves through the hold on the scatter's event; every other way out of the try is the hold to
+    # a marker and false.
+    if not tight(body).endswith(ARM_RAN) or body.count("return true;") != 1:
+        fails.append("the try does not end by holding to the scatter's event and returning true")
+    if body.count("return abandon();") != 3 or "return decline(" in body or "return false;" in body:
+        fails.append("a submission inside the try leaves other than by the hold to a marker and false")
     # The failpoint that throws: once, inside the try, after the gather and before the GEMMs.
     point = body.find(ARM_FAILPOINT)
     if sycl.count(ARM_FAILPOINT) != 1 or not (body.find(ARM_GATHER) < point < body.find(ARM_GEMM_RUN)):
@@ -721,24 +863,25 @@ def claim_j_failure_after_submission(s):
                      "never the query, by returning no event")
     # The handlers: the rethrow clause the catch contract requires, then the std::exception handler: the hold first,
     # the WARN naming tensor, device and stage, the named fallback error thrown, and no way back to the direct route.
-    after = arm[end:]
+    after = submit[end:]
     if not tight(after).startswith(tight(ARM_RETHROW + ARM_HANDLER_HEAD)):
         return fails + ["the try is not followed by exactly the fallback-error rethrow and a std::exception handler"]
-    if arm.count("catch (") != 2:
-        fails.append("the arm catches other than the rethrow clause and its one std::exception handler")
-    handler = braced_body(arm, ARM_HANDLER_HEAD, end)
+    if submit.count("catch (") != 2:
+        fails.append("the submit helper catches other than the rethrow clause and its one std::exception handler")
+    handler = braced_body(submit, ARM_HANDLER_HEAD, end)
     if handler is None:
         return fails + ["the std::exception handler does not close"]
     if not tight(handler).startswith(tight(ARM_HANDLER_HOLD)):
         fails.append("the handler does not hold to a marker before anything else")
-    for needed in (ARM_FAILURE_WARN, "src0->name, ctx.device, stage, e.what()", "static thread_local std::string "
+    for needed in (ARM_FAILURE_WARN, "src0->name, device, stage, e.what()", "static thread_local std::string "
                    "bf16_grouped_failure;", ARM_FAILURE_TEXT):
         if needed not in handler:
             fails.append(f"the handler does not contain {needed}")
     if not tight(handler).endswith(tight(ARM_FAILURE_THROW)):
         fails.append("the handler does not end by throwing the named ggml_sycl_fallback_error")
-    if "return" in handler or arm.count("throw ggml_sycl_fallback_error(") != 1:
-        fails.append("a thrown submission can leave the arm other than by the named fallback error")
+    handler_end = braced_end(submit, ARM_HANDLER_HEAD, end)
+    if "return" in handler or submit.count("throw ggml_sycl_fallback_error(") != 1 or tight(submit[handler_end:]):
+        fails.append("a thrown submission can leave the submit helper other than by the named fallback error")
     return fails
 
 
@@ -852,67 +995,116 @@ MUTANTS = [
     ("i", "sycl", ARM_FN_HEAD, f"if (!{ARM_ENABLED}) {{ return decline(moe_bf16_grouped_decline::OPT_OUT); }}", ""),
     ("i", "sycl", ARM_FN_HEAD, "return decline(moe_bf16_grouped_decline::OPT_OUT);", "return false;"),
     ("i", "sycl", ARM_DECLINE_HEAD, ARM_DECLINE_COUNT, "0"),
-    # A host wait in the chain, in the arm or in its kernels.
-    ("i", "sycl", ARM_FN_HEAD, "bool scattered = false;", "stream->wait(); bool scattered = false;"),
-    ("i", "sycl", ARM_FN_HEAD, "gemm_events.push_back(*gemm_event);",
+    # A helper asked from a second site.
+    ("i", "sycl", None, ROUTE_FN_HEAD, f"{ROUTE_FN_HEAD} (void) {ARM_QUERY_FN}(plan, expert_gemm);"),
+    # A host wait in the chain: in the submissions, the claim helper, the hold or the arm's kernels.
+    ("i", "sycl", ARM_SUBMIT_HEAD, "bool scattered = false;", "stream->wait(); bool scattered = false;"),
+    ("i", "sycl", ARM_SUBMIT_HEAD, "gemm_events.push_back(*gemm_event);",
      "gemm_event->wait(); gemm_events.push_back(*gemm_event);"),
+    ("i", "sycl", ARM_CLAIM_HEAD, "claim.take_owners(reserved);", "claim.take_owners(reserved); stream->wait();"),
+    ("i", "sycl", f"{ARM_HOLD_STRUCT}|{ARM_HOLD_MARKER_HEAD}", "if (held) { return; }",
+     "if (held) { return; } queue.wait();"),
     ("i", "arm_cpp", None, "return true;", "event->wait(); return true;"),
     ("i", "arm_cpp", None, "h.depends_on(deps);", ""),
     # The chain's edges: the GEMMs not after the gather, the scatter not after the GEMMs.
-    ("i", "sycl", ARM_FN_HEAD, ARM_GEMM_RUN, "expert_gemm(i, false, {})"),
-    ("i", "sycl", ARM_FN_HEAD, "io, gemm_events, &event)", "io, {}, &event)"),
-    # A second gather or scatter, or the scatter's dst handed to the gather.
-    ("i", "sycl", ARM_FN_HEAD, "gathered = ggml_sycl::moe_bf16_grouped_gather_submit(",
-     "gathered = ggml_sycl::moe_bf16_grouped_gather_submit(queue, rows_dev.get(), src1_dev, act, io, {}, &event) && "
-     "ggml_sycl::moe_bf16_grouped_gather_submit("),
-    ("i", "sycl", ARM_FN_HEAD, "src1_dev, act, io, gather_deps", "src1_dev, reinterpret_cast<uint16_t *>(dst_dev), "
-     "io, gather_deps"),
-    # The leases, the row map and the slot let go before the scatter's event; dst's ready event left unset.
-    ("i", "sycl", ARM_FN_HEAD, ARM_RETAIN, "(void) leases;"),
-    ("i", "sycl", f"{ARM_FN_HEAD}|{ARM_FAILURE_THROW}", ARM_ROWS_HELD, ""),
-    ("i", "sycl", ARM_FN_HEAD, ARM_RECORD, ""),
+    ("i", "sycl", ARM_SUBMIT_HEAD, ARM_GEMM_RUN, "expert_gemm(i, false, {})"),
+    ("i", "sycl", ARM_SUBMIT_HEAD, "io, gemm_events, &event)", "io, {}, &event)"),
+    # A second gather or scatter, or dst handed to the gather.
+    ("i", "sycl", ARM_SUBMIT_HEAD, "gathered = ggml_sycl::moe_bf16_grouped_gather_submit(",
+     "gathered = ggml_sycl::moe_bf16_grouped_gather_submit(queue, buffers.rows_dev, buffers.src1_dev, buffers.act, io, "
+     "{}, &event) && ggml_sycl::moe_bf16_grouped_gather_submit("),
+    ("i", "sycl", ARM_SUBMIT_HEAD, "buffers.src1_dev, buffers.act, io, gather_deps",
+     "buffers.src1_dev, reinterpret_cast<uint16_t *>(buffers.dst_dev), io, gather_deps"),
+    ("i", "sycl", ARM_FN_HEAD, ARM_BUFFERS,
+     "const moe_bf16_grouped_buffers buffers = { src1_dev, dst_dev, reinterpret_cast<uint16_t *>(dst_dev), out, "
+     "rows_dev.get() };"),
+    # The row map left out of the leases; the hold on another event, or none; dst's ready event left unset.
+    ("i", "sycl", ARM_FN_HEAD, ARM_ROWS_HELD, ""),
+    ("i", "sycl", ARM_SUBMIT_HEAD, ARM_HOLD_SCATTER, ""),
+    ("i", "sycl", ARM_SUBMIT_HEAD, ARM_HOLD_SCATTER, "hold.hold_until(gather_event);"),
     ("i", "sycl", ARM_FN_HEAD, ARM_READY, ""),
-    ("i", "sycl", ARM_FN_HEAD, ARM_RETAIN, "ggml_sycl::retain_handles_until_event(std::move(leases), gather_event);"),
     # The ring asked out of order, or with the weight-staging admission.
     ("i", "sycl", ARM_FN_HEAD, ARM_ADMIT, "ggml_sycl::pp_moe_onednn_admit_scratch(planned_shape, planned_shape)"),
     ("i", "sycl", ARM_FN_HEAD, "pp_moe_onednn_scratch_claim claim;",
      f"pp_moe_onednn_scratch_claim claim; {ARM_RESERVE};"),
+    # The claim helper: no rollback of a slot that cannot bind, the slot's generation not bound, a slot too small kept
+    # or let through; the arm asking it at another depth, or reading its false as a bare false.
+    ("i", "sycl", ARM_CLAIM_HEAD, "pp_moe_onednn_rollback_unbound_scratch_slot(device, depth, slot);", ""),
+    ("i", "sycl", ARM_CLAIM_HEAD, "reserved.generation", "0"),
+    ("i", "sycl", ARM_CLAIM_HEAD, "claim.release_unused(); return false;", "return false;"),
+    ("i", "sycl", ARM_CLAIM_HEAD, " || reserved.output_size < out_bytes", ""),
+    ("i", "sycl", ARM_FN_HEAD, "*cache, ring_depth, act_bytes", "*cache, planned_ring_depth, act_bytes"),
+    ("i", "sycl", f"{ARM_FN_HEAD}|{ARM_CLAIM_FN}(", "return decline(moe_bf16_grouped_decline::SCRATCH_SLOT);",
+     "return false;"),
+    # The query helper: a no ignored, or a run instead of a query; the arm going on after its no.
+    ("i", "sycl", ARM_QUERY_HEAD, "if (!expert_gemm(first, true, {})) { return false; }",
+     "(void) expert_gemm(first, true, {});"),
+    ("i", "sycl", ARM_QUERY_HEAD, "expert_gemm(first, true, {})", "expert_gemm(first, false, {})"),
+    ("i", "sycl", ARM_FN_HEAD, ARM_QUERY_CALL, f"(void) {ARM_QUERY_FN}(plan, expert_gemm);"),
+    # The submit helper's false read as a bare false.
+    ("i", "sycl", ARM_FN_HEAD, "return decline(moe_bf16_grouped_decline::SUBMIT);", "return false;"),
     # The GEMM's contract: its profiler context, strict f32, and a primitive that cannot be created declining.
     ("i", "sycl", ARM_FN_HEAD, '"bf16_expert"', '"onednn_gemm"'),
-    ("i", "sycl", ARM_FN_HEAD, "GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT", "GGML_SYCL_DNNL_FPMATH_DEFAULT"),
-    ("i", "sycl", ARM_FN_HEAD, "GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE", "GGML_SYCL_DNNL_CREATE_FAILURE_ABORT"),
-    ("i", "sycl", ARM_FN_HEAD, ARM_GATHER_LABEL, 'profile_label.name = "mulmat.moe.bf16_grouped";'),
-    # The claim's wait unnamed, or a statement between the comment and the claim.
-    ("i", "sycl_raw", ARM_FN_HEAD, ARM_UOP2, "//"),
-    ("i", "sycl_raw", f"{ARM_FN_HEAD}|{ARM_UOP2}", ARM_CLAIM, f"(void) 0; {ARM_CLAIM}"),
+    ("i", "sycl", ARM_FN_HEAD, "GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT", "GGML_SYCL_DNNL_FPMATH_BUILD"),
+    ("i", "sycl", ARM_FN_HEAD, "GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE", "GGML_SYCL_DNNL_CREATE_FAILURE_THROW"),
+    ("i", "sycl", ARM_SUBMIT_HEAD, ARM_GATHER_LABEL, 'profile_label.name = "mulmat.moe.bf16_grouped";'),
+    # The claim's wait unnamed, or a statement between the comment and the claim; the helper's ff54 comment gone, or a
+    # statement between it and the helper.
+    ("i", "sycl_raw", ARM_CLAIM_HEAD, ARM_UOP2, "//"),
+    ("i", "sycl_raw", f"{ARM_CLAIM_HEAD}|{ARM_UOP2}", ARM_CLAIM, f"(void) 0; {ARM_CLAIM}"),
+    ("i", "sycl_raw", None, ARM_FF54, "//"),
+    ("i", "sycl_raw", ARM_FF54, ARM_CLAIM_HEAD, f"struct ff54_gap; {ARM_CLAIM_HEAD}"),
     # The admission: asked after the ids only, its routed-rows answer ignored, or the lambda answering yes.
     ("i", "sycl", ARM_FN_HEAD, ARM_ADMIT_ROUTED, ""),
     ("i", "sycl", f"{ARM_FN_HEAD}|if (!admit_planes(io.n_rows", ARM_ADMIT_DECLINE, "(void) 0; }"),
     ("i", "sycl", ARM_FN_HEAD, ARM_ADMIT_ROUTED, f"(void) 0; {ARM_IDS_REFRESH}; {ARM_ADMIT_ROUTED}"),
     ("i", "sycl", ARM_ADMIT_LAMBDA, "return admission.allowed;", "return true;"),
     ("i", "sycl", ARM_FN_HEAD, ARM_ADMIT_PACKED, ""),
-    # The hold: run twice, without the marker, letting the row map, the leases or the slot go before it.
-    ("j", "sycl", ARM_HOLD_HEAD, "if (held) { return; }", ""),
-    ("j", "sycl", ARM_HOLD_HEAD, "held = true;", ""),
-    ("j", "sycl", ARM_HOLD_HEAD, "ggml_sycl_submit_marker<moe_bf16_grouped_abandon_marker>(*stream)", "sycl::event()"),
-    ("j", "sycl", ARM_HOLD_HEAD, ARM_ROWS_HELD, ""),
-    ("j", "sycl", ARM_HOLD_HEAD, "ggml_sycl::retain_handles_until_event(std::move(leases), passed);", "(void) leases;"),
-    ("j", "sycl", ARM_HOLD_HEAD, "claim.record(passed);", ""),
-    # A submission that declines without the hold, or not as SUBMIT.
-    ("j", "sycl", ARM_ABANDON_HEAD, "hold_until_marker();", ""),
-    ("j", "sycl", ARM_ABANDON_HEAD, "moe_bf16_grouped_decline::SUBMIT", "moe_bf16_grouped_decline::PRIMITIVE"),
-    ("j", "sycl", f"{ARM_FN_HEAD}|if (!scattered) {{", "return abandon();", "return false;"),
+    # The hold: run twice, without the marker, publishing with the retain that consumes the leases when it throws,
+    # letting the leases or the slot go before the event, or not marking the claim used.
+    ("j", "sycl", f"{ARM_HOLD_STRUCT}|{ARM_HOLD_UNTIL_HEAD}", "if (held) { return; }", ""),
+    ("j", "sycl", f"{ARM_HOLD_STRUCT}|{ARM_HOLD_MARKER_HEAD}", "if (held) { return; }", ""),
+    ("j", "sycl", f"{ARM_HOLD_STRUCT}|{ARM_HOLD_UNTIL_HEAD}", "held = true;", ""),
+    ("j", "sycl", f"{ARM_HOLD_STRUCT}|{ARM_HOLD_MARKER_HEAD}",
+     "ggml_sycl_submit_marker<moe_bf16_grouped_abandon_marker>(queue)", "sycl::event()"),
+    ("j", "sycl", f"{ARM_HOLD_STRUCT}|{ARM_HOLD_UNTIL_HEAD}",
+     "ggml_sycl::retain_handles_until_event_or_keep(leases, event);",
+     "ggml_sycl::retain_handles_until_event(std::move(leases), event);"),
+    ("j", "sycl", f"{ARM_HOLD_STRUCT}|{ARM_HOLD_UNTIL_HEAD}",
+     "ggml_sycl::retain_handles_until_event_or_keep(leases, event);", "(void) leases;"),
+    ("j", "sycl", f"{ARM_HOLD_STRUCT}|{ARM_HOLD_UNTIL_HEAD}", "claim.record(std::move(event));", ""),
+    ("j", "sycl", ARM_HOLD_STRUCT, "claim.mark_used();", ""),
+    # The destructor: not holding, rethrowing, or letting the leases go when the hold throws there.
+    ("j", "sycl", f"{ARM_HOLD_STRUCT}|{ARM_HOLD_DTOR}", "if (held) { return; } try { hold_until_marker(); }",
+     "if (held) { return; } try { }"),
+    ("j", "sycl", f"{ARM_HOLD_STRUCT}|{ARM_HOLD_DTOR}", "catch (...) {", "catch (...) { throw;"),
+    ("j", "sycl", f"{ARM_HOLD_STRUCT}|{ARM_HOLD_DTOR}", ARM_HOLD_KEEP, "(leases.clear(), true)"),
+    # The submit helper: no hold, or one made after the try; a decline without the hold, or as true; a bare false.
+    ("j", "sycl", ARM_SUBMIT_HEAD, ARM_HOLD_DECL, ""),
+    ("j", "sycl", ARM_SUBMIT_HEAD, f'{ARM_STAGE_FIRST} try {{', f'{ARM_STAGE_FIRST} try {{ {ARM_HOLD_DECL}'),
+    ("j", "sycl", ARM_ABANDON_HEAD, "hold.hold_until_marker();", ""),
+    ("j", "sycl", ARM_ABANDON_HEAD, "return false;", "return true;"),
+    ("j", "sycl", f"{ARM_SUBMIT_HEAD}|if (!scattered) {{", "return abandon();", "return false;"),
+    # The node that ran left without the hold, with `held` set by hand, or published past the hold.
+    ("j", "sycl", ARM_SUBMIT_HEAD, ARM_HOLD_SCATTER, "hold.held = true;"),
+    ("j", "sycl", ARM_SUBMIT_HEAD, ARM_HOLD_SCATTER,
+     f"ggml_sycl::retain_handles_until_event(std::move(leases), *scatter_event); {ARM_HOLD_SCATTER}"),
+    ("j", "sycl", ARM_SUBMIT_HEAD, 'stage = "handle retention"; hold.hold_until(*scatter_event); return true;',
+     "return true;"),
+    # The arm catching a submission itself.
+    ("j", "sycl", ARM_FN_HEAD, ARM_READY, f"try {{ {ARM_READY} }} catch (...) {{ }}"),
     # No try; work submitted before it; the row map's copy outside it.
-    ("j", "sycl", ARM_FN_HEAD, "try { gather_deps.push_back(", "{ gather_deps.push_back("),
-    ("j", "sycl", ARM_FN_HEAD, "sycl::event scatter_event; try {",
-     "sycl::event scatter_event; ggml_sycl_safe_memcpy(*stream, rows_dev.get(), plan.rows.data(), 0, {}); try {"),
-    ("j", "sycl", ARM_FN_HEAD, "try { gather_deps.push_back(", "try { (void) 0; gather_deps.push_back("),
+    ("j", "sycl", ARM_SUBMIT_HEAD, "try { gather_deps.push_back(", "{ gather_deps.push_back("),
+    ("j", "sycl", ARM_SUBMIT_HEAD, f"{ARM_STAGE_FIRST} try {{",
+     f"{ARM_STAGE_FIRST} ggml_sycl_safe_memcpy(*stream, buffers.rows_dev, plan.rows.data(), 0, {{}}); try {{"),
+    ("j", "sycl", ARM_SUBMIT_HEAD, "try { gather_deps.push_back(", "try { (void) 0; gather_deps.push_back("),
     # The stage the handler names left stale.
-    ("j", "sycl", ARM_FN_HEAD, 'stage = "expert GEMM";', ""),
-    ("j", "sycl", ARM_FN_HEAD, 'stage = "scatter";', ""),
+    ("j", "sycl", ARM_SUBMIT_HEAD, 'stage = "expert GEMM";', ""),
+    ("j", "sycl", ARM_SUBMIT_HEAD, 'stage = "scatter";', ""),
+    ("j", "sycl", ARM_SUBMIT_HEAD, 'stage = "handle retention";', ""),
     # The failpoint before the gather, or gone.
-    ("j", "sycl", ARM_FN_HEAD, 'stage = "gather";', f'stage = "gather"; if ({ARM_FAILPOINT}) {{ throw 1; }}'),
-    ("j", "sycl", ARM_FN_HEAD, f"if ({ARM_FAILPOINT})", "if (false)"),
+    ("j", "sycl", ARM_SUBMIT_HEAD, 'stage = "gather";', f'stage = "gather"; if ({ARM_FAILPOINT}) {{ throw 1; }}'),
+    ("j", "sycl", ARM_SUBMIT_HEAD, f"if ({ARM_FAILPOINT})", "if (false)"),
     # The failpoint that declines: failing the query too, returning an event, consumed without declining, unguarded,
     # or gone.
     ("j", "sycl", ARM_GEMM_HEAD, "if (!query_only && ", "if ("),
@@ -922,14 +1114,15 @@ MUTANTS = [
     ("j", "sycl", ARM_GEMM_HEAD, "# ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING if (!query_only", "if (!query_only"),
     ("j", "sycl", ARM_GEMM_HEAD, ARM_DECLINE_FAILURE, "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_NONE"),
     # The handler: missing, catching everything, without the hold, falling through to the direct route, rethrowing
-    # the raw error, or throwing an error that names no stage.
-    ("j", "sycl", ARM_FN_HEAD, ARM_RETHROW + " ", ""),
-    ("j", "sycl", ARM_FN_HEAD, ARM_HANDLER_HEAD, "catch (...) {"),
-    ("j", "sycl", ARM_FN_HEAD, f"{ARM_HANDLER_HEAD} {ARM_HANDLER_HOLD}", ARM_HANDLER_HEAD),
-    ("j", "sycl", ARM_FN_HEAD, ARM_FAILURE_THROW, "return decline(moe_bf16_grouped_decline::SUBMIT);"),
-    ("j", "sycl", ARM_FN_HEAD, ARM_FAILURE_THROW, "throw;"),
-    ("j", "sycl", ARM_FN_HEAD, '+ stage + " failed after submission: "', '+ " failed: "'),
-    ("j", "sycl", ARM_FN_HEAD, "src0->name, ctx.device, stage, e.what()", "src0->name, ctx.device, \"\", e.what()"),
+    # the raw error, throwing an error that names no stage, or followed by a way out.
+    ("j", "sycl", ARM_SUBMIT_HEAD, ARM_RETHROW + " ", ""),
+    ("j", "sycl", ARM_SUBMIT_HEAD, ARM_HANDLER_HEAD, "catch (...) {"),
+    ("j", "sycl", ARM_SUBMIT_HEAD, f"{ARM_HANDLER_HEAD} {ARM_HANDLER_HOLD}", ARM_HANDLER_HEAD),
+    ("j", "sycl", ARM_SUBMIT_HEAD, ARM_FAILURE_THROW, "return false;"),
+    ("j", "sycl", ARM_SUBMIT_HEAD, ARM_FAILURE_THROW, "throw;"),
+    ("j", "sycl", ARM_SUBMIT_HEAD, '+ stage + " failed at submission: "', '+ " failed: "'),
+    ("j", "sycl", ARM_SUBMIT_HEAD, "src0->name, device, stage, e.what()", "src0->name, device, \"\", e.what()"),
+    ("j", "sycl", ARM_SUBMIT_HEAD, f"{ARM_FAILURE_THROW} }}", f"{ARM_FAILURE_THROW} }} return false;"),
 ]
 
 

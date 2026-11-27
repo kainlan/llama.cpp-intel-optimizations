@@ -5181,9 +5181,9 @@ set_tests_properties(test-sycl-bf16-onednn-probe PROPERTIES
 # active expert, on 128 distinct experts at Inkling's two expert shapes and n = 16 to 128 rows, and a whole prompt node
 # against the BF16 direct kernel (moe-bf16-direct.cpp, compiled in) from 16 to 512 tokens. Standalone like the probe
 # above: SYCL, oneDNN, the deterministic attribute header and the backend-free kernel, no backend. About 3.2 GB of
-# device memory. A measurement for the lead, not a gate, so it registers no ctest: the lead builds it by name and runs
-# it once on the B70 (the command is in the file header).
-add_executable(test-sycl-bf16-expert-gemm-bench
+# device memory. A measurement for the lead, not a gate, so it registers no ctest and is not part of `all`: the lead
+# builds it by name and runs it once on the B70 (the command is in the file header).
+add_executable(test-sycl-bf16-expert-gemm-bench EXCLUDE_FROM_ALL
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-bf16-expert-gemm-bench.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe-bf16-direct.cpp
 )
@@ -6610,12 +6610,15 @@ endif() # static SYCL backend fixture
 # Task 24 (Inkling 2 Mini): a BF16 prompt MUL_MAT_ID of at least 64 tokens on a planned model, loaded the way libllama
 # loads one with Inkling's two expert shapes (128 experts, 8 used) beside an NVFP4 companion that makes the load plan
 # the PP MoE oneDNN ring, runs on the BF16 grouped arm: one batched gather, a oneDNN bf16 GEMM per active expert on the
-# expert as loaded, one batched scatter. Cases: all experts, 40 of them, the 64-token minimum, and the down shape on the
-# arm; 63 tokens and GGML_SYCL_MOE_BF16_GROUPED=0 (a child process of the test) on the BF16 direct route, with the
-# arm's decline line naming the reason; and a private failpoint that throws at the arm's GEMM stage after its gather,
-# which must fail the compute with the arm's named error, followed by the same case on the arm again. Every output row
-# within NMSE 5e-4 of the CPU backend, no refusal, and every case moves the arm's run and decline counters by exactly
-# what it should. The counters and the failpoint exist only in the private backend objects, so it links
+# expert as loaded, one batched scatter. Eleven cases: all experts, 40 of them, the 64-token minimum, a 512-token node
+# whose slot 0 routes every token to one expert (so its GEMMs take two widths), and the down shape, on the arm; 63
+# tokens and GGML_SYCL_MOE_BF16_GROUPED=0 (a child process of the test) on the BF16 direct route, with the arm's
+# decline line naming the reason; a private failpoint that throws at the arm's GEMM stage after its gather, which must
+# fail the compute with the arm's named error; and a second that makes that GEMM decline after the gather, which must
+# leave the node to the direct route as a counted `submit` decline. Each failpoint case is followed by the same case on
+# the arm again. Every output row a case computes within NMSE 5e-4 of the CPU backend, no refusal, every arm case's
+# route line naming its experts and GEMM widths, and every case moves the arm's run and decline counters by exactly
+# what it should. The counters and the failpoints exist only in the private backend objects, so it links
 # ggml-sycl-private-fixtures (not the ordinary DSO). Each model holds ~4.5 GB on the card with its ring and ~9 GB of
 # host memory (~12 GB while its experts are quantized), so the label is `model`, which keeps it out of the full sweep
 # (CLAUDE.md, .claude/rules/ctest-registration.md): run it alone. Pinned to the B70; a run with no SYCL GPU exits 77.
