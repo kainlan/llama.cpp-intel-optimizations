@@ -203,6 +203,36 @@ bool moe_hybrid_record_install(std::vector<const void *> &                  devi
     return true;
 }
 
+// Empties, in a copy of a record's slot arrays, every slot whose lease `matches` (the device entry an expert loan or
+// evict retired): its weights and its lease. Moves each emptied slot's lease into *withdrawn, for the caller to keep
+// until the queue passes, and appends its expert id to *experts, in id order. Every other slot and lease stays.
+// Returns how many slots it emptied.
+template <typename Lease, typename Match>
+size_t moe_hybrid_record_withdraw(std::vector<const void *> & device_weight,
+                                  std::vector<const void *> & host_weight,
+                                  std::vector<Lease> &        lease,
+                                  const Match &               matches,
+                                  std::vector<Lease> *        withdrawn,
+                                  std::vector<int32_t> *      experts) {
+    size_t emptied = 0;
+    for (size_t e = 0; e < lease.size(); ++e) {
+        if (!lease[e].valid() || !matches(lease[e])) {
+            continue;
+        }
+        withdrawn->push_back(std::move(lease[e]));
+        lease[e] = Lease{};
+        if (e < device_weight.size()) {
+            device_weight[e] = nullptr;
+        }
+        if (e < host_weight.size()) {
+            host_weight[e] = nullptr;
+        }
+        experts->push_back(static_cast<int32_t>(e));
+        ++emptied;
+    }
+    return emptied;
+}
+
 // What a record's slots add up to. A slot stands when it names exactly one weight and holds a lease on it.
 struct moe_hybrid_record_shape {
     size_t       n_device   = 0;

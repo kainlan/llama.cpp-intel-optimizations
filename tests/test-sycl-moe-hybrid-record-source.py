@@ -12,7 +12,8 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
 (tests/test-sycl-moe-hybrid-record.cpp) proves the bookkeeping; this gate holds where the backend calls it:
 
   T1  the lookup classifies its stamp with moe_hybrid_record_miss_classify, once, and only a NONE miss returns the
-      held decision; the stamp's own current test is not asked a second time beside it;
+      held decision, and never a record a loan or an evict withdrew a slot from; the stamp's own current test is not
+      asked a second time beside it;
   T2  the trace level is read once, in a function-local static of ggml_sycl_moe_hybrid_record_trace_level(), from
       GGML_SYCL_MOE_HYBRID_RECORD_TRACE; the name appears nowhere else in the backend;
   T3  every lookup is counted, with its miss, before the held decision returns; the lookup that finds no published
@@ -36,7 +37,11 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
       only after every way out, hands the replaced leases and the held table back for retention, and waits for
       nothing;
   T11 the build takes its slots, its shape check and its table from those same helpers, the executor is chosen in the
-      slot rule alone, and GGML_SYCL_MOE_HYBRID_RECORD_PATCH is read once.
+      slot rule alone, and GGML_SYCL_MOE_HYBRID_RECORD_PATCH is read once;
+  T12 an expert loan or evict (ggml_sycl_drop_lent_expert_views) withdraws only the record's slots that lease the
+      entry it retired, from a copy it publishes in the held record's place (never the held one), counting them on the
+      copy and moving their leases into the drop's retention; it keeps the stamp, and notes every expert it emptied,
+      so the next lookup is a generation miss the patch serves.
 
 Checks run on comment-blanked text (string literals kept). NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if another pin
@@ -67,7 +72,7 @@ ENV_NAME = "GGML_SYCL_MOE_HYBRID_RECORD_TRACE"
 CLASSIFY = ("const ggml_sycl::moe_hybrid_record_miss miss = ggml_sycl::moe_hybrid_record_miss_classify(stamp, "
             "replan_epoch, storage_generation, selected_rows);")
 HELD_RETURN = ("if (miss == ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE) { *out = weight.moe_hybrid_decode[device]; "
-               "return stamp.eligible && *out; }")
+               "return stamp.eligible && *out && (*out)->n_withdrawn == 0; }")
 TRACE_READ = "const int trace = ggml_sycl_moe_hybrid_record_trace_level();"
 TRACE_LOOKUP = "if (trace > 0) { ggml_sycl_moe_hybrid_record_trace_lookup(src0, miss,"
 NO_PLAN = ("if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) { if (trace > 0) { "
@@ -119,6 +124,7 @@ PATCH_STEPS = (
      "patched->host_weight, patched->lease);"),
     ("the build's shape rule over it",
      "if (ggml_sycl::moe_hybrid_record_shape_refusal(patched->all_host, shape) != nullptr) { return false; }"),
+    ("the copy's withdrawn count cleared, the rule having found no empty slot", "patched->n_withdrawn = 0;"),
     ("a table of the copy's own, filled from every slot",
      "patched->table = {}; if (!ggml_sycl_moe_hybrid_decode_table_fill(queue, device, extra->model_id, "
      "patched->device_weight, shape.substitute, &patched->table)) { return false; }"),
@@ -183,10 +189,35 @@ NOTE_SITES = (
      "moe_expert_storage_handles.clear(); note_moe_storage_change(" + ALL + ");"),
     ("common", "void clear_moe_storage_handles_for_owner(int owner_device) {",
      "if (erased) { note_moe_storage_change(" + ALL + "); }"),
+    # Every expert whose record slot the drop emptied, and the one whose storage record or table slot it dropped.
     ("backend", "static void ggml_sycl_drop_lent_expert_views(",
-     "if (stored) { w.note_moe_storage_change(expert_id); }"),
+     "if (stored && std::find(emptied.begin(), emptied.end(), expert_id) == emptied.end()) { "
+     "emptied.push_back(expert_id); } for (const int32_t e : emptied) { w.note_moe_storage_change(e); }"),
+    # A mutation names every expert, whatever its forget loop withdrew: the rewrite changed them all, and in every
+    # layout, while the loop forgets only the AOS records on this device.
     ("backend", "static void ggml_sycl_invalidate_backend_weight_mutation(",
-     "if (!withdrew) { extra->weight().note_moe_storage_change(" + ALL + "); }"),
+     "ctx->device); } extra->weight().note_moe_storage_change(" + ALL + ");"),
+)
+
+# T12: an expert loan's or evict's drop withdraws the record's slots that lease the retired entry, from a copy.
+DROP_SIG = "static void ggml_sycl_drop_lent_expert_views("
+WITHDRAW_SIG = "static bool ggml_sycl_moe_hybrid_decode_record_withdraw("
+WITHDRAW_DECL = ("static bool ggml_sycl_moe_hybrid_decode_record_withdraw(std::shared_ptr<const moe_hybrid_decode_record> "
+                 "& held,")
+DROP_WITHDRAW = ("if (ggml_sycl_moe_hybrid_decode_record_withdraw(w.moe_hybrid_decode[device], device, withdrawn, "
+                 "retained, emptied)) { table_dropped = true; }")
+DROP_NOTES = NOTE_SITES[6][2]
+DROP_RETIRED = ("moe_hybrid_decode_stamp", "moe_hybrid_decode[device].reset()",
+                "ggml_sycl_moe_hybrid_decode_record_append_handles(")
+WITHDRAW_MATCH = "return h.is_weight() && h.device() == device && h.key() == withdrawn;"
+WITHDRAW_STEPS = (
+    ("test that a slot leases the entry",
+     "if (!held || std::none_of(held->lease.begin(), held->lease.end(), on_entry)) { return false; }"),
+    ("copy of the held record", "auto copy = std::make_shared<moe_hybrid_decode_record>(*held);"),
+    ("withdrawal from the copy, counted on it, its leases into the drop's retention",
+     "copy->n_withdrawn += ggml_sycl::moe_hybrid_record_withdraw(copy->device_weight, copy->host_weight, copy->lease, "
+     "on_entry, &retained, &emptied);"),
+    ("publication of the copy", "held = std::move(copy);"),
 )
 # The fixture's store clear, inside a lambda of a private test function: matched in the squashed file text.
 FIXTURE_CLEAR = ("extra.weight().moe_expert_storage_handles.clear(); extra.weight().note_moe_storage_change("
@@ -458,6 +489,33 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str) -> 
         raise ContractError(f"FAIL [pin T8]: note_moe_storage_change( appears {calls} times, not "
                             f"{1 + len(NOTE_SITES) + 1}: a call site this gate does not read names an expert unchecked")
 
+    # T12: a loan's or an evict's drop withdraws the slots that lease the retired entry, from a copy, and notes them.
+    drop = body(code, DROP_SIG, "T12")
+    at_withdraw = once(drop, DROP_WITHDRAW, "T12", "the drop's withdrawal of the slots that lease the retired entry")
+    if not at_withdraw < drop.find(DROP_NOTES):
+        raise ContractError("FAIL [pin T12]: the drop notes the experts it changed before it knows which record slots "
+                            "it emptied, so an emptied slot can go unnoted and its stale table be served")
+    for retired in DROP_RETIRED:
+        if retired in drop:
+            raise ContractError(f"FAIL [pin T12]: the drop still drops the whole record or its stamp (`{retired}`), "
+                                f"so every expert loan or evict rebuilds the record over every expert")
+    if WITHDRAW_DECL not in backend_sq:
+        raise ContractError("FAIL [pin T12]: the withdrawal does not take the published record as a pointer to const, "
+                            "so it could write the record a CPU job or a queued table copy still reads")
+    spans = definition_spans(backend_sq, WITHDRAW_SIG)
+    if len(spans) != 1:
+        raise ContractError(f"FAIL [pin T12]: `{WITHDRAW_SIG}` is defined {len(spans)} times, not once")
+    withdraw = backend_sq[spans[0][0] : spans[0][1] + 1]
+    once(withdraw, WITHDRAW_MATCH, "T12", "the withdrawal's match of the retired entry by its key, as the drop's")
+    last = -1
+    for what, needle in WITHDRAW_STEPS:
+        at = once(withdraw, needle, "T12", f"the withdrawal's {what}")
+        if at < last:
+            raise ContractError(f"FAIL [pin T12]: the withdrawal's {what} is out of order")
+        last = at
+    if "const_cast" in withdraw or WAIT_CALLS.search(withdraw):
+        raise ContractError("FAIL [pin T12]: the withdrawal writes the published record or waits on the device")
+
 
 def self_test(raws: dict[str, str]) -> int:
     failures: list[str] = []
@@ -615,7 +673,7 @@ def self_test(raws: dict[str, str]) -> int:
                 [("        if (erased) {\n            note_moe_storage_change(expert_id);\n        }\n        return erased;",
                   "        if (erased) {\n            ++moe_expert_storage_generation;\n        }\n        return erased;")])
     expect_fail("raw-bump-in-backend", "T8", B,
-                [("        w.note_moe_storage_change(expert_id);", "        ++w.moe_expert_storage_generation;")])
+                [("        w.note_moe_storage_change(e);", "        ++w.moe_expert_storage_generation;")])
     expect_fail("mutation-names-one-expert", "T8", B,
                 [("extra->weight().note_moe_storage_change(" + ALL + ");",
                   "extra->weight().note_moe_storage_change(0);")])
@@ -623,6 +681,30 @@ def self_test(raws: dict[str, str]) -> int:
                 [("extra.weight().note_moe_storage_change(" + ALL + ");", "extra.weight().note_moe_storage_change(0);")])
     expect_fail("unread-note-site", "T8", B,
                 [("    if (stored || table_dropped) {", "    w.note_moe_storage_change(0);\n    if (stored || table_dropped) {")])
+    expect_fail("mutation-notes-only-when-nothing-withdrawn", "T8", B,
+                [("    extra->weight().note_moe_storage_change(" + ALL + ");\n",
+                  "    if (expert_count == 0) {\n        extra->weight().note_moe_storage_change(" + ALL + ");\n    }\n")])
+
+    # T1, T10, T12: the drop's withdrawal, and the two places that refuse or clear a withdrawn record.
+    expect_fail("held-return-serves-withdrawn", "T1", B,
+                [("        return stamp.eligible && *out && (*out)->n_withdrawn == 0;",
+                  "        return stamp.eligible && *out;")])
+    expect_fail("patch-keeps-withdrawn-count", "T10", B, [("    patched->n_withdrawn = 0;\n", "")])
+    expect_fail("drop-resets-stamp", "T12", B,
+                [("    if (stored && std::find(emptied.begin(),",
+                  "    w.moe_hybrid_decode_stamp[device] = {};\n    if (stored && std::find(emptied.begin(),")])
+    expect_fail("drop-withdraws-unnoted", "T12", B,
+                [("    std::vector<int32_t> emptied;\n", "    std::vector<int32_t> emptied;\n    std::vector<int32_t> unnoted;\n"),
+                 ("                                                    emptied)) {",
+                  "                                                    unnoted)) {")])
+    expect_fail("withdraw-writes-held", "T12", B,
+                [("    auto copy = std::make_shared<moe_hybrid_decode_record>(*held);",
+                  "    auto * copy = const_cast<moe_hybrid_decode_record *>(held.get());")])
+    expect_fail("withdraw-uncounted", "T12", B, [("    copy->n_withdrawn += ggml_sycl::", "    (void) ggml_sycl::")])
+    expect_fail("withdraw-unpublished", "T12", B, [("    held = std::move(copy);\n", "")])
+    expect_fail("withdraw-matches-by-resolve", "T12", B,
+                [("    const auto on_entry = [&](const ggml_sycl::mem_handle & h) {\n        return h.is_weight() &&",
+                  "    const auto on_entry = [&](const ggml_sycl::mem_handle & h) {\n        return h.resolve(device).ptr &&")])
 
     try:
         mutate(B, [("this anchor is in no source", "x")])

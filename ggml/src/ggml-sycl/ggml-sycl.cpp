@@ -23033,9 +23033,14 @@ static const char * ggml_sycl_expert_prepare_triplet(ggml_sycl::unified_cache & 
     return nullptr;
 }
 
-// Defined with the record (llama.cpp-7pvo): appends every handle a hybrid decode record holds, its table among them.
-static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_decode_record &     record,
-                                                              std::vector<ggml_sycl::mem_handle> & out);
+// Defined with the record, whose type is incomplete here: replaces `held` with a copy of it whose slots that lease the
+// device entry `withdrawn` on `device` are empty, moving those slots' leases into `retained` and their expert ids into
+// `emptied`. Returns false, leaving `held` as it is, when no slot leases the entry.
+static bool ggml_sycl_moe_hybrid_decode_record_withdraw(std::shared_ptr<const moe_hybrid_decode_record> & held,
+                                                        int                                               device,
+                                                        const ggml_sycl::unified_cache_key &              withdrawn,
+                                                        std::vector<ggml_sycl::mem_handle> &              retained,
+                                                        std::vector<int32_t> &                            emptied);
 
 // Take every view `extra` holds of the device entry a loan or an evict retired under `withdrawn` off the extra, keeping
 // a lease on each in `retained`. The caller keeps `retained` until the device's queue passes a barrier, so no kernel
@@ -23047,9 +23052,10 @@ static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_d
 // refuses the resolve forget_moe_storage_handle_on_device() matches by. The views are the expert's storage records, its
 // slot in the pointer table's handles, the table's per-expert leases (ggml_sycl_set_moe_ptr_table_leases), the route
 // table when one of its entries leases the entry (invalidated, with every lease it held retained, since another expert
-// it names may be lent next), and the hybrid decode record, which holds every expert's lease and its table, all
-// retained. Dropping any of them marks the device table stale, so the next MUL_MAT_ID or preload rebuilds it under the
-// plan the move publishes.
+// it names may be lent next), and the hybrid decode record's slots that lease the entry (withdrawn from a copy, their
+// leases retained; the copy keeps the other slots). Dropping any of them marks the device table stale, so the next
+// MUL_MAT_ID or preload rebuilds it under the plan the move publishes, and moves the storage generation for each
+// expert it changed.
 static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *              extra,
                                              int                                  device,
                                              int                                  expert_id,
@@ -23121,15 +23127,20 @@ static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
             break;
         }
     }
-    if (w.moe_hybrid_decode[device]) {
-        ggml_sycl_moe_hybrid_decode_record_append_handles(*w.moe_hybrid_decode[device], retained);
-        w.moe_hybrid_decode[device].reset();
-        w.moe_hybrid_decode_stamp[device] = {};
-        table_dropped                     = true;
+    // The hybrid decode record keeps every slot but those that lease the entry, and its stamp: the generation moves for
+    // each expert the drop changed, so the next lookup is a generation miss that patches those slots from wherever the
+    // experts are then, and never serves the withdrawn copy, whose table still names the retired weight.
+    std::vector<int32_t> emptied;
+    if (ggml_sycl_moe_hybrid_decode_record_withdraw(w.moe_hybrid_decode[device], device, withdrawn, retained,
+                                                    emptied)) {
+        table_dropped = true;
     }
 
-    if (stored) {
-        w.note_moe_storage_change(expert_id);
+    if (stored && std::find(emptied.begin(), emptied.end(), expert_id) == emptied.end()) {
+        emptied.push_back(expert_id);
+    }
+    for (const int32_t e : emptied) {
+        w.note_moe_storage_change(e);
     }
     if (stored || table_dropped) {
         w.mark_moe_device_table_stale(device);
@@ -40960,13 +40971,12 @@ static void ggml_sycl_invalidate_backend_weight_mutation(ggml_backend_sycl_buffe
     }
     auto *       extra        = static_cast<ggml_tensor_extra_gpu *>(tensor->extra);
     const size_t expert_count = tensor->ne[2] > 0 ? static_cast<size_t>(tensor->ne[2]) : 0;
-    bool         withdrew     = false;
     for (size_t expert = 0; expert < expert_count; ++expert) {
-        withdrew |= extra->forget_moe_storage_handle_on_device(static_cast<int>(expert), GGML_LAYOUT_AOS, ctx->device);
+        extra->forget_moe_storage_handle_on_device(static_cast<int>(expert), GGML_LAYOUT_AOS, ctx->device);
     }
-    if (!withdrew) {
-        extra->weight().note_moe_storage_change(ggml_sycl::moe_storage_change_log::ALL);
-    }
+    // Every expert changed, in every layout, while the loop forgets only the AOS records on this device: a held hybrid
+    // decode record is built again over every expert, never patched over the forgotten ones.
+    extra->weight().note_moe_storage_change(ggml_sycl::moe_storage_change_log::ALL);
     extra->weight().moe_device_table_valid[ctx->device]          = false;
     extra->weight().moe_full_local_probe_generation[ctx->device] = 0;
     extra->layout_dirty                                          = true;
@@ -90994,6 +91004,10 @@ struct moe_hybrid_decode_record {
     std::vector<ggml_sycl::mem_handle> lease;             // every expert's route lease
     sycl::event                        ready;             // one barrier over the leases' producer events
     bool                               has_ready = false;
+    // Slots an expert loan or evict emptied (ggml_sycl_moe_hybrid_decode_record_withdraw). Its table still names the
+    // retired weight in them, so a record with one is never served: the next lookup patches the slots, or builds the
+    // record again.
+    size_t                             n_withdrawn = 0;
     // The routed-expert counts of this tensor's block: set on the block's counting tensor only (its gate tensor, or its
     // fused gate/up tensor), so a (token, expert) pair counts once and not for each of gate, up and down. The record
     // holds the table, so a job still running on the CPU pool when a later model installs its own table counts into
@@ -91040,10 +91054,36 @@ static void ggml_sycl_moe_route_counts_add_prompt(int device, const ggml_tensor 
 
 static void ggml_sycl_moe_hybrid_decode_record_append_handles(const moe_hybrid_decode_record &     record,
                                                               std::vector<ggml_sycl::mem_handle> & out) {
-    out.insert(out.end(), record.lease.begin(), record.lease.end());
+    // A withdrawn slot holds no lease: the drop that emptied it retained that one already.
+    for (const ggml_sycl::mem_handle & h : record.lease) {
+        if (h.valid()) {
+            out.push_back(h);
+        }
+    }
     if (record.table.valid()) {
         out.push_back(record.table);
     }
+}
+
+static bool ggml_sycl_moe_hybrid_decode_record_withdraw(std::shared_ptr<const moe_hybrid_decode_record> & held,
+                                                        int                                               device,
+                                                        const ggml_sycl::unified_cache_key &              withdrawn,
+                                                        std::vector<ggml_sycl::mem_handle> &              retained,
+                                                        std::vector<int32_t> &                            emptied) {
+    // The drop's own match: by the retired entry's key, never by a resolve, which a retired entry refuses.
+    const auto on_entry = [&](const ggml_sycl::mem_handle & h) {
+        return h.is_weight() && h.device() == device && h.key() == withdrawn;
+    };
+    if (!held || std::none_of(held->lease.begin(), held->lease.end(), on_entry)) {
+        return false;
+    }
+    // A published record is never written: a CPU job or a queued table copy may still read it. The copy shares every
+    // other slot's lease and the table, so only the withdrawn leases need the drop's retention.
+    auto copy = std::make_shared<moe_hybrid_decode_record>(*held);
+    copy->n_withdrawn += ggml_sycl::moe_hybrid_record_withdraw(copy->device_weight, copy->host_weight, copy->lease,
+                                                               on_entry, &retained, &emptied);
+    held = std::move(copy);
+    return true;
 }
 
 // The record's table (llama.cpp-7pvo): host-pinned, n_as device weight pointers by expert id, copied to the planned
@@ -91397,6 +91437,8 @@ static bool ggml_sycl_moe_hybrid_decode_record_patch(ggml_backend_sycl_context &
     if (ggml_sycl::moe_hybrid_record_shape_refusal(patched->all_host, shape) != nullptr) {
         return false;
     }
+    // The rule found no empty slot, so every slot a loan or evict withdrew was refilled.
+    patched->n_withdrawn = 0;
     sycl::queue & queue = *ctx.stream();
     if (!patched->all_host) {
         patched->table = {};
@@ -91448,7 +91490,9 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
     }
     if (miss == ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE) {
         *out = weight.moe_hybrid_decode[device];
-        return stamp.eligible && *out;
+        // A withdrawn slot always moves the generation, so a current stamp never holds such a record; the test keeps
+        // its table, which names a retired weight, from being served if one ever did.
+        return stamp.eligible && *out && (*out)->n_withdrawn == 0;
     }
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
     if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {

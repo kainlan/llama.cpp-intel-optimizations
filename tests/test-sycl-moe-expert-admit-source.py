@@ -442,7 +442,10 @@ TO_HOST_BRANCH = ("} else { for (int r = 0; r < 3; ++r) { const ggml_sycl::exper
                   "triplet.members[r].placement; ggml_tensor_extra_gpu * extra = triplet.extras[r]; "
                   "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views); "
                   "(void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device); } }")
-DROP_BUMP = "if (stored) { w.note_moe_storage_change(expert_id); }"
+# The drop notes each expert whose hybrid record slot it emptied, and the one whose storage record or table slot it
+# dropped.
+DROP_BUMP = ("if (stored && std::find(emptied.begin(), emptied.end(), expert_id) == emptied.end()) { "
+             "emptied.push_back(expert_id); } for (const int32_t e : emptied) { w.note_moe_storage_change(e); }")
 DROP_STORED = ("stored = list.size() != before;", "stored = true;")
 RECORD_BUMPS = ("existing = std::move(record); note_moe_storage_change(expert_id); return true;",
                 "records.push_back(std::move(record)); note_moe_storage_change(expert_id); return true;")
@@ -805,8 +808,8 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("entry-asks-status", "A1", [("sycl", ENTRY_SIG, "    if (out) {",
                                              "    (void) sycl::event{}.get_info<sycl::info::event::"
                                              "command_execution_status>();\n    if (out) {")])
-    expect_fail("evict-view-drop-waits", "A1", [("sycl", DROP_SIG, "w.note_moe_storage_change(expert_id);",
-                                                 "w.note_moe_storage_change(expert_id);\n"
+    expect_fail("evict-view-drop-waits", "A1", [("sycl", DROP_SIG, "w.note_moe_storage_change(e);",
+                                                 "w.note_moe_storage_change(e);\n"
                                                  "        dpct::get_in_order_queue().wait();")])
     expect_fail("evict-cache-loan-reaps", "A1", [("cache", LOAN_SIG, "refusal = MOE_EXPERT_MOVE_SHARED_STORAGE;",
                                                   "(void) finalize_retired_entries_locked();\n"
@@ -992,7 +995,7 @@ def self_test(raw: dict[str, str]) -> int:
     expect_fail("evict-keeps-device-views", "E3", [("sycl", TXN_SIG,
                                                     "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, "
                                                     "record.device_keys[r], lent_views);", "")])
-    expect_fail("drop-keeps-generation", "E3", [("sycl", DROP_SIG, "w.note_moe_storage_change(expert_id);", "")])
+    expect_fail("drop-keeps-generation", "E3", [("sycl", DROP_SIG, "w.note_moe_storage_change(e);", "")])
     expect_fail("remember-keeps-generation", "E3", [("common", RECORD_SIG,
                                                      "records.push_back(std::move(record));\n"
                                                      "        note_moe_storage_change(expert_id);",

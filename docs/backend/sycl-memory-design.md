@@ -474,8 +474,8 @@ The event-chained hybrid decode route's per-tensor record
 too, but a generation that only expert moves advanced does not rebuild it over
 every expert. Every generation move goes through the extra's
 `note_moe_storage_change()`, which also logs the expert it changed in a bounded
-per-weight change log (`moe_storage_change_log`, 64 moves; a cleared store logs
-every expert). On such a miss the lookup patches a copy of the held record over
+per-weight change log (`moe_storage_change_log`, 64 entries, about 21 expert
+moves; a cleared store or a rewrite of the weight logs every expert). On such a miss the lookup patches a copy of the held record over
 the experts the log names since the held decision
 (`ggml_sycl_moe_hybrid_decode_record_patch`): it resolves those alone, each
 takes its slot from the build's own slot rule, so a moved expert runs where its
@@ -486,8 +486,12 @@ copy's publication (`retain_handles_until_event`); nothing waits on the host. A
 log that no longer holds every move, a replan, another selected-row count, or a
 moved expert that no longer fits the record (another layout, a device expert in
 an all-host record, no host expert left) builds the record again over every
-expert. An evict's view drop withdraws the record whole, so the lookup after an
-evict builds it again.
+expert. An expert loan's or evict's view drop
+(`ggml_sycl_drop_lent_expert_views`) does not drop the record: it withdraws, from
+a copy it publishes in the record's place, only the slots that lease the entry it
+retired, retains their leases with the other views it drops, and notes each of
+those experts, so the lookup after the move patches them. Until then the copy is
+never served: its table still names the retired weight.
 
 The named move bounds memory as follows. An evict mints its pinned host copy
 before it retires the device copy, and mints it without growing the pinned host

@@ -384,6 +384,63 @@ static int test_shape() {
     return 0;
 }
 
+// A loan or an evict withdraws, from a copy of the held record, the slots that lease the device entry it retired. The
+// copy keeps every other slot and lease, and once the held record is released only the drop's retention leases the
+// retired entry, so its room comes back when the queue passes the retention's barrier.
+static int test_withdraw() {
+    // Four experts: 0 and 2 on the device, 1 and 3 on the host; the entry expert 2's lease names is retired.
+    int                       w[4]          = {};
+    std::vector<const void *> device_weight = { &w[0], nullptr, &w[2], nullptr };
+    std::vector<const void *> host_weight   = { nullptr, &w[1], nullptr, &w[3] };
+    std::vector<fake_lease>   lease         = { lease_of(0), lease_of(1), lease_of(2), lease_of(3) };
+    const int *               retired       = lease[2].storage.get();
+
+    const auto on_entry = [retired](const fake_lease & l) {
+        return l.storage.get() == retired;
+    };
+    const auto no_entry = [](const fake_lease &) {
+        return false;
+    };
+
+    std::vector<const void *> copy_device = device_weight;
+    std::vector<const void *> copy_host   = host_weight;
+    std::vector<fake_lease>   copy_lease  = lease;
+    std::vector<fake_lease>   retained;
+    std::vector<int32_t>      emptied;
+    const size_t              n =
+        ggml_sycl::moe_hybrid_record_withdraw(copy_device, copy_host, copy_lease, on_entry, &retained, &emptied);
+    CHECK(n == 1 && emptied == std::vector<int32_t>({ 2 }) && retained.size() == 1,
+          "the drop empties the one slot that leases the retired entry and names its expert");
+    CHECK(copy_device[2] == nullptr && copy_host[2] == nullptr && !copy_lease[2].valid(),
+          "the withdrawn slot names no weight and holds no lease");
+    CHECK(copy_device[0] == &w[0] && copy_host[1] == &w[1] && copy_host[3] == &w[3] &&
+              copy_lease[0].storage == lease[0].storage && copy_lease[1].storage == lease[1].storage &&
+              copy_lease[3].storage == lease[3].storage,
+          "every other slot keeps its weight and its lease");
+    CHECK(device_weight[2] == &w[2] && lease[2].storage.get() == retired,
+          "the held record is not written: a CPU job or a queued table copy may still read it");
+
+    // The copy replaces the held record, which goes once nothing else holds it.
+    lease.clear();
+    CHECK(retained[0].storage.get() == retired && retained[0].storage.use_count() == 1,
+          "with the held record gone, only the drop's retention leases the retired entry");
+    CHECK(copy_lease[0].storage.use_count() == 1 && copy_lease[3].storage.use_count() == 1,
+          "the copy alone holds the slots it kept");
+
+    const ggml_sycl::moe_hybrid_record_shape s =
+        ggml_sycl::moe_hybrid_record_shape_of(copy_device, copy_host, copy_lease);
+    CHECK(s.n_empty == 1 && ggml_sycl::moe_hybrid_record_shape_refusal(/*all_host=*/false, s) != nullptr,
+          "a copy with a withdrawn slot does not stand until a patch refills the slot");
+
+    // An entry no slot leases empties nothing and names no expert.
+    std::vector<fake_lease> none;
+    std::vector<int32_t>    none_ids;
+    CHECK(ggml_sycl::moe_hybrid_record_withdraw(copy_device, copy_host, copy_lease, no_entry, &none, &none_ids) == 0 &&
+              none.empty() && none_ids.empty() && copy_lease[0].valid(),
+          "an entry no slot leases leaves every slot");
+    return 0;
+}
+
 // The per-token counts of what the patches did.
 static int test_trace_patches() {
     moe_hybrid_record_trace t;
@@ -398,7 +455,8 @@ static int test_trace_patches() {
 
 int main() {
     if (test_miss_classify() != 0 || test_trace_tokens() != 0 || test_trace_line() != 0 || test_change_log() != 0 ||
-        test_patch_plan() != 0 || test_install() != 0 || test_shape() != 0 || test_trace_patches() != 0) {
+        test_patch_plan() != 0 || test_install() != 0 || test_shape() != 0 || test_withdraw() != 0 ||
+        test_trace_patches() != 0) {
         return 1;
     }
     std::printf("OK: moe hybrid decode record bookkeeping\n");
