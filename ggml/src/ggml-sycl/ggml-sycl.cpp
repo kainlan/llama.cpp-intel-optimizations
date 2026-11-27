@@ -22472,6 +22472,9 @@ struct ggml_sycl_expert_loan_result {
     uint64_t     meta_us          = 0;
     uint64_t     copy_us          = 0;
     uint64_t     remap_us         = 0;
+    // The plan chunks the call's copy of the published plan cloned to record its moves (cow_chunked_vector): what the
+    // publication cost beyond the copy's chunk pointers. 0 for a call that copied no plan.
+    uint64_t     plan_chunks_cloned = 0;
     const char * reason           = "none";
 };
 
@@ -23412,7 +23415,10 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
         return refuse(ggml_sycl_txn_result::BUSY, "busy (plan changed while acquiring the transaction lock)");
     }
     // The publication's allocations, and the ledger room a loan appends into, come before the first triplet moves, so
-    // none of them can strand a moved triplet.
+    // none of them can strand a moved triplet. The plan's copy shares the published plan's entry chunks and lookups
+    // (placement_entry_store): the loop below writes entries only through indexed access
+    // (update_expert_placement, set_expert_host_backing), which clones just the chunks it writes, so the copy costs
+    // O(chunks + layers) and the published plan, which readers may still hold, is never written.
     auto                           next      = std::make_shared<ggml_sycl::lifecycle_plan_snapshot>(*current);
     auto                           next_plan = std::make_shared<ggml_sycl::placement_plan>(*current->plan);
     ggml_sycl_expert_lent_ledger & ledger    = ggml_sycl_expert_lent_ledger_locked(device, *current);
@@ -23423,6 +23429,14 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
     if (!refill && !named) {
         ledger.triplets.reserve(ledger.triplets.size() + prepared.size());
         ledger.triplet_bytes.reserve(ledger.triplet_bytes.size() + prepared.size());
+    }
+    // The flips below write the plan copy's shared chunks, which clones them. Taken here, before the first move, so a
+    // flip allocates nothing and a moved triplet is always flipped.
+    for (const ggml_sycl_expert_prepared_triplet & triplet : prepared) {
+        for (int r = 0; r < 3; ++r) {
+            const ggml_sycl::expert_placement_key & k = triplet.members[r].placement;
+            (void) next_plan->unshare_expert_entry(k.layer_id, k.expert_id, k.role);
+        }
     }
     // The triplets moved, and the device storage they moved summed per direction: what the moves to the host give back
     // (a loan's, an evict's) and what the moves to the device took (a refill's, an admit's).
@@ -23634,6 +23648,8 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
             }
         }
     }
+    // What the moves cost the plan's copy, counted whether or not the copy is published.
+    result.plan_chunks_cloned = next_plan->entries.chunks_cloned();
     // The triplet the preparation could not prepare leaves the ledger only from its back: every triplet selected before
     // it has moved, and the publication is the one it was selected under (checked above). Behind a triplet that did not
     // move, it stays, and a later boundary meets it again.
@@ -23791,6 +23807,8 @@ struct ggml_sycl_expert_move_result {
     uint64_t                                   copy_us         = 0;
     uint64_t                                   remap_us        = 0;
     uint64_t                                   total_us        = 0;
+    // The plan chunks the publication cloned (ggml_sycl_expert_loan_result::plan_chunks_cloned).
+    uint64_t                                   plan_chunks_cloned = 0;
     const char *                               reason          = "none";
     std::vector<ggml_sycl_expert_move_outcome> evicted;
     std::vector<ggml_sycl_expert_move_outcome> admitted;
@@ -23845,6 +23863,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int           
         r.copy_us         = answer.copy_us;
         r.remap_us        = answer.remap_us;
         r.total_us        = ggml_sycl::expert_move_us_since(call_start);
+        r.plan_chunks_cloned = answer.plan_chunks_cloned;
         for (ggml_sycl_expert_move_outcome & m : moves) {
             if (m.moved) {
                 ++(m.to_device ? r.n_admitted : r.n_evicted);
@@ -24670,6 +24689,7 @@ static void ggml_sycl_run_expert_swap_claimed(int                               
             cost.remap_us = result.remap_us;
             cost.meta_us  = result.meta_us;
             cost.total_us = result.total_us;
+            cost.plan_chunks_cloned = result.plan_chunks_cloned;
             return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };
         });
 }

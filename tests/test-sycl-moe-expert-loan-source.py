@@ -4125,10 +4125,10 @@ SLOT_PAD = ("const size_t padding = 3 * slot - own; "
 MEMBER_SIG = "inline size_t expert_triplet_member_bytes(const size_t (&staged)[3], int role)"
 MEMBER_BODY = "const size_t slot = expert_triplet_slot_bytes(staged); return slot != 0 ? slot : staged[role];"
 RECHARGE_SIG = ("static inline std::vector<placement_charge_change> placement_entries_recharge_expert_slots("
-                "std::vector<placement_entry> & entries)")
+                "placement_entry_store & entries)")
 RECHARGE_CHARGES = "placement_entries_charge_expert_slots(entries);"
 RECHARGE_ON_SIG = ("static inline size_t placement_entries_recharge_expert_slots_on("
-                   "std::vector<placement_entry> & entries,")
+                   "placement_entry_store & entries,")
 RECHARGE_ON_READ = "placement_entries_recharge_expert_slots(entries)"
 RECHARGE_ON_HOST = "if (!e.on_device) { continue; }"
 RECHARGE_ON_KEY = "if (d.device_id != e.target_device || !d.remaining) { continue; }"
@@ -4198,7 +4198,7 @@ OFF_TEST = "} else if (e.layout != member->layout || e.target_device != member->
 PLAN_SLOT_SIG = "static inline size_t moe_expert_triplet_slot_bytes(const placement_entry * const (&t)[3])"
 PLAN_SLOT_CALL = "return expert_triplet_slot_bytes(staged);"
 PLAN_ENTRY_STAGED = "return staged_expert_bytes(e.layout, e.type, e.ne[0], e.src_size);"
-CHARGE_SIG = "static inline size_t placement_entries_charge_expert_slots(std::vector<placement_entry> & entries)"
+CHARGE_SIG = "static inline size_t placement_entries_charge_expert_slots(placement_entry_store & entries)"
 # The charge resolves a triplet as the plan's index does (first entry of each role, no entry with no layer), so the
 # load's lookup of the slot and the charge agree, and charges every entry that stages as AOS what the load stages it at.
 CHARGE_INDEXED = ("if (e.expert_id < 0 || e.layer_id < 0 || !detail::moe_expert_role_is_triplet(e.expert_role)) { "
@@ -4671,6 +4671,120 @@ def test_mutant_dpas_restores_aos_by_the_reorder_fill_fails():
     mutant = _once(SYCL, DPAS_AOS_FILL, "if (base_layout == GGML_LAYOUT_AOS) { if (have_plan) {")
     assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
 
+
+
+# --- the plan copy shares its entries -------------------------------------------------------------------------------
+
+# The transaction's plan copy (HOIST_PLAN) shares the published plan's entries: they live in a copy-on-write chunked
+# store, so the copy costs one shared pointer per chunk and a flip clones only the chunk it writes. What this pins:
+#   - the entries are that store, so HOIST_PLAN is a sharing copy, not an O(entries) one;
+#   - the transaction takes the clones every prepared member's flip needs once the copy exists and before the first
+#     move, so a flip allocates nothing and a moved triplet is flipped whatever followed (the claim above);
+#   - the transaction reaches the copy only through the calls that write one indexed entry (the flips, the unshare)
+#     or read it, and counts the chunks it cloned: a mutable iterator over the entries would clone every chunk, so
+#     neither the transaction nor the two flips names one;
+#   - an entry's position is named by its index, never by pointer arithmetic on the store, which a chunked store
+#     cannot answer.
+ENTRY_STORE = "using placement_entry_store = cow_chunked_vector<placement_entry>;"
+ENTRY_MEMBER = "placement_entry_store entries;"
+UNSHARE_LOOP = ("for (const ggml_sycl_expert_prepared_triplet & triplet : prepared) { for (int r = 0; r < 3; ++r) { "
+                "const ggml_sycl::expert_placement_key & k = triplet.members[r].placement; "
+                "(void) next_plan->unshare_expert_entry(k.layer_id, k.expert_id, k.role); } }")
+UNSHARE_SIG = "bool unshare_expert_entry(int layer_id, int expert_id, expert_tensor_role role)"
+UNSHARE_BODY = "entries.unshare_at(it->second);"
+UPDATE_SIG = ("bool update_expert_placement(int layer_id, int expert_id, expert_tensor_role role, bool on_device, "
+              "int target)")
+BACKING_SIG = ("bool set_expert_host_backing(int layer_id, int expert_id, expert_tensor_role role, "
+               "placement_host_backing backing)")
+ENTRY_WRITE = "placement_entry & e = entries[it->second];"
+COUNT_CLONES = "result.plan_chunks_cloned = next_plan->entries.chunks_cloned();"
+# Every member the transaction names on its plan copy, and every call it hands the whole copy to (each takes it const).
+TXN_PLAN_MEMBERS = {"unshare_expert_entry", "update_expert_placement", "set_expert_host_backing",
+                    "host_backing_maps_files", "entries"}
+TXN_PLAN_WHOLE = ("ggml_sycl::moe_expert_triplet_dst_bytes(*next_plan, placed)",
+                  "ggml_sycl::moe_mmid_same_workspace_plan(*current->plan, *next_plan)")
+ENTRIES_WORD_RE = re.compile(r"\bentries\b")
+ENTRY_POINTER_ARITH_RE = re.compile(r"entries\s*\.\s*data\s*\(|-\s*&\s*\w+(\.|->)entries\s*\[")
+
+
+def claim_the_plan_copy_shares_its_entries(cache_hpp: str, cache: str, sycl: str) -> bool:
+    h = norm(cache_hpp)
+    b = body(norm(sycl), TXN_SIG)
+    lend_at = b.find(LEND)
+    members = set(re.findall(r"next_plan->(\w+)", b))
+    whole = b.count("*next_plan")
+    flips = [body(h, UPDATE_SIG), body(h, BACKING_SIG)]
+    unshare = body(h, UNSHARE_SIG)
+    return (h.count(ENTRY_STORE) == 1 and h.count(ENTRY_MEMBER) == 1 and b.count(HOIST_PLAN) == 1
+            and b.count(UNSHARE_LOOP) == 1 and lend_at >= 0 and ordered(b, HOIST_PLAN, UNSHARE_LOOP, LEND)
+            and members == TXN_PLAN_MEMBERS and b.count("next_plan->entries") == 1 and b.count(COUNT_CLONES) == 1
+            and whole == len(TXN_PLAN_WHOLE) and all(b.count(x) == 1 for x in TXN_PLAN_WHOLE)
+            and all(f and len(ENTRIES_WORD_RE.findall(f)) == 1 and f.count(ENTRY_WRITE) == 1 for f in flips)
+            and len(ENTRIES_WORD_RE.findall(unshare)) == 1 and unshare.count(UNSHARE_BODY) == 1
+            and not any(ENTRY_POINTER_ARITH_RE.search(norm(src)) for src in (cache_hpp, cache, sycl)))
+
+
+def test_the_plan_copy_shares_its_entries():
+    assert claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, SYCL)
+
+
+def test_mutant_plan_entries_in_a_plain_vector_fails():
+    """A plain vector makes HOIST_PLAN copy every entry per transaction."""
+    mutant = _once(CACHE_HPP, ENTRY_STORE, "using placement_entry_store = std::vector<placement_entry>;")
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_flips_clone_after_the_first_move_fails():
+    """Without the clones taken first, a flip after a move can throw and leave a moved triplet unflipped."""
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, _once_in(SYCL, TXN_SIG, UNSHARE_LOOP, ""))
+
+
+def test_mutant_clones_taken_inside_the_move_loop_fails():
+    moved = _once_in(SYCL, TXN_SIG, UNSHARE_LOOP, "")
+    mutant = _once_in(moved, TXN_SIG, "loaned = " + LEND + ";", "loaned = " + LEND + "; " + UNSHARE_LOOP)
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, mutant)
+
+
+def test_mutant_unshare_clones_nothing_fails():
+    mutant = _once_in(CACHE_HPP, UNSHARE_SIG, UNSHARE_BODY, "")
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_transaction_iterates_the_copy_mutably_fails():
+    """A range-for over the non-const copy takes the mutable begin(), which clones every chunk."""
+    mutant = _once_in(SYCL, TXN_SIG, COUNT_CLONES,
+                      "for (ggml_sycl::placement_entry & e : next_plan->entries) { (void) e; } " + COUNT_CLONES)
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, mutant)
+
+
+def test_mutant_transaction_hands_the_copy_to_another_writer_fails():
+    mutant = _once_in(SYCL, TXN_SIG, COUNT_CLONES, "ggml_sycl::placement_entries_charge_expert_slots("
+                      "next_plan->entries); " + COUNT_CLONES)
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, mutant)
+
+
+def test_mutant_transaction_calls_another_plan_member_fails():
+    mutant = _once_in(SYCL, TXN_SIG, COUNT_CLONES, "next_plan->build_index(); " + COUNT_CLONES)
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, mutant)
+
+
+def test_mutant_flip_walks_the_entries_fails():
+    mutant = _once_in(CACHE_HPP, UPDATE_SIG, ENTRY_WRITE,
+                      "for (placement_entry & x : entries) { (void) x; } " + ENTRY_WRITE)
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_backing_flip_walks_the_entries_fails():
+    mutant = _once_in(CACHE_HPP, BACKING_SIG, ENTRY_WRITE,
+                      "for (placement_entry & x : entries) { (void) x; } " + ENTRY_WRITE)
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_entry_position_by_pointer_arithmetic_fails():
+    mutant = norm(CACHE) + " size_t i = static_cast<size_t>(&entry - plan.entries.data());"
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, mutant, SYCL)
+    mutant = norm(CACHE) + " size_t i = static_cast<size_t>(p - &plan.entries[0]);"
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, mutant, SYCL)
 
 if __name__ == "__main__":
     import sys
