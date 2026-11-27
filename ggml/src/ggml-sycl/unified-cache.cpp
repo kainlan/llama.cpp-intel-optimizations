@@ -2394,6 +2394,8 @@ static bool runtime_registry_row_indexed(const alloc_metadata & h) noexcept {
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
 static size_t g_test_registry_rows_scanned = 0;  // guarded by g_runtime_alloc_mutex
+// The next insert into g_runtime_promotion_cleanup_rows throws std::bad_alloc; guarded by g_runtime_alloc_mutex.
+static bool   g_test_fail_next_promotion_index_insert = false;
 #endif
 
 // Registry rows visited by the settle queries and their refusal enumerations, and by the promotion-cleanup questions the
@@ -2450,6 +2452,12 @@ static void runtime_registry_index_promotion_cleanup_locked(void * key, bool pen
         return;
     }
     try {
+#if defined(GGML_SYCL_PRIVATE_TESTING)
+        if (g_test_fail_next_promotion_index_insert) {
+            g_test_fail_next_promotion_index_insert = false;
+            throw std::bad_alloc();
+        }
+#endif
         g_runtime_promotion_cleanup_rows.insert(key);
     } catch (const std::bad_alloc &) {
         // The row's flag is the durable state; the next question walks the registry to find it.
@@ -17035,6 +17043,9 @@ bool unified_cache::transition_to_retired_locked(const unified_cache_key & key, 
     entry.retired = true;
     retired_pending_count_.fetch_add(1, std::memory_order_release);
     try {
+        if (fail_next_retired_index_insert_.exchange(false)) {
+            throw std::bad_alloc();
+        }
         retired_keys_.insert(key);
     } catch (const std::bad_alloc &) {
         // The entry is retired whatever the index holds; the next finalize walks every entry to find it.
@@ -17152,6 +17163,11 @@ size_t unified_cache::finalize_retired_entries_locked() {
         cache_generation_bump();
     }
     return finalized;
+}
+
+bool unified_cache::test_retired_index_incomplete() const {
+    std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+    return retired_index_incomplete_;
 }
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
@@ -23221,6 +23237,16 @@ size_t allocation_registry_test_process_promotion_retries(int device) noexcept {
 
 bool allocation_registry_test_has_promotion_cleanup_pending(int device) noexcept {
     return has_pending_legacy_promotion_cleanup(device);
+}
+
+void allocation_registry_test_fail_next_promotion_index_insert() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    g_test_fail_next_promotion_index_insert = true;
+}
+
+bool allocation_registry_test_promotion_index_incomplete() noexcept {
+    std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
+    return g_runtime_promotion_cleanup_rows_incomplete;
 }
 
 registered_release_status allocation_registry_test_release_exact(

@@ -5831,6 +5831,12 @@ class unified_cache {
     }
 
     void test_fail_next_host_registration_insert() noexcept { fail_next_host_registration_insert_ = true; }
+
+    // The next insert into the retired-key set throws std::bad_alloc, as an allocation failure would: the retire
+    // still happens, the set is left incomplete, and the next finalize rebuilds it.
+    void test_fail_next_retired_index_insert() noexcept { fail_next_retired_index_insert_ = true; }
+
+    bool test_retired_index_incomplete() const;
     bool note_model_load_abort(uint64_t load_txn_id) noexcept;
     void note_model_load_end(uint32_t slot, uint64_t load_txn_id);
 
@@ -6579,6 +6585,7 @@ class unified_cache {
 
   private:
     std::atomic<bool> fail_next_host_registration_insert_{ false };
+    std::atomic<bool> fail_next_retired_index_insert_{ false };
 
     // Sub-allocate from a zone. When allocation_id is non-zero, physical
     // allocation, exact authority registration, and token identity share the
@@ -9110,6 +9117,10 @@ size_t allocation_registry_test_process_promotion_retries(int device) noexcept;
 // What the cache teardown asks before it dismantles: is any registry row on `device` (any device when negative) still
 // waiting for its promotion cleanup.
 bool                      allocation_registry_test_has_promotion_cleanup_pending(int device) noexcept;
+// The next insert into the promotion-cleanup row set throws std::bad_alloc, as an allocation failure would: the row's
+// flag is still set, the set is left incomplete, and the next promotion-cleanup question rebuilds it.
+void                      allocation_registry_test_fail_next_promotion_index_insert() noexcept;
+bool                      allocation_registry_test_promotion_index_incomplete() noexcept;
 registered_release_status allocation_registry_test_release_exact(
     const alloc_metadata & metadata, registered_release_mode mode) noexcept;
 registered_release_status allocation_registry_test_claim(const alloc_metadata & metadata, bool intrusive) noexcept;
