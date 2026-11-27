@@ -7501,10 +7501,15 @@ only; every device item is still the lead's.**
     242 pass, and none was skipped or not run. The two reds are not this round's:
     - `sycl-private-cpu-traits-source` fails its trait call-site inventory. This range changes no call of
       `ggml_sycl_get_type_traits_cpu`, and each file's count is the same at the base, `a09e879982`.
-    - `test-skip-policy` fails on literal `return 77;` lines in 13 files this round did not touch. It should not
-      have been selected: its environment names `build/bin/test-autorelease`, and the selector read only the
-      command and the script. That binary exits 77 in `common_get_model_or_exit`, before `llama_backend_init`, so
-      no device was opened.
+    - `test-skip-policy` fails two checks on a literal 77 used as a skip exit. They name 12 files between them: 8
+      with `return 77;` or `std::exit(77);`, and 12 with a bare 77. None of the 12 is in this task's diff from
+      `a09e879982`. The test should not have been selected: its environment names `build/bin/test-autorelease`,
+      and the selector read only the command and the script. That binary exits 77 in `common_get_model_or_exit`,
+      before `llama_backend_init`, so no device was opened.
+    - The sweep began before `2b9ea9c782`, which rewords comments in `ggml/src/ggml-sycl/CMakeLists.txt` and the
+      kernel test. The 66 selected contracts that read CMake or the kernel test were therefore run again at that
+      commit. 65 pass; the one red is the traits inventory above. `clang-format-19 --dry-run -Werror` is clean on the
+      kernel test.
   - The four artifact-inspection tests were run by name. They only run `nm` or `strings` on built files.
     - `sycl-unified-private-seams` and `sycl-retained-publication-no-export` pass.
     - `sycl-private-carrier-linkage` and `sycl-staging-failpoint-no-export` fail only on binaries this worktree never
