@@ -8,13 +8,16 @@
 // hundred of them. With this store the copy is O(chunks) and the change clones O(chunks written).
 //
 // Rules a user relies on:
-// - Const access never clones: operator[] const, front/back const, the const iterators, index_of, size.
+// - Const access never clones: operator[] const, front/back const, the const iterators, size.
 // - Non-const operator[], front() and back() clone the one chunk they reach when another store shares it, so a write
 //   can allocate (and throw) where a std::vector write could not. unshare_at() takes that clone ahead of the write.
 // - Non-const begin()/end() clone every shared chunk first, because a mutable iterator can write anywhere. A range-for
 //   over a non-const store, even with a const element reference, takes that path: iterate a const reference to the
 //   store (or index it) where a shared copy must stay shared.
-// - push_back, emplace_back, pop_back, resize, erase and clear change only this store.
+// - push_back, emplace_back, pop_back, resize, erase and clear change only this store. erase returns a mutable
+//   iterator, so like begin() it clones every shared chunk first, even for an empty range.
+// - chunks_cloned() counts the clones made for the store's current contents. Copy assignment and clear() replace the
+//   contents wholesale and start it again at 0; a copy starts at 0; a move carries the source's count over.
 //
 // Single writer per store: the "is this chunk shared" test is use_count() == 1. A count of 1 means no other store
 // holds the chunk, and no other store can start sharing it except by copying this store, which is a read of this
@@ -22,12 +25,19 @@
 // causes an unneeded clone. So a store has one writer at a time, and a copy taken for a publication is written only by
 // the thread that took it, before it is published.
 //
-// Aliasing hazard: a reference obtained through a non-const access is into a chunk this store owns alone at that
-// moment. If the store is then copied, the chunk becomes shared and writing through the old reference writes into the
-// copy too. Take references after the copy, not before.
+// Aliasing hazards, both ways. Neither exists for a std::vector, whose copy owns its own elements.
+// - A reference obtained through a non-const access is into a chunk this store owns alone at that moment. If the store
+//   is then copied, the chunk becomes shared and writing through the old reference writes into the copy too. Take
+//   references after the copy, not before.
+// - A reference or pointer obtained through a const access may be into a chunk another store shares. A later write to
+//   this store clones that chunk, and the old pointer then names the other store's element, no longer this store's: it
+//   does not see the write. A `const placement_entry *` from find_expert_entry or find_dense_entry on a plan copy goes
+//   stale for that copy this way. The expert move transaction is safe because it clones every chunk it will write (the
+//   unshare_expert_entry loop) before it looks any entry up, so no later write in the transaction clones a chunk a
+//   lookup pointed into. A caller that looks an entry up and then writes the store must look it up again after the
+//   write, or unshare first.
 #include <algorithm>
 #include <cstddef>
-#include <functional>
 #include <iterator>
 #include <memory>
 #include <utility>
@@ -47,7 +57,6 @@ template <typename T, size_t CHUNK = 32> class cow_chunked_vector {
     using reference       = T &;
     using const_reference = const T &;
 
-    static constexpr size_t npos       = static_cast<size_t>(-1);
     static constexpr size_t chunk_size = CHUNK;
 
     // A random-access iterator by position. A mutable one is handed out only after every chunk is unshared, so it
@@ -214,7 +223,8 @@ template <typename T, size_t CHUNK = 32> class cow_chunked_vector {
 
     void clear() {
         chunks_.clear();
-        size_ = 0;
+        size_   = 0;
+        cloned_ = 0;
     }
 
     void push_back(const T & value) { emplace_back(value); }
@@ -251,14 +261,15 @@ template <typename T, size_t CHUNK = 32> class cow_chunked_vector {
     }
 
     // Removes [first, last) and closes the gap, as std::vector::erase does. Returns the position after the last
-    // element removed.
+    // element removed. That is a mutable iterator, which can write anywhere, so every shared chunk is cloned first
+    // even when the range is empty, as begin() does.
     iterator erase(const_iterator first, const_iterator last) {
         const size_t from = first.index();
         const size_t to   = last.index();
+        unshare_all();
         if (from == to) {
             return iterator(this, from);
         }
-        unshare_all();
         size_t dst = from;
         for (size_t src = to; src < size_; ++src, ++dst) {
             element_unchecked(dst) = std::move(element_unchecked(src));
@@ -271,29 +282,10 @@ template <typename T, size_t CHUNK = 32> class cow_chunked_vector {
 
     iterator erase(const_iterator pos) { return erase(pos, pos + 1); }
 
-    // The position of the element `value` refers to, or npos when it is not one of this store's elements. Walks the
-    // chunks: for a caller with a position at hand (an index or an iterator) that is the cheaper answer.
-    size_t index_of(const T & value) const {
-        const T *                  p = &value;
-        const std::less<const T *> less{};
-        for (size_t c = 0; c < chunks_.size(); ++c) {
-            const chunk_type & chunk = *chunks_[c];
-            if (chunk.empty()) {
-                continue;
-            }
-            const T * first = chunk.data();
-            const T * last  = first + chunk.size();
-            if (!less(p, first) && less(p, last)) {
-                return c * CHUNK + static_cast<size_t>(p - first);
-            }
-        }
-        return npos;
-    }
-
     size_t chunk_count() const { return chunks_.size(); }
 
-    // The chunks this store has cloned since it was constructed or last assigned: the cost of its copy-on-write. A copy
-    // starts at 0.
+    // The chunks this store has cloned for its current contents: the cost of its copy-on-write. A copy starts at 0, and
+    // copy assignment and clear() start it again; a move carries the source's count over.
     size_t chunks_cloned() const { return cloned_; }
 
     // How many of this store's chunks `other` holds too, chunk by chunk at the same position.

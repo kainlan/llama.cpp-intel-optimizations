@@ -155,17 +155,43 @@ static int test_unshare_at_moves_the_clone_ahead_of_the_write() {
     return 0;
 }
 
-static int test_index_of() {
+static int test_iterator_index() {
     const store a = make_store(10);
-    for (size_t i = 0; i < a.size(); ++i) {
-        CHECK(a.index_of(a[i]) == i, "index_of names each element's position");
-    }
-    const std::string outside = "e3";
-    CHECK(a.index_of(outside) == store::npos, "an element not in the store has no index");
-    size_t i = 0;
+    size_t      i = 0;
     for (auto it = a.begin(); it != a.end(); ++it, ++i) {
         CHECK(it.index() == i, "an iterator names its position");
     }
+    return 0;
+}
+
+// erase hands back a mutable iterator even when it removes nothing, so it unshares first, as begin() does: a write
+// through that iterator must not reach another store that shares the chunk.
+static int test_empty_erase_unshares() {
+    const store   a  = make_store(10);
+    store         b  = a;
+    const store & cb = b;
+    auto          it = b.erase(cb.begin() + 3, cb.begin() + 3);
+    CHECK(b.size() == 10 && it.index() == 3, "an empty erase removes nothing and returns its position");
+    *it = "written";
+    CHECK(cb[3] == "written", "the write lands in the store erase was called on");
+    CHECK(a[3] == "e3", "the write does not reach the store it was copied from");
+    CHECK(b.chunks_cloned() == 3 && b.shared_chunks_with(a) == 0, "the mutable iterator unshared every chunk first");
+    return 0;
+}
+
+// chunks_cloned() counts the clones made for the store's current contents: copy assignment and clear() replace the
+// contents wholesale, so both start the count again.
+static int test_clear_resets_the_clone_count() {
+    const store a = make_store(10);
+    store       b = a;
+    b[1]          = "x";
+    CHECK(b.chunks_cloned() == 1, "the write cloned one chunk");
+    b.clear();
+    CHECK(b.chunks_cloned() == 0, "clear starts the count again with the contents");
+    b.push_back("fresh");
+    b[0] = "y";
+    CHECK(b.chunks_cloned() == 0, "chunks the cleared store allocates itself are never clones");
+    CHECK(a[1] == "e1" && a.size() == 10, "clearing a copy leaves the original");
     return 0;
 }
 
@@ -177,7 +203,9 @@ int main() {
                                test_sort,
                                test_erase_resize_clear,
                                test_unshare_at_moves_the_clone_ahead_of_the_write,
-                               test_index_of };
+                               test_iterator_index,
+                               test_empty_erase_unshares,
+                               test_clear_resets_the_clone_count };
     for (int (*t)() : tests) {
         if (t() != 0) {
             return 1;
