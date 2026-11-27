@@ -999,7 +999,12 @@ static bool test_retired_index_insert_failure_is_recovered(sycl::queue & q) {
     TEST_ASSERT(leased_staged.ok && lease.valid(), "leased expert stage did not publish a lease");
     leased_staged.event.wait_and_throw();
     TEST_ASSERT(!cache.test_retired_index_incomplete(), "the retired-key set starts incomplete");
-    TEST_ASSERT(cache.entry_count() == static_cast<size_t>(n_idle) + 1,
+    const size_t staged_entries = cache.entry_count();
+    if (staged_entries != static_cast<size_t>(n_idle) + 1) {
+        fprintf(stderr, "(the fixture holds %zu entries, expected %zu) ", staged_entries,
+                static_cast<size_t>(n_idle) + 1);
+    }
+    TEST_ASSERT(staged_entries == static_cast<size_t>(n_idle) + 1,
                 "the fixture holds entries other than the four staged");
 
     cache.test_fail_next_retired_index_insert();

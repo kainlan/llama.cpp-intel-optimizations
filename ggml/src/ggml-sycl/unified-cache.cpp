@@ -2318,7 +2318,8 @@ static std::unordered_map<void *, runtime_alloc_record> g_runtime_alloc_registry
 // keys back.
 static std::unordered_set<void *> g_runtime_promotion_cleanup_rows;
 static bool                       g_runtime_promotion_cleanup_rows_incomplete = false;
-// Keys the promotion-cleanup walk found naming no pending row, a bookkeeping slip it repairs (its DEFENSIVE branch).
+// Keys the promotion-cleanup walk found naming no pending row, a bookkeeping slip it repairs (its DEFENSIVE branch);
+// guarded by g_runtime_alloc_mutex.
 static uint64_t                   g_runtime_promotion_cleanup_stale_keys      = 0;
 
 // A stale index key is repaired where it is found and warned on at the 1st, 2nd, 4th, 8th, ... occurrence: visible,
