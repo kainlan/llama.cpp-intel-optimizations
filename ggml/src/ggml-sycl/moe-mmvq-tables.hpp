@@ -580,30 +580,31 @@ inline size_t moe_pp_batched_phase_count(size_t active, size_t phase_experts) {
 // causes, and the latch static_asserts that it fits.
 enum class moe_pp_batched_refusal : uint8_t {
     NONE = 0,
-    CPU_REFERENCE,      // GGML_SYCL_MOE_CPU_REFERENCE asked for the CPU reference instead
-    ROUTE_OFF,          // GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED=0 (route not selected) or GGML_SYCL_MOE_PP_ONEDNN_F16=0
-    CANDIDATE,          // the (type, layout) pair is not in the tables above, or src1/dst are not f32
-    NO_EXPERT_CACHE,    // the dispatch has no expert cache to resolve experts through
-    NO_PLAN,            // the layer has no execution plan
-    DECODE,             // one token per expert row: decode stays on MMVQ
-    NO_ROWS,            // zero tokens
-    DIMS,               // the weight row is not a whole number of quant blocks, or a stride is not packed
-    DIMS_OVERFLOW,      // a dimension does not fit the GEMM's integer types
-    EXPERT_NOT_LOCAL,   // an active expert is not device-resident on this device
-    EXPERT_LAYOUT,      // an active expert is materialized in another layout than the route's
-    NO_ACTIVE_EXPERTS,  // no expert received a token
-    XMX_TILE_CAPS,      // the XMX-tiled WOQ repack is not supported on this device
-    F16_TILED,          // XMX-tiled experts reached the f16 arm, which has no tiled dequant
-    NO_DEQUANT,         // no f16 dequant kernel for the expert's materialized layout
-    SCRATCH_SIZE,       // the scratch arithmetic overflowed
-    SCRATCH_CACHE,      // no unified cache for this device
-    SCRATCH_UNPLANNED,  // the plan's ring is smaller than this dispatch needs (for the f16 arm: one expert)
-    SCRATCH_RESERVE,    // the planned ring could not be reserved
-    SCRATCH_SLOT,       // a ring slot could not be acquired
-    SCRATCH_SLOT_SIZE,  // an acquired slot is smaller than planned
-    GEMM,               // the batched GEMM failed after the experts were staged
-    ROW_MAP_STAGING,    // not the executor's: the op's prompt row-map staging, allocated before it runs, did not fit
-    COUNT,              // not a cause: the number of causes
+    CPU_REFERENCE,       // GGML_SYCL_MOE_CPU_REFERENCE asked for the CPU reference instead
+    ROUTE_OFF,           // GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED=0 (route not selected) or GGML_SYCL_MOE_PP_ONEDNN_F16=0
+    CANDIDATE,           // the (type, layout) pair is not in the tables above, or src1/dst are not f32
+    NO_EXPERT_CACHE,     // the dispatch has no expert cache to resolve experts through
+    NO_PLAN,             // the layer has no execution plan
+    DECODE,              // one token per expert row: decode stays on MMVQ
+    NO_ROWS,             // zero tokens
+    DIMS,                // the weight row is not a whole number of quant blocks, or a stride is not packed
+    DIMS_OVERFLOW,       // a dimension does not fit the GEMM's integer types
+    EXPERT_NOT_LOCAL,    // an active expert is not device-resident on this device
+    EXPERT_LAYOUT,       // an active expert is materialized in another layout than the route's
+    NO_ACTIVE_EXPERTS,   // no expert received a token
+    XMX_TILE_CAPS,       // the XMX-tiled WOQ repack is not supported on this device
+    F16_TILED,           // XMX-tiled experts reached the f16 arm, which has no tiled dequant
+    NO_DEQUANT,          // no f16 dequant kernel for the expert's materialized layout
+    SCRATCH_SIZE,        // the scratch arithmetic overflowed
+    SCRATCH_CACHE,       // no unified cache for this device
+    SCRATCH_UNPLANNED,   // the plan's ring is smaller than this dispatch needs (for the f16 arm: one expert)
+    SCRATCH_RESERVE,     // the planned ring could not be reserved
+    SCRATCH_SLOT,        // a ring slot could not be acquired
+    SCRATCH_SLOT_SIZE,   // an acquired slot is smaller than planned
+    PACKED_ROW_STAGING,  // the node's packed-row table (gather and scatter rows) did not fit
+    GEMM,                // the batched GEMM failed after the experts were staged
+    ROW_MAP_STAGING,     // not the executor's: the op's prompt row-map staging, allocated before it runs, did not fit
+    COUNT,               // not a cause: the number of causes
 };
 
 inline const char * moe_pp_batched_refusal_name(moe_pp_batched_refusal refusal) {
@@ -652,6 +653,8 @@ inline const char * moe_pp_batched_refusal_name(moe_pp_batched_refusal refusal) 
             return "scratch-slot";
         case moe_pp_batched_refusal::SCRATCH_SLOT_SIZE:
             return "scratch-slot-size";
+        case moe_pp_batched_refusal::PACKED_ROW_STAGING:
+            return "packed-row-staging";
         case moe_pp_batched_refusal::GEMM:
             return "gemm";
         case moe_pp_batched_refusal::ROW_MAP_STAGING:
@@ -680,6 +683,7 @@ inline bool moe_pp_batched_refusal_after_claim(moe_pp_batched_refusal refusal) {
         case moe_pp_batched_refusal::SCRATCH_RESERVE:
         case moe_pp_batched_refusal::SCRATCH_SLOT:
         case moe_pp_batched_refusal::SCRATCH_SLOT_SIZE:
+        case moe_pp_batched_refusal::PACKED_ROW_STAGING:
         case moe_pp_batched_refusal::GEMM:
             return true;
         default:

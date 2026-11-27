@@ -618,6 +618,7 @@ int main() {
         moe_pp_batched_refusal::SCRATCH_RESERVE,
         moe_pp_batched_refusal::SCRATCH_SLOT,
         moe_pp_batched_refusal::SCRATCH_SLOT_SIZE,
+        moe_pp_batched_refusal::PACKED_ROW_STAGING,
         moe_pp_batched_refusal::GEMM,
     };
     for (int r = 0; r <= pp_refusal_count; ++r) {

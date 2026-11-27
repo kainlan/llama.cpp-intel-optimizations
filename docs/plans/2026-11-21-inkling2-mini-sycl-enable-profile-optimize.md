@@ -8081,7 +8081,8 @@ its kernel.
    leading dimension `ne0`, so the executor already depends on that equality. Find the guard that ensures it (the
    `DIMS` refusal, "a stride is not packed") and cite it in the report. If no guard exists, add
    `GGML_ASSERT(nb1 == ne0 * sizeof(float))` beside the scatter. The gather side is fixed: `:100099` sets the row to
-   `ne10 * 2` bytes.
+   `ne10 * 2` bytes. The guard exists: the `DIMS` precheck in `try_pp_onednn_f16_batched` refuses
+   `nb1 != static_cast<size_t>(ne0) * sizeof(float)` (`:100255` at `447e952caf`), so no assert is added.
 3. The executor, in `try_pp_onednn_f16_batched`:
    - (a) After `moe_pp_pack_gemm_groups` succeeds (`:100474`), build `spans` from `active_experts` in sorted order
      (`{expert.row_begin, expert.row_end}`) and call `moe_pp_pack_row_table`. On false, return
@@ -8089,16 +8090,22 @@ its kernel.
      point. Declare the host vector in the scope that encloses the scatter's submit, as `row_maps_flat` is.
    - (b) Before the scratch claim (before `reserve_pp_moe_onednn_scratch`), allocate a
      `scoped_unified_queue_temp<ggml_sycl::moe_pp_packed_row> packed_rows_dev` of `table.size()` with cohort id
-     `"moe_pp_packed_rows"`. Declare it in the scope that encloses the scatter's submit. Upload it with
+     `"moe_pp_packed_rows"`. Declare it in the scope that encloses the scatter's submit. Upload it after
+     `pp_batched_submitted = true;`, just before the `ready_events` barrier, with
      `ggml_sycl_safe_memcpy(*stream, packed_rows_dev.get(), table.data(), table.size() * sizeof(moe_pp_packed_row), {})`
-     and keep its event as `packed_rows_ready`.
+     and keep its event as `packed_rows_ready`. The upload does not go before the claim: pin S5 of
+     `tests/test-sycl-moe-gate-up-role-source.py` refuses any queue call in the executor before the first-submission
+     mark, because a node the direct MMID route deferred goes back to that route only while nothing is submitted.
      - On a failed allocation, return `reject_batched(moe_pp_batched_refusal::PACKED_ROW_STAGING, nullptr)`, a new
        cause.
      - Add the value just before `GEMM` in `moe_pp_batched_refusal` (`moe-mmvq-tables.hpp:581`), with the comment
        `// the node's packed-row table (gather and scatter rows) did not fit`.
      - Add a name case `"packed-row-staging"` to `moe_pp_batched_refusal_name`.
-     - Check `moe_pp_batched_refusal_after_claim` and the latch's static_assert (`COUNT <= 32`): the new cause is
-       before the claim, so it must not count as after-claim.
+     - Check `moe_pp_batched_refusal_after_claim` and the latch's static_assert (`COUNT <= 32`). The new cause is
+       after-claim (loud): "claim" there is the op claim (`ggml_sycl_moe_pp_onednn_batched_claims_tensor`), not the
+       scratch slot, and this refusal is reached after the op claim, as `SCRATCH_SIZE`, `SCRATCH_CACHE` and
+       `SCRATCH_RESERVE` are. Add it to `POST_CLAIM` in `tests/test-sycl-moe-pp-batched-types-source.py` and to
+       `pp_post_claim` in `tests/test-sycl-moe-mmvq-tables.cpp`.
      - Update every source test that enumerates the causes. Grep `tests/*.py` for `SCRATCH_SLOT_SIZE` and
        `ROW_MAP_STAGING, COUNT`, and `tests/test-sycl-moe-pp-batched-types-source.py:1323` pins the tail.
    - (c) Replace the gather loop with one `ggml_sycl_profile_submit`. Keep the label name, category and metadata
@@ -8132,7 +8139,8 @@ its kernel.
      mismatch, an empty span, an inverted span, a span longer than its group's `n_rows` (a hand-built layout), a
      layout whose groups skip a position, and a `second` above `INT32_MAX`.
 - The full build is `./scripts/sycl-build.sh` in the task worktree. Build only there, never in the shared checkout.
-  Then `ctest --test-dir build -R '^test-moe-pp-pack$' --output-on-failure`, and the Python source sweeps:
+  Then `ctest --test-dir build -R '^sycl-moe-pp-pack$' --output-on-failure` (the test is registered as
+  `sycl-moe-pp-pack`), and the Python source sweeps:
   `ctest --test-dir build -R 'test-sycl-.*-source' -j 4 --output-on-failure`. Report every red with its first failing
   assertion.
 - If an existing source test pins the per-expert form of either loop, it is the test that changes: update it to pin
@@ -8161,6 +8169,8 @@ its kernel.
 - So the following task is not "batch the dequant launch". It is "stop dequantizing every expert every micro-batch":
   an NVFP4 weight-only-quantized GEMM, as MXFP4 has, or an f16 plane kept across micro-batches. It is written after
   this task's profile measures the dequant's real time.
+
+Amended by the lead, 2026-11-27: upload after the submitted mark (S5); PACKED_ROW_STAGING is after-claim.
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 

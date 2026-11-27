@@ -14,7 +14,9 @@
 using ggml_sycl::moe_pp_gemm_group;
 using ggml_sycl::moe_pp_gemm_row_align;
 using ggml_sycl::moe_pp_pack_gemm_groups;
+using ggml_sycl::moe_pp_pack_row_table;
 using ggml_sycl::moe_pp_packed_layout;
+using ggml_sycl::moe_pp_packed_row;
 
 static int g_failures = 0;
 
@@ -172,6 +174,113 @@ static void test_rejections() {
           "a refusal leaves the output untouched");
 }
 
+// The row table of three experts whose row-map spans are in expert-id order, not size order: the second-largest
+// expert's rows come first in the map, the smallest's at its start. Every routed row gets one entry, in its expert's
+// slot, and no entry lands on another entry's row or in a slot's padding.
+static void test_row_table_three_experts() {
+    const std::vector<size_t>                    rows  = { 40, 30, 3 };
+    const std::vector<std::pair<size_t, size_t>> spans = {
+        { 10, 50 },
+        { 50, 80 },
+        { 0,  3  },
+    };
+    moe_pp_packed_layout layout;
+    check(moe_pp_pack_gemm_groups(rows, &layout), "three experts pack");
+    std::vector<moe_pp_packed_row> table;
+    check(moe_pp_pack_row_table(spans, layout, &table), "three experts build a row table");
+    check(table.size() == 73, "the table has one entry per routed row");
+    if (table.size() != 73) {
+        return;
+    }
+    check(table[0].map_row == 10 && table[0].packed_row == 0, "entry 0 is the first expert's first row");
+    check(table[39].map_row == 49 && table[39].packed_row == 39, "entry 39 is the first expert's last row");
+    check(table[40].map_row == 50 && table[40].packed_row == 64, "entry 40 starts the second expert's slot at 64");
+    check(table[70].map_row == 0 && table[70].packed_row == 128 && table[71].map_row == 1 &&
+              table[71].packed_row == 129 && table[72].map_row == 2 && table[72].packed_row == 130,
+          "the third expert's group starts at 128");
+    std::vector<bool> seen(layout.packed_rows, false);
+    bool              unique = true;
+    for (const moe_pp_packed_row & e : table) {
+        if (e.packed_row < 0 || static_cast<size_t>(e.packed_row) >= seen.size() || seen[e.packed_row]) {
+            unique = false;
+            break;
+        }
+        seen[e.packed_row] = true;
+    }
+    check(unique, "no packed row appears twice");
+    bool   outside_padding = true;
+    size_t at              = 0;
+    for (size_t i = 0; i < spans.size(); ++i) {
+        const size_t n = spans[i].second - spans[i].first;
+        for (size_t r = 0; r < n; ++r, ++at) {
+            const size_t packed = static_cast<size_t>(table[at].packed_row);
+            if (packed < layout.slot_base_row[i] || packed >= layout.slot_base_row[i] + n) {
+                outside_padding = false;
+            }
+        }
+    }
+    check(outside_padding, "no entry lies in an expert's padding");
+}
+
+// One expert of one row: one entry, the row-map row to packed row 0.
+static void test_row_table_one_row() {
+    moe_pp_packed_layout layout;
+    check(moe_pp_pack_gemm_groups({ 1 }, &layout), "one row packs");
+    const std::vector<std::pair<size_t, size_t>> spans = { std::make_pair(size_t(5), size_t(6)) };
+    std::vector<moe_pp_packed_row>               table;
+    check(moe_pp_pack_row_table(spans, layout, &table), "one row builds a row table");
+    check(table.size() == 1 && table[0].map_row == 5 && table[0].packed_row == 0, "one row is entry {5, 0}");
+}
+
+static void test_row_table_rejections() {
+    static_assert(sizeof(moe_pp_packed_row) == 2 * sizeof(int32_t), "the device reads the table as two ints");
+    moe_pp_packed_layout two;
+    check(moe_pp_pack_gemm_groups({ 4, 3 }, &two), "two experts pack");
+    const moe_pp_packed_row        sentinel = { -7, -9 };
+    std::vector<moe_pp_packed_row> table    = { sentinel };
+    const auto                     intact   = [&]() {
+        return table.size() == 1 && table[0].map_row == sentinel.map_row && table[0].packed_row == sentinel.packed_row;
+    };
+    using spans_t                                 = std::vector<std::pair<size_t, size_t>>;
+    const std::pair<size_t, size_t> a             = { 0, 4 };
+    const std::pair<size_t, size_t> b             = { 4, 7 };
+    const size_t                    past_i32      = static_cast<size_t>(std::numeric_limits<int32_t>::max()) + 1;
+    const spans_t                   empty_span    = { a, std::make_pair(size_t(4), size_t(4)) };
+    const spans_t                   inverted_span = { a, std::make_pair(size_t(7), size_t(4)) };
+    const spans_t                   three_spans   = { a, b, std::make_pair(size_t(7), size_t(8)) };
+    const spans_t                   past_i32_span = { a, std::make_pair(past_i32 - 3, past_i32) };
+
+    check(!moe_pp_pack_row_table({ a, b }, two, nullptr), "a null output is refused");
+    check(!moe_pp_pack_row_table({}, two, &table) && intact(), "empty spans are refused");
+    check(!moe_pp_pack_row_table({ a }, two, &table) && intact(), "a size mismatch is refused");
+    check(!moe_pp_pack_row_table(empty_span, two, &table) && intact(), "an empty span is refused");
+    check(!moe_pp_pack_row_table(inverted_span, two, &table) && intact(), "an inverted span is refused");
+
+    // A hand-built layout whose one group's slots hold 2 rows, under the 4 the first span holds.
+    moe_pp_packed_layout short_slot;
+    short_slot.groups.push_back(moe_pp_gemm_group{ 0, 2, 2, 0 });
+    short_slot.slot_base_row = { 0, 2 };
+    short_slot.packed_rows   = 4;
+    check(!moe_pp_pack_row_table({ a, b }, short_slot, &table) && intact(), "a span longer than its slot is refused");
+
+    // Groups that skip position 1: the second group starts at 2.
+    moe_pp_packed_layout skip;
+    skip.groups.push_back(moe_pp_gemm_group{ 0, 1, 64, 0 });
+    skip.groups.push_back(moe_pp_gemm_group{ 2, 3, 64, 64 });
+    skip.slot_base_row = { 0, 64, 128 };
+    skip.packed_rows   = 192;
+    check(!moe_pp_pack_row_table(three_spans, skip, &table) && intact(), "groups that skip a position");
+
+    // Groups that stop short: the one group covers position 0 of two.
+    moe_pp_packed_layout short_groups;
+    short_groups.groups.push_back(moe_pp_gemm_group{ 0, 1, 64, 0 });
+    short_groups.slot_base_row = { 0, 64 };
+    short_groups.packed_rows   = 128;
+    check(!moe_pp_pack_row_table({ a, b }, short_groups, &table) && intact(), "groups that stop short are refused");
+
+    check(!moe_pp_pack_row_table(past_i32_span, two, &table) && intact(), "a span end above INT32_MAX is refused");
+}
+
 int main() {
     test_even_spread();
     test_one_hot_expert();
@@ -179,6 +288,9 @@ int main() {
     test_random_routings();
     test_offsets_past_4gib();
     test_rejections();
+    test_row_table_three_experts();
+    test_row_table_one_row();
+    test_row_table_rejections();
     if (g_failures != 0) {
         std::fprintf(stderr, "FAIL: %d check(s) failed\n", g_failures);
         return 1;
