@@ -945,6 +945,7 @@ static bool test_deferred_free_pass_visits_only_retired_entries(sycl::queue & q)
     TEST_ASSERT(deferred_pass_visited(cache, 1, "retired and leased"),
                 "with one retired entry, the deferred-free pass visited entries other than it");
     TEST_ASSERT(cache.retired_pending_count_for_test() == 1, "the pass finalized an entry that is still leased");
+    TEST_ASSERT(cache.test_retired_index_consistent(), "the retired-key set disagrees with the retired entries");
     TEST_ASSERT(lease.resolve().ptr == leased_staged.ptr, "the pass invalidated the live lease");
 
     lease = {};
@@ -952,6 +953,7 @@ static bool test_deferred_free_pass_visits_only_retired_entries(sycl::queue & q)
                 "the pass after the lease went did not visit the retired entry alone");
     TEST_ASSERT(cache.retired_pending_count_for_test() == 0, "the retired entry did not finalize after its lease");
     TEST_ASSERT(cache.lookup_expert(leased) == nullptr, "the retired entry survived its final lease");
+    TEST_ASSERT(cache.test_retired_index_consistent(), "the retired-key set kept a finalized entry");
     TEST_ASSERT(deferred_pass_visited(cache, 0, "after the final lease"),
                 "after every retired entry finalized, the deferred-free pass still visited entries");
     for (int i = 0; i < n_idle; ++i) {

@@ -5818,6 +5818,9 @@ class unified_cache {
     uint64_t test_id_remap_walks() const noexcept;
     // The entries the retired-entry finalize has visited over the cache's life (retired_entry_visits_).
     uint64_t test_retired_entry_visits() const noexcept;
+    // The retired-key set names exactly the retired entries entries_ holds, as many as retired_pending_count_ counts
+    // (unless an insert could not allocate). O(entries); only the tests use it.
+    bool     test_retired_index_consistent() const;
     // The key `id` maps to, in *out; false when the id maps to nothing.
     bool     test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const;
     // Clear has_evictions_, as reclaim_weight_entries() does, so a case starts from a clean latch.
@@ -6697,7 +6700,8 @@ class unified_cache {
     // internal cache mutations call the locked form to avoid recursive locking.
     void        process_deferred_frees_locked();
     size_t      finalize_retired_entries_locked();
-    bool        transition_to_retired_locked(unified_cache_entry & entry) noexcept;
+    bool        transition_to_retired_locked(const unified_cache_key & key, unified_cache_entry & entry) noexcept;
+    void        complete_retired_index_locked() noexcept;
     entry_map::iterator erase_entry_locked(entry_map::iterator it) noexcept;
     size_t              erase_entry_locked(const unified_cache_key & key) noexcept;
     void        remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & id, const unified_cache_key & removed_key);
@@ -7922,6 +7926,19 @@ class unified_cache {
     std::vector<deferred_free_entry>      deferred_frees_;
     std::vector<deferred_host_free_entry> deferred_host_frees_;
     std::atomic<size_t>                   retired_pending_count_{ 0 };
+    // The keys of the retired entries entries_ still holds: what finalize_retired_entries_locked() walks, so the
+    // deferred-free pass on every synchronize costs what is retired, not the size of the cache (tens of thousands of
+    // expert entries on a MoE model). Guarded by rw_mutex_, with entries_. transition_to_retired_locked() adds a key,
+    // and a restore and erase_entry_locked() take it out, so the set and retired_pending_count_ name the same entries.
+    // A retired entry still leased stays in the set until the pass that finds its last lease gone erases it.
+    // Retirement must not fail once withdrawal has begun, so an insert that cannot allocate only sets
+    // retired_index_incomplete_, and the next finalize walks every entry once to put the missing keys back.
+    using retired_key_set = std::unordered_set<unified_cache_key,
+                                               unified_cache_key_hash,
+                                               std::equal_to<unified_cache_key>,
+                                               detail::cache_guard_allocator<unified_cache_key>>;
+    retired_key_set retired_keys_;
+    bool            retired_index_incomplete_ = false;
 
     struct inflight_unpin_entry {
         ggml_sycl_cache_id key       = {};
