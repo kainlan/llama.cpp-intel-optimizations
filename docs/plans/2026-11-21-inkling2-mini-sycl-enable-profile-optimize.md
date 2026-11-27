@@ -7934,6 +7934,234 @@ pp / tg in t/s.
   - The next task batches those stage submissions. `llama.cpp-uop2` (the two host waits) and `llama.cpp-ff54` (one
     ring-claim helper) follow.
 
+### Task 25: The batched prompt executor gathers and scatters a node's rows in one launch each (written 2026-11-27)
+
+**Track:** S3-prompt. **Base:** `6ca5b46565` (`feat/inkling2`; its tree is `d69cbe7985`'s plus this plan).
+**Tracker:** `llama.cpp-cl5q` part (a), the gather and scatter half. The dequant half is a later task (see "Not in
+scope").
+
+**Found by:** the B70 long-prompt profile at `992568b6f8`
+(`t24-kprof-pp-long-b70-992568b6f8/kprof.csv`, one pass of 4737 tokens):
+
+| row | count | device ms | bytes |
+|---|---|---|---|
+| `moe.pp.stage.scatter` | 96,556 | 397.2 | 30.7 GB |
+| `moe.pp.stage.act` | 96,556 | 255.3 | 11.5 GB |
+| `moe.pp.dequant.nvfp4` | 96,556 | 9.7 (not the kernel, see below) | 768.8 GB |
+| `moe.pp.gemm.execute` | 9,995 | 1842.8 | |
+
+The pass submits 398,636 kernels. About 290,000 of them are these three per-expert rows. The gather and the scatter
+average 2.6 and 4.1 µs of device time each: each one moves one expert's ~32 rows, and its host submit costs more than
+its kernel.
+
+**What exists** (line numbers at `6ca5b46565`, all in `ggml/src/ggml-sycl/ggml-sycl.cpp` unless named):
+- `:99952-100013`: the node's row map. A host counting sort of the ids gives `row_maps_flat`, ordered by expert id.
+  It is uploaded once into `dev_row_mappings` (a `scoped_unified_queue_temp<mmid_row_mapping>`), and its event is
+  `row_mappings_ready`. An expert's rows are `[row_begin, row_end)` of that map.
+- `:100474`: `moe_pp_pack_gemm_groups` (`moe-pp-pack.hpp`) lays out the packed scratch. The active experts are
+  sorted largest first, and `pack.slot_base_row[slot]` is each one's first scratch row. A group pads its experts to
+  its head's row count rounded up to 64, so the scratch holds padding rows.
+- `:100838-100929`: **the gather.** One `ggml_sycl_profile_submit` per active expert, with one work-group per row of
+  `k_copy_src1_to_contiguous_f16_mapped` (`:84748`). It writes `sycl::half(float)` of src1's row into
+  `act_base(slot) + i * src1_contiguous_f16_row_bytes`, where `src1_contiguous_f16_row_bytes == ne10 * 2` (`:100099`).
+- `:101515-101555`: **the scatter.** One submit per active expert, with one work-group per row of
+  `k_copy_dst_from_contiguous` (`:84771`). It reads `out_base(slot) + i * nb1` and writes dst row
+  `(i1, i2)` of the map.
+- Both loops serve every type the executor takes: the f16 arm (NVFP4, Qwen's IQ types and the others) and the MXFP4
+  WOQ arm (GPT-OSS). Under `GGML_SYCL_MXFP4_PP_PROFILE` they also push one event per expert into
+  `pp_profile_stage_events`. `append_pp_log_entries` in the scatter loop is host bookkeeping per expert.
+- `scoped_unified_queue_temp` (`:2104`) releases queue-ordered: its destructor submits a marker and retains the handle
+  until that marker completes. A table held by one is therefore safe to read from any kernel submitted before the
+  holder leaves scope.
+- Task 24's `moe_bf16_grouped_gather_submit` / `_scatter_submit` (`moe-bf16-grouped.cpp`) are the one-launch shape
+  this task copies. They do not drop in: they write bf16 from a `moe_bf16_grouped_row` table, and this executor
+  writes `sycl::half` laid out by `pack.slot_base_row`.
+
+**Design (decided; no checkpoint).**
+1. A dependency-free table builder in `moe-pp-pack.hpp`:
+   ```cpp
+   // One routed row of the batched executor: the row-map entry its gather and scatter read, and the packed scratch
+   // row they write and read. Padding rows of the scratch have no entry.
+   struct moe_pp_packed_row {
+       int32_t map_row    = 0;  // index into the node's row map
+       int32_t packed_row = 0;  // row of the activation and output scratch
+   };
+   static_assert(sizeof(moe_pp_packed_row) == 2 * sizeof(int32_t), "the device reads the table as two ints");
+
+   // spans[i] is the row-map range [first, second) of the expert at sorted position i (the order `layout` was built
+   // from). Writes one entry per routed row, group by group, expert by expert, row by row: entry r of expert i is
+   // { first + r, layout.slot_base_row[i] + r }. Returns false, leaving *out untouched, when out is null, spans is
+   // empty or not the layout's size, a span is empty or inverted, a span holds more rows than its group's n_rows, the
+   // groups do not cover every position once, or an index does not fit int32_t.
+   inline bool moe_pp_pack_row_table(const std::vector<std::pair<size_t, size_t>> & spans,
+                                     const moe_pp_packed_layout &                   layout,
+                                     std::vector<moe_pp_packed_row> *               out);
+   ```
+   ```cpp
+   inline bool moe_pp_pack_row_table(const std::vector<std::pair<size_t, size_t>> & spans,
+                                     const moe_pp_packed_layout &                   layout,
+                                     std::vector<moe_pp_packed_row> *               out) {
+       constexpr size_t k_i32 = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+       if (out == nullptr || spans.empty() || spans.size() != layout.slot_base_row.size()) {
+           return false;
+       }
+       size_t total = 0;
+       for (const auto & span : spans) {
+           if (span.second <= span.first || span.second > k_i32) {
+               return false;
+           }
+           total += span.second - span.first;
+       }
+       std::vector<moe_pp_packed_row> table;
+       table.reserve(total);
+       size_t next = 0;  // the groups must visit positions 0..n-1 in order, each once
+       for (const moe_pp_gemm_group & group : layout.groups) {
+           if (group.begin != next || group.end <= group.begin || group.end > spans.size()) {
+               return false;
+           }
+           for (size_t i = group.begin; i < group.end; ++i) {
+               const size_t rows = spans[i].second - spans[i].first;
+               const size_t base = layout.slot_base_row[i];
+               if (rows > group.n_rows || base > k_i32 - rows) {
+                   return false;
+               }
+               for (size_t r = 0; r < rows; ++r) {
+                   table.push_back({ static_cast<int32_t>(spans[i].first + r), static_cast<int32_t>(base + r) });
+               }
+           }
+           next = group.end;
+       }
+       if (next != spans.size()) {
+           return false;
+       }
+       *out = std::move(table);
+       return true;
+   }
+   ```
+   It needs `<cstdint>` added to the header's includes.
+2. Two kernels next to `k_copy_src1_to_contiguous_f16_mapped` (`:84748`), one work-group per table entry. Each does
+   exactly the per-row arithmetic of the kernel it replaces, so the output is bit-identical:
+   ```cpp
+   // The batched executor's gather (Inkling Task 25): table entry g fills packed activation row table[g].packed_row
+   // from the src1 row its row-map entry names, as k_copy_src1_to_contiguous_f16_mapped fills one expert's rows.
+   __dpct_inline__ static void k_copy_src1_to_packed_f16(const char * __restrict__ src1_original,
+                                                         sycl::half * __restrict__ act,
+                                                         const mmid_row_mapping * __restrict__ row_mapping,
+                                                         const ggml_sycl::moe_pp_packed_row * __restrict__ table,
+                                                         int64_t ne11, int64_t ne10, size_t nb11, size_t nb12,
+                                                         const sycl::nd_item<3> & item_ct1) {
+       const ggml_sycl::moe_pp_packed_row entry = table[item_ct1.get_group(2)];
+       const mmid_row_mapping             map   = row_mapping[entry.map_row];
+       const float * src1_row = (const float *) (src1_original + (map.i1 % ne11) * nb11 + map.i2 * nb12);
+       sycl::half *  act_row  = act + static_cast<int64_t>(entry.packed_row) * ne10;
+       for (int j = item_ct1.get_local_id(2); j < ne10; j += item_ct1.get_local_range(2)) {
+           act_row[j] = sycl::half(src1_row[j]);
+       }
+   }
+
+   // The batched executor's scatter (Inkling Task 25): table entry g writes packed output row table[g].packed_row to
+   // the dst row its row-map entry names, as k_copy_dst_from_contiguous writes one expert's rows.
+   __dpct_inline__ static void k_copy_dst_from_packed(char * __restrict__ dst_original,
+                                                      const float * __restrict__ out,
+                                                      const mmid_row_mapping * __restrict__ row_mapping,
+                                                      const ggml_sycl::moe_pp_packed_row * __restrict__ table,
+                                                      int64_t ne0, size_t nb1, size_t nb2,
+                                                      const sycl::nd_item<3> & item_ct1) {
+       const ggml_sycl::moe_pp_packed_row entry = table[item_ct1.get_group(2)];
+       const mmid_row_mapping             map   = row_mapping[entry.map_row];
+       const float * out_row = out + static_cast<int64_t>(entry.packed_row) * ne0;
+       float *       dst_row = (float *) (dst_original + map.i1 * nb1 + map.i2 * nb2);
+       for (int j = item_ct1.get_local_id(2); j < ne0; j += item_ct1.get_local_range(2)) {
+           dst_row[j] = out_row[j];
+       }
+   }
+   ```
+   The old kernel addressed the scratch row as `out_base(slot) + i * nb1` bytes, and the new one as
+   `packed_row * ne0` floats. These agree only when `nb1 == ne0 * sizeof(float)`. The GEMM writes the output with
+   leading dimension `ne0`, so the executor already depends on that equality. Find the guard that ensures it (the
+   `DIMS` refusal, "a stride is not packed") and cite it in the report. If no guard exists, add
+   `GGML_ASSERT(nb1 == ne0 * sizeof(float))` beside the scatter. The gather side is fixed: `:100099` sets the row to
+   `ne10 * 2` bytes.
+3. The executor, in `try_pp_onednn_f16_batched`:
+   - (a) After `moe_pp_pack_gemm_groups` succeeds (`:100474`), build `spans` from `active_experts` in sorted order
+     (`{expert.row_begin, expert.row_end}`) and call `moe_pp_pack_row_table`. On false, return
+     `reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, "packed-row-table")`. Nothing has been submitted at that
+     point. Declare the host vector in the scope that encloses the scatter's submit, as `row_maps_flat` is.
+   - (b) Before the scratch claim (before `reserve_pp_moe_onednn_scratch`), allocate a
+     `scoped_unified_queue_temp<ggml_sycl::moe_pp_packed_row> packed_rows_dev` of `table.size()` with cohort id
+     `"moe_pp_packed_rows"`. Declare it in the scope that encloses the scatter's submit. Upload it with
+     `ggml_sycl_safe_memcpy(*stream, packed_rows_dev.get(), table.data(), table.size() * sizeof(moe_pp_packed_row), {})`
+     and keep its event as `packed_rows_ready`.
+     - On a failed allocation, return `reject_batched(moe_pp_batched_refusal::PACKED_ROW_STAGING, nullptr)`, a new
+       cause.
+     - Add the value just before `GEMM` in `moe_pp_batched_refusal` (`moe-mmvq-tables.hpp:581`), with the comment
+       `// the node's packed-row table (gather and scatter rows) did not fit`.
+     - Add a name case `"packed-row-staging"` to `moe_pp_batched_refusal_name`.
+     - Check `moe_pp_batched_refusal_after_claim` and the latch's static_assert (`COUNT <= 32`): the new cause is
+       before the claim, so it must not count as after-claim.
+     - Update every source test that enumerates the causes. Grep `tests/*.py` for `SCRATCH_SLOT_SIZE` and
+       `ROW_MAP_STAGING, COUNT`, and `tests/test-sycl-moe-pp-batched-types-source.py:1323` pins the tail.
+   - (c) Replace the gather loop with one `ggml_sycl_profile_submit`. Keep the label name, category and metadata
+     unchanged (`moe.pp.stage.act` or `mxfp4.pp.stage.act`, `phase=activation_copy_in`). Set `bytes` to
+     `table.size() * ne10 * sizeof(sycl::half)`. Use `grid_dims(1, 1, table.size())` and the same
+     `pp_copy_work_group_size(ne10)` block. Depend on `{ row_mappings_ready, packed_rows_ready }`. The `act` base is
+     `batched_acts`, the packed row 0.
+   - (d) The WOQ fallback repack (the `!woq_repack_batched` branch inside the gather loop) moves into its own
+     per-slot loop, unchanged and in the same position: before the gather submit.
+   - (e) Replace the scatter loop the same way, with label `moe.pp.stage.scatter` / `mxfp4.pp.stage.scatter`,
+     `phase=output_scatter_out`, `bytes = table.size() * ne0 * sizeof(float)` and the `out` base `batched_out`.
+     Keep `append_pp_log_entries` as a host loop over `active_experts` before the submit.
+   - (f) `pp_profile_stage_events` gets one event from each launch, two per dispatch. Reserve 2 in place of
+     `active_experts.size() * 2`. Update the component-4 comment (`:89300`) and the `GGML_SYCL_MXFP4_PP_PROFILE` row
+     of `docs/backend/sycl-env-vars.md`: the stage count is now 2 per dispatch, and a capture before this task counts
+     2 per active expert, so the two are not comparable (the same wording llama.cpp-1lon used for the repack).
+   - (g) The comment above the old gather loop names llama.cpp-cl5q. Rewrite it: the gather and scatter are batched
+     here (Inkling Task 25), and the per-expert dequant in the phase loop is cl5q's remaining half.
+   - Leave `act_base` and `out_base` in place: the GEMM calls still use them.
+
+**RED -> GREEN (implementer; no GPU).**
+- `ggml/src/ggml-sycl/tests/test-moe-pp-pack.cpp` (host-only, registered at `ggml/src/ggml-sycl/CMakeLists.txt:8564`).
+  Add cases that fail before the builder exists, each building a layout with `moe_pp_pack_gemm_groups` first:
+  1. rows `{40, 30, 3}` with row-map spans `{{10,50},{50,80},{0,3}}` (the map is ordered by expert id, not by size).
+     There are 73 entries. Entry 0 is `{10, 0}`, entry 39 is `{49, 39}`, entry 40 is `{50, 64}`, and the third
+     expert's group starts at `128`, so its entries are `{0,128},{1,129},{2,130}`. No packed row appears twice. No
+     entry's packed row lies in an expert's padding: for each expert, every packed row is below its
+     `slot_base_row + rows`.
+  2. One expert of 1 row: 1 entry, `{span.first, 0}`.
+  3. Every refusal leaves `*out` untouched (pre-fill it with a sentinel entry): a null `out`, empty spans, a size
+     mismatch, an empty span, an inverted span, a span longer than its group's `n_rows` (a hand-built layout), a
+     layout whose groups skip a position, and a `second` above `INT32_MAX`.
+- The full build is `./scripts/sycl-build.sh` in the task worktree. Build only there, never in the shared checkout.
+  Then `ctest --test-dir build -R '^test-moe-pp-pack$' --output-on-failure`, and the Python source sweeps:
+  `ctest --test-dir build -R 'test-sycl-.*-source' -j 4 --output-on-failure`. Report every red with its first failing
+  assertion.
+- If an existing source test pins the per-expert form of either loop, it is the test that changes: update it to pin
+  the batched form, and say which test and which pins in the report.
+- The device test `test-moe-pp-batched-dequant` (skewed cases) is the executor's correctness vehicle. Build it, do
+  NOT run it: it uses a GPU, and the lead runs it.
+
+**Acceptance (lead; each device run once, B70 = `level_zero:0`, B50 = `level_zero:1`).**
+- `test-moe-pp-batched-dequant` passes on the B70 and on the B50.
+- The B70 long-prompt kernel profile has one row each of `moe.pp.stage.act` and `moe.pp.stage.scatter`, each with a
+  count of at most 2,000 (from 96,556), equal to each other.
+- The B70 long-prompt text is byte-equal to `mb4-long-b70-d69cbe798/out.txt`, and the B50 long-prompt text to
+  `mb4-long-b50-b-d69cbe798/out.txt`.
+- Inkling's B70 perplexity is 7.5957 (bit-identical output), and the Inkling, Mistral B70 and GPT-OSS B50/B70 gates
+  pass.
+- The Qwen session's QD and QS arms reproduce their text md5s (`4c9e55fa81`, `faacbed8de`): IQ experts on the f16 arm.
+- The sweeps show no new red against `d69cbe7985`.
+- An interleaved ABBA against `d69cbe7985` (W's build) shows no regression. Report Inkling B70 pp and the long-prompt
+  pp, but do not gate on them: the dequant (below) is device time the profile does not show, so the pp gain from
+  this task is not predicted.
+
+**Not in scope.**
+- The per-expert NVFP4 dequant. Its profile row times something other than the kernel: a full expert matrix cannot be
+  dequantized in 0.1 µs. Its bytes column says the pass writes 768.8 GB of f16 weights, about 1.3-1.5 s of device
+  time at a realistic write rate, and that time is in no row.
+- So the following task is not "batch the dequant launch". It is "stop dequantizing every expert every micro-batch":
+  an NVFP4 weight-only-quantized GEMM, as MXFP4 has, or an f16 plane kept across micro-batches. It is written after
+  this task's profile measures the dequant's real time.
+
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
 *Left by Task 21, step 1d (2026-11-24):*
