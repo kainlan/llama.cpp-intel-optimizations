@@ -33581,8 +33581,8 @@ static void reorder_plan_entries_for_moe_materialization(placement_plan &       
         return;
     }
 
-    std::vector<uint8_t>         used(plan.entries.size(), 0);
-    std::vector<placement_entry> reordered;
+    std::vector<uint8_t>  used(plan.entries.size(), 0);
+    placement_entry_store reordered;
     reordered.reserve(plan.entries.size());
 
     // Keep dense/non-expert entries in their existing priority order.  MoE expert
@@ -34792,7 +34792,9 @@ static size_t add_single_moe_pp_executable_alternates(placement_plan &          
     std::map<std::string, size_t> tensor_index;
     std::vector<pending_tensor>   pending;
 
-    for (placement_entry & entry : plan.entries) {
+    // By position: each alternate below records its entry's index, which the loop has at hand.
+    for (size_t entry_index = 0; entry_index < plan.entries.size(); ++entry_index) {
+        placement_entry & entry = plan.entries[entry_index];
         if (entry.expert_id < 0) {
             continue;
         }
@@ -34827,7 +34829,7 @@ static size_t add_single_moe_pp_executable_alternates(placement_plan &          
             pending.push_back(std::move(tensor));
         }
         pending_tensor & tensor = pending[it->second];
-        tensor.alts.push_back({ static_cast<size_t>(&entry - plan.entries.data()), alt_size, alt_charge });
+        tensor.alts.push_back({ entry_index, alt_size, alt_charge });
         tensor.charge += alt_charge;
     }
 
@@ -36404,7 +36406,9 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
             }
         }
         std::map<int, bool> actual_owners;
-        for (const placement_entry & entry : plan.entries) {
+        // Read through a const view: the plan is writable here, and the runtime replan hands it a copy that shares
+        // the live plan's entry chunks, which the mutable begin() would clone one by one.
+        for (const placement_entry & entry : std::as_const(plan.entries)) {
             if (entry.name != item.name || entry.expert_id < 0) {
                 continue;
             }
@@ -41933,21 +41937,6 @@ placement_plan compute_multi_device_plan(const std::vector<device_budget> &     
         if (plan.layer_device.find(l) == plan.layer_device.end()) {
             plan.layer_device[l] = -1;
         }
-    }
-
-    // expert_device: per-layer per-expert device assignment (from entry target_device).
-    // With per-expert splitting (n_experts > 0), each expert has its own entry
-    // and can be assigned to a different device.  Without splitting, the whole
-    // MoE tensor goes to one device and all experts share that target.
-    for (const auto & entry : plan.entries) {
-        if (!placement_priority_is_moe_weight(entry.priority)) {
-            continue;
-        }
-        if (entry.layer_id < 0) {
-            continue;
-        }
-        const int eid                           = (entry.expert_id >= 0) ? entry.expert_id : 0;
-        plan.expert_device[entry.layer_id][eid] = entry.target_device;
     }
 
     const int64_t  activation_hidden_dim = planner_infer_activation_hidden_dim(tensor_inventory);

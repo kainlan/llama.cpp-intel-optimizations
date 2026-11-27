@@ -598,7 +598,6 @@ static bool test_planner_role_specific_expert_placement() {
                                ggml_sycl::expert_tensor_role::UP, true, 0 });
     manual.entries.push_back({ "blk.2.ffn_down_exps.weight", 1024, 1024, 0, ggml_sycl::placement_priority::MOE_DOWN, 2,
                                5, ggml_sycl::expert_tensor_role::DOWN, false, -1 });
-    manual.expert_device[2][5] = -1;  // Deliberately stale compatibility summary.
     manual.build_index();
 
     const auto manual_gate = manual.lookup_expert_placement("blk.2.ffn_gate_exps.weight", 5);
@@ -611,7 +610,7 @@ static bool test_planner_role_specific_expert_placement() {
     TEST_ASSERT(manual_down.found() && !manual_down.on_device,
                 "role-specific down placement must preserve host placement");
     TEST_ASSERT(manual.expert_on_device("blk.2.ffn_gate_exps.weight", 5, 1),
-                "role-specific helper must ignore stale collapsed expert_device summary");
+                "role-specific helper must answer the gate's own planned device");
     TEST_ASSERT(!manual.expert_on_device("blk.2.ffn_gate_exps.weight", 5, 0),
                 "role-specific helper must not route gate to the wrong device");
 

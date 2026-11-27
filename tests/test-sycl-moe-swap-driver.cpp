@@ -698,18 +698,21 @@ static void test_decode_graphs_after_a_move_are_counted() {
 static void test_the_summary_sums_what_the_transactions_cost() {
     rig r(1, 8, 4);
     r.decode[r.index(0, 5)] = 10;
-    r.txn_cost              = moe_swap_txn_cost{ 10, 20, 30, 100 };
+    r.txn_cost              = moe_swap_txn_cost{ 10, 20, 30, 100, 5, 2 };
     r.to_period();  // the evict
-    r.txn_cost = moe_swap_txn_cost{ 1, 2, 3, 4 };
+    r.txn_cost = moe_swap_txn_cost{ 1, 2, 3, 4, 7, 1 };
     r.boundary();   // the admit
     CHECK(r.d.stats.txn_sent == 2);
     CHECK(r.d.stats.txn_copy_us == 11);
     CHECK(r.d.stats.txn_remap_us == 22);
     CHECK(r.d.stats.txn_meta_us == 33);
     CHECK(r.d.stats.txn_total_us == 104);
+    CHECK(r.d.stats.txn_plan_chunks_cloned == 12);
+    CHECK(r.d.stats.txn_view_scan_fallbacks == 3);
     const std::string faults = ggml_sycl::moe_swap_driver_summary_faults(r.d.stats, 0);
     CHECK(contains(faults,
-                   "transaction cost over 2: copy submit 11 us, id remap 22 us, meta lookup 33 us, total 104 us"));
+                   "transaction cost over 2: copy submit 11 us, id remap 22 us, meta lookup 33 us, total 104 "
+                   "us, plan chunks cloned 12, lent-view table walks 3"));
     rig quiet(1, 8, 4);
     CHECK(contains(ggml_sycl::moe_swap_driver_summary_faults(quiet.d.stats, 0), "transaction cost over 0: "));
 }

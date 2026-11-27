@@ -215,6 +215,7 @@ SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 SYCL_CMAKE = read("ggml/src/ggml-sycl/CMakeLists.txt")
 COMMON = read("ggml/src/ggml-sycl/common.hpp")
 PLAN_HPP = read("ggml/src/ggml-sycl/moe-stream-plan.hpp")
+ROUTE_HPP = read("ggml/src/ggml-sycl/moe-route-table.hpp")
 
 
 def body(text: str, signature: str) -> str:
@@ -684,7 +685,8 @@ PROBE = ('if (probe_mode) { result.accepted = n_selected != 0; result.bytes_free
          'finish(ggml_sycl_txn_result::REFUSED, "nothing lendable"); }')
 LEASE = "registry.acquire_live_update(current_token)"
 FORGET = "(void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device);"
-DROP = "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views);"
+DROP = ("ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views, "
+        "view_scan_fallbacks);")
 # Every direction remembers each new copy with the tensor's bytes per expert as its range, never a copy's size.
 REMEMBER = ("(void) triplet.extras[r]->remember_moe_storage_handle(triplet.members[r].placement.expert_id, "
             "GGML_LAYOUT_AOS, std::move(record.handles[r]), &record.copy_events[r], 0, "
@@ -726,12 +728,15 @@ def claim_lent_views_dropped_by_key(sycl: str) -> bool:
 # table never sees a freed buffer, wherever the loan runs.
 RETAIN_RECORD = "retained.push_back(record.handle);"
 RETAIN_SLOT = "retained.push_back(std::move(w.moe_expert_handles[device][slot]));"
-RETAIN_LEASE = "if (on_entry(lease)) { retained.push_back(lease); }"
-RETAIN_ROUTES = "if (held.lease.valid()) { retained.push_back(held.lease); }"
+# The pointer table's leases on the entry come out of its keyed bag by the entry's key, into `retained`.
+LEASE_TAKE = "w.moe_expert_ptrs_leases[device].take_key(ggml_sycl::moe_lease_key{ device, withdrawn }, retained)"
+RETAIN_LEASE = LEASE_TAKE
+# A route table that leases the entry is invalidated and every lease it held moves into `retained`.
+RETAIN_ROUTES = "if (held.lease.valid()) { retained.push_back(std::move(held.lease)); }"
 # The hybrid decode record keeps its slots that do not lease the entry: the drop withdraws only those that do, from
 # a copy it publishes in the record's place, and their leases go to `retained` with the other views'.
-RETAIN_HYBRID = ("ggml_sycl_moe_hybrid_decode_record_withdraw(w.moe_hybrid_decode[device], device, withdrawn, "
-                 "retained, emptied)")
+RETAIN_HYBRID = ("ggml_sycl_moe_hybrid_decode_record_withdraw(w.moe_hybrid_decode[device], device, expert_id, "
+                 "withdrawn, retained, emptied, scan_fallbacks)")
 RETAIN_VIEWS = ("ggml_sycl::retain_handles_until_event(std::move(lent_views), "
                 "queue ? queue->ext_oneapi_submit_barrier() : sycl::event{});")
 
@@ -741,7 +746,7 @@ def claim_lent_views_retained_to_a_barrier(sycl: str) -> bool:
     helper = body(n, DROP_SIG)
     txn = body(n, TXN_SIG)
     return (all(helper.count(x) == 1 for x in (RETAIN_RECORD, RETAIN_SLOT, RETAIN_LEASE, RETAIN_ROUTES, RETAIN_HYBRID))
-            and ordered(helper, RETAIN_RECORD, "list.erase(", RETAIN_SLOT, RETAIN_LEASE, "leases.erase(", RETAIN_ROUTES,
+            and ordered(helper, RETAIN_RECORD, "list.erase(", RETAIN_SLOT, RETAIN_LEASE, RETAIN_ROUTES,
                         "routes.invalidate();", RETAIN_HYBRID)
             and txn.count(RETAIN_VIEWS) == 1
             and ordered(txn, LEND, DROP, REMEMBER, BREAK_ESCAPED, RETAIN_VIEWS, PUBLISH))
@@ -764,11 +769,9 @@ MARK_STALE = "if (stored || table_dropped) { w.mark_moe_device_table_stale(devic
 # leaves, with no storage record and no slot naming the entry), the route table invalidated, or a hybrid record slot
 # withdrawn. Without it a table whose only view of the entry was its leases stays valid, its raw pointer into room the
 # ring reuses.
-# The count the lease flag compares against is taken before the erase: taken after it, the flag is always false.
-N_LEASES = "const size_t n_leases = leases.size();"
-LEASE_ERASE = "leases.erase(std::remove_if(leases.begin(), leases.end(), on_entry), leases.end());"
-TABLE_FROM_LEASES = "table_dropped = leases.size() != n_leases;"
-TABLE_FROM_ROUTES = "routes.invalidate(); table_dropped = true; break;"
+# The lease flag is set from how many leases the keyed take moved: any, and the table is stale.
+TABLE_FROM_LEASES = "table_dropped = " + LEASE_TAKE + " != 0;"
+TABLE_FROM_ROUTES = "routes.invalidate(); table_dropped = true; }"
 TABLE_FROM_HYBRID = "if (" + RETAIN_HYBRID + ") { table_dropped = true; }"
 # The member's guard is its first statement: inverted, every stale mark is a no-op on a valid device.
 STALE_GUARD = "{ if (!ggml_sycl_valid_device_index(dev)) { return; }"
@@ -780,11 +783,63 @@ def claim_lent_views_mark_the_table_stale(sycl: str, common: str) -> bool:
     return (member.startswith(STALE_GUARD) and all(member.count(x) == 1 for x in STALE_MARKS)
             and helper.count(NULL_PAYLOAD) == 1 and ordered(helper, RETAIN_SLOT, NULL_PAYLOAD, "stored = true;")
             and helper.count(BUMP_GENERATION) == 1 and helper.count(MARK_STALE) == 1
-            and all(helper.count(x) == 1
-                    for x in (N_LEASES, LEASE_ERASE, TABLE_FROM_LEASES, TABLE_FROM_ROUTES, TABLE_FROM_HYBRID))
+            and all(helper.count(x) == 1 for x in (TABLE_FROM_LEASES, TABLE_FROM_ROUTES, TABLE_FROM_HYBRID))
             and helper.count("table_dropped = true;") == 2
-            and ordered(helper, RETAIN_LEASE, N_LEASES, LEASE_ERASE, TABLE_FROM_LEASES, RETAIN_ROUTES,
-                        TABLE_FROM_ROUTES, TABLE_FROM_HYBRID, BUMP_GENERATION, MARK_STALE))
+            and ordered(helper, TABLE_FROM_LEASES, RETAIN_ROUTES, TABLE_FROM_ROUTES, TABLE_FROM_HYBRID,
+                        BUMP_GENERATION, MARK_STALE))
+
+
+# No view is found by a walk: the pointer table's leases come out of a bag keyed by (device, entry
+# key), the same pair the drop's match reads, and the route table and the hybrid decode record are asked at the moved
+# expert's own slot, where its retired entry is (an expert move refuses a device copy that shares storage). A table or
+# record whose slot does not hold the entry is still walked whole, so no view is missed, and each such walk counts in
+# the transaction's view_scan_fallbacks, which the swap summary prints.
+LEASE_KEY_OF = "if (!h.is_weight()) { return false; } *out = moe_lease_key{ h.device(), h.key() }; return true;"
+LEASE_KEY_OF_SIG = "bool operator()(const mem_handle & h, moe_lease_key * out) const"
+LEASE_BAG = "using moe_lease_bag = keyed_handle_bag<mem_handle, moe_lease_key, moe_lease_key_hash, moe_lease_key_of>;"
+LEASE_MEMBER = "ggml_sycl::moe_lease_bag moe_expert_ptrs_leases[GGML_SYCL_MAX_DEVICES];"
+ROUTE_SLOT = "bool route_holds = slot < routes.experts.size() && on_entry(routes.experts[slot].lease);"
+ROUTE_WALK = ("if (!route_holds && !routes.experts.empty()) { ++scan_fallbacks; route_holds = "
+              "std::any_of(routes.experts.begin(), routes.experts.end(), "
+              "[&](const ggml_sycl::moe_route_entry & route) { return on_entry(route.lease); }); }")
+ROUTE_DROP = "if (route_holds) { for (ggml_sycl::moe_route_entry & held : routes.experts) {"
+RECORD_WITHDRAW_DEF = ("static bool ggml_sycl_moe_hybrid_decode_record_withdraw(std::shared_ptr<const "
+                       "moe_hybrid_decode_record> & held, int device, int expert_id, const "
+                       "ggml_sycl::unified_cache_key & withdrawn, std::vector<ggml_sycl::mem_handle> & retained, "
+                       "std::vector<int32_t> & emptied, uint32_t & scan_fallbacks)")
+RECORD_SLOT = "const bool at_slot = ggml_sycl::moe_hybrid_record_slot_matches(held->lease, expert_id, on_entry);"
+RECORD_WALK = ("if (!at_slot) { ++scan_fallbacks; if (std::none_of(held->lease.begin(), held->lease.end(), on_entry)) "
+               "{ return false; } }")
+RECORD_SLOT_WITHDRAW = ("if (at_slot) { copy->n_withdrawn += ggml_sycl::moe_hybrid_record_withdraw_slot("
+                        "copy->device_weight, copy->host_weight, copy->lease, expert_id, &retained, &emptied) ? 1 : 0; "
+                        "}")
+TXN_WALKS = ("result.plan_chunks_cloned = next_plan->entries.chunks_cloned(); "
+             "result.view_scan_fallbacks = view_scan_fallbacks;")
+
+
+def definition(text: str, signature: str) -> str:
+    """The body of the definition of `signature` (its text followed by ` {`), past any declaration of it."""
+    at = text.find(signature + " {")
+    return body(text[at:], signature) if at >= 0 else ""
+
+
+def claim_lent_views_found_without_a_walk(sycl: str, route_hpp: str, common: str) -> bool:
+    n = norm(sycl)
+    helper = body(n, DROP_SIG)
+    record = definition(n, RECORD_WITHDRAW_DEF)
+    txn = body(n, TXN_SIG)
+    r = norm(route_hpp)
+    return (body(r, LEASE_KEY_OF_SIG).count(LEASE_KEY_OF) == 1 and r.count(LEASE_BAG) == 1
+            and norm(common).count(LEASE_MEMBER) == 1
+            and helper.count("moe_expert_ptrs_leases") == 1 and helper.count(LEASE_TAKE) == 1
+            and all(helper.count(x) == 1 for x in (ROUTE_SLOT, ROUTE_WALK, ROUTE_DROP))
+            and ordered(helper, ROUTE_SLOT, ROUTE_WALK, ROUTE_DROP, "routes.invalidate();")
+            and helper.count("++scan_fallbacks;") == 1
+            and all(record.count(x) == 1 for x in (RECORD_SLOT, RECORD_SLOT_WITHDRAW, RECORD_WALK))
+            and ordered(record, RECORD_SLOT, RECORD_WALK, RECORD_SLOT_WITHDRAW)
+            and record.count("++scan_fallbacks;") == 1
+            and txn.count(DROP) == 1 and txn.count(TXN_WALKS) == 1
+            and txn.count("uint32_t view_scan_fallbacks = 0;") == 1)
 
 
 # --- an exception while lending publishes what was lent -------------------------------------------------------------
@@ -2655,18 +2710,85 @@ def test_mutant_slot_payload_kept_fails():
 
 def test_mutant_table_lease_drop_sets_no_flag_fails():
     """The preload's holder: only the table's leases name the entry, so with no flag the table stays valid."""
-    assert not claim_lent_views_mark_the_table_stale(_once_in(SYCL, DROP_SIG, TABLE_FROM_LEASES, ""), COMMON)
-
-
-def test_mutant_lease_count_taken_after_the_erase_fails():
-    """The same holder in another spelling: counted after the erase, the flag compares equal sizes and stays false."""
     assert not claim_lent_views_mark_the_table_stale(
-        _once_in(SYCL, DROP_SIG, N_LEASES + " " + LEASE_ERASE, LEASE_ERASE + " " + N_LEASES), COMMON)
+        _once_in(SYCL, DROP_SIG, TABLE_FROM_LEASES, "(void) " + LEASE_TAKE + ";"), COMMON)
+
+
+def test_mutant_lease_flag_inverted_fails():
+    """The same holder in another spelling: the flag set when the take moved nothing, so a drop leaves it false."""
+    assert not claim_lent_views_mark_the_table_stale(
+        _once_in(SYCL, DROP_SIG, TABLE_FROM_LEASES, "table_dropped = " + LEASE_TAKE + " == 0;"), COMMON)
+
+
+def test_lent_views_found_without_a_walk():
+    assert claim_lent_views_found_without_a_walk(SYCL, ROUTE_HPP, COMMON)
+
+
+def test_mutant_table_leases_walked_fails():
+    """The pointer table's leases walked again, beside the keyed take."""
+    mutant = _once_in(SYCL, DROP_SIG, TABLE_FROM_LEASES,
+                      "for (const ggml_sycl::mem_handle & lease : w.moe_expert_ptrs_leases[device]) { (void) lease; } "
+                      + TABLE_FROM_LEASES)
+    assert not claim_lent_views_found_without_a_walk(mutant, ROUTE_HPP, COMMON)
+
+
+def test_mutant_lease_key_drops_the_device_fails():
+    """A key without the device takes another card's lease on an entry with the same key."""
+    mutant = _once(ROUTE_HPP, LEASE_KEY_OF, LEASE_KEY_OF.replace("h.device()", "0"))
+    assert not claim_lent_views_found_without_a_walk(SYCL, mutant, COMMON)
+
+
+def test_mutant_lease_key_takes_any_handle_fails():
+    """A key for a handle that is no weight's indexes table buffers the drop's match never names."""
+    mutant = _once(ROUTE_HPP, LEASE_KEY_OF, LEASE_KEY_OF.replace("if (!h.is_weight()) { return false; } ", ""))
+    assert not claim_lent_views_found_without_a_walk(SYCL, mutant, COMMON)
+
+
+def test_mutant_leases_in_a_plain_vector_fails():
+    mutant = _once(COMMON, LEASE_MEMBER,
+                   "std::vector<ggml_sycl::mem_handle> moe_expert_ptrs_leases[GGML_SYCL_MAX_DEVICES];")
+    assert not claim_lent_views_found_without_a_walk(SYCL, ROUTE_HPP, mutant)
+
+
+def test_mutant_route_table_always_walked_fails():
+    mutant = _once_in(SYCL, DROP_SIG, ROUTE_SLOT, "bool route_holds = false;")
+    assert not claim_lent_views_found_without_a_walk(mutant, ROUTE_HPP, COMMON)
+
+
+def test_mutant_route_table_walk_uncounted_fails():
+    """A walk the summary never shows: the slot rule could miss on every drop and nothing would say so."""
+    mutant = _once_in(SYCL, DROP_SIG, ROUTE_WALK, ROUTE_WALK.replace("++scan_fallbacks; ", ""))
+    assert not claim_lent_views_found_without_a_walk(mutant, ROUTE_HPP, COMMON)
+
+
+def test_mutant_route_table_never_walked_fails():
+    """Without the walk a table whose slot does not hold the entry keeps its view of it."""
+    mutant = _once_in(SYCL, DROP_SIG, ROUTE_WALK, "")
+    assert not claim_lent_views_found_without_a_walk(mutant, ROUTE_HPP, COMMON)
+
+
+def test_mutant_record_always_walked_fails():
+    n = norm(SYCL)
+    record = definition(n, RECORD_WITHDRAW_DEF)
+    mutant = n.replace(record, record.replace(RECORD_SLOT, "const bool at_slot = false;", 1), 1)
+    assert not claim_lent_views_found_without_a_walk(mutant, ROUTE_HPP, COMMON)
+
+
+def test_mutant_record_walk_uncounted_fails():
+    n = norm(SYCL)
+    record = definition(n, RECORD_WITHDRAW_DEF)
+    mutant = n.replace(record, record.replace(RECORD_WALK, RECORD_WALK.replace("++scan_fallbacks; ", ""), 1), 1)
+    assert not claim_lent_views_found_without_a_walk(mutant, ROUTE_HPP, COMMON)
+
+
+def test_mutant_walks_not_reported_fails():
+    mutant = _once_in(SYCL, TXN_SIG, TXN_WALKS, "result.plan_chunks_cloned = next_plan->entries.chunks_cloned();")
+    assert not claim_lent_views_found_without_a_walk(mutant, ROUTE_HPP, COMMON)
 
 
 def test_mutant_route_table_drop_sets_no_flag_fails():
     assert not claim_lent_views_mark_the_table_stale(
-        _once_in(SYCL, DROP_SIG, TABLE_FROM_ROUTES, "routes.invalidate(); break;"), COMMON)
+        _once_in(SYCL, DROP_SIG, TABLE_FROM_ROUTES, "routes.invalidate(); }"), COMMON)
 
 
 def test_mutant_hybrid_record_drop_sets_no_flag_fails():
@@ -4125,10 +4247,10 @@ SLOT_PAD = ("const size_t padding = 3 * slot - own; "
 MEMBER_SIG = "inline size_t expert_triplet_member_bytes(const size_t (&staged)[3], int role)"
 MEMBER_BODY = "const size_t slot = expert_triplet_slot_bytes(staged); return slot != 0 ? slot : staged[role];"
 RECHARGE_SIG = ("static inline std::vector<placement_charge_change> placement_entries_recharge_expert_slots("
-                "std::vector<placement_entry> & entries)")
+                "placement_entry_store & entries)")
 RECHARGE_CHARGES = "placement_entries_charge_expert_slots(entries);"
 RECHARGE_ON_SIG = ("static inline size_t placement_entries_recharge_expert_slots_on("
-                   "std::vector<placement_entry> & entries,")
+                   "placement_entry_store & entries,")
 RECHARGE_ON_READ = "placement_entries_recharge_expert_slots(entries)"
 RECHARGE_ON_HOST = "if (!e.on_device) { continue; }"
 RECHARGE_ON_KEY = "if (d.device_id != e.target_device || !d.remaining) { continue; }"
@@ -4198,7 +4320,7 @@ OFF_TEST = "} else if (e.layout != member->layout || e.target_device != member->
 PLAN_SLOT_SIG = "static inline size_t moe_expert_triplet_slot_bytes(const placement_entry * const (&t)[3])"
 PLAN_SLOT_CALL = "return expert_triplet_slot_bytes(staged);"
 PLAN_ENTRY_STAGED = "return staged_expert_bytes(e.layout, e.type, e.ne[0], e.src_size);"
-CHARGE_SIG = "static inline size_t placement_entries_charge_expert_slots(std::vector<placement_entry> & entries)"
+CHARGE_SIG = "static inline size_t placement_entries_charge_expert_slots(placement_entry_store & entries)"
 # The charge resolves a triplet as the plan's index does (first entry of each role, no entry with no layer), so the
 # load's lookup of the slot and the charge agree, and charges every entry that stages as AOS what the load stages it at.
 CHARGE_INDEXED = ("if (e.expert_id < 0 || e.layer_id < 0 || !detail::moe_expert_role_is_triplet(e.expert_role)) { "
@@ -4670,6 +4792,232 @@ def test_mutant_dpas_restores_aos_by_the_reorder_fill_fails():
     """The reorder fill writes its whole destination, so at the slot it would copy past the expert's bytes."""
     mutant = _once(SYCL, DPAS_AOS_FILL, "if (base_layout == GGML_LAYOUT_AOS) { if (have_plan) {")
     assert not claim_every_member_mint_takes_the_triplet_slot(mutant, CACHE, PLAN_HPP, SLOT_HPP)
+
+
+
+# --- the plan copy shares its entries -------------------------------------------------------------------------------
+
+# The transaction's plan copy (HOIST_PLAN) shares the published plan's entries: they live in a copy-on-write chunked
+# store, so the copy costs one shared pointer per chunk and a flip clones only the chunk it writes. What this pins:
+#   - the entries are that store, so HOIST_PLAN is a sharing copy, not an O(entries) one;
+#   - the transaction takes the clones every prepared member's flip needs once the copy exists and before the first
+#     move, so a flip's entry write allocates nothing (its residency count can still append one small pair per group
+#     and device, which the transaction's comment accepts) and a moved triplet is flipped whatever followed;
+#   - the transaction reaches the copy only through the calls that write one indexed entry (the flips, the unshare)
+#     or read it, and counts the chunks it cloned: a mutable iterator over the entries would clone every chunk, so
+#     neither the transaction nor the two flips names one;
+#   - an entry's position is named by its index, never by pointer arithmetic on the store, which a chunked store
+#     cannot answer.
+ENTRY_STORE = "using placement_entry_store = cow_chunked_vector<placement_entry>;"
+ENTRY_MEMBER = "placement_entry_store entries;"
+UNSHARE_LOOP = ("for (const ggml_sycl_expert_prepared_triplet & triplet : prepared) { for (int r = 0; r < 3; ++r) { "
+                "const ggml_sycl::expert_placement_key & k = triplet.members[r].placement; "
+                "(void) next_plan->unshare_expert_entry(k.layer_id, k.expert_id, k.role); } }")
+UNSHARE_SIG = "bool unshare_expert_entry(int layer_id, int expert_id, expert_tensor_role role)"
+UNSHARE_BODY = "entries.unshare_at(it->second);"
+UPDATE_SIG = ("bool update_expert_placement(int layer_id, int expert_id, expert_tensor_role role, bool on_device, "
+              "int target)")
+BACKING_SIG = ("bool set_expert_host_backing(int layer_id, int expert_id, expert_tensor_role role, "
+               "placement_host_backing backing)")
+ENTRY_WRITE = "placement_entry & e = entries[it->second];"
+COUNT_CLONES = "result.plan_chunks_cloned = next_plan->entries.chunks_cloned();"
+# Every member the transaction names on its plan copy, and every call it hands the whole copy to (each takes it const).
+TXN_PLAN_MEMBERS = {"unshare_expert_entry", "update_expert_placement", "set_expert_host_backing",
+                    "host_backing_maps_files", "entries"}
+TXN_PLAN_WHOLE = ("ggml_sycl::moe_expert_triplet_dst_bytes(*next_plan, placed)",
+                  "ggml_sycl::moe_mmid_same_workspace_plan(*current->plan, *next_plan)")
+# Each of those takes the plan const, so handing it the copy reads its entries without cloning a chunk: a writable
+# parameter would make every entry read there a non-const index, which clones the chunk it lands in.
+TXN_PLAN_WHOLE_CONST = (("plan_hpp", "static inline size_t moe_expert_triplet_dst_bytes(const placement_plan & plan,"),
+                        ("cache_hpp", "bool moe_mmid_same_workspace_plan(const placement_plan & a, "
+                                      "const placement_plan & b) noexcept;"))
+ENTRIES_WORD_RE = re.compile(r"\bentries\b")
+# A per-(layer, expert) map on the plan is copied whole by HOIST_PLAN, node by node, and a flip that writes it can
+# allocate. The plan held one (expert_device, a collapsed summary nothing read); the entries and their shared index are
+# the one per-expert record.
+PER_EXPERT_MAP = "std::unordered_map<int, std::unordered_map<int, int>>"
+# An entry's address taken from the store's data or subtracted from an indexed entry, through any chain of objects
+# (the backend reaches the store as `published.plan->entries` and `current->plan->entries`) or none (inside a plan
+# member the store is the bare `entries`).
+ENTRY_POINTER_ARITH_RE = re.compile(r"entries\s*\.\s*data\s*\(|-\s*&\s*(?:\w+\s*(?:\.|->)\s*)*entries\s*\[")
+# Any backend source can hold a plan and position an entry, so the pointer-arithmetic ban covers every C++ file under
+# ggml-sycl; the four sources the claim takes as arguments are scanned from those arguments instead, so their mutants
+# count. Normalized once here, because the claim runs for every mutant.
+_ENTRY_ARITH_ARGS = ("ggml/src/ggml-sycl/unified-cache.hpp", "ggml/src/ggml-sycl/unified-cache.cpp",
+                     "ggml/src/ggml-sycl/ggml-sycl.cpp", "ggml/src/ggml-sycl/moe-stream-plan.hpp")
+SYCL_TREE_OTHERS = {
+    p.relative_to(ROOT).as_posix(): norm(p.read_text())
+    for p in sorted((ROOT / "ggml" / "src" / "ggml-sycl").rglob("*"))
+    if p.is_file() and p.suffix in (".cpp", ".hpp") and p.relative_to(ROOT).as_posix() not in _ENTRY_ARITH_ARGS
+}
+
+
+def claim_the_plan_copy_shares_its_entries(cache_hpp: str, cache: str, sycl: str, plan_hpp: str = PLAN_HPP,
+                                           others: dict = SYCL_TREE_OTHERS) -> bool:
+    h = norm(cache_hpp)
+    by_file = {"plan_hpp": norm(plan_hpp), "cache_hpp": h}
+    b = body(norm(sycl), TXN_SIG)
+    lend_at = b.find(LEND)
+    members = set(re.findall(r"next_plan->(\w+)", b))
+    whole = b.count("*next_plan")
+    flips = [body(h, UPDATE_SIG), body(h, BACKING_SIG)]
+    unshare = body(h, UNSHARE_SIG)
+    plan_struct = body(h, "struct placement_plan ")
+    return (h.count(ENTRY_STORE) == 1 and h.count(ENTRY_MEMBER) == 1 and b.count(HOIST_PLAN) == 1
+            and ENTRY_MEMBER in plan_struct and PER_EXPERT_MAP not in plan_struct
+            and not re.search(r"\bexpert_device\b", h)
+            and b.count(UNSHARE_LOOP) == 1 and lend_at >= 0 and ordered(b, HOIST_PLAN, UNSHARE_LOOP, LEND)
+            and members == TXN_PLAN_MEMBERS and b.count("next_plan->entries") == 1 and b.count(COUNT_CLONES) == 1
+            and whole == len(TXN_PLAN_WHOLE) and all(b.count(x) == 1 for x in TXN_PLAN_WHOLE)
+            and all(by_file[f].count(sig) == 1 for f, sig in TXN_PLAN_WHOLE_CONST)
+            and all(f and len(ENTRIES_WORD_RE.findall(f)) == 1 and f.count(ENTRY_WRITE) == 1 for f in flips)
+            and len(ENTRIES_WORD_RE.findall(unshare)) == 1 and unshare.count(UNSHARE_BODY) == 1
+            and len(others) > 0
+            and not any(ENTRY_POINTER_ARITH_RE.search(norm(src)) for src in (cache_hpp, cache, sycl, plan_hpp))
+            and not any(ENTRY_POINTER_ARITH_RE.search(src) for src in others.values()))
+
+
+def test_the_plan_copy_shares_its_entries():
+    assert claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, SYCL)
+
+
+def test_mutant_plan_entries_in_a_plain_vector_fails():
+    """A plain vector makes HOIST_PLAN copy every entry per transaction."""
+    mutant = _once(CACHE_HPP, ENTRY_STORE, "using placement_entry_store = std::vector<placement_entry>;")
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_plan_keeps_a_per_expert_map_fails():
+    """The collapsed per-expert device summary, back on the plan: HOIST_PLAN copies it node by node."""
+    mutant = _once(CACHE_HPP, ENTRY_MEMBER, ENTRY_MEMBER + " " + PER_EXPERT_MAP + " expert_device;")
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_flips_clone_after_the_first_move_fails():
+    """Without the clones taken first, a flip after a move can throw and leave a moved triplet unflipped."""
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, _once_in(SYCL, TXN_SIG, UNSHARE_LOOP, ""))
+
+
+def test_mutant_clones_taken_inside_the_move_loop_fails():
+    moved = _once_in(SYCL, TXN_SIG, UNSHARE_LOOP, "")
+    mutant = _once_in(moved, TXN_SIG, "loaned = " + LEND + ";", "loaned = " + LEND + "; " + UNSHARE_LOOP)
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, mutant)
+
+
+def test_mutant_unshare_clones_nothing_fails():
+    mutant = _once_in(CACHE_HPP, UNSHARE_SIG, UNSHARE_BODY, "")
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_transaction_iterates_the_copy_mutably_fails():
+    """A range-for over the non-const copy takes the mutable begin(), which clones every chunk."""
+    mutant = _once_in(SYCL, TXN_SIG, COUNT_CLONES,
+                      "for (ggml_sycl::placement_entry & e : next_plan->entries) { (void) e; } " + COUNT_CLONES)
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, mutant)
+
+
+def test_mutant_transaction_hands_the_copy_to_another_writer_fails():
+    mutant = _once_in(SYCL, TXN_SIG, COUNT_CLONES, "ggml_sycl::placement_entries_charge_expert_slots("
+                      "next_plan->entries); " + COUNT_CLONES)
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, mutant)
+
+
+def test_mutant_transaction_calls_another_plan_member_fails():
+    mutant = _once_in(SYCL, TXN_SIG, COUNT_CLONES, "next_plan->build_index(); " + COUNT_CLONES)
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, mutant)
+
+
+def test_mutant_flip_walks_the_entries_fails():
+    mutant = _once_in(CACHE_HPP, UPDATE_SIG, ENTRY_WRITE,
+                      "for (placement_entry & x : entries) { (void) x; } " + ENTRY_WRITE)
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_backing_flip_walks_the_entries_fails():
+    mutant = _once_in(CACHE_HPP, BACKING_SIG, ENTRY_WRITE,
+                      "for (placement_entry & x : entries) { (void) x; } " + ENTRY_WRITE)
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_triplet_bytes_takes_the_plan_writable_fails():
+    """The transaction's triplet sizing, handed the copy writable: every entry it reads would clone its chunk."""
+    mutant = _once(PLAN_HPP, TXN_PLAN_WHOLE_CONST[0][1],
+                   "static inline size_t moe_expert_triplet_dst_bytes(placement_plan & plan,")
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, SYCL, mutant)
+
+
+def test_mutant_same_workspace_takes_the_plan_writable_fails():
+    """The workspace comparison, handed the copy writable: every entry it reads would clone its chunk."""
+    mutant = _once(CACHE_HPP, TXN_PLAN_WHOLE_CONST[1][1],
+                   "bool moe_mmid_same_workspace_plan(const placement_plan & a, placement_plan & b) noexcept;")
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_entry_position_by_pointer_arithmetic_fails():
+    mutant = norm(CACHE) + " size_t i = static_cast<size_t>(&entry - plan.entries.data());"
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, mutant, SYCL)
+    mutant = norm(CACHE) + " size_t i = static_cast<size_t>(p - &plan.entries[0]);"
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, mutant, SYCL)
+
+
+def test_mutant_entry_position_by_bare_store_arithmetic_fails():
+    """Inside a plan member the store is the bare `entries`, with no object to name."""
+    mutant = norm(CACHE_HPP) + " size_t i = static_cast<size_t>(&e - &entries[0]);"
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_entry_position_through_a_snapshots_plan_fails():
+    """Two object steps to the store, as the backend reaches a published plan's entries."""
+    mutant = norm(SYCL) + " size_t i = static_cast<size_t>(&e - &current->plan->entries[0]);"
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, mutant)
+
+
+def test_mutant_entry_position_by_arithmetic_elsewhere_in_the_backend_fails():
+    """A backend file outside the four the claim names, positioning an entry by its address."""
+    slot = "ggml/src/ggml-sycl/expert-slot.hpp"
+    assert slot in SYCL_TREE_OTHERS
+    others = dict(SYCL_TREE_OTHERS)
+    others[slot] += " size_t i = static_cast<size_t>(&e - &plan->entries[0]);"
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, SYCL, PLAN_HPP, others)
+
+
+# --- the runtime workspace replan shares its demand copy's entries ---------------------------------------------------
+
+# The runtime replan sizes the MMID workspaces on a copy of the live plan (its demand), which shares the entries'
+# chunks like any plan copy. The workspace planner takes that copy writable to record the workspaces on it, so a
+# range-for over its entries would take the mutable begin() and clone every chunk: an O(entries) copy on each KV
+# refresh that the chunked store exists to avoid. The planner reads the entries only through std::as_const, and the
+# replan hands the copy to nothing else that reaches its entries.
+REPLAN_SIG = "bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,"
+REPLAN_COPY = "placement_plan demand = plan;"
+REPLAN_PLANS = "plan_moe_mmid_workspaces(demand, tensor_inventory, n_expert_used);"
+WORKSPACE_PLAN_SIG = "static void plan_moe_mmid_workspaces(placement_plan & plan,"
+WORKSPACE_PLAN_READ = "std::as_const(plan.entries)"
+
+
+def claim_the_runtime_replan_shares_its_demand_entries(cache: str) -> bool:
+    c = norm(cache)
+    replan = body(c, REPLAN_SIG)
+    planner = body(c, WORKSPACE_PLAN_SIG)
+    return (replan.count(REPLAN_COPY) == 1 and replan.count(REPLAN_PLANS) == 1
+            and len(re.findall(r"\bdemand\b(?!\.moe_mmid_)", replan)) == 2
+            and planner.count(WORKSPACE_PLAN_READ) >= 1
+            and len(ENTRIES_WORD_RE.findall(planner)) == planner.count(WORKSPACE_PLAN_READ))
+
+
+def test_the_runtime_replan_shares_its_demand_entries():
+    assert claim_the_runtime_replan_shares_its_demand_entries(CACHE)
+
+
+def test_mutant_workspace_planner_iterates_the_entries_mutably_fails():
+    """A range-for over the writable plan takes the mutable begin(), which clones every chunk of the demand copy."""
+    mutant = _once_in(CACHE, WORKSPACE_PLAN_SIG, WORKSPACE_PLAN_READ, "plan.entries")
+    assert not claim_the_runtime_replan_shares_its_demand_entries(mutant)
+
+
+def test_mutant_replan_hands_the_demand_copy_to_another_writer_fails():
+    mutant = _once_in(CACHE, REPLAN_SIG, REPLAN_PLANS, REPLAN_PLANS + " demand.build_index();")
+    assert not claim_the_runtime_replan_shares_its_demand_entries(mutant)
 
 
 if __name__ == "__main__":

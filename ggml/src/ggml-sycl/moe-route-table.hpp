@@ -4,6 +4,7 @@
 // Ownership: entries hold real mem_handle leases (canonical contract: a live
 // model's weights are non-evictable while leased — that is the desired
 // semantics during inference). Invalidation releases the leases.
+#include "keyed-handle-bag.hpp"
 #include "mem-handle.hpp"
 
 #include <atomic>
@@ -61,6 +62,35 @@ struct moe_route_table {
         experts.clear();  // releases leases via mem_handle dtors
     }
 };
+
+// A lease's place in a pointer table's lease bag (ggml_tensor_extra_gpu_weight_ext::moe_expert_ptrs_leases): the cache
+// entry it holds, on its device. Only a weight's lease has one. An expert loan or evict takes every lease on the
+// device entry it retired by this pair, matching as the drop's other views are matched: by key, never by a resolve,
+// which a retired entry refuses.
+struct moe_lease_key {
+    int               device = -1;
+    unified_cache_key key    = {};
+
+    bool operator==(const moe_lease_key & other) const { return device == other.device && key == other.key; }
+};
+
+struct moe_lease_key_hash {
+    size_t operator()(const moe_lease_key & k) const {
+        return detail::cache_hash_combine(unified_cache_key_hash{}(k.key), std::hash<int>()(k.device));
+    }
+};
+
+struct moe_lease_key_of {
+    bool operator()(const mem_handle & h, moe_lease_key * out) const {
+        if (!h.is_weight()) {
+            return false;
+        }
+        *out = moe_lease_key{ h.device(), h.key() };
+        return true;
+    }
+};
+
+using moe_lease_bag = keyed_handle_bag<mem_handle, moe_lease_key, moe_lease_key_hash, moe_lease_key_of>;
 
 static inline bool moe_route_table_current(const moe_route_table_stamp & stamp,
                                            uint64_t                      plan_generation,

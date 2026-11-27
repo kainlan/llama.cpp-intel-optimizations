@@ -1454,7 +1454,7 @@ static inline size_t moe_expert_triplet_slot_bytes(const placement_plan & plan, 
 // (placement_entries_repeats_off_their_member). Pure over `entries` and needs no index: the planner runs it while it
 // builds the plan, before an index exists. A triplet that misses a role is left alone. Returns the number of triplets
 // charged a slot.
-static inline size_t placement_entries_charge_expert_slots(std::vector<placement_entry> & entries) {
+static inline size_t placement_entries_charge_expert_slots(placement_entry_store & entries) {
     struct triplet_entries {
         placement_entry *              members[3] = { nullptr, nullptr, nullptr };
         std::vector<placement_entry *> repeats;  // an entry of a role met before: staged, but no member
@@ -1509,7 +1509,7 @@ struct placement_repeat_off_member {
 // placement_entries_charge_expert_slots resolves a triplet. The load stages such a repeat as its member while the plan
 // charges it on its own layout and device, so its charge does not follow the slot the load stages it at.
 static inline std::vector<placement_repeat_off_member> placement_entries_repeats_off_their_member(
-    const std::vector<placement_entry> & entries) {
+    const placement_entry_store & entries) {
     struct triplet_members {
         const placement_entry * members[3] = { nullptr, nullptr, nullptr };
     };
@@ -1544,7 +1544,7 @@ struct placement_charge_change {
 // (a charge left 0 reads as its dst_size's) and after. The caller moves the plan's totals by each change
 // (placement_charge_move), so the plan charges what the load stages.
 static inline std::vector<placement_charge_change> placement_entries_recharge_expert_slots(
-    std::vector<placement_entry> & entries) {
+    placement_entry_store & entries) {
     std::vector<size_t> before(entries.size());
     for (size_t i = 0; i < entries.size(); ++i) {
         const placement_entry & e = entries[i];
@@ -1600,7 +1600,7 @@ struct placement_recharge_device {
 // room, its VRAM total when it has one, and the plan's weight and VRAM totals. A host entry's charge moves no total,
 // nor does an entry on a device not in `devices`, which the caller's pass does not account. Returns the bytes charged
 // past the devices' remaining room.
-static inline size_t placement_entries_recharge_expert_slots_on(std::vector<placement_entry> &                 entries,
+static inline size_t placement_entries_recharge_expert_slots_on(placement_entry_store &                        entries,
                                                                 const std::vector<placement_recharge_device> & devices,
                                                                 size_t & weight_vram,
                                                                 size_t & vram) {

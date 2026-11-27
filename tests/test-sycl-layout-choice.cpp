@@ -5344,7 +5344,7 @@ static bool run_layout_choice_test() {
 //
 // The FUSED gate+up expert tensor "blk.N.ffn_gate_up_exps.weight" contains
 // neither "ffn_gate_exps" nor "ffn_up_exps", so both name classifiers returned
-// UNKNOWN.  build_index() drops UNKNOWN roles from expert_placement_index_, so
+// UNKNOWN.  build_index() drops UNKNOWN roles from the expert placement index, so
 // lookup_expert_placement() missed, the route resolver set plan_missing=1, and
 // MUL_MAT_ID aborted with "[MOE-ROUTE] unresolved planner expert".  This test
 // pins the exact failing call: lookup BY NAME, which is what the resolver does.

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -727,24 +728,24 @@ constexpr expert_tensor_role kDown = expert_tensor_role::DOWN;
 
 // A 640 x 2560 IQ4_NL expert (gate and up 921600 bytes, down 921816 staged), a Q4_K gate and up beside a Q5_K down, and
 // an IQ4_NL expert whose down is SOA.
-std::vector<ggml_sycl::placement_entry> slot_triplets() {
-    return {
-        slot_member(0, 0, kGate, GGML_TYPE_IQ4_NL, 2560, 921600),
-        slot_member(0, 0, kUp, GGML_TYPE_IQ4_NL, 2560, 921600),
-        slot_member(0, 0, kDown, GGML_TYPE_IQ4_NL, 640, 921600),
-        slot_member(0, 1, kGate, GGML_TYPE_Q4_K, 2048, 589824),
-        slot_member(0, 1, kUp, GGML_TYPE_Q4_K, 2048, 589824),
-        slot_member(0, 1, kDown, GGML_TYPE_Q5_K, 512, 720896),
-        slot_member(0, 2, kGate, GGML_TYPE_IQ4_NL, 2560, 921600),
-        slot_member(0, 2, kUp, GGML_TYPE_IQ4_NL, 2560, 921600),
-        slot_member(0, 2, kDown, GGML_TYPE_IQ4_NL, 640, 921600, GGML_LAYOUT_SOA),
-    };
+ggml_sycl::placement_entry_store slot_triplets() {
+    ggml_sycl::placement_entry_store entries;
+    entries.push_back(slot_member(0, 0, kGate, GGML_TYPE_IQ4_NL, 2560, 921600));
+    entries.push_back(slot_member(0, 0, kUp, GGML_TYPE_IQ4_NL, 2560, 921600));
+    entries.push_back(slot_member(0, 0, kDown, GGML_TYPE_IQ4_NL, 640, 921600));
+    entries.push_back(slot_member(0, 1, kGate, GGML_TYPE_Q4_K, 2048, 589824));
+    entries.push_back(slot_member(0, 1, kUp, GGML_TYPE_Q4_K, 2048, 589824));
+    entries.push_back(slot_member(0, 1, kDown, GGML_TYPE_Q5_K, 512, 720896));
+    entries.push_back(slot_member(0, 2, kGate, GGML_TYPE_IQ4_NL, 2560, 921600));
+    entries.push_back(slot_member(0, 2, kUp, GGML_TYPE_IQ4_NL, 2560, 921600));
+    entries.push_back(slot_member(0, 2, kDown, GGML_TYPE_IQ4_NL, 640, 921600, GGML_LAYOUT_SOA));
+    return entries;
 }
 
 // The planner charges each member of a triplet with a slot the slot, and leaves a triplet the slot would pad past 1/128
 // (mixed quant types) or whose member does not stage as AOS at each member's own charge.
 void test_charge_expert_slots_takes_the_slot_only_where_nearly_free() {
-    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    ggml_sycl::placement_entry_store        entries = slot_triplets();
     std::vector<size_t>                     own;
     for (const ggml_sycl::placement_entry & e : entries) {
         own.push_back(e.vram_charge_size);
@@ -762,7 +763,7 @@ void test_charge_expert_slots_takes_the_slot_only_where_nearly_free() {
 // After a layout pass reset a member's charge to its own size (or left it 0, read as its dst_size's charge), the
 // re-charge gives the triplet its slot again and reports each changed entry with its charge before and after.
 void test_recharge_reports_each_changed_charge() {
-    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    ggml_sycl::placement_entry_store entries = slot_triplets();
     ggml_sycl::placement_entries_charge_expert_slots(entries);
     entries[0].vram_charge_size = 921600;
     entries[1].vram_charge_size = 0;
@@ -804,7 +805,7 @@ void test_charge_move() {
 // now, so its AOS members go back to their own charge. The up member gives its slot back (921856 -> 921600); the down
 // member's own charge rounds to the slot already, so it does not change. A second re-charge changes nothing.
 void test_recharge_gives_back_a_lost_slot() {
-    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    ggml_sycl::placement_entry_store entries = slot_triplets();
     ggml_sycl::placement_entries_charge_expert_slots(entries);
     CHECK(entries[1].vram_charge_size == 921856);
     entries[0].layout           = GGML_LAYOUT_SOA;
@@ -824,19 +825,21 @@ void test_recharge_gives_back_a_lost_slot() {
 // the devices given: a device with no per-device total (a single-device plan) still moves its remaining room and the
 // plan's totals, and an entry on the host or on a device not given moves nothing.
 void test_recharge_on_moves_the_target_devices_room() {
-    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    ggml_sycl::placement_entry_store entries = slot_triplets();
     for (size_t i = 3; i < 6; ++i) {
         entries[i].target_device = 1;
     }
     for (size_t i = 6; i < 9; ++i) {
         entries[i].on_device = false;
     }
-    std::vector<ggml_sycl::placement_entry> plus = slot_triplets();
+    ggml_sycl::placement_entry_store plus = slot_triplets();
     for (ggml_sycl::placement_entry & e : plus) {
         e.layer_id      = 1;
         e.target_device = 7;
     }
-    entries.insert(entries.end(), plus.begin(), plus.end());
+    for (const ggml_sycl::placement_entry & e : std::as_const(plus)) {
+        entries.push_back(e);
+    }
     entries[3].vram_charge_size = 1000000;  // the mixed triplet on device 1 was charged more than its own size
     entries[6].vram_charge_size = 1;        // a host member's charge moves no device total
 
@@ -861,7 +864,7 @@ void test_recharge_on_moves_the_target_devices_room() {
     CHECK(entries[9].vram_charge_size == 921856 && entries[10].vram_charge_size == 921856);
 
     // Past a device's remaining room the slot is still charged, and the excess is returned.
-    std::vector<ggml_sycl::placement_entry> tight           = slot_triplets();
+    ggml_sycl::placement_entry_store        tight           = slot_triplets();
     size_t                                  remaining_tight = 300;
     size_t                                  weight_tight    = 0;
     size_t                                  vram_tight      = 0;
@@ -891,7 +894,7 @@ void test_recharge_on_moves_the_target_devices_room() {
 // for it (placement_entries_repeats_off_their_member). Here the first down is AOS with a tail, so the triplet has a
 // slot, and a later SOA down keeps its own SOA charge although the load stages the AOS member at the slot.
 void test_charge_expert_slots_resolves_a_duplicated_role_by_its_first_entry() {
-    std::vector<ggml_sycl::placement_entry> entries = slot_triplets();
+    ggml_sycl::placement_entry_store entries = slot_triplets();
     entries.resize(3);
     entries.push_back(slot_member(0, 0, kDown, GGML_TYPE_IQ4_NL, 640, 921600, GGML_LAYOUT_SOA));
     entries.push_back(slot_member(0, 0, kGate, GGML_TYPE_IQ4_NL, 2560, 460800));
@@ -966,6 +969,24 @@ void test_bulk_staged_mirrors_the_slot_stride_decline() {
         CHECK(!ggml_sycl::detail::moe_loan_tensor_bulk_staged(alt_aos, name, 0));
         CHECK(ggml_sycl::detail::moe_loan_tensor_bulk_staged(alt_soa, name, 0));
     }
+}
+
+// A moved-from plan answers every lookup with "not found": the move takes the entries and the index together, and the
+// plan reads a missing index as the empty one instead of dereferencing it.
+void test_moved_from_plan_finds_nothing() {
+    placement_plan source = make_plan();
+    CHECK(source.find_expert_entry(1, 0, expert_tensor_role::GATE) != nullptr);
+    CHECK(source.has_dense_entry("blk.1.attn_q.weight"));
+    const placement_plan moved = std::move(source);
+    CHECK(moved.find_expert_entry(1, 0, expert_tensor_role::GATE) != nullptr);
+    CHECK(moved.find_dense_entry("blk.1.attn_q.weight") != nullptr);
+    CHECK(source.entries.empty());
+    CHECK(source.find_expert_entry(1, 0, expert_tensor_role::GATE) == nullptr);
+    CHECK(source.find_expert_entry("blk.1.ffn_gate_exps.weight", 0) == nullptr);
+    CHECK(!source.has_dense_entry("blk.1.attn_q.weight"));
+    CHECK(source.find_dense_entry("blk.1.attn_q.weight") == nullptr);
+    CHECK(!source.expert_on_device("blk.1.ffn_gate_exps.weight", 0));
+    CHECK(source.summarize_expert_placements().planned == 0);
 }
 
 }  // namespace
@@ -1066,6 +1087,7 @@ int main() {
     test_recharge_on_moves_the_target_devices_room();
     test_charge_expert_slots_resolves_a_duplicated_role_by_its_first_entry();
     test_bulk_staged_mirrors_the_slot_stride_decline();
+    test_moved_from_plan_finds_nothing();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);

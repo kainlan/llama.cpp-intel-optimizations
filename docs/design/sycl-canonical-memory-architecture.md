@@ -26,7 +26,7 @@ that covers:
 | Category | `placement_plan` field(s) |
 |---|---|
 | Dense weights (each layer) | `entries[]`, `layer_device` |
-| MoE experts | `entries[]`, `expert_device` |
+| MoE experts | `entries[]` (one per expert and role; `lookup_expert_placement`) |
 | KV cache (per slot, where the layer that executes the slot lives) | `kv_device`, `kv_vram_bytes`, `kv_host_bytes`, `layer_phys` |
 | oneDNN reorder scratch | `onednn_reorder_bytes` → Zone: SCRATCH |
 | oneDNN scratchpad | `onednn_scratchpad_bytes` → Zone: ONEDNN |
@@ -571,7 +571,7 @@ completes and shared by its contexts:
 | `g_model_n_layer` | `ggml-sycl.cpp:12350` | Model-scoped |
 | `unified_cache` WEIGHT zone | `unified-cache.cpp` | Model-scoped: weight entries survive across requests. The host `WEIGHT` zone also holds cache-lifetime owners that no graph boundary checks (`HOST_COMPUTE` logits, the `EXPERT_CACHE` pinned-buffer pool, the CPU job input marker's word through `persistent_owner`), each freed per allocation through `unified_free_record` (llama.cpp-nqbe) |
 | `placement_plan::entries` | `unified-cache.hpp` | Model-scoped |
-| `placement_plan::layer_device`, `expert_device`, `kv_device` | `unified-cache.hpp` | Model-scoped |
+| `placement_plan::layer_device`, `kv_device` | `unified-cache.hpp` | Model-scoped |
 
 This table previously listed a mutable `g_placement_plan` and a
 `g_has_placement_plan` validity flag. Both symbols were eliminated by the
@@ -832,7 +832,7 @@ forms above with the understanding that they are scheduled for replacement.
 - One `unified_cache` instance per device (`get_unified_cache_for_device(dev)`).
 - `compute_multi_device_plan(...)` called at model load; produces a single
   `placement_plan` with `multi_device = true` and populated `devices`,
-  `per_device_vram`, `layer_device`, `expert_device`, `kv_device` maps.
+  `per_device_vram`, `layer_device`, `kv_device` maps.
 - Each `placement_entry` has `target_device` set explicitly. No entry may have
   `target_device = -1` unless placement is `HOST`.
 - As of bead `llama.cpp-32dg8.15.11`, `from_direct` requires an explicit `device`
@@ -843,8 +843,8 @@ forms above with the understanding that they are scheduled for replacement.
   stage via host.
 - The `mem_handle::device()` value is authoritative for which cache instance to
   query. Dispatch must not assume handles from different devices are interchangeable.
-- Multi-GPU layout: `layer_device` maps dense layers, `expert_device` maps MoE
-  experts. Each KV cache slot co-locates with the dense weights of the layer that executes it (`kv_device`, keyed
+- Multi-GPU layout: `layer_device` maps dense layers, and each MoE expert's entry (one per role) names its
+  device. Each KV cache slot co-locates with the dense weights of the layer that executes it (`kv_device`, keyed
   by slot). A looped model runs one weight layer for several slots (`layer_phys`, the slot-to-layer map libllama
   names in the inventory; empty when every slot is its own layer), and the layer is charged for each of its slots.
 

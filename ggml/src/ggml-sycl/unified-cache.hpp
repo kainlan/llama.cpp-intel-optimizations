@@ -7,6 +7,7 @@
 #ifndef GGML_SYCL_UNIFIED_CACHE_HPP
 #define GGML_SYCL_UNIFIED_CACHE_HPP
 
+#include "cow-chunked-vector.hpp"
 #include "cpu-job-signal.hpp"
 #include "device-pool.hpp"
 #include "dpct/helper.hpp"
@@ -57,6 +58,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #if !defined(_WIN32) && !defined(__SYCL_DEVICE_ONLY__)
 #    include <sys/mman.h>
@@ -1238,10 +1240,14 @@ struct placement_moe_block_slots {
     bool   ranked       = false;
 };
 
+// The plan's entries: chunks a copy of the plan shares, so an expert move's copy of the published plan clones only the
+// chunks it writes (cow-chunked-vector.hpp states the single-writer rule and the reference hazard).
+using placement_entry_store = cow_chunked_vector<placement_entry>;
+
 // Complete placement plan for all model weights.
 // Supports single-device (P4) and multi-device (P4.5) planning.
 struct placement_plan {
-    std::vector<placement_entry> entries;            // All weights, sorted by priority
+    placement_entry_store        entries;            // All weights, sorted by priority
     size_t                       vram_bytes;         // Total planned bytes on device(s), including KV
     size_t                       host_bytes;         // Total planned bytes on host, including KV
     size_t                       weight_vram_bytes;  // Weight bytes on device(s)
@@ -1565,11 +1571,6 @@ struct placement_plan {
     int                                  fastest_dense_device = -1;
     double                               fastest_dense_score  = 0.0;
 
-    // Compatibility summary: expert_device[layer_id][expert_id] = device_id (-1 = host/CPU).
-    // This collapses gate/up/down and is not authoritative for role-specific MoE placement.
-    // Use lookup_expert_placement(layer, expert, role) for planner decisions.
-    std::unordered_map<int, std::unordered_map<int, int>> expert_device;
-
     // kv_device[slot] = device_id (-1 = host tier) of each KV cache slot. A slot's KV lives on the device of the weight
     // layer that executes it (layer_phys), so a looped model's later slots go where their layer's weights are.
     std::unordered_map<int, int> kv_device;
@@ -1774,7 +1775,7 @@ struct placement_plan {
             if (idx >= entries.size()) {
                 continue;
             }
-            const placement_entry & e     = entries[idx];
+            const placement_entry & e     = std::as_const(entries)[idx];  // a read: no chunk is unshared
             const size_t            bytes = basis == placement_size_basis::SRC ? e.src_size : e.dst_size;
             charge_host_weight(e.host_backing, bytes);
             group_bytes += bytes;
@@ -1820,7 +1821,8 @@ struct placement_plan {
     // the term stale: the file bytes of every device-planned FILE_MAPPED entry.
     void recount_host_mapped_source_bytes() noexcept {
         size_t bytes = 0;
-        for (const placement_entry & e : entries) {
+        // Through a const view: a non-const iteration would clone every chunk a copy shares, and this is noexcept.
+        for (const placement_entry & e : std::as_const(entries)) {
             if (e.on_device && e.host_backing == placement_host_backing::FILE_MAPPED) {
                 bytes += e.src_size;
             }
@@ -1888,8 +1890,8 @@ struct placement_plan {
     // lookup_expert_placement() below returns a copy, std::string and
     // std::vector included, and is kept for planner and diagnostic paths.
     const placement_entry * find_expert_entry(int layer_id, int expert_id, expert_tensor_role role) const {
-        auto it = expert_placement_index_.find(expert_placement_key{ layer_id, expert_id, role });
-        return it == expert_placement_index_.end() ? nullptr : &entries[it->second];
+        auto it = plan_index().expert_placement.find(expert_placement_key{ layer_id, expert_id, role });
+        return it == plan_index().expert_placement.end() ? nullptr : &entries[it->second];
     }
 
     // Parses the tensor name on every call: a caller asking about several
@@ -1931,10 +1933,26 @@ struct placement_plan {
         return lookup_expert_placement(layer_id, expert_id, role);
     }
 
+    // Takes now the entry-chunk clone that update_expert_placement and set_expert_host_backing would take for this
+    // expert, so their entry writes allocate nothing. A copy shares its source's chunks, and the expert move
+    // transaction must flip every triplet the cache has moved, whatever followed: it calls this for each member before
+    // the first move. update_expert_placement can still allocate in one place, its residency count's first pair for a
+    // device a group had no device-resident expert on (expert_residency_group::count_residency): at most one small
+    // append per group and device, which the transaction accepts (see its unshare loop). False when the plan has no
+    // such entry.
+    bool unshare_expert_entry(int layer_id, int expert_id, expert_tensor_role role) {
+        auto it = plan_index().expert_placement.find(expert_placement_key{ layer_id, expert_id, role });
+        if (it == plan_index().expert_placement.end()) {
+            return false;
+        }
+        entries.unshare_at(it->second);
+        return true;
+    }
+
     bool update_expert_placement(int layer_id, int expert_id, expert_tensor_role role, bool on_device, int target) {
         const expert_placement_key key{ layer_id, expert_id, role };
-        auto                       it = expert_placement_index_.find(key);
-        if (it == expert_placement_index_.end()) {
+        auto                       it = plan_index().expert_placement.find(key);
+        if (it == plan_index().expert_placement.end()) {
             return false;
         }
 
@@ -1985,12 +2003,6 @@ struct placement_plan {
 
         e.on_device     = on_device;
         e.target_device = target;
-
-        if (!on_device) {
-            expert_device[layer_id][expert_id] = -1;
-        } else {
-            expert_device[layer_id][expert_id] = target;
-        }
         return true;
     }
 
@@ -2000,8 +2012,8 @@ struct placement_plan {
     // device, and a re-admitted one is staged from the load's own source again.
     bool set_expert_host_backing(int layer_id, int expert_id, expert_tensor_role role, placement_host_backing backing) {
         const expert_placement_key key{ layer_id, expert_id, role };
-        auto                       it = expert_placement_index_.find(key);
-        if (it == expert_placement_index_.end()) {
+        auto                       it = plan_index().expert_placement.find(key);
+        if (it == plan_index().expert_placement.end()) {
             return false;
         }
 
@@ -2034,9 +2046,9 @@ struct placement_plan {
 
     expert_placement_summary summarize_expert_placements(int expected_layers = -1, int expected_experts = -1) const {
         expert_placement_summary summary;
-        summary.planned      = expert_placement_index_.size();
-        summary.duplicates   = expert_placement_duplicate_count_;
-        summary.unclassified = expert_placement_unclassified_count_;
+        summary.planned      = plan_index().expert_placement.size();
+        summary.duplicates   = plan_index().duplicates;
+        summary.unclassified = plan_index().unclassified;
         for (const auto & e : entries) {
             if (e.expert_id < 0) {
                 continue;
@@ -2092,23 +2104,25 @@ struct placement_plan {
     // For dense weights (expert_id == -1) only; MoE expert entries are not
     // indexed by name alone — use expert_on_device() for per-expert queries.
     bool is_on_device(const std::string & name) const {
-        auto it = name_index_.find(name);
-        return it != name_index_.end() && entries[it->second].on_device;
+        auto it = plan_index().name.find(name);
+        return it != plan_index().name.end() && entries[it->second].on_device;
     }
 
-    bool has_dense_entry(const std::string & name) const { return name_index_.find(name) != name_index_.end(); }
+    bool has_dense_entry(const std::string & name) const {
+        return plan_index().name.find(name) != plan_index().name.end();
+    }
 
     // The dense-weight entry for `name`, or nullptr. Same name index as has_dense_entry.
     const placement_entry * find_dense_entry(const std::string & name) const {
-        auto it = name_index_.find(name);
-        return it != name_index_.end() ? &entries[it->second] : nullptr;
+        auto it = plan_index().name.find(name);
+        return it != plan_index().name.end() ? &entries[it->second] : nullptr;
     }
 
     // Multi-device query: is this tensor on a specific device?
     // Returns true if the tensor is assigned to device_id.
     bool is_on_device(const std::string & name, int dev_id) const {
-        auto it = name_index_.find(name);
-        if (it == name_index_.end()) {
+        auto it = plan_index().name.find(name);
+        if (it == plan_index().name.end()) {
             return false;
         }
         const auto & e = entries[it->second];
@@ -2117,8 +2131,8 @@ struct placement_plan {
 
     // Get the target device for a tensor (-1 if host or not found).
     int get_target_device(const std::string & name) const {
-        auto it = name_index_.find(name);
-        if (it == name_index_.end()) {
+        auto it = plan_index().name.find(name);
+        if (it == plan_index().name.end()) {
             return -1;
         }
         return entries[it->second].target_device;
@@ -2127,8 +2141,8 @@ struct placement_plan {
     bool dense_alternate_on_device(const std::string &          name,
                                    int                          dev_id,
                                    placement_alternate_layout * out = nullptr) const {
-        auto it = name_index_.find(name);
-        if (it == name_index_.end()) {
+        auto it = plan_index().name.find(name);
+        if (it == plan_index().name.end()) {
             return false;
         }
         const placement_entry & e = entries[it->second];
@@ -2166,8 +2180,8 @@ struct placement_plan {
 
     // Did the plan promise a dense extra (same-device, additional) copy in `layout`?
     bool dense_extra_layout_on_device(const std::string & name, int dev_id, ggml_layout_mode layout) const {
-        auto it = name_index_.find(name);
-        if (it == name_index_.end()) {
+        auto it = plan_index().name.find(name);
+        if (it == plan_index().name.end()) {
             return false;
         }
         const placement_entry & e = entries[it->second];
@@ -2283,38 +2297,37 @@ struct placement_plan {
         return has_host_experts(tensor_name.c_str(), n_experts, device_id);
     }
 
-    // Build the name->index lookup after entries are populated.
+    // Build the name->index lookup after entries are populated. The lookup is built whole and replaces the shared one:
+    // a copy of this plan keeps the lookup it was copied with, so the plan it was copied from is never written.
     void build_index() {
-        name_index_.clear();
-        expert_index_.clear();
-        expert_placement_index_.clear();
-        expert_placement_duplicate_count_    = 0;
-        expert_placement_unclassified_count_ = 0;
-        name_index_.reserve(entries.size());
-        expert_index_.reserve(entries.size());
-        expert_placement_index_.reserve(entries.size());
-        for (size_t i = 0; i < entries.size(); ++i) {
-            const auto & e = entries[i];
+        const auto & all   = entries;  // const: reading must not unshare a chunk another plan holds
+        auto         index = std::make_shared<placement_plan_index>();
+        index->name.reserve(all.size());
+        index->expert.reserve(all.size());
+        index->expert_placement.reserve(all.size());
+        for (size_t i = 0; i < all.size(); ++i) {
+            const auto & e = all[i];
             if (e.expert_id >= 0) {
                 // MoE expert entry: index by "tensor_name:eN"
                 const std::string key = e.name + ":e" + std::to_string(e.expert_id);
-                expert_index_[key]    = i;
+                index->expert[key]    = i;
 
                 if (e.expert_role == expert_tensor_role::UNKNOWN || e.layer_id < 0) {
-                    expert_placement_unclassified_count_++;
+                    index->unclassified++;
                     continue;
                 }
 
                 const expert_placement_key semantic_key{ e.layer_id, e.expert_id, e.expert_role };
-                auto                       inserted = expert_placement_index_.emplace(semantic_key, i);
+                auto                       inserted = index->expert_placement.emplace(semantic_key, i);
                 if (!inserted.second) {
-                    expert_placement_duplicate_count_++;
+                    index->duplicates++;
                 }
             } else {
                 // Dense weight: index by name
-                name_index_[e.name] = i;
+                index->name[e.name] = i;
             }
         }
+        index_ = std::move(index);
 
         // Residency summary (llama.cpp-5tdy). One group per (layer, role) of
         // the semantic index. The fallback groups hold the name-keyed entries
@@ -2323,11 +2336,11 @@ struct placement_plan {
         expert_groups_.clear();
         expert_fallback_groups_.clear();
         expert_fallback_entries_.clear();
-        for (const auto & [key, index] : expert_placement_index_) {
-            expert_groups_[expert_residency_group_key(key.layer_id, key.role)].add_entry(entries[index]);
+        for (const auto & [key, index] : plan_index().expert_placement) {
+            expert_groups_[expert_residency_group_key(key.layer_id, key.role)].add_entry(all[index]);
         }
-        for (const auto & [key, index] : expert_index_) {
-            const placement_entry & e = entries[index];
+        for (const auto & [key, index] : plan_index().expert) {
+            const placement_entry & e = all[index];
             if (find_expert_entry(e.name.c_str(), e.expert_id)) {
                 continue;
             }
@@ -2358,12 +2371,12 @@ struct placement_plan {
     // in tensor_name's fallback group: without that group there is nothing to
     // find, and the key string is never built.
     const placement_entry * find_fallback_expert_entry(const char * tensor_name, int expert_id) const {
-        if (expert_index_.empty() || !find_fallback_group(tensor_name)) {
+        if (plan_index().expert.empty() || !find_fallback_group(tensor_name)) {
             return nullptr;
         }
         const std::string key = std::string(tensor_name) + ":e" + std::to_string(expert_id);
-        auto              it  = expert_index_.find(key);
-        return it == expert_index_.end() ? nullptr : &entries[it->second];
+        auto              it  = plan_index().expert.find(key);
+        return it == plan_index().expert.end() ? nullptr : &entries[it->second];
     }
 
     const expert_residency_group * find_fallback_group(const char * tensor_name) const {
@@ -2425,12 +2438,26 @@ struct placement_plan {
         return count;
     }
 
-    std::unordered_map<std::string, size_t> name_index_;    // Dense weights: name -> index
-    std::unordered_map<std::string, size_t> expert_index_;  // MoE experts: "name:eN" -> index
-    std::unordered_map<expert_placement_key, size_t, expert_placement_key_hash>
-           expert_placement_index_;                         // MoE experts: (layer, expert, role) -> index
-    size_t expert_placement_duplicate_count_    = 0;
-    size_t expert_placement_unclassified_count_ = 0;
+    // The lookups build_index() makes, shared by every copy of the plan: a copy for a placement move changes entries'
+    // fields, never their positions, so the lookups stay right for it and need no copy. Only build_index() replaces
+    // them, whole.
+    struct placement_plan_index {
+        std::unordered_map<std::string, size_t> name;    // Dense weights: name -> index
+        std::unordered_map<std::string, size_t> expert;  // MoE experts: "name:eN" -> index
+        std::unordered_map<expert_placement_key, size_t, expert_placement_key_hash>
+               expert_placement;                         // MoE experts: (layer, expert, role) -> index
+        size_t duplicates   = 0;
+        size_t unclassified = 0;
+    };
+
+    // The plan's index, read through here so a moved-from plan answers every lookup with "not found": the defaulted
+    // move takes the shared pointer and leaves index_ null, and the moved-from entries are empty too.
+    const placement_plan_index & plan_index() const {
+        static const placement_plan_index empty;
+        return index_ ? *index_ : empty;
+    }
+
+    std::shared_ptr<const placement_plan_index>                index_ = std::make_shared<const placement_plan_index>();
     std::unordered_map<uint64_t, expert_residency_group>       expert_groups_;  // (layer, role) -> residency
     // name -> fallback residency. An ordered map with a transparent comparator,
     // because unordered_map's heterogeneous find() is C++20: a by-name query

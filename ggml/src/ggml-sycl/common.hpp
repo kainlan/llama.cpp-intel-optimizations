@@ -4437,7 +4437,9 @@ struct ggml_tensor_extra_gpu_weight_ext {
     // moe_expert_ptr_payload is only the resolved raw-pointer kernel ABI payload
     // uploaded to the device table; it must not own or outlive the handles.
     // moe_expert_ptrs_leases covers the active transient table payload so graph
-    // replay/direct dispatch retains the underlying mem_handles.
+    // replay/direct dispatch retains the underlying mem_handles. It is keyed by
+    // the cache entry each lease holds, so an expert move takes the leases on
+    // the entry it retired without walking the table's leases.
     ggml_sycl::mem_handle moe_expert_ptrs_handle[GGML_SYCL_MAX_DEVICES];
     size_t                moe_expert_ptrs_size[GGML_SYCL_MAX_DEVICES]          = { 0 };
     bool                  moe_expert_ptrs_from_prealloc[GGML_SYCL_MAX_DEVICES] = { false };
@@ -4487,7 +4489,7 @@ struct ggml_tensor_extra_gpu_weight_ext {
     ggml_sycl::moe_route_table         moe_route_tables[GGML_SYCL_MAX_DEVICES];
     std::vector<ggml_sycl::mem_handle> moe_expert_handles[GGML_SYCL_MAX_DEVICES];
     std::vector<void *>                moe_expert_ptr_payload[GGML_SYCL_MAX_DEVICES];
-    std::vector<ggml_sycl::mem_handle> moe_expert_ptrs_leases[GGML_SYCL_MAX_DEVICES];
+    ggml_sycl::moe_lease_bag                        moe_expert_ptrs_leases[GGML_SYCL_MAX_DEVICES];
 
     // MoE compact pointer list (row-major by id) and missing flag.
     ggml_sycl::mem_handle moe_expert_ptrs_compact_handle[GGML_SYCL_MAX_DEVICES];

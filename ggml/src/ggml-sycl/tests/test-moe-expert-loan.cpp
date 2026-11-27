@@ -88,7 +88,10 @@
 //                           table leases expert 2's device entry (checked first). Slot 0's table leases are then made
 //                           the only view its extra holds of that entry, its storage records and slot handle dropped
 //                           (checked, with no route-table lease and no hybrid record), so only the loan's lease path
-//                           can mark that table stale; slots 1 and 2 keep every view. After the loan each table is
+//                           can mark that table stale; slots 1 and 2 keep every view, and slot 2 also gets the route
+//                           table a decode build stores, leasing expert 2's entry at its own id (checked). The loan
+//                           walks no table to drop that view (view_scan_fallbacks 0), leaves the plan it replaced
+//                           unchanged, clones one plan chunk, and leaves no route lease. After the loan each table is
 //                           stale, slot 0's checked by its stale mark alone and the others' also by a payload that no
 //                           longer names expert 2. The one-triplet loan takes expert 2 and no other triplet; after the
 //                           loan's own boundary drain and the one deferred-free pass synchronize runs after it, with no

@@ -440,7 +440,8 @@ LEND_CALL = "cache->loan_expert_triplet(triplet.members, record)"
 # E3: the to-host branch, a loan's and an evict's, and the generation every step of it moves.
 TO_HOST_BRANCH = ("} else { for (int r = 0; r < 3; ++r) { const ggml_sycl::expert_placement_key & k = "
                   "triplet.members[r].placement; ggml_tensor_extra_gpu * extra = triplet.extras[r]; "
-                  "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views); "
+                  "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, record.device_keys[r], lent_views, "
+                  "view_scan_fallbacks); "
                   "(void) extra->forget_moe_storage_handle_on_device(k.expert_id, GGML_LAYOUT_AOS, device); } }")
 # The drop notes each expert whose hybrid record slot it emptied, and the one whose storage record or table slot it
 # dropped.
@@ -994,7 +995,9 @@ def self_test(raw: dict[str, str]) -> int:
                                                    "*transient = false;")])
     expect_fail("evict-keeps-device-views", "E3", [("sycl", TXN_SIG,
                                                     "ggml_sycl_drop_lent_expert_views(extra, device, k.expert_id, "
-                                                    "record.device_keys[r], lent_views);", "")])
+                                                    "record.device_keys[r], lent_views,\n"
+                                                    "                                                     "
+                                                    "view_scan_fallbacks);", "")])
     expect_fail("drop-keeps-generation", "E3", [("sycl", DROP_SIG, "w.note_moe_storage_change(e);", "")])
     expect_fail("remember-keeps-generation", "E3", [("common", RECORD_SIG,
                                                      "records.push_back(std::move(record));\n"
