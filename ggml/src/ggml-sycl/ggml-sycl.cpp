@@ -100505,10 +100505,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                       [](const pp_onednn_batched_expert & a, const pp_onednn_batched_expert & b) {
                           return (a.row_end - a.row_begin) > (b.row_end - b.row_begin);
                       });
-            std::vector<size_t> rows_desc;
+            // Each sorted expert's row count (for the groups) and its row-map span (for the packed-row table).
+            std::vector<size_t>                    rows_desc;
+            std::vector<std::pair<size_t, size_t>> packed_row_spans;
             rows_desc.reserve(active_experts.size());
+            packed_row_spans.reserve(active_experts.size());
             for (const pp_onednn_batched_expert & expert : active_experts) {
                 rows_desc.push_back(expert.row_end - expert.row_begin);
+                packed_row_spans.emplace_back(expert.row_begin, expert.row_end);
             }
             ggml_sycl::moe_pp_packed_layout pack;
             if (!ggml_sycl::moe_pp_pack_gemm_groups(rows_desc, &pack)) {
@@ -100516,11 +100520,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             // Inkling Task 25: every routed row's row-map entry and packed scratch row, in sorted order, so the gather
             // and the scatter below each run as one launch over the node's rows.
-            std::vector<std::pair<size_t, size_t>> packed_row_spans;
-            packed_row_spans.reserve(active_experts.size());
-            for (const pp_onednn_batched_expert & expert : active_experts) {
-                packed_row_spans.emplace_back(expert.row_begin, expert.row_end);
-            }
             std::vector<ggml_sycl::moe_pp_packed_row> packed_rows;
             if (!ggml_sycl::moe_pp_pack_row_table(packed_row_spans, pack, &packed_rows)) {
                 return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, "packed-row-table");
@@ -100528,9 +100527,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const std::vector<ggml_sycl::moe_pp_gemm_group> & gemm_groups = pack.groups;
             // host-stall attribution cycle, phase 4/6: active_experts
             // reserve+build+sort (llama.cpp-dboi's bimodal-routing sort)
-            // plus the gemm_groups build above -- pure host CPU work, no
-            // device interaction, bounded by the active expert count
-            // (~32 for GPT-OSS 20B).
+            // plus the gemm_groups build above, bounded by the active expert
+            // count (~32 for GPT-OSS 20B), and the packed-row table build,
+            // linear in the node's routed rows -- pure host CPU work, no
+            // device interaction.
             host_phase_mark(&mxfp4_pp_batched_profile_accum::host_grouping_us,
                             &mxfp4_pp_batched_profile_accum::host_grouping_calls);
 
@@ -100783,8 +100783,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             batched_acts = static_cast<sycl::half *>(reserved.activation);
             batched_out  = static_cast<float *>(reserved.output);
-            // Where the expert at sorted position `slot` has its rows. Every reader of the scratch asks here, so they
-            // cannot disagree about an expert's rows.
+            // Where the expert at sorted position `slot` has its rows. The GEMM arms and the debug compare ask here, so
+            // they cannot disagree about an expert's rows. The batched gather and scatter address the scratch from row 0
+            // through the packed-row table, whose rows come from the same layout (slot_base_row).
             const auto act_base = [&](size_t slot) -> sycl::half * {
                 return batched_acts + pack.slot_base_row[slot] * static_cast<size_t>(ne10);
             };
@@ -100917,8 +100918,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 }
             }
 
-            // Fallback: this dispatch exceeded the batched repack's slot capacity (see GGML_SYCL_MXFP4_WOQ_
-            // REPACK_MAX_SLOTS above) -- repack each slot individually, exactly as before llama.cpp-1lon.
+            // Fallback: this dispatch exceeded the batched repack's slot capacity (see
+            // GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS above) -- repack each slot individually, exactly as before
+            // llama.cpp-1lon.
             if (pp_woq_arm && !woq_repack_batched) {
                 for (size_t slot = 0; slot < active_experts.size(); ++slot) {
                     const pp_onednn_batched_expert & expert     = active_experts[slot];
@@ -101084,11 +101086,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // hangs/aborts without explicit event chaining, a host wait right
             // after the GEMM cures it, sync-only-first-dispatch does not). Fix
             // with explicit events instead of a host wait: capture a barrier
-            // over everything queued so far (the activation copies above and
+            // over everything queued so far (the one gather launch above and
             // the phase's per-expert dequant) as each phase's GEMM input
             // dependency, then barrier again on every GEMM's own completion
             // event so every later submission on this in-order queue -- the
-            // dst-scatter loop and the done marker -- observes it.
+            // one scatter launch and the done marker -- observes it.
             std::vector<sycl::event> gemm_events;
             gemm_events.reserve(gemm_groups.size() + phases.size());
             // llama.cpp-6405 fix cycle (F1, BLOCKING -- confirmed on hardware:

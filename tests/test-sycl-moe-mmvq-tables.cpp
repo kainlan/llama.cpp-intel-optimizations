@@ -608,18 +608,12 @@ int main() {
     // 9b. Post-claim causes warn at default verbosity; prechecks stay behind the trace knob. The list is written out
     //     here rather than read from the header, so a cause moved across the split fails this table.
     const moe_pp_batched_refusal pp_post_claim[] = {
-        moe_pp_batched_refusal::EXPERT_NOT_LOCAL,
-        moe_pp_batched_refusal::EXPERT_LAYOUT,
-        moe_pp_batched_refusal::XMX_TILE_CAPS,
-        moe_pp_batched_refusal::F16_TILED,
-        moe_pp_batched_refusal::NO_DEQUANT,
-        moe_pp_batched_refusal::SCRATCH_SIZE,
-        moe_pp_batched_refusal::SCRATCH_CACHE,
-        moe_pp_batched_refusal::SCRATCH_RESERVE,
-        moe_pp_batched_refusal::SCRATCH_SLOT,
-        moe_pp_batched_refusal::SCRATCH_SLOT_SIZE,
-        moe_pp_batched_refusal::PACKED_ROW_STAGING,
-        moe_pp_batched_refusal::GEMM,
+        moe_pp_batched_refusal::EXPERT_NOT_LOCAL,   moe_pp_batched_refusal::EXPERT_LAYOUT,
+        moe_pp_batched_refusal::XMX_TILE_CAPS,      moe_pp_batched_refusal::F16_TILED,
+        moe_pp_batched_refusal::NO_DEQUANT,         moe_pp_batched_refusal::SCRATCH_SIZE,
+        moe_pp_batched_refusal::SCRATCH_CACHE,      moe_pp_batched_refusal::SCRATCH_RESERVE,
+        moe_pp_batched_refusal::SCRATCH_SLOT,       moe_pp_batched_refusal::SCRATCH_SLOT_SIZE,
+        moe_pp_batched_refusal::PACKED_ROW_STAGING, moe_pp_batched_refusal::GEMM,
     };
     for (int r = 0; r <= pp_refusal_count; ++r) {
         const moe_pp_batched_refusal refusal = static_cast<moe_pp_batched_refusal>(r);

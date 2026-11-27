@@ -1152,7 +1152,8 @@ the `GGML_SYCL_MXFP4_PP_PROFILE` gate and print once per eval, same as
 **HOST** — the original six phases inside the batched-executor loop itself:
 `readback` (device→host ids readback), `ptrtable` (expert pointer table
 build/upload), `routeresolve` (per-expert route resolution inside the
-dispatch loop), `grouping` (expert grouping for the batched kernel calls),
+dispatch loop), `grouping` (expert grouping for the batched kernel calls,
+and the packed-row table build, linear in the node's routed rows),
 `repackstage` (repack-kernel staging), `submission` (kernel submission
 itself).
 
