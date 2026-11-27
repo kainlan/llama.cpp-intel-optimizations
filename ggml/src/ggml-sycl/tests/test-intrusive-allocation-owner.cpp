@@ -571,6 +571,208 @@ void promotion_cleanup_retry_visits_all_snapshot_rows() {
                  "PASS promotion-cleanup-refusal-fairness\n";
 }
 
+void check_rows_scanned(size_t expected, const char * message) {
+    const size_t scanned = allocation_registry_test_rows_scanned();
+    if (scanned != expected) {
+        std::cerr << "registry rows visited: " << scanned << ", expected " << expected << '\n';
+    }
+    check(scanned == expected, message);
+}
+
+// The deferred-free pass asks the promotion-cleanup questions on every backend synchronize: is a row on this device
+// still waiting for its cleanup, and release the ones that are. Their cost follows the rows waiting, not the registry:
+// with none waiting neither question reads a row, and with one waiting among idle rows each reads that row alone.
+void promotion_cleanup_questions_visit_only_pending_rows() {
+    fake_release_backend        backend;
+    const size_t                baseline_rows = allocation_registry_test_size();
+    std::vector<alloc_metadata> idle;
+    for (uint64_t id = 100; id < 108; ++id) {
+        idle.push_back(metadata(id));
+        check(allocation_registry_test_publish(idle.back(), false), "idle row publication failed");
+    }
+    const int device = idle.front().device;
+
+    allocation_registry_test_reset_rows_scanned();
+    check(!allocation_registry_test_has_promotion_cleanup_pending(device), "an idle registry reported a pending row");
+    check(allocation_registry_test_process_promotion_retries(device) == 0, "a retry with no pending row released one");
+    check_rows_scanned(0, "with no row pending, the promotion-cleanup questions visited registry rows");
+
+    // The control: one leased row whose promotion was refused waits among the idle ones.
+    const alloc_metadata pending = metadata(108);
+    check(allocation_registry_test_publish(pending, false), "pending row publication failed");
+    check(allocation_registry_test_acquire_exact_lease(pending), "pending row lease acquisition failed");
+    auto coordinator = std::make_shared<allocation_release_coordinator>(device, release_fake, &backend);
+    allocation_owner_test_fail_next_control_allocations(1);
+    check(allocation_registry_test_promote(pending, coordinator).error == allocation_error::RELEASE_RETAINED,
+          "the leased row's refused promotion did not leave it pending");
+    check(allocation_registry_test_cleanup_pending(pending.ptr), "the refused promotion did not mark its row pending");
+
+    allocation_registry_test_reset_rows_scanned();
+    check(allocation_registry_test_has_promotion_cleanup_pending(device), "the pending row was not reported");
+    check(allocation_registry_test_process_promotion_retries(device) == 0, "a retry released a leased row");
+    check(allocation_registry_test_cleanup_pending(pending.ptr), "a refused retry dropped the row's pending cleanup");
+    // 2: has_pending reads the pending row once, and the retry reads it once more.
+    check_rows_scanned(2, "the promotion-cleanup questions visited rows other than the one pending");
+    check(allocation_registry_test_index_consistent(), "the registry counters disagree with a recount");
+
+    check(allocation_registry_test_release_exact_lease(pending), "pending row lease release failed");
+    check(allocation_registry_test_process_promotion_retries(device) == 1, "the unleased pending row was not released");
+    check(!allocation_registry_test_contains(pending.ptr), "the released pending row is still registered");
+
+    allocation_registry_test_reset_rows_scanned();
+    check(!allocation_registry_test_has_promotion_cleanup_pending(device), "a released row is still reported pending");
+    check(allocation_registry_test_process_promotion_retries(device) == 0, "a second retry released another row");
+    check_rows_scanned(0, "after the pending row's release the promotion-cleanup questions still visit rows");
+
+    for (const alloc_metadata & row : idle) {
+        allocation_registry_test_erase(row.ptr);
+    }
+    check(allocation_registry_test_index_consistent(), "the registry counters disagree with a recount at the end");
+    check(allocation_registry_test_size() == baseline_rows, "the idle rows leaked");
+    check(coordinator->live_controls() == 0, "the refused promotion changed the coordinator census");
+    std::cout << "PASS promotion-cleanup-questions-visit-no-row-when-none-pending\n"
+                 "PASS promotion-cleanup-questions-visit-only-the-pending-row\n";
+}
+
+// The row flag, not the set of pending rows, is the durable cleanup state. When the set cannot take a row's key (an
+// allocation failure), the next cleanup pass walks the registry once, puts the key back, and releases the row; the set
+// is complete again afterwards.
+void promotion_cleanup_index_insert_failure_is_recovered() {
+    fake_release_backend backend;
+    const size_t         baseline_rows = allocation_registry_test_size();
+    const alloc_metadata exact         = metadata(110);
+    check(allocation_registry_test_publish(exact, false), "index-failure row publication failed");
+    check(allocation_registry_test_acquire_exact_lease(exact), "index-failure row lease acquisition failed");
+    auto coordinator = std::make_shared<allocation_release_coordinator>(exact.device, release_fake, &backend);
+
+    check(!allocation_registry_test_promotion_index_incomplete(), "the pending-row set starts incomplete");
+    allocation_registry_test_fail_promotion_index_insert_at(1);
+    allocation_owner_test_fail_next_control_allocations(1);
+    check(allocation_registry_test_promote(exact, coordinator).error == allocation_error::RELEASE_RETAINED,
+          "the leased row's refused promotion did not leave it pending");
+    check(allocation_registry_test_cleanup_pending(exact.ptr), "a failed index insert lost the row's pending flag");
+    check(allocation_registry_test_promotion_index_incomplete(),
+          "the failed index insert did not mark the pending-row set incomplete");
+
+    check(allocation_registry_test_release_exact_lease(exact), "index-failure row lease release failed");
+    check(allocation_registry_test_process_promotion_retries(exact.device) == 1,
+          "the pass after a failed index insert did not release the pending row");
+    check(!allocation_registry_test_contains(exact.ptr) && allocation_registry_test_size() == baseline_rows,
+          "the released row is still registered");
+    check(!allocation_registry_test_promotion_index_incomplete(), "the pass did not rebuild the pending-row set");
+    check(allocation_registry_test_index_consistent(), "the rebuilt pending-row set disagrees with a recount");
+
+    allocation_registry_test_reset_rows_scanned();
+    check(!allocation_registry_test_has_promotion_cleanup_pending(exact.device), "a released row is still pending");
+    check_rows_scanned(0, "after the rebuild the promotion-cleanup questions still visit rows");
+    check(coordinator->live_controls() == 0, "the index-failure promotion changed the coordinator census");
+    std::cout << "PASS promotion-cleanup-index-insert-failure-is-recovered\n";
+}
+
+// The rebuild can fail too, partway through the registry. While it does, the cleanup questions must not take the
+// incomplete set at its word: has_pending answers true (the cache teardown trusts a false), and the retry releases
+// nothing, rather than release only the rows the set happens to hold. The set stays incomplete, and the first pass
+// whose rebuild succeeds releases every pending row.
+void promotion_cleanup_index_rebuild_failure_answers_pending() {
+    fake_release_backend backend;
+    const size_t         baseline_rows = allocation_registry_test_size();
+    const alloc_metadata first         = metadata(111);
+    const alloc_metadata second        = metadata(112);
+    auto coordinator = std::make_shared<allocation_release_coordinator>(first.device, release_fake, &backend);
+    for (const alloc_metadata & row : { first, second }) {
+        check(allocation_registry_test_publish(row, false), "rebuild-failure row publication failed");
+        check(allocation_registry_test_acquire_exact_lease(row), "rebuild-failure row lease acquisition failed");
+        // Neither row's key reaches the set: each promotion's insert fails.
+        allocation_registry_test_fail_promotion_index_insert_at(1);
+        allocation_owner_test_fail_next_control_allocations(1);
+        check(allocation_registry_test_promote(row, coordinator).error == allocation_error::RELEASE_RETAINED,
+              "the leased row's refused promotion did not leave it pending");
+        check(allocation_registry_test_cleanup_pending(row.ptr), "a failed index insert lost the row's pending flag");
+    }
+    for (const alloc_metadata & row : { first, second }) {
+        check(allocation_registry_test_release_exact_lease(row), "rebuild-failure row lease release failed");
+    }
+    check(allocation_registry_test_promotion_index_incomplete(), "the failed inserts left the set complete");
+
+    // The rebuild's first insert fails, so the set holds no key: only the failure itself can answer true.
+    allocation_registry_test_fail_promotion_index_insert_at(1);
+    check(allocation_registry_test_has_promotion_cleanup_pending(first.device),
+          "with the rebuild failing, has_pending answered false for two pending rows");
+    check(allocation_registry_test_promotion_index_incomplete(), "a failed rebuild marked the set complete");
+
+    // The rebuild puts one key back, then its second insert fails: two releasable rows, and the retry releases none.
+    allocation_registry_test_fail_promotion_index_insert_at(2);
+    check(allocation_registry_test_process_promotion_retries(first.device) == 0,
+          "a retry whose rebuild failed partway released rows");
+    check(allocation_registry_test_cleanup_pending(first.ptr) && allocation_registry_test_cleanup_pending(second.ptr),
+          "a retry whose rebuild failed dropped a row's pending cleanup");
+    check(allocation_registry_test_promotion_index_incomplete(), "a partial rebuild marked the set complete");
+
+    check(allocation_registry_test_process_promotion_retries(first.device) == 2,
+          "the pass whose rebuild succeeded did not release both pending rows");
+    check(!allocation_registry_test_contains(first.ptr) && !allocation_registry_test_contains(second.ptr) &&
+              allocation_registry_test_size() == baseline_rows,
+          "a released row is still registered");
+    check(!allocation_registry_test_promotion_index_incomplete(), "the successful rebuild left the set incomplete");
+    check(allocation_registry_test_index_consistent(), "the rebuilt pending-row set disagrees with a recount");
+
+    allocation_registry_test_reset_rows_scanned();
+    check(!allocation_registry_test_has_promotion_cleanup_pending(first.device), "a released row is still pending");
+    check_rows_scanned(0, "after the rebuild the promotion-cleanup questions still visit rows");
+    check(coordinator->live_controls() == 0, "the rebuild-failure promotions changed the coordinator census");
+    std::cout << "PASS promotion-cleanup-index-rebuild-failure-answers-pending\n";
+}
+
+// A retry that meets a pending row another claimant holds (RELEASING) is BUSY: the row stays pending through it and
+// through the claimant's rollback, and the next retry after the lease goes releases it.
+void busy_pending_row_stays_pending_through_a_retry() {
+    fake_release_backend backend;
+    const size_t         baseline_rows = allocation_registry_test_size();
+    const alloc_metadata exact         = metadata(109);
+    check(allocation_registry_test_publish(exact, false), "busy-row publication failed");
+    check(allocation_registry_test_acquire_exact_lease(exact), "busy-row lease acquisition failed");
+    auto coordinator = std::make_shared<allocation_release_coordinator>(exact.device, release_fake, &backend);
+
+    allocation_registry_test_pause_claim(true);
+    registered_release_status claimant = registered_release_status::NOT_FOUND;
+    std::thread t1([&] { claimant = allocation_registry_test_release_exact(exact, registered_release_mode::LEGACY); });
+    while (!allocation_registry_test_claim_reached()) {
+        std::this_thread::yield();
+    }
+
+    allocation_owner_test_fail_next_control_allocations(1);
+    check(allocation_registry_test_promote(exact, coordinator).error == allocation_error::RELEASE_RETAINED,
+          "promotion against the in-flight claim did not hand off its cleanup");
+    check(allocation_registry_test_cleanup_pending(exact.ptr), "the in-flight row was not marked pending");
+    check(allocation_registry_test_has_promotion_cleanup_pending(exact.device),
+          "the in-flight pending row was not reported");
+    // The control: the row is held RELEASING, so a release of it now answers BUSY, not a lease refusal.
+    check(allocation_registry_test_release_exact(exact, registered_release_mode::LEGACY) ==
+              registered_release_status::BUSY,
+          "a release during the paused claim did not answer BUSY");
+    check(allocation_registry_test_process_promotion_retries(exact.device) == 0,
+          "a retry released a row another claimant holds");
+    check(allocation_registry_test_cleanup_pending(exact.ptr), "a BUSY retry dropped the row's pending cleanup");
+
+    allocation_registry_test_pause_claim(false);
+    t1.join();
+    check(claimant == registered_release_status::LEASE_REFUSED, "the paused claimant did not roll back");
+    check(allocation_registry_test_cleanup_pending(exact.ptr) &&
+              allocation_registry_test_has_promotion_cleanup_pending(exact.device),
+          "the claimant's rollback lost the pending cleanup");
+
+    check(allocation_registry_test_release_exact_lease(exact), "busy-row lease release failed");
+    check(allocation_registry_test_process_promotion_retries(exact.device) == 1,
+          "the retry after the lease went did not release the row");
+    check(!allocation_registry_test_contains(exact.ptr) && allocation_registry_test_size() == baseline_rows,
+          "the released busy row is still registered");
+    check(!allocation_registry_test_has_promotion_cleanup_pending(exact.device),
+          "the released busy row is still reported pending");
+    check(allocation_registry_test_index_consistent(), "the registry counters disagree with a recount");
+    check(coordinator->live_controls() == 0, "the busy-row promotion changed the coordinator census");
+    std::cout << "PASS busy-pending-row-stays-pending-through-a-retry\n";
+}
+
 void invalid_request_has_zero_coordinator_census() {
     const size_t before = allocation_coordinator_test_count();
     alloc_request invalid{};
@@ -760,6 +962,10 @@ int main() {
     stale_releasing_row_claim_survives_releaser_rollback();
     live_row_at_the_address_is_still_refused();
     promotion_cleanup_retry_visits_all_snapshot_rows();
+    promotion_cleanup_questions_visit_only_pending_rows();
+    busy_pending_row_stays_pending_through_a_retry();
+    promotion_cleanup_index_insert_failure_is_recovered();
+    promotion_cleanup_index_rebuild_failure_answers_pending();
     invalid_request_has_zero_coordinator_census();
     owner_use_count_has_no_owner_zero();
     owner_use_count_counts_every_reference_exactly();

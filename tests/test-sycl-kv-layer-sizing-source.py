@@ -1904,7 +1904,7 @@ def optional_layout_release_violations(sycl_cpp: str, cache_cpp: str) -> list[st
 
     body = strip_comments(function(cache_cpp, YIELD_SIGNATURE) + function(cache_cpp, YIELD_FINISH_SIGNATURE) +
                           function(cache_cpp, YIELD_FINISH_RELEASE_SIGNATURE))
-    retire = body.find("transition_to_retired_locked(entry);")
+    retire = body.find("transition_to_retired_locked(pick.key, entry);")
     gate = body.find("entry.last_write_event = release.readers_done;")
     barrier = body.find("release.readers_done = submit_barrier_all();")
     if min(retire, gate, barrier) < 0 or not barrier < gate < retire:
