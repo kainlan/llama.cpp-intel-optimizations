@@ -7,8 +7,9 @@
 // kernel writes that slot; a token whose picks repeat an expert gives that expert one row per pick; and, for picks that
 // are distinct experts (what MUL_MAT_ID routing gives), the packed total stays within the ring's planned rows
 // (pp_moe_onednn_packed_rows_at) and the distinct GEMM widths, which the oneDNN primitive cache is keyed on, stay at
-// most ceil(n_tokens / align): at a 512-token micro-batch at most 8 per expert shape over every node, so at most 16
-// primitives for Inkling's two shapes. Repeated picks can exceed that width bound, and one case shows it.
+// most ceil(n_tokens / align): at a 512-token micro-batch at most 8 over every node, one primitive per width and expert
+// shape, so at most 2 x 8 = 16 primitives for Inkling's two shapes. Repeated picks can exceed that width bound, and one
+// case shows it.
 
 #include "moe-bf16-grouped-plan.hpp"
 #include "moe-scratch-admission.hpp"
@@ -354,22 +355,14 @@ static void test_unselected_experts() {
 }
 
 // The primitive cache bound, for distinct picks: at every token count up to a 512-token micro-batch, uniform and fully
-// skewed routing, a node's distinct widths stay at most ceil(n_tokens / align). The cache is keyed on the shape and the
-// width, and a layer's gate_up and down nodes route the same ids, so over every node the primitives are the (shape,
-// width) pairs the two shapes' plans give: at most 8 widths per shape, 16 primitives in all.
+// skewed routing, a node's distinct widths stay at most ceil(n_tokens / align), and the union of the widths over every
+// node stays at most ceil(512 / align) = 8. The cache is keyed on the shape and the width, and a layer's gate_up and
+// down nodes route the same ids, so each width gives one primitive per Inkling expert shape: the primitive bound 16 is
+// 2 x 8.
 static void test_gemm_width_bound() {
-    constexpr int64_t                    k_gate_up_m = 4608;  // the two Inkling expert shapes' output widths (m)
-    constexpr int64_t                    k_down_m    = 2304;
-    std::set<std::pair<int64_t, size_t>> primitives;
-    const auto                           key_widths = [&](const moe_bf16_grouped_plan & p) {
-        for (const int64_t m : { k_gate_up_m, k_down_m }) {
-            for (const size_t width : p.gemm_widths) {
-                primitives.insert({ m, width });
-            }
-        }
-    };
-    std::mt19937 rng(99);
-    bool         ok = true;
+    std::set<size_t> widths;  // the union of every node's GEMM widths
+    std::mt19937     rng(99);
+    bool             ok = true;
     for (size_t n_tokens = 1; n_tokens <= 512; ++n_tokens) {
         const size_t                       bound   = ceil_div(n_tokens, moe_bf16_grouped_row_align);
         // Uniform top-8 of 128.
@@ -378,7 +371,7 @@ static void test_gemm_width_bound() {
         const moe_bf16_grouped_plan_status uniform_status =
             moe_bf16_grouped_plan_build(uniform.data(), n_tokens, 8, 128, &plan);
         ok = ok && uniform_status == moe_bf16_grouped_plan_status::OK && plan.gemm_widths.size() <= bound;
-        key_widths(plan);
+        widths.insert(plan.gemm_widths.begin(), plan.gemm_widths.end());
         // Skewed: slot s of every token goes to expert s, so eight experts hold every row.
         std::vector<int32_t> skewed(n_tokens * 8);
         for (size_t t = 0; t < n_tokens; ++t) {
@@ -391,18 +384,12 @@ static void test_gemm_width_bound() {
             moe_bf16_grouped_plan_build(skewed.data(), n_tokens, 8, 128, &skew_plan);
         ok = ok && skew_status == moe_bf16_grouped_plan_status::OK && skew_plan.gemm_widths.size() <= bound &&
              well_formed(skewed, n_tokens, 8, 128, skew_plan);
-        key_widths(skew_plan);
+        widths.insert(skew_plan.gemm_widths.begin(), skew_plan.gemm_widths.end());
     }
     check(ok, "every token count up to 512, distinct picks: at most ceil(n_tokens / align) GEMM widths");
-    const size_t per_shape = ceil_div(512, moe_bf16_grouped_row_align);
-    size_t       gate_up = 0, down = 0;
-    for (const auto & key : primitives) {
-        gate_up += key.first == k_gate_up_m ? 1 : 0;
-        down += key.first == k_down_m ? 1 : 0;
-    }
-    check(per_shape == 8 && gate_up <= per_shape && down <= per_shape,
-          "over every node up to 512 tokens: at most ceil(512 / align) = 8 GEMM widths per shape");
-    check(gate_up + down <= 16, "over every node up to 512 tokens: at most 16 primitives over Inkling's two shapes");
+    const size_t union_bound = ceil_div(512, moe_bf16_grouped_row_align);
+    check(union_bound == 8 && widths.size() <= union_bound,
+          "over every node up to 512 tokens: at most ceil(512 / align) = 8 GEMM widths in all");
 }
 
 int main() {
