@@ -2,6 +2,7 @@
 // and the per-token count GGML_SYCL_MOE_HYBRID_RECORD_TRACE prints. ggml-sycl/moe-hybrid-record.hpp and the weight's
 // change log it reads (ggml-sycl/moe-storage-change-log.hpp) are SYCL-free, so these run without a device and link
 // nothing.
+#include "ggml-sycl/cow-chunked-vector.hpp"
 #include "ggml-sycl/moe-hybrid-record.hpp"
 #include "ggml-sycl/moe-storage-change-log.hpp"
 
@@ -562,6 +563,87 @@ static int test_withdraw_slot() {
     return 0;
 }
 
+// The record keeps its leases in chunks shared between a record and the copies a patch or a drop publishes, so a copy
+// that writes one slot clones that slot's chunk and shares the rest with the held record.
+using chunked_leases = ggml_sycl::cow_chunked_vector<fake_lease, ggml_sycl::moe_hybrid_record_lease_chunk>;
+
+static chunked_leases chunked_leases_of(size_t n) {
+    chunked_leases out;
+    for (size_t e = 0; e < n; ++e) {
+        out.push_back(lease_of(static_cast<int>(e)));
+    }
+    return out;
+}
+
+static int test_lease_chunks_shared() {
+    constexpr size_t          chunk = ggml_sycl::moe_hybrid_record_lease_chunk;
+    constexpr size_t          n_as  = 3 * chunk;  // three chunks
+    std::vector<int>          w(n_as + 1);
+    std::vector<const void *> device_weight(n_as, nullptr);
+    std::vector<const void *> host_weight(n_as, nullptr);
+    for (size_t e = 0; e < n_as; ++e) {
+        device_weight[e] = &w[e];
+    }
+    const chunked_leases held = chunked_leases_of(n_as);  // the published record's leases: never written
+    const auto           kept = [&](const chunked_leases & copy) {
+        return copy.chunks_cloned() == 1 && copy.shared_chunks_with(held) == 2;
+    };
+
+    // A patch moves the last expert (third chunk) to the host.
+    {
+        chunked_leases            copy = held;
+        std::vector<const void *> dw = device_weight, hw = host_weight;
+        std::vector<fake_slot>    fresh(1);
+        fresh[0].host_weight = &w[n_as];
+        fresh[0].lease       = lease_of(100);
+        std::vector<fake_lease> replaced;
+        CHECK(ggml_sycl::moe_hybrid_record_install(dw, hw, copy, { static_cast<int32_t>(n_as - 1) }, fresh, &replaced),
+              "the patch installs the moved expert's slot in the chunked leases");
+        CHECK(kept(copy), "the patch clones the moved slot's chunk alone and shares the other two");
+        CHECK(replaced.size() == 1 && replaced[0].storage == held[n_as - 1].storage &&
+                  *std::as_const(copy)[n_as - 1].storage == 100,
+              "the replaced lease is retained, the held record still holds it, and the copy holds the new one");
+        const ggml_sycl::moe_hybrid_record_shape s = ggml_sycl::moe_hybrid_record_shape_of(dw, hw, copy);
+        CHECK(s.n_device == n_as - 1 && s.n_host == 1 && s.n_empty == 0 && copy.chunks_cloned() == 1,
+              "reading the copy's shape clones nothing");
+    }
+    // A drop empties expert 3's slot (first chunk) directly.
+    {
+        chunked_leases            copy = held;
+        std::vector<const void *> dw = device_weight, hw = host_weight;
+        std::vector<fake_lease>   retained;
+        std::vector<int32_t>      emptied;
+        CHECK(ggml_sycl::moe_hybrid_record_withdraw_slot(dw, hw, copy, 3, &retained, &emptied),
+              "the slot withdraw empties the slot in the chunked leases");
+        CHECK(kept(copy), "the slot withdraw clones that slot's chunk alone");
+        CHECK(held[3].valid() && !std::as_const(copy)[3].valid(), "the held record keeps the lease the copy dropped");
+    }
+    // A drop that walks every slot finds expert chunk + 1 (second chunk).
+    {
+        chunked_leases            copy = held;
+        std::vector<const void *> dw = device_weight, hw = host_weight;
+        const int *               retired  = held[chunk + 1].storage.get();
+        const auto                on_entry = [retired](const fake_lease & l) {
+            return l.storage.get() == retired;
+        };
+        std::vector<fake_lease> retained;
+        std::vector<int32_t>    emptied;
+        CHECK(ggml_sycl::moe_hybrid_record_withdraw(dw, hw, copy, on_entry, &retained, &emptied) == 1 &&
+                  emptied == std::vector<int32_t>({ static_cast<int32_t>(chunk + 1) }),
+              "the walk empties the one slot that leases the retired entry");
+        CHECK(kept(copy), "the walk reads every slot but clones only the emptied slot's chunk");
+
+        chunked_leases untouched = held;
+        const auto     no_entry  = [](const fake_lease &) {
+            return false;
+        };
+        CHECK(ggml_sycl::moe_hybrid_record_withdraw(dw, hw, untouched, no_entry, &retained, &emptied) == 0 &&
+                  untouched.chunks_cloned() == 0 && untouched.shared_chunks_with(held) == 3,
+              "a walk that empties nothing clones nothing");
+    }
+    return 0;
+}
+
 // The per-token counts of what the patches did, and of the slots loans and evicts had withdrawn from the records the
 // lookups replaced: the one sign on a device that a drop matched a record slot by the entry it retired.
 static int test_trace_patches() {
@@ -581,7 +663,8 @@ static int test_trace_patches() {
 int main() {
     if (test_miss_classify() != 0 || test_trace_tokens() != 0 || test_trace_line() != 0 || test_change_log() != 0 ||
         test_patch_plan() != 0 || test_install() != 0 || test_shape() != 0 || test_plan_frame() != 0 ||
-        test_withdraw() != 0 || test_withdraw_slot() != 0 || test_trace_patches() != 0) {
+        test_withdraw() != 0 || test_withdraw_slot() != 0 || test_lease_chunks_shared() != 0 ||
+        test_trace_patches() != 0) {
         return 1;
     }
     std::printf("OK: moe hybrid decode record bookkeeping\n");

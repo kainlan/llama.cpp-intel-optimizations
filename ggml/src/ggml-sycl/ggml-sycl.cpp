@@ -105,6 +105,7 @@
 #include "ggml-sycl/compute-refusal-advice.hpp"
 #include "ggml-sycl/context-tenant-measure.hpp"
 #include "ggml-sycl/convert.hpp"
+#include "ggml-sycl/cow-chunked-vector.hpp"
 #include "ggml-sycl/cpy.hpp"
 #include "ggml-sycl/dispatch-tuning.hpp"
 #include "ggml-sycl/dsv4-hc.hpp"
@@ -91633,7 +91634,10 @@ struct moe_hybrid_decode_record {
     ggml_sycl::mem_handle              table;             // host-pinned: n_as device weight pointers, by expert id
     std::vector<const void *>          device_weight;     // expert e's device weight, nullptr for a host expert
     std::vector<const void *>          host_weight;       // expert e's host weight, nullptr for a device expert
-    std::vector<ggml_sycl::mem_handle> lease;             // every expert's route lease
+    // Every expert's route lease, by expert id. Chunked copy-on-write: the copy a patch or a drop publishes shares
+    // with this record the chunks of the slots it does not write (moe_hybrid_record_lease_chunk says why they are
+    // small).
+    ggml_sycl::cow_chunked_vector<ggml_sycl::mem_handle, ggml_sycl::moe_hybrid_record_lease_chunk> lease;
     sycl::event                        ready;             // one barrier over the leases' producer events
     bool                               has_ready = false;
     // Slots an expert loan or evict emptied (ggml_sycl_moe_hybrid_decode_record_withdraw). Its table still names the

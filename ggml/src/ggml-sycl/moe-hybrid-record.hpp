@@ -129,17 +129,31 @@ template <typename Lease> struct moe_hybrid_record_slot {
     Lease        lease;
 };
 
+// The record's leases are a copy-on-write chunked vector (cow-chunked-vector.hpp) of this many slots a chunk. A patch
+// or a drop publishes a copy of the held record that writes a slot or a few; the copy shares every chunk it does not
+// write, so it pays one shared pointer per chunk plus a whole chunk of lease copies per chunk it writes, where a plain
+// vector paid a lease copy per expert. A lease copy is the costly part (a mem_handle copy takes the handle's lock and
+// copies its owners), so the chunk is small: 8 slots keeps a 32-expert record at four chunks and a 512-expert one at
+// 64 pointer copies.
+//
+// The helpers below take the leases as any random-access container of leases (a std::vector in the host test, the
+// chunked vector in the backend). A non-const index clones the chunk it lands in, so a slot a helper only reads is
+// read through a const view: the walk reads every slot so and writes only those it empties, the slot withdraw reads
+// its slot so and writes it only when it holds a lease, and shape_of and slot_matches take the leases const. Install
+// writes every slot it names.
+inline constexpr size_t moe_hybrid_record_lease_chunk = 8;
+
 // Installs fresh[i] as the slot of expert changed[i] in a record's slot arrays and moves each lease it replaces into
 // *replaced, in slot order, for the caller to keep until the queue passes the record the patch publishes. Every other
 // slot and lease stays as it was. Returns false, having changed nothing, when an id is outside the record or `fresh`
 // does not pair with `changed`.
-template <typename Lease>
-bool moe_hybrid_record_install(std::vector<const void *> &                  device_weight,
-                               std::vector<const void *> &                  host_weight,
-                               std::vector<Lease> &                         lease,
-                               const std::vector<int32_t> &                 changed,
-                               std::vector<moe_hybrid_record_slot<Lease>> & fresh,
-                               std::vector<Lease> *                         replaced) {
+template <typename Leases>
+bool moe_hybrid_record_install(std::vector<const void *> &                                        device_weight,
+                               std::vector<const void *> &                                        host_weight,
+                               Leases &                                                           lease,
+                               const std::vector<int32_t> &                                       changed,
+                               std::vector<moe_hybrid_record_slot<typename Leases::value_type>> & fresh,
+                               std::vector<typename Leases::value_type> *                         replaced) {
     const size_t n_as = lease.size();
     if (fresh.size() != changed.size() || device_weight.size() != n_as || host_weight.size() != n_as) {
         return false;
@@ -165,20 +179,21 @@ bool moe_hybrid_record_install(std::vector<const void *> &                  devi
 // evict retired): its weights and its lease. Moves each emptied slot's lease into *withdrawn, for the caller to keep
 // until the queue passes, and appends its expert id to *experts, in id order. Every other slot and lease stays.
 // Returns how many slots it emptied.
-template <typename Lease, typename Match>
-size_t moe_hybrid_record_withdraw(std::vector<const void *> & device_weight,
-                                  std::vector<const void *> & host_weight,
-                                  std::vector<Lease> &        lease,
-                                  const Match &               matches,
-                                  std::vector<Lease> *        withdrawn,
-                                  std::vector<int32_t> *      experts) {
-    size_t emptied = 0;
+template <typename Leases, typename Match>
+size_t moe_hybrid_record_withdraw(std::vector<const void *> &                device_weight,
+                                  std::vector<const void *> &                host_weight,
+                                  Leases &                                   lease,
+                                  const Match &                              matches,
+                                  std::vector<typename Leases::value_type> * withdrawn,
+                                  std::vector<int32_t> *                     experts) {
+    size_t         emptied = 0;
+    const Leases & held    = lease;  // a slot the walk only reads must not clone its chunk
     for (size_t e = 0; e < lease.size(); ++e) {
-        if (!lease[e].valid() || !matches(lease[e])) {
+        if (!held[e].valid() || !matches(held[e])) {
             continue;
         }
         withdrawn->push_back(std::move(lease[e]));
-        lease[e] = Lease{};
+        lease[e] = typename Leases::value_type{};
         if (e < device_weight.size()) {
             device_weight[e] = nullptr;
         }
@@ -240,10 +255,10 @@ struct moe_hybrid_record_shape {
     const void * substitute = nullptr;  // the first device slot's weight: what a host slot's table entry names
 };
 
-template <typename Lease>
+template <typename Leases>
 moe_hybrid_record_shape moe_hybrid_record_shape_of(const std::vector<const void *> & device_weight,
                                                    const std::vector<const void *> & host_weight,
-                                                   const std::vector<Lease> &        lease) {
+                                                   const Leases &                    lease) {
     moe_hybrid_record_shape s;
     if (device_weight.size() != lease.size() || host_weight.size() != lease.size()) {
         s.n_empty = lease.size() + 1;

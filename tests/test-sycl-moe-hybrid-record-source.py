@@ -72,6 +72,12 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
       do;
   T14 a build that replaces the held record retains the replaced record's handles to a barrier on the queue before
       it replaces or drops it, as a published patch retains what it replaced.
+  T15 the record keeps its leases in a copy-on-write chunked vector of moe_hybrid_record_lease_chunk slots a chunk
+      (the header names the chunk), so the copy a patch (T10) or a drop (T12) publishes shares the held record's lease
+      chunks and clones only those of the slots it writes. The header's walk and slot withdraw read a slot through a
+      const view and write it only when they empty it; shape_of and slot_matches take the leases const. The backend
+      names a copy's leases (copy->lease, patched->lease) only as an argument to those helpers, since any other use
+      (an iteration, an index) of a writable copy would clone chunks no slot write asked for.
 
 Checks run on comment-blanked text (string literals kept). NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and a mutant aimed at one of a pin's several rules
@@ -343,6 +349,21 @@ WITHDRAWN_COUNT = ("if (trace > 0 && held && held->n_withdrawn > 0) { "
 # The replaced record's handles, retained to a barrier, skip a withdrawn slot's empty lease.
 APPEND_SIG = "static void ggml_sycl_moe_hybrid_decode_record_append_handles("
 APPEND_LEASES = "for (const ggml_sycl::mem_handle & h : record.lease) { if (h.valid()) { out.push_back(h); } }"
+# T15: the record's leases share chunks with the copies it is patched or withdrawn into.
+RECORD_STRUCT_SIG = "struct moe_hybrid_decode_record {"
+RECORD_LEASES = "ggml_sycl::cow_chunked_vector<ggml_sycl::mem_handle, ggml_sycl::moe_hybrid_record_lease_chunk> lease;"
+LEASE_CHUNK = "inline constexpr size_t moe_hybrid_record_lease_chunk = "
+WALK_SIG = "size_t moe_hybrid_record_withdraw("
+WALK_READS = ("const Leases & held = lease;", "if (!held[e].valid() || !matches(held[e])) { continue; }")
+SLOT_WITHDRAW_SIG = "bool moe_hybrid_record_withdraw_slot("
+SLOT_WITHDRAW_READ = "if (!std::as_const(lease)[e].valid()) { return false; }"
+CONST_LEASES = ("const std::vector<const void *> & host_weight, const Leases & lease) {",
+                "bool moe_hybrid_record_slot_matches(const Leases & lease, int64_t expert, const Match & matches) {")
+# Each copy's leases are named once per helper call: the drop's slot withdraw and walk, the patch's install and shape.
+COPY_LEASE_USES = (("copy->lease", ("copy->host_weight, copy->lease, expert_id,", "copy->host_weight, copy->lease,"
+                                    " on_entry,")),
+                   ("patched->lease", ("patched->host_weight, patched->lease, changed,",
+                                       "patched->host_weight, patched->lease);")))
 WITHDRAW_STEPS = (
     ("return with no held record", "if (!held) { return false; }"),
     ("test that the moved expert's own slot leases the entry",
@@ -786,6 +807,25 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str, log
         raise ContractError("FAIL [pin T14]: the replaced record's handles are not retained before the build replaces "
                             "it, so a table copy or kernel still on the queue could read storage the cache reused")
 
+    # T15: the record's leases are chunked copy-on-write, and nothing writable reads a copy's leases.
+    once(body(code, RECORD_STRUCT_SIG, "T15"), RECORD_LEASES, "T15", "the record's chunked leases")
+    once(squash(header), LEASE_CHUNK, "T15", "the header's lease chunk")
+    walk = body(header, WALK_SIG, "T15")
+    if not all(walk.count(r) == 1 for r in WALK_READS):
+        raise ContractError("FAIL [pin T15]: the walk does not read each slot through a const view, so it clones every "
+                            "chunk of the copy it walks")
+    if body(header, SLOT_WITHDRAW_SIG, "T15").count(SLOT_WITHDRAW_READ) != 1:
+        raise ContractError("FAIL [pin T15]: the slot withdraw does not read its slot through a const view, so a slot "
+                            "with no lease still clones its chunk")
+    if not all(squash(header).count(c) == 1 for c in CONST_LEASES):
+        raise ContractError("FAIL [pin T15]: shape_of or slot_matches takes the leases writable, so reading a copy "
+                            "clones its chunks")
+    arrows = squash(arrow_spelling(code))
+    for name, calls in COPY_LEASE_USES:
+        if arrows.count(name) != len(calls) or not all(arrows.count(c) == 1 for c in calls):
+            raise ContractError(f"FAIL [pin T15]: `{name}` is named outside the record helpers' calls, so a writable "
+                                "copy's leases are read or walked where a slot write did not ask for a clone")
+
 
 def self_test(raws: dict[str, str]) -> int:
     failures: list[str] = []
@@ -1211,6 +1251,42 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("docs-row-blames-own-allocations", "T7", D,
                 [("by an expert move on another thread that overlapped the lookup",
                   "by a loan or evict its own allocations set off")])
+
+    record_leases = ("    ggml_sycl::cow_chunked_vector<ggml_sycl::mem_handle, "
+                     "ggml_sycl::moe_hybrid_record_lease_chunk> lease;\n")
+    expect_fail("record-leases-plain-vector", "T15", B,
+                [(record_leases, "    std::vector<ggml_sycl::mem_handle> lease;\n")], says="chunked leases")
+    expect_fail("record-leases-default-chunk", "T15", B,
+                [(record_leases, "    ggml_sycl::cow_chunked_vector<ggml_sycl::mem_handle> lease;\n")],
+                says="chunked leases")
+    expect_fail("lease-chunk-unnamed", "T15", H,
+                [("inline constexpr size_t moe_hybrid_record_lease_chunk = 8;",
+                  "inline constexpr size_t moe_hybrid_record_chunk = 8;")], says="lease chunk")
+    expect_fail("walk-reads-writable", "T15", H,
+                [("        if (!held[e].valid() || !matches(held[e])) {",
+                  "        if (!lease[e].valid() || !matches(lease[e])) {")], says="const view, so it clones every")
+    expect_fail("slot-withdraw-reads-writable", "T15", H,
+                [("    if (!std::as_const(lease)[e].valid()) {", "    if (!lease[e].valid()) {")],
+                says="slot with no lease")
+    expect_fail("shape-of-takes-writable-leases", "T15", H,
+                [("const Leases &                    lease) {", "Leases &                    lease) {")],
+                says="takes the leases writable")
+    expect_fail("slot-matches-takes-writable-leases", "T15", H,
+                [("bool moe_hybrid_record_slot_matches(const Leases & lease,",
+                  "bool moe_hybrid_record_slot_matches(Leases & lease,")], says="takes the leases writable")
+    expect_fail("drop-walks-the-copy", "T15", B,
+                [("    auto copy = std::make_shared<moe_hybrid_decode_record>(*held);\n",
+                  "    auto copy = std::make_shared<moe_hybrid_decode_record>(*held);\n"
+                  "    const auto n_held = std::count_if(copy->lease.begin(), copy->lease.end(), on_entry);\n")],
+                says="`copy->lease`")
+    expect_fail("patch-indexes-the-copy", "T15", B,
+                [("    patched->n_withdrawn = 0;\n",
+                  "    patched->n_withdrawn = 0;\n    (void) patched->lease[0].valid();\n")],
+                says="`patched->lease`")
+    expect_fail("patch-indexes-the-copy-by-deref", "T15", B,
+                [("    patched->n_withdrawn = 0;\n",
+                  "    patched->n_withdrawn = 0;\n    (void) (*patched).lease[0].valid();\n")],
+                says="`patched->lease`")
 
     try:
         mutate(B, [("this anchor is in no source", "x")])
