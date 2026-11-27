@@ -100,7 +100,7 @@ static int test_assign_take_all_and_clear() {
         { -1, 3 },
     };
     b.assign(std::move(v));
-    CHECK(b.size() == 3 && index_matches(b), "assign indexes what it is given");
+    CHECK(b.size() == 3 && index_matches(b), "after assign, the index built on first use names every keyed handle");
     std::vector<fake_handle> all = b.take_all();
     CHECK(all.size() == 3 && b.empty() && b.indexed() == 0, "take_all empties the bag and its index");
     b.push_back({ 4, 4 });
@@ -109,7 +109,7 @@ static int test_assign_take_all_and_clear() {
     return 0;
 }
 
-static int test_remove_if_reindexes() {
+static int test_remove_if_keeps_the_rest_findable() {
     bag b;
     for (int i = 0; i < 8; ++i) {
         b.push_back({ i, i });
@@ -117,7 +117,7 @@ static int test_remove_if_reindexes() {
     const size_t removed = b.remove_if([](const fake_handle & h) { return h.serial % 3 == 0; });
     CHECK(removed == 3, "remove_if removes each match");
     CHECK(serials(b) == std::vector<int>({ 1, 2, 4, 5, 7 }), "remove_if keeps the rest");
-    CHECK(index_matches(b), "remove_if leaves the index whole");
+    CHECK(index_matches(b), "after remove_if, the index built on first use names every kept keyed handle");
     std::vector<fake_handle> out;
     CHECK(b.take_key(4, out) == 1 && out.back().serial == 4, "a key after remove_if is still found");
     return 0;
@@ -234,7 +234,7 @@ int main() {
     int (*const tests[])() = { test_take_key_moves_every_lease_on_the_key,
                                test_take_key_with_the_last_element_on_the_key,
                                test_assign_take_all_and_clear,
-                               test_remove_if_reindexes,
+                               test_remove_if_keeps_the_rest_findable,
                                test_index_is_built_lazily,
                                test_random_operations_match_a_reference };
     for (int (*t)() : tests) {
