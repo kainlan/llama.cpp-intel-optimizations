@@ -7649,24 +7649,27 @@ contracts. The builds and the host tests ran after the lead's "builds GO", and t
 - Host evidence taken under the hold, with nothing compiled:
   - `clang-format-19 --dry-run -Werror` is clean on every C++ hunk of the round: `ggml-sycl.cpp` checked by `--lines`
     over the round's hunks; the device test, `moe-bf16-grouped-plan.hpp` and the plan test checked whole.
-  - Contract results:
+  - The logs of the runs in this list were deleted with the scratch directory, so every count in it is not logged.
+    The review round 3 record below cites saved logs for the reruns that supersede these counts.
+  - Contract results (not logged):
     - `test-sycl-moe-bf16-direct-source.py`: 158 passed.
     - `check-sycl-dnnl-decline-consumers.py`: PASS, 223 mutants killed.
     - The scratch-admission contract: PASS on 37 checks, and its self-test kills its 14 mutants.
     - The inventory: `--output`, `--check` and `--check-classification` all return 0.
     - `test-sycl-static-storage-audit`: PASS (8 tests).
   - The registered Python contracts ran directly at `7bf59a61b4`, four at a time, each by its registration (command,
-    directory, environment, skip code, `WILL_FAIL`). There were 330 selected: 317 passed and 13 failed.
-    - The ten alloc-zone tests failed, which led to `1b34e95659`. With it, all ten pass: the base check (823 debt
-      entries, no new violation), the witnesses (51 checks), and the eight mutation shards (86 cases each, 0 wrong).
+    directory, environment, skip code, `WILL_FAIL`). There were 330 selected: 317 passed and 13 failed (not logged).
+    - The ten alloc-zone tests failed, which led to `1b34e95659`. With it, all ten pass (not logged): the base check
+      (823 debt entries, no new violation), the witnesses (51 checks), and the eight mutation shards (86 cases each,
+      0 wrong).
     - `sycl-private-cpu-traits-source` failed on the round 1 inventory, unchanged.
     - `test-llama-lazy-declaration-source` and `test-llama-lazy-range-record-source` failed. They read only `src/`,
       `common/arg.cpp` and their own files, and none of those changed in `9710996f92..HEAD`, so they fail the same way
       at the range's base. One flags a `deepseek41` tensor with no declaration entry. The other finds no class
       `llm_graph_input_ple` in `qwen4exp.cpp`.
     - After `1b34e95659`, the CMake comment's edit and this record, the 96 selected contracts whose code names
-      CMakeLists, the plan or a glob ran again, the ten alloc-zone tests among them. 94 passed. The two that failed
-      are `sycl-private-cpu-traits-source` and `test-llama-lazy-declaration-source`, as above.
+      CMakeLists, the plan or a glob ran again, the ten alloc-zone tests among them. 94 passed (not logged). The two
+      that failed are `sycl-private-cpu-traits-source` and `test-llama-lazy-declaration-source`, as above.
   - 30 were left out because they run what the hold forbids: a `build/bin` binary, a compiler, bash or `readelf`.
     - The four artifact tests named below.
     - `sycl-cache-backing-token-forgery-compile`, `test-llama-context-cpu-only-compile`,
@@ -7679,22 +7682,24 @@ contracts. The builds and the host tests ran after the lead's "builds GO", and t
   first on `PATH`:
   - `sycl-build.sh` built `ggml-sycl`, `test-moe-bf16-grouped-plan`, `test-moe-scratch-admission`,
     `test-sycl-moe-bf16-grouped-kernel`, `test-sycl-moe-bf16-direct-kernel`, `test-moe-bf16-grouped-device`,
-    `test-moe-pp-staging-refusal` and `test-sycl-staging-replacement-failpoints`. It returned 0.
+    `test-moe-pp-staging-refusal` and `test-sycl-staging-replacement-failpoints`. It returned 0. Log:
+    `/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/tmpdir-t24/build-r2.log`.
     - Both backend objects recompiled: `ggml-sycl.cpp.o` and the Q1 route-test objects' copy.
     - The build added no warning in the arm's lines or in the device test.
     - `test-sycl-bf16-expert-gemm-bench` was not built: it now builds only by name.
     - The cache records `/home/kainlan/miniconda3/bin/python3`. A first launch with the system Python first on
       `PATH` was stopped after a minute and relaunched.
-  - Host tests, through ctest. Each printed its own PASS line, so none of them skipped:
+  - The logs below are in `/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/tmpdir-t24/`.
+  - Host tests, through ctest. Each printed its own PASS line, so none of them skipped (`host-tests-v.log`):
     - `sycl-moe-bf16-grouped-plan`: PASS.
     - `sycl-moe-scratch-admission`: PASS, 13 cases.
     - On `opencl:cpu`: `sycl-moe-bf16-grouped-kernel` and `sycl-moe-bf16-direct-kernel` both PASS.
-  - The artifact tests:
+  - The artifact tests (`artifact-tests.log`):
     - `sycl-unified-private-seams`, `sycl-retained-publication-no-export` and `sycl-staging-failpoint-no-export`
       pass. The last now has its fixture, `test-sycl-staging-replacement-failpoints`.
     - `sycl-private-carrier-linkage` stops at `test-layout-cache`, the one carrier of its 49 this worktree never
-      built. Run on the 48 that exist, it passes all 48.
-  - The four compile contracts left out above:
+      built; the log shows 37 PASS lines before that stop. Run on the 48 that exist, it passed all 48 (not logged).
+  - The four compile contracts left out above (`compile-contracts.log`):
     - `sycl-cache-backing-token-forgery-compile`, `test-sycl-kv-layer-sizing-source` and
       `test-sycl-lifecycle-public-wrappers` pass.
     - `test-llama-context-cpu-only-compile` fails: `src/llama-context.cpp` uses `llama_context_sycl_device_index`
@@ -7707,6 +7712,70 @@ contracts. The builds and the host tests ran after the lead's "builds GO", and t
     - Every device test. Those are the lead's, among them `test-moe-bf16-grouped-device` (11 cases, the eleventh never
       run yet) and `test-moe-pp-staging-refusal`.
     - The build without oneDNN, where `src1` and the `[[maybe_unused]]` counter change what compiles.
+
+**Review round 3 fixes (implementer, 2026-11-27): the re-review of `4951bde2f1..992568b6f8` passed, with three minor
+findings and one doc check.**
+- M1. Two texts said the hold never releases the leases when a hold throws in its destructor: the guard's comment in
+  `ggml-sycl.cpp` and the reason of `E-MOE-BF16-GROUPED-HOLD`.
+  - That overstates it. When `keep_handles_after_failed_wait` cannot even allocate the leak, it returns false with the
+    leases whole, and the arm's vector releases them on unwind.
+  - Both texts now state that residual, in the words of `E-MEM-HANDLE-KEEP-AFTER-FAILED-WAIT`'s reason: the handler
+    reports it at ERROR.
+- M2. The plan test's primitive bound could not fail on its own.
+  - It filed every width under both shapes' m, so its "at most 16 primitives" check only repeated the per-shape one.
+  - It now drops the m and asserts that the union of the GEMM widths over every node is at most ceil(512 / 64) = 8.
+    A comment says the primitive bound 16 is 2 x 8: one primitive per width and expert shape.
+  - RED: a mutant build that halves that bound fails the check
+    ("FAIL: over every node up to 512 tokens: at most ceil(512 / align) = 8 GEMM widths in all"). The source was
+    restored, rebuilt, and passes.
+- M3. In the round 2 record above, every count without a saved log is marked "not logged", and the counts with a
+  saved log cite it.
+- D1. Checked, and not changed: the memory design's figures for Inkling's ring are right.
+  - Source: the GGUF header of `/models/Inkling-2-Mini-UD-Q8_K_XL.gguf`, read with gguf-py, read-only, without loading
+    the model.
+  - Hyperparameters: `inkling2_loop.embedding_length` is 2304 and `expert_feed_forward_length` is 1152.
+  - Tensors: `blk.N.ffn_gate_up_exps.weight` has ne [2304, 2304, 128] (NVFP4 in layer 0, BF16 in layer 20), and
+    `blk.N.ffn_down_exps.weight` has ne [1152, 2304, 128].
+  - So the fused gate_up is K 2304 by N 2304 (2 x 1152), and its f32 output row is 9,216 bytes.
+  - The loader sizes the rows from the largest `ne[0]` and `ne[1]` of the expert weights (`llama-model.cpp:545-547`,
+    `:579-580`): 4,608-byte activation rows and 9,216-byte output rows.
+  - The doc's figures follow from these shapes, in MiB (which the doc writes as MB):
+    - weight slot: 128 x 2,820,096 B = 344.3;
+    - activation slot: 16,256 x 4,608 B = 71.4;
+    - output slot: 16,256 x 9,216 B = 142.9;
+    - ring: 558.6;
+    - with the down weight alone: 172.1 + 35.7 + 142.9 = 350.7.
+  - The shape is wrong elsewhere, and was left for the lead to rule on, because fixing it changes tests the lead has
+    run:
+    - this task's acceptance text above ("2304 x 4608 gate_up and 2304 x 2304 down");
+    - the device test (`k_gate_up = 4608`, and "down (k 2304, m 2304)");
+    - the kernel test's rows "Inkling gate_up shape" (k 2304, m 4608) and "Inkling down shape" (k 2304, m 2304);
+    - the round 2 record's Q11 above, which counted primitive keys over m 4608 and 2304.
+  - Inkling's gate_up has m 2304, not 4608, and its down has k 1152, not 2304. Those cases pass on shapes that are not
+    Inkling's.
+- Evidence. The logs are in `/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/tmpdir-t24/`.
+  - `clang-format-19 --dry-run -Werror` is clean on the guard's comment (`--lines`) and on the plan test, whole.
+  - The alloc-zone contract, with the new reason (`az-r3/`):
+    - base check: PASS, 823 debt entries, no new violation;
+    - witnesses: 51 checks, 0 wrong;
+    - the eight mutation shards: 86 cases each, 0 wrong.
+  - The static-storage inventory (`r3/inv-gen.log`, `r3/inv-check.log`, `r3/inv-class.log`):
+    - regenerated because the comment grew by a line; generate, `--check` and `--check-classification` return 0;
+    - the diff is the one-line shift alone: 535 rows move, and all 1,727 rows match the previous file once every
+      `ggml-sycl.cpp` line from 90518 on is taken back by one.
+  - Contracts on the changed files, through ctest (`r3/contracts-r3.log`): all five pass.
+    - `test-sycl-moe-bf16-direct-source`: 158 passed.
+    - `test-sycl-dnnl-decline-consumers`: 223 mutants killed.
+    - `sycl-pp-moe-scratch-admission-contract`: PASS on 37 checks; its self-test kills its 14 mutants.
+    - `test-sycl-static-storage-audit`: 8 tests OK.
+    - `test-sycl-mul-mat-f32-batched-route-source`: 15 passed.
+  - `sycl-build.sh ggml-sycl test-moe-bf16-grouped-plan` returned 0 (`r3/build-r3.log`). It rebuilt the plan test,
+    `ggml-sycl.cpp.o` and `libggml-sycl.so`.
+    - The Q1 route-test copy of `ggml-sycl.cpp` and the device-test binaries were not rebuilt. Their sources differ
+      from them by the comment alone.
+  - `sycl-moe-bf16-grouped-plan`: PASS (`r3/host-plan.log`).
+  - The nine contracts that read the plan, run through ctest after this record (`r3/plan-readers.log`): all nine
+    pass.
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
