@@ -752,7 +752,7 @@ STALE_SIG = "void mark_moe_device_table_stale(int dev)"
 STALE_MARKS = ("moe_device_table_valid[dev] = false;", "moe_full_local_probe_generation[dev] = 0;",
                "moe_full_local_probe_layout[dev] = GGML_LAYOUT_AOS;", "moe_full_local_probe_ok[dev] = false;")
 NULL_PAYLOAD = "w.moe_expert_ptr_payload[device][slot] = nullptr;"
-BUMP_GENERATION = "if (stored) { ++w.moe_expert_storage_generation; }"
+BUMP_GENERATION = "if (stored) { w.note_moe_storage_change(expert_id); }"
 MARK_STALE = "if (stored || table_dropped) { w.mark_moe_device_table_stale(device); }"
 # The flag behind a drop of the table's views alone: a pointer-table lease erased (the holder a prompt graph's preload
 # leaves, with no storage record and no slot naming the entry), the route table invalidated, or the hybrid record
@@ -2639,7 +2639,7 @@ def test_mutant_stale_mark_never_applied_fails():
 def test_mutant_storage_generation_not_bumped_fails():
     """A dropped storage record or slot leaves the generation alone: whatever is keyed on it reads as current."""
     assert not claim_lent_views_mark_the_table_stale(
-        _once_in(SYCL, DROP_SIG, "++w.moe_expert_storage_generation;", ""), COMMON)
+        _once_in(SYCL, DROP_SIG, "w.note_moe_storage_change(expert_id);", ""), COMMON)
 
 
 def test_mutant_slot_payload_kept_fails():

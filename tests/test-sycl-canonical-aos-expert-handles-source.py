@@ -121,7 +121,9 @@ def violations(source: str) -> list[str]:
         "transaction prebuild": "replacement.reserve(expert_count)" in publish,
         "transaction rollback": "had_previous" in publish and "catch (...)" in publish,
         "mutation withdrawal": "forget_moe_storage_handle_on_device" in invalidate,
-        "mutation generation": "moe_expert_storage_generation" in invalidate,
+        # The generation moves through the one function that logs the move; a mutation that withdrew nothing names
+        # every expert, since the rewrite changed them all.
+        "mutation generation": "note_moe_storage_change(ggml_sycl::moe_storage_change_log::ALL)" in invalidate,
         "mutation cache invalidation": "ggml_sycl_drop_all_weight_cache_entries" in invalidate,
         "whole buffer inventory": "ctx->tensor_extras" in invalidate_buffer,
         "set invalidates": "ggml_sycl_invalidate_backend_weight_mutation(ctx, tensor)" in setter,

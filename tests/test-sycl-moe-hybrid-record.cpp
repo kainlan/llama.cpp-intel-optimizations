@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #define CHECK(cond, msg)                      \
     do {                                      \
@@ -158,8 +159,60 @@ static int test_trace_line() {
     return 0;
 }
 
+// The weight's log of which expert each generation bump changed: a holder of a decision made at `since` asks which
+// experts changed up to `now`, and the log answers only when it saw every bump in between and each named an expert.
+static int test_change_log() {
+    using ggml_sycl::moe_storage_change_log;
+    moe_storage_change_log log;
+    std::vector<int32_t>   ids = { 99 };
+
+    // The weight's generation starts at 1 with no bump made.
+    CHECK(log.changed_since(1, 1, &ids) && ids.empty(), "no bump since the decision: nothing changed");
+    CHECK(!log.changed_since(1, 2, &ids), "a bump the log never saw has no answer");
+    CHECK(!log.changed_since(3, 2, &ids), "a decision newer than the weight has no answer");
+
+    // An evict of expert 5 (its storage record dropped, then its host copy remembered) and an admit of expert 7.
+    log.note(2, 5);
+    log.note(3, 5);
+    log.note(4, 7);
+    CHECK(log.changed_since(1, 4, &ids) && ids == std::vector<int32_t>({ 5, 7 }),
+          "every bump since the decision, each expert once, ascending");
+    CHECK(log.changed_since(3, 4, &ids) && ids == std::vector<int32_t>({ 7 }), "only the bumps after the decision");
+    CHECK(log.changed_since(4, 4, &ids) && ids.empty(), "a decision at the newest generation: nothing changed");
+
+    // A bump that changed every expert (a cleared store) answers nothing across it, and the bumps after it still do.
+    log.note(5, moe_storage_change_log::ALL);
+    CHECK(!log.changed_since(4, 5, &ids), "a bump naming every expert has no per-expert answer");
+    CHECK(!log.changed_since(1, 5, &ids), "nor does any window that holds it");
+    log.note(6, 3);
+    CHECK(log.changed_since(5, 6, &ids) && ids == std::vector<int32_t>({ 3 }), "the bump after it answers alone");
+
+    // A bump made without a note leaves a hole: a window across the hole has no answer, one after it does.
+    log.note(8, 1);
+    CHECK(!log.changed_since(6, 8, &ids), "generation 7 moved without a note: no answer across it");
+    CHECK(log.changed_since(7, 8, &ids) && ids == std::vector<int32_t>({ 1 }), "the window after the hole answers");
+    CHECK(!log.changed_since(8, 9, &ids), "a newest bump made without a note: no answer");
+
+    // The log keeps the last `capacity` bumps. A window the log still holds answers, across the ring's wrap; a window
+    // reaching past it does not.
+    moe_storage_change_log ring;
+    const uint64_t         first = 10;
+    const uint64_t         last  = first + moe_storage_change_log::capacity + 3;
+    for (uint64_t g = first; g <= last; ++g) {
+        ring.note(g, static_cast<int32_t>(g % 5));
+    }
+    CHECK(ring.changed_since(last - moe_storage_change_log::capacity, last, &ids) &&
+              ids == std::vector<int32_t>({ 0, 1, 2, 3, 4 }),
+          "the widest window the log holds answers, across the wrap");
+    CHECK(ring.changed_since(last - 2, last, &ids) && ids.size() == 2, "a narrow window at the end answers");
+    CHECK(!ring.changed_since(last - moe_storage_change_log::capacity - 1, last, &ids),
+          "one bump past the log's window: no answer");
+    CHECK(!ring.changed_since(first - 1, last, &ids), "a decision older than every bump the log holds: no answer");
+    return 0;
+}
+
 int main() {
-    if (test_miss_classify() != 0 || test_trace_tokens() != 0 || test_trace_line() != 0) {
+    if (test_miss_classify() != 0 || test_trace_tokens() != 0 || test_trace_line() != 0 || test_change_log() != 0) {
         return 1;
     }
     std::printf("OK: moe hybrid decode record bookkeeping\n");

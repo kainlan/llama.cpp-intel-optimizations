@@ -8342,7 +8342,7 @@ bool test_moe_storage_handle_first_route_and_negatives() {
     }
     auto clear_records = [&]() {
         extra.weight().moe_expert_storage_handles.clear();
-        ++extra.weight().moe_expert_storage_generation;
+        extra.weight().note_moe_storage_change(ggml_sycl::moe_storage_change_log::ALL);
     };
     auto route_closed = [&]() {
         moe_expert_route route = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
@@ -23129,7 +23129,7 @@ static void ggml_sycl_drop_lent_expert_views(ggml_tensor_extra_gpu *            
     }
 
     if (stored) {
-        ++w.moe_expert_storage_generation;
+        w.note_moe_storage_change(expert_id);
     }
     if (stored || table_dropped) {
         w.mark_moe_device_table_stale(device);
@@ -40965,7 +40965,7 @@ static void ggml_sycl_invalidate_backend_weight_mutation(ggml_backend_sycl_buffe
         withdrew |= extra->forget_moe_storage_handle_on_device(static_cast<int>(expert), GGML_LAYOUT_AOS, ctx->device);
     }
     if (!withdrew) {
-        ++extra->weight().moe_expert_storage_generation;
+        extra->weight().note_moe_storage_change(ggml_sycl::moe_storage_change_log::ALL);
     }
     extra->weight().moe_device_table_valid[ctx->device]          = false;
     extra->weight().moe_full_local_probe_generation[ctx->device] = 0;

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Source contract: how the event-chained hybrid decode route keeps its per-tensor record current, and what it counts.
 
-Host-only: reads ggml-sycl.cpp, moe-hybrid-record.hpp and docs/backend/sycl-env-vars.md, builds nothing, loads no model
-and touches no device.
+Host-only: reads ggml-sycl.cpp, common.hpp, moe-hybrid-record.hpp and docs/backend/sycl-env-vars.md, builds nothing,
+loads no model and touches no device.
 
 The route (ggml_sycl_moe_hybrid_decode_event_chained) looks its tensor's record up at every decode op
 (ggml_sycl_moe_hybrid_decode_record_current). The record is cached under a stamp of (replan epoch, the weight's expert
@@ -21,7 +21,11 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
   T5  the per-token line and the per-build line are WARN, each printed from one site, the per-build one only at
       level 2 and above; the per-token line's buffer is the 512 bytes the host test proves the widest line fits;
   T6  the header is plain host code: standard includes and moe-decode-hostpath.hpp only, no SYCL;
-  T7  the env-var row names the variable, both line tags, the read-once rule and the token rule.
+  T7  the env-var row names the variable, both line tags, the read-once rule and the token rule;
+  T8  every move of a weight's expert storage generation goes through note_moe_storage_change(), which logs the
+      expert the move changed: no other site writes the generation, each site that moves one expert's storage names
+      that expert, and each site that clears a whole store names every expert (moe_storage_change_log::ALL). A site
+      that named one expert for a cleared store would let a held record keep slots the clear withdrew.
 
 Checks run on comment-blanked text (string literals kept). NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if another pin
@@ -40,6 +44,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 HEADER = ROOT / "ggml/src/ggml-sycl/moe-hybrid-record.hpp"
+COMMON = ROOT / "ggml/src/ggml-sycl/common.hpp"
 DOCS = ROOT / "docs/backend/sycl-env-vars.md"
 
 CURRENT_SIG = "static bool ggml_sycl_moe_hybrid_decode_record_current("
@@ -73,6 +78,38 @@ DOC_NEEDLES = ("`GGML_SYCL_MOE_HYBRID_RECORD_TRACE=1\\|2`", "[MOE-HYBRID-RECORD]
                "Read once", "lower block")
 HEADER_INCLUDE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]', re.M)
 HEADER_ALLOWED = {"moe-decode-hostpath.hpp"}
+
+# T8: the one function that moves the generation, and what each site that calls it names.
+NOTE_SIG = "void note_moe_storage_change(int32_t expert_id) {"
+NOTE_BODY = ("{ ++moe_expert_storage_generation; "
+             "moe_expert_storage_changes.note(moe_expert_storage_generation, expert_id); }")
+GENERATION_DECL = "uint64_t moe_expert_storage_generation = 1;"
+# A write of the generation: an increment or decrement, or an assignment (an `==` compare is not one).
+GENERATION_WRITE = re.compile(r"(?:\+\+|--)\s*(?:[\w.]|->)*\bmoe_expert_storage_generation\b"
+                              r"|\bmoe_expert_storage_generation\s*(?:\+\+|--|[-+]?=(?!=))")
+ALL = "ggml_sycl::moe_storage_change_log::ALL"
+# (file, enclosing signature, the call as it reads, squashed): one expert's storage moved, or a whole store went.
+NOTE_SITES = (
+    ("common", "bool remember_moe_storage_handle(int expert_id,",
+     "existing = std::move(record); note_moe_storage_change(expert_id); return true;"),
+    ("common", "bool remember_moe_storage_handle(int expert_id,",
+     "records.push_back(std::move(record)); note_moe_storage_change(expert_id); return true;"),
+    ("common", "bool forget_moe_storage_handle_on_device(int expert_id, ggml_layout_mode layout, int owner_device) {",
+     "if (erased) { note_moe_storage_change(expert_id); } return erased;"),
+    ("common", "bool take_moe_storage_handle_on_device(int expert_id,",
+     "mark_moe_device_table_stale(owner_device); } } } note_moe_storage_change(expert_id); return true;"),
+    ("common", "void clear_moe_storage_handles() {",
+     "moe_expert_storage_handles.clear(); note_moe_storage_change(" + ALL + ");"),
+    ("common", "void clear_moe_storage_handles_for_owner(int owner_device) {",
+     "if (erased) { note_moe_storage_change(" + ALL + "); }"),
+    ("backend", "static void ggml_sycl_drop_lent_expert_views(",
+     "if (stored) { w.note_moe_storage_change(expert_id); }"),
+    ("backend", "static void ggml_sycl_invalidate_backend_weight_mutation(",
+     "if (!withdrew) { extra->weight().note_moe_storage_change(" + ALL + "); }"),
+)
+# The fixture's store clear, inside a lambda of a private test function: matched in the squashed file text.
+FIXTURE_CLEAR = ("extra.weight().moe_expert_storage_handles.clear(); extra.weight().note_moe_storage_change("
+                 + ALL + ");")
 
 
 class ContractError(AssertionError):
@@ -129,6 +166,42 @@ def body(code: str, sig: str, pin: str) -> str:
     raise ContractError(f"FAIL [pin {pin}]: the body of `{sig}` is unbalanced")
 
 
+def matching_close(text: str, open_at: int, open_ch: str, close_ch: str) -> int:
+    """The index of the bracket that closes `text[open_at]`, string literals skipped; -1 when it is unbalanced."""
+    depth = 0
+    k = open_at
+    while k < len(text):
+        c = text[k]
+        if c == '"':
+            k += 1
+            while k < len(text) and text[k] != '"':
+                k += 2 if text[k] == "\\" else 1
+        elif c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return -1
+
+
+def definition_spans(sq: str, sig: str) -> list[tuple[int, int]]:
+    """The `{...}` spans of every definition in squashed `sq` whose text starts with `sig`; declarations are skipped."""
+    spans = []
+    at = sq.find(sig)
+    while at >= 0:
+        params = sq.find("(", at)
+        close = matching_close(sq, params, "(", ")") if params >= 0 else -1
+        if close >= 0 and sq[close + 1 : close + 3] == " {":
+            open_at = close + 2
+            end = matching_close(sq, open_at, "{", "}")
+            if end >= 0:
+                spans.append((open_at, end))
+        at = sq.find(sig, at + 1)
+    return spans
+
+
 def once(text: str, needle: str, pin: str, what: str) -> int:
     n = text.count(needle)
     if n != 1:
@@ -136,7 +209,7 @@ def once(text: str, needle: str, pin: str, what: str) -> int:
     return text.find(needle)
 
 
-def check(backend_raw: str, header_raw: str, docs_raw: str) -> None:
+def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str) -> None:
     code = blank_comments(backend_raw)
     current = body(code, CURRENT_SIG, "T1")
     build = body(code, BUILD_SIG, "T4")
@@ -217,6 +290,41 @@ def check(backend_raw: str, header_raw: str, docs_raw: str) -> None:
         if needle not in rows[0]:
             raise ContractError(f"FAIL [pin T7]: the {ENV_NAME} row does not say `{needle}`")
 
+    # T8: one function moves the generation and logs the expert; each site names what its move changed.
+    common_code = blank_comments(common_raw)
+    common_sq = squash(common_code)
+    backend_sq = squash(code)
+    notes = definition_spans(common_sq, NOTE_SIG)
+    if len(notes) != 1 or common_sq[notes[0][0] : notes[0][1] + 1] != NOTE_BODY:
+        raise ContractError("FAIL [pin T8]: note_moe_storage_change() is not defined once as the generation's one "
+                            "increment followed by the change log's note of it")
+    common_writes = [m.start() for m in GENERATION_WRITE.finditer(common_sq)]
+    in_note = [w for w in common_writes if notes[0][0] < w < notes[0][1]]
+    declared = common_sq.count(GENERATION_DECL)
+    if len(in_note) != 1 or declared != 1 or len(common_writes) != 2:
+        raise ContractError(f"FAIL [pin T8]: common.hpp writes moe_expert_storage_generation {len(common_writes)} "
+                            f"times; only its declaration and note_moe_storage_change() may, so a bump elsewhere "
+                            f"would move the generation without a log entry")
+    backend_writes = GENERATION_WRITE.findall(backend_sq)
+    if backend_writes:
+        raise ContractError(f"FAIL [pin T8]: ggml-sycl.cpp writes moe_expert_storage_generation directly "
+                            f"(`{backend_writes[0]}`), not through note_moe_storage_change()")
+    texts = {"common": common_sq, "backend": backend_sq}
+    for file, sig, call in NOTE_SITES:
+        sq = texts[file]
+        if sq.count(call) != 1:
+            raise ContractError(f"FAIL [pin T8]: `{call}` appears {sq.count(call)} times in {file}, not once")
+        at = sq.find(call)
+        if not any(open_at < at < end for open_at, end in definition_spans(sq, sig)):
+            raise ContractError(f"FAIL [pin T8]: `{call}` is not in a definition of `{sig}`")
+    if backend_sq.count(FIXTURE_CLEAR) != 1:
+        raise ContractError("FAIL [pin T8]: the fixture's store clear does not note every expert")
+    calls = common_sq.count("note_moe_storage_change(") + backend_sq.count("note_moe_storage_change(")
+    # The definition, the six common.hpp sites, the two backend sites and the fixture's.
+    if calls != 1 + len(NOTE_SITES) + 1:
+        raise ContractError(f"FAIL [pin T8]: note_moe_storage_change( appears {calls} times, not "
+                            f"{1 + len(NOTE_SITES) + 1}: a call site this gate does not read names an expert unchecked")
+
 
 def self_test(raws: dict[str, str]) -> int:
     failures: list[str] = []
@@ -242,7 +350,7 @@ def self_test(raws: dict[str, str]) -> int:
             print(f"  mutant {name}: NOT APPLIED ({e})")
             return
         try:
-            check(mutated["backend"], mutated["header"], mutated["docs"])
+            check(mutated["backend"], mutated["header"], mutated["docs"], mutated["common"])
         except ContractError as e:
             if f"[pin {pin}]" not in str(e):
                 failures.append(f"{name}: caught, but not by pin {pin}: {str(e)[:140]}")
@@ -290,6 +398,27 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("header-includes-common", "T6", H, [("#include <cstdio>", '#include "common.hpp"\n#include <cstdio>')])
     expect_fail("docs-row-dropped", "T7", D, [(f"| `{ENV_NAME}=1\\|2`", f"| `{ENV_NAME}_OLD=1\\|2`")])
     expect_fail("docs-row-lacks-build-line", "T7", D, [("`[MOE-HYBRID-RECORD-BUILD]", "`[MOE-HYBRID-BUILD]")])
+    C = "common"
+    expect_fail("clear-names-one-expert", "T8", C,
+                [("        moe_expert_storage_handles.clear();\n        note_moe_storage_change(" + ALL + ");",
+                  "        moe_expert_storage_handles.clear();\n        note_moe_storage_change(0);")])
+    expect_fail("owner-clear-names-the-owner", "T8", C,
+                [("        if (erased) {\n            note_moe_storage_change(" + ALL + ");",
+                  "        if (erased) {\n            note_moe_storage_change(owner_device);")])
+    expect_fail("note-does-not-log", "T8", C,
+                [("        moe_expert_storage_changes.note(moe_expert_storage_generation, expert_id);\n", "")])
+    expect_fail("raw-bump-in-common", "T8", C,
+                [("        if (erased) {\n            note_moe_storage_change(expert_id);\n        }\n        return erased;",
+                  "        if (erased) {\n            ++moe_expert_storage_generation;\n        }\n        return erased;")])
+    expect_fail("raw-bump-in-backend", "T8", B,
+                [("        w.note_moe_storage_change(expert_id);", "        ++w.moe_expert_storage_generation;")])
+    expect_fail("mutation-names-one-expert", "T8", B,
+                [("extra->weight().note_moe_storage_change(" + ALL + ");",
+                  "extra->weight().note_moe_storage_change(0);")])
+    expect_fail("fixture-clear-names-one-expert", "T8", B,
+                [("extra.weight().note_moe_storage_change(" + ALL + ");", "extra.weight().note_moe_storage_change(0);")])
+    expect_fail("unread-note-site", "T8", B,
+                [("    if (stored || table_dropped) {", "    w.note_moe_storage_change(0);\n    if (stored || table_dropped) {")])
 
     try:
         mutate(B, [("this anchor is in no source", "x")])
@@ -299,7 +428,7 @@ def self_test(raws: dict[str, str]) -> int:
         print("  self-test: a stale mutant anchor is reported")
 
     try:
-        check(raws["backend"], raws["header"], raws["docs"])
+        check(raws["backend"], raws["header"], raws["docs"], raws["common"])
         print("  self-test: unmodified tree passes")
     except ContractError as e:
         print(f"  self-test: unmodified tree FAILS: {e}")
@@ -314,7 +443,7 @@ def self_test(raws: dict[str, str]) -> int:
 
 def main(argv: list[str]) -> int:
     raws = {}
-    for key, path in (("backend", BACKEND), ("header", HEADER), ("docs", DOCS)):
+    for key, path in (("backend", BACKEND), ("header", HEADER), ("docs", DOCS), ("common", COMMON)):
         try:
             raws[key] = path.read_text()
         except FileNotFoundError:
@@ -323,7 +452,7 @@ def main(argv: list[str]) -> int:
     if "--self-test" in argv:
         return self_test(raws)
     try:
-        check(raws["backend"], raws["header"], raws["docs"])
+        check(raws["backend"], raws["header"], raws["docs"], raws["common"])
     except ContractError as e:
         print(e)
         return 1
