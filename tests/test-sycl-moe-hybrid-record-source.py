@@ -46,9 +46,10 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
       still the device's; resolves only the changed experts and declines unless every one resolved, each operand
       answering for its moved expert; takes each slot from the build's slot rule, writes a copy of the held record
       (never the held one), declines when the install into it refuses, checks the copy's shape with the build's rule,
-      gives it a table of its own filled from every slot (the one table it fills; the held table it only hands back),
-      a ready barrier over the held one's and the new events, records the block's residency only after every way out,
-      hands the replaced leases and the held table back for retention, and waits for nothing;
+      gives it a table of its own filled from every slot (the one table it fills; the held table it only hands back,
+      it resolves no handle, and it names the copy's table, the held one's handle until the reset, only to reset and
+      fill it), a ready barrier over the held one's and the new events, records the block's residency only after every
+      way out, hands the replaced leases and the held table back for retention, and waits for nothing;
   T11 the build takes its plan, its frame, its slots, its shape check and its table from those same helpers and
       records the expert its layout came from; the plan is asked in the plan rule alone, the routable cards and the
       MMID direct route in the frame rule alone, the executor in the slot rule alone; and
@@ -143,6 +144,9 @@ PATCH_DECLINE = "const auto decline = [reason](const char * why) { *reason = why
 # The held table's one use in the patch: handed back for retention, never resolved or filled.
 PATCH_HELD_TABLE = "if (held->table.valid()) { replaced->push_back(held->table); }"
 TABLE_FILL = "ggml_sycl_moe_hybrid_decode_table_fill("
+# The copy starts as the held record, so its table is the held table's handle until the reset: the patch names the
+# copy's table only to reset it and to fill it.
+PATCH_COPY_TABLE_USES = ("patched->table = {};", "&patched->table)")
 PATCH_STEPS = (
     ("decline helper", PATCH_DECLINE),
     ("the build's plan rule, asked again",
@@ -608,10 +612,19 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str, log
                             "leaving the count of a record it did not publish")
     if WAIT_CALLS.search(patch):
         raise ContractError("FAIL [pin T10]: the patch waits on the device")
-    # The held table may be the source of a table copy still on the queue: the patch only hands it back.
-    if "held->table.resolve" in patch or patch.count("held->table") != PATCH_HELD_TABLE.count("held->table"):
+    # The held table may be the source of a table copy still on the queue: the patch only hands it back. The copy
+    # shares its handle until the reset, so the patch resolves no handle at all, and names the copy's table only to
+    # reset and fill it: the fill writes the one table the patch writes.
+    if ".resolve(" in patch:
+        raise ContractError("FAIL [pin T10]: the patch resolves a handle, so it could write the held table, through "
+                            "the held record or through the copy that shares its table until the reset")
+    if patch.count("held->table") != PATCH_HELD_TABLE.count("held->table"):
         raise ContractError("FAIL [pin T10]: the patch names the held table other than to hand it back for retention, "
                             "so it could write a table a queued copy still reads")
+    copy_table_uses = [patch.count(use) for use in PATCH_COPY_TABLE_USES]
+    if copy_table_uses != [1] * len(PATCH_COPY_TABLE_USES) or patch.count("patched->table") != sum(copy_table_uses):
+        raise ContractError("FAIL [pin T10]: the patch names the copy's table other than to reset it and fill it, so "
+                            "it could use the held table's handle, which the copy holds until the reset")
     if patch.count(TABLE_FILL) != 1:
         raise ContractError("FAIL [pin T10]: the patch fills a table besides the copy's own")
 
@@ -889,6 +902,14 @@ def self_test(raws: dict[str, str]) -> int:
                   "                                                  shape.substitute,\n"
                   "                                                  const_cast<ggml_sycl::mem_handle *>(&held->table));\n"
                   "    if (!ready.empty()) {\n        // The unchanged slots' weights")])
+    # The copy shares the held table's handle until its reset, so a write through it before then writes the held table.
+    expect_fail("patch-writes-held-table-through-copy", "T10", B,
+                [("        patched->table = {};\n",
+                  "        static_cast<const void **>(patched->table.resolve().ptr)[changed.front()] = nullptr;\n"
+                  "        patched->table = {};\n")])
+    expect_fail("patch-releases-held-table-through-copy", "T10", B,
+                [("        patched->table = {};\n",
+                  "        (void) patched->table.reset_owned_allocation();\n        patched->table = {};\n")])
     expect_fail("patch-ignores-layout-expert", "T10", B,
                 [("held->layout_expert, counts.on_device == 0,", "-1, counts.on_device == 0,")])
     expect_fail("patch-resolves-every-expert", "T10", B,
