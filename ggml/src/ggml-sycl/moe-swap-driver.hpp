@@ -166,7 +166,7 @@ struct moe_swap_txn_cost {
     uint64_t total_us = 0;
     // The placement plan's entry chunks the transaction's copy of the plan cloned to record its moves: the
     // copy-on-write's cost, so a change that makes the publication clone the whole plan again shows in the summary.
-    uint64_t plan_chunks_cloned = 0;
+    uint64_t plan_chunks_cloned  = 0;
     // The transaction's lent-view drops that walked a whole route table or hybrid decode record because the moved
     // expert's own slot did not hold the retired entry: a view the slot rule missed is still dropped, and counted here.
     uint64_t view_scan_fallbacks = 0;

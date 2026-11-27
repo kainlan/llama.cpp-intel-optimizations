@@ -8492,8 +8492,7 @@ bool test_moe_storage_handle_first_route_and_negatives() {
     ggml_set_name(&tensor, "blk.31.ffn_gate_exps.weight");
     placement_plan plan{};
     plan.entries.push_back({ "blk.31.ffn_gate_exps.weight", expert_size, expert_size, 0,
-                             placement_priority::MOE_GATE_PROJ, 31, expert_id, expert_tensor_role::GATE,
-                             false, -1 });
+                             placement_priority::MOE_GATE_PROJ, 31, expert_id, expert_tensor_role::GATE, false, -1 });
     plan.build_index();
     ggml_sycl_publish_test_plan(std::move(plan));
     moe_expert_route mismatch = ggml_sycl_resolve_moe_expert_route(&tensor, 0, expert_id, GGML_LAYOUT_AOS);
@@ -8820,8 +8819,8 @@ bool test_moe_ptr_table_cached_reuse_is_tensor_specific() {
                                  ggml_sycl::placement_priority::MOE_UP, 12, e, ggml_sycl::expert_tensor_role::UP, true,
                                  0 });
         plan.entries.push_back({ "blk.12.ffn_down_exps.weight", down_data.size(), down_data.size(), 0,
-                                 ggml_sycl::placement_priority::MOE_DOWN, 12, e,
-                                 ggml_sycl::expert_tensor_role::DOWN, true, 0 });
+                                 ggml_sycl::placement_priority::MOE_DOWN, 12, e, ggml_sycl::expert_tensor_role::DOWN,
+                                 true, 0 });
     }
     plan.build_index();
     ggml_sycl_publish_test_plan(std::move(plan));
@@ -22471,7 +22470,7 @@ struct ggml_sycl_expert_loan_result {
     uint64_t     remap_us         = 0;
     // The plan chunks the call's copy of the published plan cloned to record its moves (cow_chunked_vector): what the
     // publication cost beyond the copy's chunk pointers. 0 for a call that copied no plan.
-    uint64_t     plan_chunks_cloned = 0;
+    uint64_t     plan_chunks_cloned  = 0;
     // The lent-view drops that walked a whole route table or hybrid decode record because the slot of the moved expert
     // did not hold the retired entry (ggml_sycl_drop_lent_expert_views). 0 when every drop found its view in place.
     uint64_t     view_scan_fallbacks = 0;
@@ -23822,7 +23821,7 @@ struct ggml_sycl_expert_move_result {
     uint64_t                                   remap_us        = 0;
     uint64_t                                   total_us        = 0;
     // The plan chunks the publication cloned (ggml_sycl_expert_loan_result::plan_chunks_cloned).
-    uint64_t                                   plan_chunks_cloned = 0;
+    uint64_t                                   plan_chunks_cloned  = 0;
     // The lent-view drops that walked a whole table (ggml_sycl_expert_loan_result::view_scan_fallbacks).
     uint64_t                                   view_scan_fallbacks = 0;
     const char *                               reason          = "none";
@@ -23879,7 +23878,7 @@ static ggml_sycl_txn_result ggml_sycl_expert_move_transaction_run(int           
         r.copy_us         = answer.copy_us;
         r.remap_us        = answer.remap_us;
         r.total_us        = ggml_sycl::expert_move_us_since(call_start);
-        r.plan_chunks_cloned = answer.plan_chunks_cloned;
+        r.plan_chunks_cloned  = answer.plan_chunks_cloned;
         r.view_scan_fallbacks = answer.view_scan_fallbacks;
         for (ggml_sycl_expert_move_outcome & m : moves) {
             if (m.moved) {
@@ -24706,7 +24705,7 @@ static void ggml_sycl_run_expert_swap_claimed(int                               
             cost.remap_us = result.remap_us;
             cost.meta_us  = result.meta_us;
             cost.total_us = result.total_us;
-            cost.plan_chunks_cloned = result.plan_chunks_cloned;
+            cost.plan_chunks_cloned  = result.plan_chunks_cloned;
             cost.view_scan_fallbacks = result.view_scan_fallbacks;
             return ggml_sycl::moe_swap_txn_room{ epoch_after, result.room_self_delta, cost };
         });

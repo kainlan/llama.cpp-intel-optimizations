@@ -1374,9 +1374,9 @@ def self_test(raw: dict[str, str]) -> int:
                           ("total", "r.total_us        = ggml_sycl::expert_move_us_since(call_start);")):
         expect_fail(f"{field}-cost-not-carried-by-the-entry", "D20", [("sycl", ENTRY_SIG, anchor, "")])
     expect_fail("plan-chunks-cost-not-carried-by-the-entry", "D20",
-                [("sycl", ENTRY_SIG, "r.plan_chunks_cloned = answer.plan_chunks_cloned;", "")])
+                [("sycl", ENTRY_SIG, "r.plan_chunks_cloned  = answer.plan_chunks_cloned;", "")])
     expect_fail("plan-chunks-cost-not-built-by-the-callback", "D20",
-                [("sycl", CORE_SIG, "cost.plan_chunks_cloned = result.plan_chunks_cloned;", "")])
+                [("sycl", CORE_SIG, "cost.plan_chunks_cloned  = result.plan_chunks_cloned;", "")])
     expect_fail("plan-chunks-cost-not-summed", "D20",
                 [("driver", "", "st.txn_plan_chunks_cloned += c.plan_chunks_cloned;", "")])
     expect_fail("plan-chunks-not-counted-by-the-transaction", "D20",
