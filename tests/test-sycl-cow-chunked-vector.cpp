@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -195,6 +196,85 @@ static int test_clear_resets_the_clone_count() {
     return 0;
 }
 
+// Copy assignment replaces the contents, so it starts the clone count again; a move carries the count to the target
+// and leaves the source empty.
+static int test_assignment_and_move_counts() {
+    const store a = make_store(10);
+    store       b = a;
+    b[0]          = "x";
+    CHECK(b.chunks_cloned() == 1, "the write cloned one chunk");
+    b = a;
+    CHECK(b.chunks_cloned() == 0 && b.shared_chunks_with(a) == 3, "copy assignment shares again and counts from 0");
+
+    b[5] = "y";
+    store c(std::move(b));
+    CHECK(c.chunks_cloned() == 1 && c[5] == "y", "a move carries the count and the contents");
+    CHECK(b.size() == 0 && b.chunk_count() == 0 && b.chunks_cloned() == 0, "the moved-from store is empty");
+    store d = make_store(2);
+    d       = std::move(c);
+    CHECK(d.chunks_cloned() == 1 && d.size() == 10, "move assignment carries the count and the contents");
+    CHECK(c.size() == 0 && c.chunk_count() == 0 && c.chunks_cloned() == 0, "the moved-from store is empty");
+    return 0;
+}
+
+// Non-const front() and back() hand out a writable reference, so each clones the one chunk it reaches.
+static int test_front_back_clone() {
+    const store a = make_store(10);
+    store       b = a;
+    b.front()     = "first";
+    CHECK(b.chunks_cloned() == 1 && a.front() == "e0", "front() clones the first chunk alone");
+    b.back() = "last";
+    CHECK(b.chunks_cloned() == 2 && a.back() == "e9", "back() clones the last chunk alone");
+    CHECK(b.shared_chunks_with(a) == 1, "the middle chunk stays shared");
+    return 0;
+}
+
+// An element whose constructor throws, so a test can fail an append at a chunk boundary.
+static int g_throw_on = -1;
+
+struct throwing_element {
+    int value = 0;
+
+    throwing_element() = default;
+
+    explicit throwing_element(int v) : value(v) {
+        if (v == g_throw_on) {
+            throw std::runtime_error("element constructor");
+        }
+    }
+};
+
+// An append whose element constructor throws leaves the store as it was, at a chunk boundary as well as inside a chunk.
+static int test_throwing_append_leaves_the_store() {
+    ggml_sycl::cow_chunked_vector<throwing_element, 4> s;
+    for (int i = 0; i < 4; ++i) {
+        s.emplace_back(i);  // one full chunk: the next append opens a new one
+    }
+    g_throw_on = 4;
+    bool threw = false;
+    try {
+        s.emplace_back(4);
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    CHECK(threw && s.size() == 4 && s.chunk_count() == 1, "a throw at a chunk boundary leaves no empty chunk");
+    g_throw_on = -1;
+    s.emplace_back(5);
+    s.emplace_back(6);
+    g_throw_on = 7;
+    threw      = false;
+    try {
+        s.emplace_back(7);
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    g_throw_on      = -1;
+    const auto & cs = s;
+    CHECK(threw && s.size() == 6 && s.chunk_count() == 2, "a throw inside a chunk leaves the store's size");
+    CHECK(cs[4].value == 5 && cs[5].value == 6, "the elements after the failed append are where they belong");
+    return 0;
+}
+
 int main() {
     int (*const tests[])() = { test_copy_shares_chunks,
                                test_write_to_copy_leaves_original,
@@ -205,7 +285,10 @@ int main() {
                                test_unshare_at_moves_the_clone_ahead_of_the_write,
                                test_iterator_index,
                                test_empty_erase_unshares,
-                               test_clear_resets_the_clone_count };
+                               test_clear_resets_the_clone_count,
+                               test_assignment_and_move_counts,
+                               test_front_back_clone,
+                               test_throwing_append_leaves_the_store };
     for (int (*t)() : tests) {
         if (t() != 0) {
             return 1;

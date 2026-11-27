@@ -13,7 +13,8 @@
 //   can allocate (and throw) where a std::vector write could not. unshare_at() takes that clone ahead of the write.
 // - Non-const begin()/end() clone every shared chunk first, because a mutable iterator can write anywhere. A range-for
 //   over a non-const store, even with a const element reference, takes that path: iterate a const reference to the
-//   store (or index it) where a shared copy must stay shared.
+//   store (or index it) where a shared copy must stay shared. That clone pass makes non-const end() O(chunks): hoist it
+//   out of a loop condition.
 // - push_back, emplace_back, pop_back, resize, erase and clear change only this store. erase returns a mutable
 //   iterator, so like begin() it clones every shared chunk first, even for an empty range.
 // - chunks_cloned() counts the clones made for the store's current contents. Copy assignment and clear() replace the
@@ -24,6 +25,13 @@
 // store that must not race its writer (the same rule as std::vector). A count read as 2 that is falling to 1 only
 // causes an unneeded clone. So a store has one writer at a time, and a copy taken for a publication is written only by
 // the thread that took it, before it is published.
+//
+// The writer also keeps the store it copied from alive while it writes the copy (the transaction holds the published
+// plan it copied, the record drop and patch hold the record they copied). Then every chunk another thread can still
+// read is held by that source as well and reads as shared, so it is cloned. The reason: use_count() is a relaxed read
+// that does not synchronize with another thread's release, so a count that fell to 1 because the last reader dropped
+// its store would let the writer write in place over a chunk that reader just read, with no happens-before between
+// that read and the write.
 //
 // Aliasing hazards, both ways. Neither exists for a std::vector, whose copy owns its own elements.
 // - A reference obtained through a non-const access is into a chunk this store owns alone at that moment. If the store
@@ -231,11 +239,17 @@ template <typename T, size_t CHUNK = 32> class cow_chunked_vector {
 
     void push_back(T && value) { emplace_back(std::move(value)); }
 
+    // The element is constructed before the store changes, so a constructor that throws leaves the store as it was.
+    // At a chunk boundary it goes into the fresh chunk, which joins the store only once it holds the element; inside a
+    // chunk it goes into the reserved room, which a failed construction leaves untouched.
     template <typename... Args> T & emplace_back(Args &&... args) {
         if (size_ % CHUNK == 0) {
             auto fresh = std::make_shared<chunk_type>();
             fresh->reserve(CHUNK);
+            fresh->emplace_back(std::forward<Args>(args)...);
             chunks_.push_back(std::move(fresh));
+            ++size_;
+            return chunks_.back()->back();
         }
         chunk_type & last = *unique_chunk(chunks_.size() - 1);
         last.emplace_back(std::forward<Args>(args)...);
