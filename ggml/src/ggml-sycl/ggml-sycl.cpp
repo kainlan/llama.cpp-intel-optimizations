@@ -91466,9 +91466,8 @@ static bool ggml_sycl_moe_hybrid_decode_record_patch(ggml_backend_sycl_context &
     }
     // The copy keeps the held record's route-count table and records the block's residency in it. A later model's
     // table replaces the device's, and the build installs that one, so a held table that is no longer the device's
-    // is the build's to replace.
-    if (ggml_sycl_moe_route_counts_tensor(src0->name) &&
-        held->route_counts != ggml_sycl::moe_route_counts_current(device)) {
+    // is the build's to replace. The build gave the record a block only for the tensor that counts its block.
+    if (held->route_block >= 0 && held->route_counts != ggml_sycl::moe_route_counts_current(device)) {
         return decline("the device's route-count table was replaced since the held record's build");
     }
     const ggml_sycl::moe_resolved_batch_result resolved = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
