@@ -971,6 +971,24 @@ void test_bulk_staged_mirrors_the_slot_stride_decline() {
     }
 }
 
+// A moved-from plan answers every lookup with "not found": the move takes the entries and the index together, and the
+// plan reads a missing index as the empty one instead of dereferencing it.
+void test_moved_from_plan_finds_nothing() {
+    placement_plan source = make_plan();
+    CHECK(source.find_expert_entry(1, 0, expert_tensor_role::GATE) != nullptr);
+    CHECK(source.has_dense_entry("blk.1.attn_q.weight"));
+    const placement_plan moved = std::move(source);
+    CHECK(moved.find_expert_entry(1, 0, expert_tensor_role::GATE) != nullptr);
+    CHECK(moved.find_dense_entry("blk.1.attn_q.weight") != nullptr);
+    CHECK(source.entries.empty());
+    CHECK(source.find_expert_entry(1, 0, expert_tensor_role::GATE) == nullptr);
+    CHECK(source.find_expert_entry("blk.1.ffn_gate_exps.weight", 0) == nullptr);
+    CHECK(!source.has_dense_entry("blk.1.attn_q.weight"));
+    CHECK(source.find_dense_entry("blk.1.attn_q.weight") == nullptr);
+    CHECK(!source.expert_on_device("blk.1.ffn_gate_exps.weight", 0));
+    CHECK(source.summarize_expert_placements().planned == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -1069,6 +1087,7 @@ int main() {
     test_recharge_on_moves_the_target_devices_room();
     test_charge_expert_slots_resolves_a_duplicated_role_by_its_first_entry();
     test_bulk_staged_mirrors_the_slot_stride_decline();
+    test_moved_from_plan_finds_nothing();
 
     if (failures) {
         std::fprintf(stderr, "test-moe-stream-plan: %d failure(s)\n", failures);
