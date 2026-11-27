@@ -7434,15 +7434,28 @@ only; every device item is still the lead's.**
    - A submission that declines without throwing still declines SUBMIT, and the direct route runs the node. That
      covers a kernel entry that refuses and a GEMM whose primitive the execute could not create. dst is still
      unwritten, and the queue took the marker.
+   - Lead ruling, 2026-11-27: "no fall-through after a failed submission" means a thrown failure, which leaves the
+     queue or the library in an unknown state. A refusal that returns a value leaves the queue healthy and dst
+     unwritten; everything submitted wrote only the ring planes and the row map, which `abandon()` holds until its
+     marker. So these three sites stay `return abandon();` (SUBMIT), and the direct route runs the node.
    - The hold runs once. A decline whose own bookkeeping throws reaches the handler with everything already held. A
      marker the queue cannot take throws its own error out of the handler.
-   - A private failpoint, `GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_AFTER_GATHER` (the q1 seam header), throws once
-     at the GEMM stage, after the gather. The device test's case `gate_up-thrown-after-gather` expects:
+   - A private failpoint, `GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_THROW_AFTER_GATHER` (the q1 seam header),
+     throws once at the GEMM stage, after the gather. The device test's case `gate_up-thrown-after-gather` expects:
      - status FAILED, and the failpoint consumed once;
      - the WARN and the fallback line once each, both naming `expert GEMM`;
      - no arm line and no direct-route line;
      - no run or decline counted.
      The next case, `gate_up-after-thrown`, runs on the arm again.
+   - A second private failpoint, `GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_DECLINE_AFTER_GATHER`, opens the expert
+     GEMM lambda. On a run, never on the query, it makes the GEMM return no event once, as a primitive the query
+     admitted and oneDNN cannot create at execute would. So the run after the gather reaches the real
+     `if (!gemm_event) { return abandon(); }`. The case `gate_up-declined-after-gather` expects:
+     - runs +0, declines +1, SUBMIT +1;
+     - the arm's decline line with `reason=submit`, the direct-route line, and no arm line;
+     - dst matching the CPU within the same NMSE bound, and no refusal;
+     - the failpoint consumed exactly once.
+     The next case, `gate_up-after-declined`, runs on the arm again. Every other case must consume no failpoint.
 2. The planned-size admission now runs before the ids, on the routed rows unpadded. No packing is smaller, so the
    admission declines no node it would admit later. A SCRATCH_UNPLANNED decline therefore pays no ids wait. The same
    admission runs again on the packed rows after the plan. The per-node row-count check stays after the ids.
@@ -7452,7 +7465,8 @@ only; every device item is still the lead's.**
    - An arm case must move runs by 1 and declines by 0.
    - A decline case (`tokens`, `opt_out`) must move runs by 0, declines by 1 and its own reason by 1.
    - The route lines stay as a second witness.
-   - The test now links `ggml-sycl-private-fixtures`. It has 8 cases and ends `PASS: BF16 grouped prompt arm, 8 cases`.
+   - The test now links `ggml-sycl-private-fixtures`. It has 9 cases (8 in round 1, and the declined case added after
+     the lead's ruling) and ends `PASS: BF16 grouped prompt arm, 9 cases`.
 4. Round to nearest even is proved at kernel level, in `tests/test-sycl-moe-bf16-grouped-kernel.cpp` (ctest
    `sycl-moe-bf16-grouped-kernel`, `opencl:cpu`, labels `sycl;moe;bf16;kernel;hostonly`).
    - A table of 27 f32 inputs gives each one's bf16 bits. It covers ties to even both ways, one ulp either side of a
@@ -7473,8 +7487,11 @@ only; every device item is still the lead's.**
   - `test-sycl-moe-bf16-direct-source.py`:
     - (i) now orders the routed-rows admission before the ids, the ids refresh once and before the plan, and the
       packed-rows admission after the table.
-    - The new (j) pins the hold to a marker, the one `try`, and the handler with no way back to the direct route. It
-      has 23 mutants.
+    - The new (j) pins the hold to a marker, the one `try`, and the handler with no way back to the direct route.
+      After the ruling it also pins the declining failpoint: once, opening the expert GEMM lambda, private builds
+      only, on a run and never on the query, returning no event. It has 28 mutants, 5 of them for that failpoint.
+  - `scripts/check-sycl-dnnl-decline-consumers.py`: its pin on the expert GEMM lambda's opening now includes the
+    declining failpoint.
   - `test-sycl-pp-moe-scratch-admission-contract.py`: the arm's refusal and its latched WARN now go through
     `admit_planes`.
   - `docs/backend/sycl-static-storage-inventory.csv` is regenerated. Its one new row is the handler's `thread_local`
@@ -7514,7 +7531,22 @@ only; every device item is still the lead's.**
     - `sycl-unified-private-seams` and `sycl-retained-publication-no-export` pass.
     - `sycl-private-carrier-linkage` and `sycl-staging-failpoint-no-export` fail only on binaries this worktree never
       built (16 of the carrier test's 49). Every carrier binary that exists passes. Both need the lead's full build.
-  - Not run here, as the lead's: `test-moe-bf16-grouped-device` (8 cases), every other device test, and the two fixed
+  - Host evidence after the lead's ruling, at `a80eefadec`:
+    - The build: `ggml-sycl`, `test-moe-bf16-grouped-device` and `test-moe-pp-staging-refusal` (the seam header
+      changed), `BUILD_RC=0`. Both backend objects and both test objects are newer than their last edited source.
+    - `test-moe-bf16-grouped-device` still lists no `libggml-sycl` in NEEDED, the same set as
+      `test-moe-pp-staging-refusal`. The shipped DSO exports no test or failpoint symbol.
+    - The static-storage inventory is regenerated; only line numbers change. `--check` and `--check-classification`
+      return 0.
+    - The same selection was run again by name, without `test-skip-policy` and with the four artifact tests added:
+      247 tests. 244 pass, and none was skipped or not run. That includes `test-sycl-moe-bf16-direct-source` (130),
+      `test-sycl-dnnl-decline-consumers` and `test-sycl-static-storage-audit`. The three reds:
+      - `sycl-private-cpu-traits-source`: the inventory above, unchanged.
+      - `sycl-private-carrier-linkage` stops at its first missing binary. 16 of its 49 carriers were never built in
+        this worktree. Run on the 33 that exist, it passes all 33.
+      - `sycl-staging-failpoint-no-export`: its export check passes (no `failpoint` symbol in the shipped DSO). Its
+        positive control needs `test-sycl-staging-replacement-failpoints`, which this worktree never built.
+  - Not run here, as the lead's: `test-moe-bf16-grouped-device` (9 cases), every other device test, and the two fixed
     sweeps.
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
