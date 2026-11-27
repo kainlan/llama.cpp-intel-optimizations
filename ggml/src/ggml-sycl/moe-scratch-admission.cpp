@@ -148,6 +148,16 @@ pp_moe_onednn_scratch_admission pp_moe_onednn_admit_scratch(const pp_moe_onednn_
     return pp_moe_onednn_preflight_scratch(planned, required, &aligned_required);
 }
 
+pp_moe_onednn_scratch_admission pp_moe_onednn_admit_weightless_scratch(const pp_moe_onednn_scratch_shape & planned,
+                                                                       size_t activation_bytes,
+                                                                       size_t output_bytes) {
+    // RED (Task 24): not decided yet.
+    (void) planned;
+    (void) activation_bytes;
+    (void) output_bytes;
+    return { false, pp_moe_onednn_scratch_admission_reason::MISSING_PLAN };
+}
+
 const char * pp_moe_onednn_scratch_admission_reason_name(pp_moe_onednn_scratch_admission_reason reason) {
     switch (reason) {
         case pp_moe_onednn_scratch_admission_reason::ALLOWED:

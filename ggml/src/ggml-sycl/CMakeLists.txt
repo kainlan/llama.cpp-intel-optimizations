@@ -8505,6 +8505,25 @@ set_tests_properties(sycl-moe-pp-pack PROPERTIES
     TIMEOUT 30
 )
 
+# The layout of the BF16 grouped prompt arm of MUL_MAT_ID (Inkling 2 Mini plan Task 24): which experts a node routes
+# rows to, each routed row's packed row, and the GEMM widths the oneDNN primitive cache is keyed on.
+# moe-bf16-grouped-plan.hpp is header-only and includes no SYCL header; moe-scratch-admission.cpp supplies the ring's
+# planned rows the test checks the layout against. No -fsycl, no backend library.
+add_executable(test-moe-bf16-grouped-plan
+    tests/test-moe-bf16-grouped-plan.cpp
+    moe-scratch-admission.cpp
+)
+target_include_directories(test-moe-bf16-grouped-plan PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+set_target_properties(test-moe-bf16-grouped-plan PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-bf16-grouped-plan COMMAND test-moe-bf16-grouped-plan)
+set_tests_properties(sycl-moe-bf16-grouped-plan PROPERTIES
+    LABELS "sycl;moe;host-only;tsan-capable"
+    TIMEOUT 30
+)
+
 # Runtime admission of the PP MoE oneDNN scratch ring (llama.cpp-u1bb): which
 # slots go to the RUNTIME zone and which to the KV zone's post-KV headroom.
 # Same dependency-free unit and registration as test-moe-scratch-admission.

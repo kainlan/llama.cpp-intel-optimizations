@@ -126,6 +126,17 @@ pp_moe_onednn_scratch_admission pp_moe_onednn_preflight_scratch(const pp_moe_one
 pp_moe_onednn_scratch_admission pp_moe_onednn_admit_scratch(const pp_moe_onednn_scratch_shape & planned,
                                                             const pp_moe_onednn_scratch_shape & required);
 
+// The same cap for a node that stages no weight: the BF16 grouped prompt arm of MUL_MAT_ID (Inkling 2 Mini plan Task
+// 24) reads each expert where it is loaded and uses only one ring slot's activation and output planes. The plan must
+// still be whole (MISSING_PLAN otherwise), because the ring the arm claims is the one the plan sized, weight plane
+// included; the request is the two byte counts, each nonzero (INVALID_REQUEST otherwise) and within its aligned plane
+// (ACTIVATION_CAP, OUTPUT_CAP). pp_moe_onednn_preflight_scratch refuses a zero weight request, which is right for a
+// node that dequantizes into the weight plane and wrong for one that stages none, so this entry point exists rather
+// than a fake weight size.
+pp_moe_onednn_scratch_admission pp_moe_onednn_admit_weightless_scratch(const pp_moe_onednn_scratch_shape & planned,
+                                                                       size_t activation_bytes,
+                                                                       size_t output_bytes);
+
 const char * pp_moe_onednn_scratch_admission_reason_name(pp_moe_onednn_scratch_admission_reason reason);
 
 // One-shot gate for the unconditional refusal warning.

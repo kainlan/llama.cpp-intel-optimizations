@@ -28,6 +28,7 @@
 using ggml_sycl::moe_pp_pack_gemm_groups;
 using ggml_sycl::moe_pp_packed_layout;
 using ggml_sycl::pp_moe_onednn_admit_scratch;
+using ggml_sycl::pp_moe_onednn_admit_weightless_scratch;
 using ggml_sycl::pp_moe_onednn_align_scratch_shape;
 using ggml_sycl::pp_moe_onednn_checked_align_slot_bytes;
 using ggml_sycl::pp_moe_onednn_packed_rows_at;
@@ -561,6 +562,103 @@ static void test_refusal_report_fires_once() {
           "an admitted request does not consume the latch");
 }
 
+// The BF16 grouped prompt arm (Inkling 2 Mini plan Task 24) stages no weight: it reads each BF16 expert where it is
+// loaded and uses only one ring slot's activation and output planes. The plan below is the ring as Inkling's prompt
+// executor sizes it at a 512-row micro-batch, 128 experts, top-8: one dequantized f16 gate_up expert (2304 in, 4608
+// out) in the weight plane and the packed bound's rows in the other two. The arm's widest node packs every routed row
+// plus at most 63 per active expert: 512 * 8 + 63 * 128 = 12,160 rows, against the bound's 16,256.
+static void test_weightless_admission() {
+    constexpr size_t k_in       = 2304;
+    constexpr size_t gate_up    = 4608;
+    constexpr size_t down       = 2304;
+    constexpr size_t arm_rows   = 512u * 8u + 63u * 128u;
+    constexpr size_t act_row    = k_in * 2u;     // one bf16 activation row
+    constexpr size_t gu_out_row = gate_up * 4u;  // one f32 output row of gate_up
+    constexpr size_t dn_out_row = down * 4u;     // one f32 output row of down
+
+    pp_moe_onednn_scratch_shape planned;
+    planned.weight_slot_bytes = k_in * gate_up * 2u;
+    planned.ring_depth        = 1;
+    check(pp_moe_onednn_slots_at(512, 128, 8, act_row, gu_out_row, &planned.activation_slot_bytes,
+                                 &planned.output_slot_bytes),
+          "the Inkling ring's slots size");
+
+    const auto gate_up_node =
+        pp_moe_onednn_admit_weightless_scratch(planned, arm_rows * act_row, arm_rows * gu_out_row);
+    check(gate_up_node.allowed && gate_up_node.reason == pp_moe_onednn_scratch_admission_reason::ALLOWED,
+          std::string("the Inkling plan admits the arm's widest gate_up node (reason=") +
+              pp_moe_onednn_scratch_admission_reason_name(gate_up_node.reason) + ")");
+    check(pp_moe_onednn_admit_weightless_scratch(planned, arm_rows * act_row, arm_rows * dn_out_row).allowed,
+          "the Inkling plan admits the arm's widest down node");
+    check(pp_moe_onednn_admit_weightless_scratch(planned, planned.activation_slot_bytes, planned.output_slot_bytes)
+              .allowed,
+          "the exact planes are admitted");
+
+    // The weight plane is the arm's to ignore, not to require: a plan whose weight plane is one byte still admits.
+    pp_moe_onednn_scratch_shape tiny_weight = planned;
+    tiny_weight.weight_slot_bytes           = 1;
+    check(pp_moe_onednn_admit_weightless_scratch(tiny_weight, act_row, gu_out_row).allowed,
+          "a one-byte weight plane still admits a weightless node");
+
+    // A plan with any plane or the depth missing was never published: the ring the arm would claim does not exist.
+    for (int field = 0; field < 4; ++field) {
+        pp_moe_onednn_scratch_shape missing = planned;
+        switch (field) {
+            case 0:
+                missing.weight_slot_bytes = 0;
+                break;
+            case 1:
+                missing.activation_slot_bytes = 0;
+                break;
+            case 2:
+                missing.output_slot_bytes = 0;
+                break;
+            default:
+                missing.ring_depth = 0;
+                break;
+        }
+        expect_reason(pp_moe_onednn_admit_weightless_scratch(missing, act_row, gu_out_row),
+                      pp_moe_onednn_scratch_admission_reason::MISSING_PLAN,
+                      "a plan missing field " + std::to_string(field) + " fails closed");
+    }
+
+    // A node that stages no activation or writes no output is not a node.
+    expect_reason(pp_moe_onednn_admit_weightless_scratch(planned, 0, gu_out_row),
+                  pp_moe_onednn_scratch_admission_reason::INVALID_REQUEST, "zero activation bytes are invalid");
+    expect_reason(pp_moe_onednn_admit_weightless_scratch(planned, act_row, 0),
+                  pp_moe_onednn_scratch_admission_reason::INVALID_REQUEST, "zero output bytes are invalid");
+    expect_reason(pp_moe_onednn_admit_weightless_scratch(planned, std::numeric_limits<size_t>::max(), gu_out_row),
+                  pp_moe_onednn_scratch_admission_reason::INVALID_REQUEST, "an unalignable size is invalid");
+
+    // One alignment unit over either plane is refused with that plane's reason, never clamped.
+    expect_reason(pp_moe_onednn_admit_weightless_scratch(
+                      planned, planned.activation_slot_bytes + PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT, gu_out_row),
+                  pp_moe_onednn_scratch_admission_reason::ACTIVATION_CAP, "an over-plan activation is refused");
+    expect_reason(pp_moe_onednn_admit_weightless_scratch(
+                      planned, act_row, planned.output_slot_bytes + PP_MOE_ONEDNN_SCRATCH_SLOT_ALIGNMENT),
+                  pp_moe_onednn_scratch_admission_reason::OUTPUT_CAP, "an over-plan output is refused");
+
+    // The cap is the aligned plan, as for the staged ring: an unaligned plan admits itself and whatever rounds to it.
+    pp_moe_onednn_scratch_shape unaligned;
+    unaligned.weight_slot_bytes     = 1000;
+    unaligned.activation_slot_bytes = 1000;
+    unaligned.output_slot_bytes     = 1000;
+    unaligned.ring_depth            = 1;
+    check(pp_moe_onednn_admit_weightless_scratch(unaligned, 1000, 1000).allowed,
+          "an unaligned plan admits its own planes");
+    check(pp_moe_onednn_admit_weightless_scratch(unaligned, 1024, 1024).allowed,
+          "an unaligned plan admits what rounds to its aligned planes");
+    expect_reason(pp_moe_onednn_admit_weightless_scratch(unaligned, 1025, 1000),
+                  pp_moe_onednn_scratch_admission_reason::ACTIVATION_CAP, "one byte past the aligned plane is refused");
+
+    // Why this entry point exists: the staged preflight refuses a zero weight request.
+    pp_moe_onednn_scratch_shape no_weight = planned;
+    no_weight.weight_slot_bytes           = 0;
+    expect_reason(pp_moe_onednn_admit_scratch(planned, no_weight),
+                  pp_moe_onednn_scratch_admission_reason::INVALID_REQUEST,
+                  "the staged preflight still refuses a zero weight request");
+}
+
 int main() {
     const struct {
         const char * name;
@@ -578,6 +676,7 @@ int main() {
         { "reason-names-are-stable",                 test_reason_names_are_stable                 },
         { "refusal-reaches-no-side-effect",          test_refusal_reaches_no_side_effect          },
         { "refusal-report-fires-once",               test_refusal_report_fires_once               },
+        { "weightless-admission",                    test_weightless_admission                    },
     };
 
     for (const auto & test_case : cases) {
