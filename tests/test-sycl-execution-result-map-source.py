@@ -11,6 +11,8 @@ With comments blanked, in ggml-sycl.cpp:
      under the registry mutex is a code defect, not memory pressure, and must not be retried), and a value outside
      the enum also ends in INTERNAL_ERROR, never BUSY.
   N. ggml_sycl_execution_error_name has a case for every enumerator and returns the enumerator's own name.
+  E. the enum body and both functions are found and non-empty, so a rename fails the test instead of leaving
+     the coverage pins with nothing to check.
   D. neither switch has a `default:` label, so the compiler sees a missing enumerator.
   P. both functions sit inside one `#pragma clang diagnostic` push/pop region that makes -Wswitch an error, so a
      new enumerator breaks the build instead of printing a warning that is read past.
@@ -84,14 +86,16 @@ def claims(header, sycl):
     pop = sycl.find(POP, err)
     region = sycl[err:pop] if 0 <= push < err < pop else ""
     return {
-        "enum parsed": len(names) >= 11 and "OK" in names,
-        "C every enumerator has a c_result case": bool(c_fn) and all(n in c_cases for n in names),
+        "E the enum body is found and has enumerators": bool(names) and "OK" in names,
+        "E ggml_sycl_execution_c_result is found with cases": bool(c_fn) and bool(c_cases),
+        "E ggml_sycl_execution_error_name is found with cases": bool(n_fn) and bool(n_cases),
+        "C every enumerator has a c_result case": bool(names) and bool(c_fn) and all(n in c_cases for n in names),
         "M ALLOCATION_FAILED maps to ALLOCATION_FAILURE": c_cases.get("ALLOCATION_FAILED") ==
             EXPECTED_C["ALLOCATION_FAILED"],
         "M LOCK_HELD_ALLOCATION maps to INTERNAL_ERROR": c_cases.get("LOCK_HELD_ALLOCATION") ==
             EXPECTED_C["LOCK_HELD_ALLOCATION"],
         "M out of range maps to INTERNAL_ERROR": trailing_return(c_fn) == OUT_OF_RANGE,
-        "N every enumerator has a name case": bool(n_fn) and all(n in n_cases for n in names),
+        "N every enumerator has a name case": bool(names) and bool(n_fn) and all(n in n_cases for n in names),
         "N each name is the enumerator's own": all(n_cases.get(n) == f'"{n}"' for n in names),
         "D no default in c_result": c_fn != "" and re.search(r"\bdefault\s*:", c_fn) is None,
         "D no default in error_name": n_fn != "" and re.search(r"\bdefault\s*:", n_fn) is None,
@@ -141,6 +145,13 @@ def mutants(header, sycl):
          sub(sycl, case("NOT_FOUND", '"NOT_FOUND"'), 'default: return "NOT_FOUND";')),
         ("P -Wswitch is an error across both functions", header, sub(sycl, re.escape(ERROR_SWITCH), "")),
         ("P -Wswitch is an error across both functions", header, sub(sycl, re.escape(NAME_FN), POP + "\n" + NAME_FN)),
+        ("E the enum body is found and has enumerators", sub(header, r"enum class error \{", "enum class errors {"), sycl),
+        ("E ggml_sycl_execution_c_result is found with cases", header,
+         sub(sycl, "ggml_sycl_execution_c_result\\(ggml_sycl::execution::error e\\) \\{",
+             "ggml_sycl_execution_c_result_renamed(ggml_sycl::execution::error e) {")),
+        ("E ggml_sycl_execution_error_name is found with cases", header,
+         sub(sycl, "ggml_sycl_execution_error_name\\(ggml_sycl::execution::error e\\) \\{",
+             "ggml_sycl_execution_error_name_renamed(ggml_sycl::execution::error e) {")),
         ("C every enumerator has a c_result case", extra(header), sycl),
         ("N every enumerator has a name case", extra(header), sycl),
         ("C every enumerator has a c_result case", extra_no_comma(header), sycl),
