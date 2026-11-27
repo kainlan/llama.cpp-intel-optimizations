@@ -5816,6 +5816,13 @@ class unified_cache {
     // Test-only: the last clears the eviction latch, which production code must never do outside a reclaim.
     // The walks of entries_ the id remap has made over the cache's life (id_remap_walks_).
     uint64_t test_id_remap_walks() const noexcept;
+    // The entries the retired-entry finalize has visited over the cache's life (retired_entry_visits_).
+    uint64_t test_retired_entry_visits() const noexcept;
+    // The retired-key set names exactly the retired entries entries_ holds, as many as retired_pending_count_ counts
+    // (unless an insert could not allocate). O(entries); only the tests use it.
+    bool     test_retired_index_consistent() const;
+    // An insert into the retired-key set failed and no finalize has rebuilt the set since.
+    bool     test_retired_index_incomplete() const;
     // The key `id` maps to, in *out; false when the id maps to nothing.
     bool     test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const;
     // Clear has_evictions_, as reclaim_weight_entries() does, so a case starts from a clean latch.
@@ -5826,6 +5833,11 @@ class unified_cache {
     }
 
     void test_fail_next_host_registration_insert() noexcept { fail_next_host_registration_insert_ = true; }
+
+    // The next insert into the retired-key set throws std::bad_alloc, as an allocation failure would: the retire
+    // still happens, the set is left incomplete, and the next finalize rebuilds it.
+    void test_fail_next_retired_index_insert() noexcept { fail_next_retired_index_insert_ = true; }
+
     bool note_model_load_abort(uint64_t load_txn_id) noexcept;
     void note_model_load_end(uint32_t slot, uint64_t load_txn_id);
 
@@ -6574,6 +6586,7 @@ class unified_cache {
 
   private:
     std::atomic<bool> fail_next_host_registration_insert_{ false };
+    std::atomic<bool> fail_next_retired_index_insert_{ false };
 
     // Sub-allocate from a zone. When allocation_id is non-zero, physical
     // allocation, exact authority registration, and token identity share the
@@ -6695,7 +6708,8 @@ class unified_cache {
     // internal cache mutations call the locked form to avoid recursive locking.
     void        process_deferred_frees_locked();
     size_t      finalize_retired_entries_locked();
-    bool        transition_to_retired_locked(unified_cache_entry & entry) noexcept;
+    bool        transition_to_retired_locked(const unified_cache_key & key, unified_cache_entry & entry) noexcept;
+    void        complete_retired_index_locked() noexcept;
     entry_map::iterator erase_entry_locked(entry_map::iterator it) noexcept;
     size_t              erase_entry_locked(const unified_cache_key & key) noexcept;
     void        remap_or_erase_id_mapping_locked(const ggml_sycl_cache_id & id, const unified_cache_key & removed_key);
@@ -6908,6 +6922,10 @@ class unified_cache {
     // under GGML_SYCL_PRIVATE_TESTING: one relaxed add costs nothing beside the walk it counts, and a member that one
     // build variant has and another lacks would give the class two layouts.
     std::atomic<uint64_t> id_remap_walks_{ 0 };
+    // How many entries finalize_retired_entries_locked() has visited over the cache's life. The deferred-free pass
+    // runs on every backend synchronize, several times per decoded token, so the device tests read the count across
+    // one to pin that a pass with nothing retired visits no entry. Kept in every build, as id_remap_walks_ is.
+    std::atomic<uint64_t> retired_entry_visits_{ 0 };
 
     // Slots held by llama_model objects that are still alive (llama.cpp-0qlw).
     // Guarded by rw_mutex_ like entries_, so a reclaim decision and the liveness
@@ -7916,6 +7934,21 @@ class unified_cache {
     std::vector<deferred_free_entry>      deferred_frees_;
     std::vector<deferred_host_free_entry> deferred_host_frees_;
     std::atomic<size_t>                   retired_pending_count_{ 0 };
+    // The keys of the retired entries entries_ still holds: what finalize_retired_entries_locked() walks, so the
+    // deferred-free pass on every synchronize costs what is retired, not the size of the cache (tens of thousands of
+    // expert entries on a MoE model). Guarded by rw_mutex_, with entries_. transition_to_retired_locked() adds a key,
+    // and a restore and erase_entry_locked() take it out, so the set and retired_pending_count_ name the same entries.
+    // A retired entry still leased stays in the set until the pass that finds its last lease gone erases it.
+    // Retirement must not fail once withdrawal has begun, so an insert that cannot allocate only sets
+    // retired_index_incomplete_, and the next finalize walks every entry once to put the missing keys back. The set
+    // takes the standard allocator, not cache_guard_allocator: the private fixtures' allocation-failure countdown counts
+    // the cache's map allocations, and an index insert must not take the failure a fixture aimed at one of them.
+    using retired_key_set = std::unordered_set<unified_cache_key, unified_cache_key_hash>;
+    retired_key_set retired_keys_;
+    bool            retired_index_incomplete_ = false;
+    // Keys the finalize found naming no retired entry, a bookkeeping slip it repairs; it warns on the 1st, 2nd, 4th, ...
+    // so a recurring slip stays visible without flooding the log. Guarded by rw_mutex_.
+    uint64_t        retired_index_stale_keys_ = 0;
 
     struct inflight_unpin_entry {
         ggml_sycl_cache_id key       = {};
@@ -9085,6 +9118,14 @@ bool allocation_registry_test_release_exact_lease(const alloc_metadata & metadat
 bool                      allocation_registry_test_hold_physical_release(const alloc_metadata & metadata) noexcept;
 bool                      allocation_registry_test_unhold_physical_release(const alloc_metadata & metadata) noexcept;
 size_t allocation_registry_test_process_promotion_retries(int device) noexcept;
+// What the cache teardown asks before it dismantles: is any registry row on `device` (any device when negative) still
+// waiting for its promotion cleanup.
+bool                      allocation_registry_test_has_promotion_cleanup_pending(int device) noexcept;
+// The `nth` insert into the promotion-cleanup row set from now (1 = the next) throws std::bad_alloc, as an allocation
+// failure would; 0 disarms. A failed insert from a pending-flag write leaves the flag set and the set incomplete; one
+// from the rebuild leaves the set incomplete for the next question to retry.
+void                      allocation_registry_test_fail_promotion_index_insert_at(size_t nth) noexcept;
+bool                      allocation_registry_test_promotion_index_incomplete() noexcept;
 registered_release_status allocation_registry_test_release_exact(
     const alloc_metadata & metadata, registered_release_mode mode) noexcept;
 registered_release_status allocation_registry_test_claim(const alloc_metadata & metadata, bool intrusive) noexcept;

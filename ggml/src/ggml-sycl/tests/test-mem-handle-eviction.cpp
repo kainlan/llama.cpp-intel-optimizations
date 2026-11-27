@@ -880,6 +880,164 @@ static bool test_retired_status_query_failure_is_deferred(sycl::queue & q) {
 }
 
 // =============================================================================
+// Test 10b: the deferred-free pass runs on every backend synchronize, several
+// times per decoded token, so its cost follows the retired entries, not the
+// cache. A pass with nothing retired visits no entry. A retired entry nobody
+// leases finalizes at its retire. A retired entry still leased stays through a
+// pass that visits it alone, and the pass after its lease goes finalizes it.
+// =============================================================================
+static bool deferred_pass_visited(ggml_sycl::unified_cache & cache, uint64_t expected, const char * when) {
+    const uint64_t before = cache.test_retired_entry_visits();
+    cache.process_deferred_frees_public();
+    const uint64_t visited = cache.test_retired_entry_visits() - before;
+    if (visited != expected) {
+        fprintf(stderr, "(%s: the deferred-free pass visited %llu entries, expected %llu) ", when,
+                (unsigned long long) visited, (unsigned long long) expected);
+    }
+    return visited == expected;
+}
+
+static bool test_deferred_free_pass_visits_only_retired_entries(sycl::queue & q) {
+    TEST_BEGIN("deferred_free_pass_visits_only_retired_entries");
+
+    constexpr size_t         bytes  = 4096;
+    constexpr int            n_idle = 6;
+    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
+    void *                   src = sycl::malloc_host(bytes, q);
+    TEST_ASSERT(src != nullptr, "malloc_host for the visit-count source failed");
+    std::memset(src, 0x3C, bytes);
+
+    for (int i = 0; i < n_idle; ++i) {
+        const auto key = make_test_cache_id(745, 60 + i, bytes);
+        auto staged = cache.direct_stage_expert(key, src, bytes, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr);
+        TEST_ASSERT(staged.ok, "idle expert stage failed");
+        staged.event.wait_and_throw();
+    }
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 0, "the fixture starts with a retired entry");
+    TEST_ASSERT(deferred_pass_visited(cache, 0, "nothing retired"),
+                "a deferred-free pass with nothing retired visited cache entries");
+
+    // Retired and unleased: its retire finalizes it, and the next pass has nothing to visit.
+    const auto unleased = make_test_cache_id(745, 80, bytes);
+    auto       unleased_staged =
+        cache.direct_stage_expert(unleased, src, bytes, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr);
+    TEST_ASSERT(unleased_staged.ok, "unleased expert stage failed");
+    unleased_staged.event.wait_and_throw();
+    TEST_ASSERT(cache.retire_expert_entry_exact(unleased, GGML_LAYOUT_AOS, "test-unleased-retire") ==
+                    ggml_sycl::expert_retire_status::WITHDRAWN,
+                "an unleased retire did not withdraw its entry");
+    TEST_ASSERT(cache.lookup_expert(unleased) == nullptr, "a retired, unleased entry was not finalized");
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 0, "the unleased retire left a retirement pending");
+    TEST_ASSERT(deferred_pass_visited(cache, 0, "after the unleased retire"),
+                "after the unleased entry finalized, the deferred-free pass still visited entries");
+
+    // Retired and leased: it stays through a pass that visits it alone, then finalizes once the lease goes.
+    const auto            leased = make_test_cache_id(745, 81, bytes);
+    ggml_sycl::mem_handle lease;
+    auto                  leased_staged =
+        cache.direct_stage_expert(leased, src, bytes, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, &lease);
+    TEST_ASSERT(leased_staged.ok && lease.valid(), "leased expert stage did not publish a lease");
+    leased_staged.event.wait_and_throw();
+    TEST_ASSERT(cache.retire_expert_entry_exact(leased, GGML_LAYOUT_AOS, "test-leased-retire") ==
+                    ggml_sycl::expert_retire_status::DEFERRED,
+                "a leased retire did not defer");
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 1, "the leased retire did not count one pending entry");
+    TEST_ASSERT(deferred_pass_visited(cache, 1, "retired and leased"),
+                "with one retired entry, the deferred-free pass visited entries other than it");
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 1, "the pass finalized an entry that is still leased");
+    TEST_ASSERT(cache.test_retired_index_consistent(), "the retired-key set disagrees with the retired entries");
+    TEST_ASSERT(lease.resolve().ptr == leased_staged.ptr, "the pass invalidated the live lease");
+
+    lease = {};
+    TEST_ASSERT(deferred_pass_visited(cache, 1, "lease released"),
+                "the pass after the lease went did not visit the retired entry alone");
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 0, "the retired entry did not finalize after its lease");
+    TEST_ASSERT(cache.lookup_expert(leased) == nullptr, "the retired entry survived its final lease");
+    TEST_ASSERT(cache.test_retired_index_consistent(), "the retired-key set kept a finalized entry");
+    TEST_ASSERT(deferred_pass_visited(cache, 0, "after the final lease"),
+                "after every retired entry finalized, the deferred-free pass still visited entries");
+    for (int i = 0; i < n_idle; ++i) {
+        TEST_ASSERT(cache.lookup_expert(make_test_cache_id(745, 60 + i, bytes)) != nullptr,
+                    "an idle entry did not survive the passes");
+    }
+
+    sycl::free(src, q);
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
+// Test 10c: the retired flag, not the retired-key set, is the durable state.
+// A retire whose key the set cannot take (an allocation failure) still
+// retires, and the next finalize walks every entry once to put the key back:
+// here the retire's own finalize. The entry then stays while leased and
+// finalizes on the pass after its lease goes, as any retired entry does.
+// A rebuild that itself fails partway is not driven here: the finalize then
+// walks what the set holds, which only delays an entry a pass, and that path
+// is covered by reading complete_retired_index_locked().
+// =============================================================================
+static bool test_retired_index_insert_failure_is_recovered(sycl::queue & q) {
+    TEST_BEGIN("retired_index_insert_failure_is_recovered");
+
+    constexpr size_t         bytes  = 4096;
+    constexpr int            n_idle = 3;
+    ggml_sycl::unified_cache cache(q, 16 * 1024 * 1024);
+    void *                   src = sycl::malloc_host(bytes, q);
+    TEST_ASSERT(src != nullptr, "malloc_host for the index-failure source failed");
+    std::memset(src, 0x4B, bytes);
+
+    for (int i = 0; i < n_idle; ++i) {
+        const auto key = make_test_cache_id(746, 60 + i, bytes);
+        auto staged = cache.direct_stage_expert(key, src, bytes, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, nullptr);
+        TEST_ASSERT(staged.ok, "idle expert stage failed");
+        staged.event.wait_and_throw();
+    }
+    const auto            leased = make_test_cache_id(746, 81, bytes);
+    ggml_sycl::mem_handle lease;
+    auto                  leased_staged =
+        cache.direct_stage_expert(leased, src, bytes, bytes, GGML_LAYOUT_AOS, nullptr, nullptr, &q, &lease);
+    TEST_ASSERT(leased_staged.ok && lease.valid(), "leased expert stage did not publish a lease");
+    leased_staged.event.wait_and_throw();
+    TEST_ASSERT(!cache.test_retired_index_incomplete(), "the retired-key set starts incomplete");
+    const size_t staged_entries = cache.entry_count();
+    if (staged_entries != static_cast<size_t>(n_idle) + 1) {
+        fprintf(stderr, "(the fixture holds %zu entries, expected %zu) ", staged_entries,
+                static_cast<size_t>(n_idle) + 1);
+    }
+    TEST_ASSERT(staged_entries == static_cast<size_t>(n_idle) + 1,
+                "the fixture holds entries other than the four staged");
+
+    cache.test_fail_next_retired_index_insert();
+    const uint64_t before = cache.test_retired_entry_visits();
+    TEST_ASSERT(cache.retire_expert_entry_exact(leased, GGML_LAYOUT_AOS, "test-index-failure-retire") ==
+                    ggml_sycl::expert_retire_status::DEFERRED,
+                "a leased retire whose index insert failed did not defer");
+    const uint64_t     visited        = cache.test_retired_entry_visits() - before;
+    // The retire runs one finalize: its rebuild walks the four staged entries, then the walk visits the retired one.
+    constexpr uint64_t rebuilt_visits = n_idle + 2;
+    if (visited != rebuilt_visits) {
+        fprintf(stderr, "(the retire's finalize visited %llu entries, expected %llu) ", (unsigned long long) visited,
+                (unsigned long long) rebuilt_visits);
+    }
+    TEST_ASSERT(visited == rebuilt_visits, "the finalize after a failed index insert did not rebuild the set once");
+    TEST_ASSERT(!cache.test_retired_index_incomplete(), "the finalize did not mark the rebuilt set complete");
+    TEST_ASSERT(cache.test_retired_index_consistent(), "the rebuilt retired-key set disagrees with a recount");
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 1, "the retire did not count one pending entry");
+    TEST_ASSERT(lease.resolve().ptr == leased_staged.ptr, "the retire invalidated the live lease");
+
+    lease = {};
+    TEST_ASSERT(deferred_pass_visited(cache, 1, "after the rebuild, lease released"),
+                "the pass after the lease went did not visit the retired entry alone");
+    TEST_ASSERT(cache.retired_pending_count_for_test() == 0, "the retired entry did not finalize after its lease");
+    TEST_ASSERT(cache.lookup_expert(leased) == nullptr, "the retired entry survived its final lease");
+    TEST_ASSERT(cache.test_retired_index_consistent(), "the retired-key set kept a finalized entry");
+
+    sycl::free(src, q);
+    TEST_PASS();
+    return true;
+}
+
+// =============================================================================
 // Test 10: terminal ticket state transitions commit exact event authority.
 // =============================================================================
 static bool test_terminal_retention_ticket_state_machine(sycl::queue & q) {
@@ -1755,6 +1913,8 @@ int main(int argc, char ** argv) {
     all_passed &= test_owner_failure_prevents_raw_stage_use(q);
     all_passed &= test_abort_cleanup_status_is_observable(q);
     all_passed &= test_retired_status_query_failure_is_deferred(q);
+    all_passed &= test_deferred_free_pass_visits_only_retired_entries(q);
+    all_passed &= test_retired_index_insert_failure_is_recovered(q);
     all_passed &= test_terminal_retention_ticket_state_machine(q);
     all_passed &= test_mmvq_rmsnorm_second_batch_failure_drains_first(q);
     all_passed &= test_graph_recording_epoch_reuse_rejected(q);

@@ -1380,7 +1380,7 @@ checks = {
     # any ready event is terminal. An eager storage_owner.reset() here would
     # regress that ordering.
     and cache_abort_body.index("released.reset();") < cache_abort_body.index("cache_lock(rw_mutex_)")
-    and cache_abort_body.index("transition_to_retired_locked(entry)") < cache_abort_body.index("finalize_retired_entries_locked()")
+    and cache_abort_body.index("transition_to_retired_locked(pair.first, entry)") < cache_abort_body.index("finalize_retired_entries_locked()")
     and "entry.storage_owner.reset()" not in cache_abort_body
     and "entry.in_use_count.load() != 0" in cache_finalize_retired_body
     and "entry.ready_event.get_info<sycl::info::event::command_execution_status>()" in cache_finalize_retired_body
@@ -1873,8 +1873,8 @@ mutants = (
      "    const bool empty   = !current || !current->plan || current->plan->entries.empty();\n    return empty;",
      "    return current.get() != nullptr;"),
     ("retirement helper early storage release", "cache",
-     "bool unified_cache::transition_to_retired_locked(unified_cache_entry & entry) noexcept {",
-     "bool unified_cache::transition_to_retired_locked(unified_cache_entry & entry) noexcept {\n"
+     "bool unified_cache::transition_to_retired_locked(const unified_cache_key & key, unified_cache_entry & entry) noexcept {",
+     "bool unified_cache::transition_to_retired_locked(const unified_cache_key & key, unified_cache_entry & entry) noexcept {\n"
      "    entry.storage_owner.reset();"),
 )
 mutant_failures = []
