@@ -100732,7 +100732,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // The packed-row table the gather and the scatter read (Inkling Task 25), allocated before the scratch
             // claim, so a table that does not fit declines with no slot claimed and no work of this dispatch
             // submitted. Its upload follows the first-submission mark below. The holder releases queue-ordered, after
-            // every kernel this dispatch submits before it leaves scope.
+            // every kernel this dispatch submits before it leaves scope. A decline between its allocation and the
+            // submitted mark releases it through a queue-ordered marker that touches only this table, so a direct
+            // re-entry is not ordered after any work on the node's data.
             scoped_unified_queue_temp<ggml_sycl::moe_pp_packed_row> packed_rows_dev;
             if (!packed_rows_dev.alloc(*stream, ctx.device, packed_rows.size(), "moe_pp_packed_rows")) {
                 return reject_batched(moe_pp_batched_refusal::PACKED_ROW_STAGING, nullptr);

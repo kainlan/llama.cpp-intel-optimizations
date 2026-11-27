@@ -8170,7 +8170,11 @@ its kernel.
   an NVFP4 weight-only-quantized GEMM, as MXFP4 has, or an f16 plane kept across micro-batches. It is written after
   this task's profile measures the dequant's real time.
 
-Amended by the lead, 2026-11-27: upload after the submitted mark (S5); PACKED_ROW_STAGING is after-claim.
+Amended by the lead, 2026-11-27: upload after the submitted mark (S5); PACKED_ROW_STAGING is after-claim; the
+admission contract's no-temporary pin (`tests/test-sycl-pp-moe-scratch-admission-contract.py`) admits exactly one
+temporary, `packed_rows_dev`, as Task 24's BF16 arm admits its row map; the scratch-helper pin
+(`tests/test-sycl-moe-pp-pack-source.py`) admits one pinned row-0 read of `batched_acts` in the gather and one of
+`batched_out` in the scatter, with a mutant that a third bare reader fails.
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 

@@ -1,9 +1,11 @@
 """The batched MoE prompt executor takes every activation and output offset from one helper each.
 
 The executor lambda try_pp_onednn_f16_batched (ggml/src/ggml-sycl/ggml-sycl.cpp) lays its activation and output
-scratch out per GEMM group, from moe_pp_pack_gemm_groups (moe-pp-pack.hpp). Every reader of that scratch (the gather,
-both GEMM arms, the scatter and the debug compare) takes its offsets from act_base and out_base, so they cannot disagree
-about where an expert's rows are, and none of the old rectangle's names remains.
+scratch out per GEMM group, from moe_pp_pack_gemm_groups (moe-pp-pack.hpp). Every reader of that scratch that addresses
+one expert (both GEMM arms and the debug compare) takes its offsets from act_base and out_base, so they cannot disagree
+about where an expert's rows are, and none of the old rectangle's names remains. The batched gather and scatter (Inkling
+Task 25) address the scratch from row 0 through the packed-row table, whose rows come from the same layout
+(slot_base_row, moe_pp_pack_row_table): each takes its pointer once, in one pinned spelling.
 
 Host-only text assertions. llama_test_pytest hands this file to pytest, so every check lives inside a test_*()
 function: a file with none is "no tests collected" (exit 5), which ctest scores as a failure. Checks run on
@@ -64,15 +66,38 @@ def test_every_offset_comes_from_one_helper(pointer, helper, uses):
     assert not failures, "\n".join(failures)
 
 
-@pytest.mark.parametrize(
-    "pointer,pointee,field,helper",
-    [("batched_acts", "sycl::half", "activation", "act_base"), ("batched_out", "float", "output", "out_base")],
-)
-def test_the_scratch_pointers_are_read_only_through_their_helpers(pointer, pointee, field, helper):
+# The batched gather's and scatter's one read of each scratch pointer (Inkling Task 25): the packed-row table's rows
+# are absolute scratch rows, so these two kernels take the scratch from row 0.
+POINTER_CASES = [
+    ("batched_acts", "sycl::half", "activation", "act_base",
+     r"\bsycl::half\s*\*\s*__restrict\s+act_get\s*=\s*batched_acts\s*;"),
+    ("batched_out", "float", "output", "out_base",
+     r"\bconst\s+float\s*\*\s*__restrict\s+out_get\s*=\s*batched_out\s*;"),
+]
+
+
+@pytest.mark.parametrize("pointer,pointee,field,helper,row0", POINTER_CASES)
+def test_the_scratch_pointers_are_read_only_through_their_helpers(pointer, pointee, field, helper, row0):
+    failures = _pointer_failures(_executor_body(), pointer, pointee, field, helper, row0)
+    assert not failures, "\n".join(failures)
+
+
+def test_a_third_bare_reader_of_the_scratch_fails():
+    # Positive control: a reader that takes batched_acts outside the pinned places, beside the gather's own read.
+    pointer, pointee, field, helper, row0 = POINTER_CASES[0]
+    body = _executor_body()
+    anchor = "batched_scratch_claim.mark_used();"
+    assert body.count(anchor) == 1, "the mutation anchor is missing"
+    mutated = body.replace(anchor, "sycl::half * stray_reader = batched_acts; " + anchor, 1)
+    assert not _pointer_failures(body, pointer, pointee, field, helper, row0)
+    assert _pointer_failures(mutated, pointer, pointee, field, helper, row0)
+
+
+def _pointer_failures(body, pointer, pointee, field, helper, row0):
     # A reader that takes the pointer itself assumes where an expert's rows are instead of asking, and the offset count
     # above cannot see it when the read is at offset 0 (no `+`). So the pointer may appear only where it is declared,
-    # where the reservation sets it, and inside its helper, and the reservation's field only where it sets the pointer.
-    body = _executor_body()
+    # where the reservation sets it, inside its helper and in the batched gather's or scatter's one pinned read, and the
+    # reservation's field only where it sets the pointer.
     t = re.escape(pointee)
     allowed = {
         "its declaration": rf"\b{t}\s*\*\s*{pointer}\s*=\s*nullptr\s*;",
@@ -83,6 +108,7 @@ def test_the_scratch_pointers_are_read_only_through_their_helpers(pointer, point
             rf"\bconst\s+auto\s+{helper}\s*=\s*\[&\]\s*\(\s*size_t\s+slot\s*\)\s*->\s*{t}\s*\*\s*\{{\s*"
             rf"return\s+{pointer}\s*\+"
         ),
+        "the batched gather's or scatter's read from row 0": row0,
     }
     failures = []
     for where, pattern in allowed.items():
@@ -93,7 +119,7 @@ def test_the_scratch_pointers_are_read_only_through_their_helpers(pointer, point
     if uses != len(allowed):
         failures.append(
             f"{pointer}: {uses} uses in the executor, want {len(allowed)} (its declaration, its assignment from the "
-            f"reservation and {helper}); every other reader must ask {helper}"
+            f"reservation, {helper} and the batched gather's or scatter's read); every other reader must ask {helper}"
         )
     # The reservation's own field is the same address under another name, so a reader that takes it bypasses the
     # helper just as the bare pointer would. Whole words, so reserved.<field>_size does not count.
@@ -103,7 +129,7 @@ def test_the_scratch_pointers_are_read_only_through_their_helpers(pointer, point
             f"reserved.{field}: {field_uses} uses in the executor, want exactly one (the assignment to {pointer}); "
             f"every other reader must ask {helper}"
         )
-    assert not failures, "\n".join(failures)
+    return failures
 
 
 if __name__ == "__main__":
