@@ -197,6 +197,9 @@ RETIRED_TRACKER = re.compile(r"\bstatic\s+thread_local\s+int\s+last_seq_layer_cp
 # N9: the record's all-host mode, decided from the plan in the builder, and the route's device half kept out of it.
 RECORD_DEF = "struct moe_hybrid_decode_record {"
 RECORD_BUILD = "ggml_sycl_moe_hybrid_decode_record_build"
+# The slot rule the build, and the patch of a built record, take every expert's slot from: its refusals are the
+# build's, so the refusal rules read it as they read the build.
+RECORD_SLOT = "ggml_sycl_moe_hybrid_decode_record_slot"
 ALL_HOST_FIELD = re.compile(r"\bbool\s+all_host\s*=\s*false\s*;")
 ALL_HOST_DECIDED = re.compile(r"\bconst\s+bool\s+all_host\s*=\s*counts\.on_device\s*==\s*0\s*;")
 ALL_HOST_RECORDED = re.compile(r"\brecord->all_host\s*=\s*all_host\s*;")
@@ -248,6 +251,13 @@ ROUTE_BOUNDARY = {
         "stamp, not per token.  It resolves every expert's route through ggml_sycl_build_moe_resolved_batch and "
         "allocates the record's host-pinned pointer table, so it reaches the resolvers' and the allocator's "
         "synchronous paths; a steady decode reuses the record and calls none of it"
+    ),
+    "ggml_sycl_moe_hybrid_decode_record_patch": (
+        "the record's patch over the experts an expert move changed: reached only on a lookup whose stamp missed "
+        "because the expert storage generation moved, not per token of a steady decode.  It resolves the moved "
+        "experts alone through ggml_sycl_build_moe_resolved_batch (allow_materialize false, as the build passes) "
+        "and allocates the patched record's host-pinned table, so it reaches the same resolver and allocator paths "
+        "the build does, for fewer experts"
     ),
 }
 
@@ -1042,6 +1052,55 @@ def device_expert_only(text: str, at: int) -> bool:
     return False
 
 
+def check_n9_refusals(name: str, squashed: str) -> None:
+    """No refusal or retry in `name` (squashed) needs a device expert outside the all-host mode, or fires for the
+    all-host case itself outside an `if` only a device expert enters."""
+    elses = list(REFUSAL_ELSE.finditer(squashed))
+    read = len(BUILD_REFUSAL.findall(squashed)) + len(REFUSAL_HELPER.findall(squashed)) + len(elses)
+    if read != len(REFUSAL_RETURNS.findall(squashed)):
+        raise ContractError(
+            f"FAIL [N9]: {name} has a refusal or retry outside an `if (...) {{...}}` this rule reads, "
+            f"the `refuse` helper's body or a final `else`, so its condition goes unchecked and could refuse "
+            f"every all-host tensor unseen ({TAG_7PVO})"
+        )
+    for m in BUILD_REFUSAL.finditer(squashed):
+        cond = m.group(1)
+        if DEVICE_LOOKUP.search(cond) and "!all_host" not in cond.replace(" ", ""):
+            raise ContractError(
+                f"FAIL [N9]: {name} refuses or retries on `{cond}`, which only a device expert can "
+                f"satisfy, without `!all_host`, so every tensor whose experts all live on the host is refused "
+                f"({TAG_7PVO})"
+            )
+        operand = all_host_operand(cond)
+        if operand is not None and not device_expert_only(squashed, m.start()):
+            raise ContractError(
+                f"FAIL [N9]: {name} refuses or retries on `{cond}`, whose `||` operand `{operand}` is the "
+                f"all-host case itself, outside any `if` only a device expert enters, so the layers the placement "
+                f"leaves entirely on the host keep their readback ({TAG_7PVO})"
+            )
+    for m in elses:
+        links = if_chain_links(squashed, m.start())
+        if links is None:
+            raise ContractError(
+                f"FAIL [N9]: {name} refuses or retries in a final `else` that closes no plain "
+                f"`if (...) {{...}} else if (...) {{...}}` chain, so the rule cannot read when it fires ({TAG_7PVO})"
+            )
+        for link in links:
+            if NOT_ALL_HOST.search(link):
+                raise ContractError(
+                    f"FAIL [N9]: {name} refuses or retries in the final `else` after `if ({link})`, a "
+                    f"link that tests a tensor is not all-host, so every all-host tensor that fails it is refused "
+                    f"there: the all-host case itself ({TAG_7PVO})"
+                )
+        lookups = [link for link in links if DEVICE_LOOKUP.search(link)]
+        if lookups and not any(ALL_HOST_LINK.search(link) for link in links):
+            raise ContractError(
+                f"FAIL [N9]: {name} refuses or retries in the final `else` of a chain that tests "
+                f"`{lookups[0]}`, which only a device expert can satisfy, with no `all_host || ...` link to keep "
+                f"an all-host tensor out of it ({TAG_7PVO})"
+            )
+
+
 def check_n9(scan: Scan) -> None:
     """The route admits a tensor whose experts all live on the host (llama.cpp-7pvo): the record has an all-host
     mode the builder decides from the plan, no builder refusal needs a device expert outside that mode, and the
@@ -1063,51 +1122,14 @@ def check_n9(scan: Scan) -> None:
             f"plan and store it with `record->all_host = all_host;`, so the route cannot tell an all-host record "
             f"from a split one ({TAG_7PVO})"
         )
-    squashed = squash(build)
-    elses = list(REFUSAL_ELSE.finditer(squashed))
-    read = len(BUILD_REFUSAL.findall(squashed)) + len(REFUSAL_HELPER.findall(squashed)) + len(elses)
-    if read != len(REFUSAL_RETURNS.findall(squashed)):
+    slots = scan.defs.get(RECORD_SLOT, [])
+    if len(slots) != 1:
         raise ContractError(
-            f"FAIL [N9]: {RECORD_BUILD} has a refusal or retry outside an `if (...) {{...}}` this rule reads, "
-            f"the `refuse` helper's body or a final `else`, so its condition goes unchecked and could refuse "
-            f"every all-host tensor unseen ({TAG_7PVO})"
+            f"FAIL [N9]: `{RECORD_SLOT}`, the slot rule {RECORD_BUILD} takes every expert's slot from, is not "
+            f"defined once, so the refusals it makes for the build go unread ({TAG_7PVO})"
         )
-    for m in BUILD_REFUSAL.finditer(squashed):
-        cond = m.group(1)
-        if DEVICE_LOOKUP.search(cond) and "!all_host" not in cond.replace(" ", ""):
-            raise ContractError(
-                f"FAIL [N9]: {RECORD_BUILD} refuses or retries on `{cond}`, which only a device expert can "
-                f"satisfy, without `!all_host`, so every tensor whose experts all live on the host is refused "
-                f"({TAG_7PVO})"
-            )
-        operand = all_host_operand(cond)
-        if operand is not None and not device_expert_only(squashed, m.start()):
-            raise ContractError(
-                f"FAIL [N9]: {RECORD_BUILD} refuses or retries on `{cond}`, whose `||` operand `{operand}` is the "
-                f"all-host case itself, outside any `if` only a device expert enters, so the layers the placement "
-                f"leaves entirely on the host keep their readback ({TAG_7PVO})"
-            )
-    for m in elses:
-        links = if_chain_links(squashed, m.start())
-        if links is None:
-            raise ContractError(
-                f"FAIL [N9]: {RECORD_BUILD} refuses or retries in a final `else` that closes no plain "
-                f"`if (...) {{...}} else if (...) {{...}}` chain, so the rule cannot read when it fires ({TAG_7PVO})"
-            )
-        for link in links:
-            if NOT_ALL_HOST.search(link):
-                raise ContractError(
-                    f"FAIL [N9]: {RECORD_BUILD} refuses or retries in the final `else` after `if ({link})`, a "
-                    f"link that tests a tensor is not all-host, so every all-host tensor that fails it is refused "
-                    f"there: the all-host case itself ({TAG_7PVO})"
-                )
-        lookups = [link for link in links if DEVICE_LOOKUP.search(link)]
-        if lookups and not any(ALL_HOST_LINK.search(link) for link in links):
-            raise ContractError(
-                f"FAIL [N9]: {RECORD_BUILD} refuses or retries in the final `else` of a chain that tests "
-                f"`{lookups[0]}`, which only a device expert can satisfy, with no `all_host || ...` link to keep "
-                f"an all-host tensor out of it ({TAG_7PVO})"
-            )
+    for name, text in ((RECORD_BUILD, build), (RECORD_SLOT, slots[0][1])):
+        check_n9_refusals(name, squash(text))
     _, route = scan.defs[ROUTE][0]
     guard = route.find(DEVICE_HALF_GUARD)
     if guard < 0:
@@ -1387,8 +1409,13 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "    if (all_host) {\n        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;\n    }\n")
     sub("N9", "builder refuses a tensor with no device layout", "    if (!all_host && materialized < 0) {",
         "    if (materialized < 0) {")
-    sub("N9", "builder refuses a tensor with no substitute", "    if ((!all_host && !substitute) || !any_host) {",
-        "    if (!substitute || !any_host) {")
+    sub("N9", "builder retries a tensor with no table",
+        "    if (!all_host && !ggml_sycl_moe_hybrid_decode_table_fill(queue,",
+        "    if (!ggml_sycl_moe_hybrid_decode_table_fill(queue,")
+    sub("N9", "builder refuses a tensor with no substitute",
+        "    if (const char * why = ggml_sycl::moe_hybrid_record_shape_refusal(all_host, shape)) {",
+        "    if (const char * why = shape.substitute ? ggml_sycl::moe_hybrid_record_shape_refusal(all_host, shape) :\n"
+        "                                              \"no device expert pointer stands in for the host slots\") {")
     no_layout = (
         "    if (!all_host && materialized < 0) {\n"
         "        return refuse(\"no device expert is materialized in a layout the batched kernel reads\");\n"
@@ -1410,11 +1437,23 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "        return refuse(\"no device layout\");\n    }\n")
     sub("N9", "builder refuses on a condition that ors in all_host", no_layout,
         "    if (n_as < 0 || all_host) {\n        return refuse(\"all host\");\n    }\n")
-    sub("N9", "builder refuses an all-host tensor's host expert",
-        "            if (!view.ptr || view.on_device || view.retention) {\n"
-        "                return refuse(\"a host expert has no plain host view\");",
-        "            if (all_host || !view.ptr || view.on_device || view.retention) {\n"
-        "                return refuse(\"a host expert has no plain host view\");")
+    sub("N9", "slot rule refuses an all-host tensor's host expert",
+        "        if (!view.ptr || view.on_device || view.retention) {\n"
+        "            return refuse(\"a host expert has no plain host view\");",
+        "        if (all_host || !view.ptr || view.on_device || view.retention) {\n"
+        "            return refuse(\"a host expert has no plain host view\");")
+    sub("N9", "slot rule refuses the all-host case", "        return refuse(\"an expert has no executor\");\n    }\n",
+        "        return refuse(\"an expert has no executor\");\n    }\n"
+        "    if (all_host) {\n        return refuse(\"all host\");\n    }\n")
+    sub("N9", "slot rule refuses the all-host case in a final else",
+        "    } else {\n        return refuse(\"an expert runs on neither this device nor the CPU\");\n    }\n",
+        "    } else if (!all_host) {\n        (void) choice;\n"
+        "    } else {\n        return refuse(\"an expert runs on neither this device nor the CPU\");\n    }\n")
+    sub("N9", "slot rule renamed away",
+        "ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_slot(\n",
+        "ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_slot_v2(\n")
+    sub("N7", "record patch no longer reached", "ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, held,",
+        "ggml_sycl_moe_hybrid_decode_record_patch_retired(ctx, src0, held,")
     sub("N9", "builder refusal hides its condition from the scan",
         "    if (!all_host && materialized < 0) {\n"
         "        return refuse(\"no device expert is materialized in a layout the batched kernel reads\");\n"

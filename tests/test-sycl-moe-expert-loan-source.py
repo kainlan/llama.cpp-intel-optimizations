@@ -69,8 +69,8 @@ What this gate pins (the retire, the boundary and the ready event are lead rulin
     execution queue passes a barrier, after the loop and before the publication, so no kernel still reading a dropped
     table sees a freed buffer; and every drop leaves the device table stale (the slot's payload nulled, the storage
     generation bumped, and the table marked stale through mark_moe_device_table_stale, whose marks are pinned, behind
-    its device guard as its first statement): a dropped pointer-table lease, route table or hybrid record each sets
-    the flag that marks it, so a drop of the table's views alone still does;
+    its device guard as its first statement): a dropped pointer-table lease, route table or hybrid record slot each
+    sets the flag that marks it, so a drop of the table's views alone still does;
   - a probe returns before any lease, allocation, lock or loan, and a loan publishes once, then bumps the exec-graph
     epoch;
   - the WARN format strings;
@@ -728,7 +728,10 @@ RETAIN_RECORD = "retained.push_back(record.handle);"
 RETAIN_SLOT = "retained.push_back(std::move(w.moe_expert_handles[device][slot]));"
 RETAIN_LEASE = "if (on_entry(lease)) { retained.push_back(lease); }"
 RETAIN_ROUTES = "if (held.lease.valid()) { retained.push_back(held.lease); }"
-RETAIN_HYBRID = "ggml_sycl_moe_hybrid_decode_record_append_handles(*w.moe_hybrid_decode[device], retained);"
+# The hybrid decode record keeps its slots that do not lease the entry: the drop withdraws only those that do, from
+# a copy it publishes in the record's place, and their leases go to `retained` with the other views'.
+RETAIN_HYBRID = ("ggml_sycl_moe_hybrid_decode_record_withdraw(w.moe_hybrid_decode[device], device, withdrawn, "
+                 "retained, emptied)")
 RETAIN_VIEWS = ("ggml_sycl::retain_handles_until_event(std::move(lent_views), "
                 "queue ? queue->ext_oneapi_submit_barrier() : sycl::event{});")
 
@@ -739,7 +742,7 @@ def claim_lent_views_retained_to_a_barrier(sycl: str) -> bool:
     txn = body(n, TXN_SIG)
     return (all(helper.count(x) == 1 for x in (RETAIN_RECORD, RETAIN_SLOT, RETAIN_LEASE, RETAIN_ROUTES, RETAIN_HYBRID))
             and ordered(helper, RETAIN_RECORD, "list.erase(", RETAIN_SLOT, RETAIN_LEASE, "leases.erase(", RETAIN_ROUTES,
-                        "routes.invalidate();", RETAIN_HYBRID, "w.moe_hybrid_decode[device].reset();")
+                        "routes.invalidate();", RETAIN_HYBRID)
             and txn.count(RETAIN_VIEWS) == 1
             and ordered(txn, LEND, DROP, REMEMBER, BREAK_ESCAPED, RETAIN_VIEWS, PUBLISH))
 
@@ -752,18 +755,21 @@ STALE_SIG = "void mark_moe_device_table_stale(int dev)"
 STALE_MARKS = ("moe_device_table_valid[dev] = false;", "moe_full_local_probe_generation[dev] = 0;",
                "moe_full_local_probe_layout[dev] = GGML_LAYOUT_AOS;", "moe_full_local_probe_ok[dev] = false;")
 NULL_PAYLOAD = "w.moe_expert_ptr_payload[device][slot] = nullptr;"
-BUMP_GENERATION = "if (stored) { ++w.moe_expert_storage_generation; }"
+# Each expert whose record slot the drop emptied, and the one whose storage record or table slot it dropped.
+BUMP_GENERATION = ("if (stored && std::find(emptied.begin(), emptied.end(), expert_id) == emptied.end()) { "
+                   "emptied.push_back(expert_id); } for (const int32_t e : emptied) { "
+                   "w.note_moe_storage_change(e); }")
 MARK_STALE = "if (stored || table_dropped) { w.mark_moe_device_table_stale(device); }"
 # The flag behind a drop of the table's views alone: a pointer-table lease erased (the holder a prompt graph's preload
-# leaves, with no storage record and no slot naming the entry), the route table invalidated, or the hybrid record
-# reset. Without it a table whose only view of the entry was its leases stays valid, its raw pointer into room the
+# leaves, with no storage record and no slot naming the entry), the route table invalidated, or a hybrid record slot
+# withdrawn. Without it a table whose only view of the entry was its leases stays valid, its raw pointer into room the
 # ring reuses.
 # The count the lease flag compares against is taken before the erase: taken after it, the flag is always false.
 N_LEASES = "const size_t n_leases = leases.size();"
 LEASE_ERASE = "leases.erase(std::remove_if(leases.begin(), leases.end(), on_entry), leases.end());"
 TABLE_FROM_LEASES = "table_dropped = leases.size() != n_leases;"
 TABLE_FROM_ROUTES = "routes.invalidate(); table_dropped = true; break;"
-TABLE_FROM_HYBRID = "w.moe_hybrid_decode_stamp[device] = {}; table_dropped = true; }"
+TABLE_FROM_HYBRID = "if (" + RETAIN_HYBRID + ") { table_dropped = true; }"
 # The member's guard is its first statement: inverted, every stale mark is a no-op on a valid device.
 STALE_GUARD = "{ if (!ggml_sycl_valid_device_index(dev)) { return; }"
 
@@ -778,7 +784,7 @@ def claim_lent_views_mark_the_table_stale(sycl: str, common: str) -> bool:
                     for x in (N_LEASES, LEASE_ERASE, TABLE_FROM_LEASES, TABLE_FROM_ROUTES, TABLE_FROM_HYBRID))
             and helper.count("table_dropped = true;") == 2
             and ordered(helper, RETAIN_LEASE, N_LEASES, LEASE_ERASE, TABLE_FROM_LEASES, RETAIN_ROUTES,
-                        TABLE_FROM_ROUTES, RETAIN_HYBRID, TABLE_FROM_HYBRID, BUMP_GENERATION, MARK_STALE))
+                        TABLE_FROM_ROUTES, TABLE_FROM_HYBRID, BUMP_GENERATION, MARK_STALE))
 
 
 # --- an exception while lending publishes what was lent -------------------------------------------------------------
@@ -2639,7 +2645,7 @@ def test_mutant_stale_mark_never_applied_fails():
 def test_mutant_storage_generation_not_bumped_fails():
     """A dropped storage record or slot leaves the generation alone: whatever is keyed on it reads as current."""
     assert not claim_lent_views_mark_the_table_stale(
-        _once_in(SYCL, DROP_SIG, "++w.moe_expert_storage_generation;", ""), COMMON)
+        _once_in(SYCL, DROP_SIG, "w.note_moe_storage_change(e);", ""), COMMON)
 
 
 def test_mutant_slot_payload_kept_fails():
@@ -2665,7 +2671,7 @@ def test_mutant_route_table_drop_sets_no_flag_fails():
 
 def test_mutant_hybrid_record_drop_sets_no_flag_fails():
     assert not claim_lent_views_mark_the_table_stale(
-        _once_in(SYCL, DROP_SIG, TABLE_FROM_HYBRID, "w.moe_hybrid_decode_stamp[device] = {}; }"), COMMON)
+        _once_in(SYCL, DROP_SIG, TABLE_FROM_HYBRID, "if (" + RETAIN_HYBRID + ") { }"), COMMON)
 
 
 def test_mutant_stale_guard_inverted_fails():

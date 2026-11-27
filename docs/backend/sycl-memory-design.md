@@ -469,6 +469,50 @@ the graph: while a graph records, the direct route's upload chains no ready
 event; it asks each slot's event for its status and refuses the table while a
 slot's copy is still in flight.
 
+The event-chained hybrid decode route's per-tensor record
+(`ggml_sycl_moe_hybrid_decode_record_current`) is kept per storage generation
+too, but a generation that only expert moves advanced does not rebuild it over
+every expert. Every generation move goes through the extra's
+`note_moe_storage_change()`, which also logs the expert it changed in a bounded
+per-weight change log (`moe_storage_change_log`, 64 entries; an expert move
+writes two or three notes per tensor, so about 21 to 32 moves; a cleared store
+or a rewrite of the weight logs every expert). On such a
+miss the lookup patches a copy of the held record over the experts the log names
+since the held decision (`ggml_sycl_moe_hybrid_decode_record_patch`): it
+resolves those alone, each takes its slot from the build's own slot rule, so a
+moved expert runs where its data now is, and the copy gets a host-pinned table
+of its own, because a table copy still on the queue reads the held table when it
+runs. The replaced slots' leases and the held table are kept until the queue
+passes a barrier behind the copy's publication (`retain_handles_until_event`);
+nothing waits on the host. An expert move rewrites the placement plan without
+moving the replan epoch, so the patch first asks the plan again through the
+build's own plan rule
+(`ggml_sycl_moe_hybrid_decode_record_plan_refusal`). A log that no longer
+holds every move, a replan, another selected-row count, a plan that now
+refuses the record or names the other all-host mode, a moved expert at or before
+the one whose layouts gave the record its layout (the build's layout scan could
+stop elsewhere), a moved expert that no longer fits the record (another layout,
+a device expert in an all-host record, no host expert left), the build's frame
+rule refusing the record (`ggml_sycl_moe_hybrid_decode_record_frame_refusal`:
+more than one routable card, a tensor the MMID direct route runs), or a later
+model's route-count table in the device's place builds the record again over
+every expert. A level-2 `GGML_SYCL_MOE_HYBRID_RECORD_TRACE` line names the rule
+that declined a patch. A patch or build that the expert storage moved under is
+not served: the patch declines, the build ends as a retry, and the record's
+leases wait for the queue as a replaced record's do. The check is defensive:
+nothing in the lookup's own resolves or allocations moves the generation (an
+expert move runs in a transaction that refuses while a graph computes, and
+both resolves pass `allow_materialize=false`). It guards against an expert
+move on another thread that overlaps the lookup: the graph-compute flag is one
+process-wide flag, so a transaction that passed its check just before a graph
+set it, or ran while another context's graph had cleared it, can overlap.
+An expert loan's or evict's view drop
+(`ggml_sycl_drop_lent_expert_views`) does not drop the record: it withdraws,
+from a copy it publishes in the record's place, only the slots that lease the
+entry it retired, retains their leases with the other views it drops, and notes
+each of those experts, so the lookup after the move patches them. Until then the
+copy is never served: its table still names the retired weight.
+
 The named move bounds memory as follows. An evict mints its pinned host copy
 before it retires the device copy, and mints it without growing the pinned host
 WEIGHT zone (`ggml_sycl_host_expert_alloc_no_growth`): a decode boundary must not

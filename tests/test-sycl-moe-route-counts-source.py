@@ -22,9 +22,10 @@ shows that. This gate holds them:
   P8  the prompt count reads the prompt ids snapshot, after it is taken, on the gate tensor only, into the prompt
       counts only;
   P9  the table is sized at the hybrid init from the model's own blocks and experts, with no clamp;
-  P10 the counts feed only the expert swap driver (GGML_SYCL_MOE_SWAP=1): the backend takes the table in three places
-      only (the record build, the prompt helper and the swap driver), and reads a count back only in the swap driver,
-      the decode and the prompt count once each;
+  P10 the counts feed only the expert swap driver (GGML_SYCL_MOE_SWAP=1): the backend takes the table in four places
+      only (the record build, the record patch's one comparison of the held table with the device's, the prompt
+      helper and the swap driver), and reads a count back only in the swap driver, the decode and the prompt count
+      once each;
   P11 the header is plain host code: standard includes only, no SYCL, no device allocation;
   P12 lifetime: the record holds the table by shared_ptr, the registry replaces it under its lock and is never
       destroyed;
@@ -69,6 +70,10 @@ BUILD_FN = "static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_dec
 INIT_FN = "static void moe_hybrid_init_once(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph) {"
 PROMPT_HELPER = "static void ggml_sycl_moe_route_counts_add_prompt("
 SWAP_FN = "static void ggml_sycl_run_expert_swap_claimed("
+PATCH_FN = "static bool ggml_sycl_moe_hybrid_decode_record_patch("
+# The record patch takes the device's table only to compare it with the one its held record holds, and declines when
+# a later model replaced it, so the build installs the new one; it reads no count from it.
+PATCH_TABLE_CHECK = "held->route_counts != ggml_sycl::moe_route_counts_current(device)"
 REPORT_FN = "void moe_route_counts_report_final(int device, int64_t tokens) {"
 INSTALL_FN = "std::shared_ptr<moe_route_counts> moe_route_counts_install("
 COUNT_GUARD = "if (record->route_counts && record->route_block >= 0) {"
@@ -383,9 +388,12 @@ def check(s: Sources) -> None:
     # P10 ------------------------------------------------------------------------------------------------------------
     swap_b, swap_e = be.block_after(SWAP_FN, "P10")
     swap = be.code[swap_b:swap_e]
-    if be.code.count("moe_route_counts_current(") != 3 or swap.count("moe_route_counts_current(") != 1:
-        raise ContractError("FAIL [pin P10]: the backend takes the table other than in the record build, the helper "
-                            "and the swap driver")
+    patch_b, patch_e = be.block_after(PATCH_FN, "P10")
+    patch = be.code[patch_b:patch_e]
+    if (be.code.count("moe_route_counts_current(") != 4 or swap.count("moe_route_counts_current(") != 1
+            or patch.count("moe_route_counts_current(") != 1 or patch.count(PATCH_TABLE_CHECK) != 1):
+        raise ContractError("FAIL [pin P10]: the backend takes the table other than in the record build, the record "
+                            "patch's comparison of the held table, the helper and the swap driver")
     readers = list(re.finditer(
         r"\b(?:decode_count|prompt_count|block_hits|block_misses|block_resident|moe_route_top_n_coverage\w*|"
         r"moe_route_overall_hit_rate|moe_route_mean_resident_experts|moe_route_csv|moe_route_block_table)\(",
@@ -659,6 +667,13 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    record->route_counts = ggml_sycl::moe_route_counts_current(device);",
                   "    record->route_counts = ggml_sycl::moe_route_counts_current(device);\n"
                   "        (void) ggml_sycl::moe_route_counts_current(device);")])
+    expect_fail("patch-installs-the-current-table", "P10", B,
+                [("    patched->n_withdrawn = 0;\n",
+                  "    patched->n_withdrawn = 0;\n"
+                  "    patched->route_counts = ggml_sycl::moe_route_counts_current(device);\n")])
+    expect_fail("patch-takes-the-table-to-read-it", "P10", B,
+                [(PATCH_TABLE_CHECK,
+                  "ggml_sycl::moe_route_counts_current(device)->decode_count(0, 0) != 0")])
     anchor = "    record->route_counts = ggml_sycl::moe_route_counts_current(device);"
     expect_fail("table-taken-in-the-else-arm-of-a-private-block", "P10", B,
                 [(anchor, anchor + "\n#if defined(GGML_SYCL_PRIVATE_TESTING)\n        (void) 0;\n#else\n"
