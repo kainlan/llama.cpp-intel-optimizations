@@ -7418,7 +7418,99 @@ reference kernels and must not be used.
     count is 9 both at base `a09e879982` and at the GREEN commit.
   - `test-skip-policy` was left out because it launches `build/bin/test-autorelease`.
 
----
+**Review round 1 fixes (implementer, 2026-11-26): the spec review of `a09e879982..9710996f92` failed. Host-verified
+only; every device item is still the lead's.**
+1. A submission that throws after the first one fails the graph by name and never falls through to the direct kernel.
+   - Every submission of the arm is inside one `try`, the row map's copy first, and nothing is submitted before it.
+   - Its `std::exception` handler starts with what a decline after a submission does. It submits a marker behind
+     everything already submitted, then holds the record leases, the row map and the slot until that marker.
+   - It then logs `[MoE] BF16 grouped arm failed after submission: tensor=... device=... stage=... error=...` at WARN.
+     It throws `ggml_sycl_fallback_error("BF16 grouped arm: <stage> failed after submission: <what>")`, where the
+     stage is the row map copy, the gather, the expert GEMM or the scatter.
+   - `graph_compute` prints that error as `recoverable runtime fallback failed: ...` and fails the compute, and the
+     process lives. The handler has no `return`.
+   - The `catch (const ggml_sycl_fallback_error &) { throw; }` clause before it is the alloc-zone contract's clause
+     (g). Nothing in the chain throws that error, so the clause never runs.
+   - A submission that declines without throwing still declines SUBMIT, and the direct route runs the node. That
+     covers a kernel entry that refuses and a GEMM whose primitive the execute could not create. dst is still
+     unwritten, and the queue took the marker.
+   - The hold runs once. A decline whose own bookkeeping throws reaches the handler with everything already held. A
+     marker the queue cannot take throws its own error out of the handler.
+   - A private failpoint, `GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_AFTER_GATHER` (the q1 seam header), throws once
+     at the GEMM stage, after the gather. The device test's case `gate_up-thrown-after-gather` expects:
+     - status FAILED, and the failpoint consumed once;
+     - the WARN and the fallback line once each, both naming `expert GEMM`;
+     - no arm line and no direct-route line;
+     - no run or decline counted.
+     The next case, `gate_up-after-thrown`, runs on the arm again.
+2. The planned-size admission now runs before the ids, on the routed rows unpadded. No packing is smaller, so the
+   admission declines no node it would admit later. A SCRATCH_UNPLANNED decline therefore pays no ids wait. The same
+   admission runs again on the packed rows after the plan. The per-node row-count check stays after the ids.
+3. The device test reads the arm's counters through the private seam,
+   `ggml_sycl_moe_bf16_grouped_test_counters_read`. It returns the runs, the declines under every reason, and the
+   declines under the one reason asked for.
+   - An arm case must move runs by 1 and declines by 0.
+   - A decline case (`tokens`, `opt_out`) must move runs by 0, declines by 1 and its own reason by 1.
+   - The route lines stay as a second witness.
+   - The test now links `ggml-sycl-private-fixtures`. It has 8 cases and ends `PASS: BF16 grouped prompt arm, 8 cases`.
+4. Round to nearest even is proved at kernel level, in `tests/test-sycl-moe-bf16-grouped-kernel.cpp` (ctest
+   `sycl-moe-bf16-grouped-kernel`, `opencl:cpu`, labels `sycl;moe;bf16;kernel;hostonly`).
+   - A table of 27 f32 inputs gives each one's bf16 bits. It covers ties to even both ways, one ulp either side of a
+     tie, the largest finite value rounding to infinity, infinities, quiet NaN and signalling NaN made quiet,
+     subnormals and zeros. Each must hold for `ggml_sycl_bf16::f32_to_bf16_rne` and for the CPU backend's
+     `ggml_fp32_to_bf16`.
+   - Every routed row of the gathered plane must equal `f32_to_bf16_rne` bit for bit. The inputs are the table first,
+     then random 32-bit patterns. Almost all of them lie between two bf16 values. The exceptions are the table's few
+     exact entries: 1.0, the zeros, the infinities and a quiet NaN.
+   - The scatter must write the output rows bit for bit. Padding rows and unrouted dst elements stay untouched.
+   - Six cases: a broadcast row and a row per slot, Inkling's two shapes, padded strides, and a 70-token case with two
+     GEMM widths.
+   - Each refusal must leave the caller's event as it was.
+   - Positive control: with the gather built to truncate instead, 5 of the 6 cases fail. The sixth reads only 1.0,
+     which both roundings give exactly. With the source restored and rebuilt, the test passes.
+5. Withdrawn by the lead: the Claude-Session trailer. Co-Authored-By alone is the rule.
+- Contracts updated:
+  - `test-sycl-moe-bf16-direct-source.py`:
+    - (i) now orders the routed-rows admission before the ids, the ids refresh once and before the plan, and the
+      packed-rows admission after the table.
+    - The new (j) pins the hold to a marker, the one `try`, and the handler with no way back to the direct route. It
+      has 23 mutants.
+  - `test-sycl-pp-moe-scratch-admission-contract.py`: the arm's refusal and its latched WARN now go through
+    `admit_planes`.
+  - `docs/backend/sycl-static-storage-inventory.csv` is regenerated. Its one new row is the handler's `thread_local`
+    message, `bf16_grouped_failure`.
+- Host evidence for this round:
+  - The build: `ggml-sycl`, `test-moe-bf16-grouped-device`, `test-sycl-moe-bf16-grouped-kernel`,
+    `test-moe-bf16-grouped-plan`, `test-moe-scratch-admission` and `test-moe-pp-staging-refusal`, `BUILD_RC=0`. Both
+    backend objects, the shipped one and the private-fixture one, were rebuilt after the last source edit.
+  - `sycl-moe-bf16-grouped-kernel` passes on `opencl:cpu`. Its truncation control is described in item 4.
+  - Linkage, read with `readelf` and `nm`, without running anything:
+    - `test-moe-bf16-grouped-device` does not list `libggml-sycl` in NEEDED, the same set as
+      `test-moe-pp-staging-refusal`;
+    - it defines the counter reader and the failpoint itself;
+    - the shipped DSO exports no test symbol.
+  - `scripts/check-ctest-safety-net.sh --build-dir build` prints "safety net intact".
+  - The static-storage inventory's generate, `--check` and `--check-classification` all return 0.
+  - 244 registered tests were run by name, `-j 4`. They are:
+    - the 236 Python-only contracts that read a file this round touched;
+    - four contracts that only parse the build's registration (`test-sycl-cmake-dl-link-source`,
+      `test-sycl-gate-registration-audit`, `test-sycl-gate-registration-census`, `test-sycl-guarded-tests-source`);
+    - four host binaries: `sycl-moe-bf16-grouped-kernel` and `sycl-moe-bf16-direct-kernel` on `opencl:cpu`,
+      `sycl-moe-bf16-grouped-plan` and `sycl-moe-scratch-admission`.
+
+    242 pass, and none was skipped or not run. The two reds are not this round's:
+    - `sycl-private-cpu-traits-source` fails its trait call-site inventory. This range changes no call of
+      `ggml_sycl_get_type_traits_cpu`, and each file's count is the same at the base, `a09e879982`.
+    - `test-skip-policy` fails on literal `return 77;` lines in 13 files this round did not touch. It should not
+      have been selected: its environment names `build/bin/test-autorelease`, and the selector read only the
+      command and the script. That binary exits 77 in `common_get_model_or_exit`, before `llama_backend_init`, so
+      no device was opened.
+  - The four artifact-inspection tests were run by name. They only run `nm` or `strings` on built files.
+    - `sycl-unified-private-seams` and `sycl-retained-publication-no-export` pass.
+    - `sycl-private-carrier-linkage` and `sycl-staging-failpoint-no-export` fail only on binaries this worktree never
+      built (16 of the carrier test's 49). Every carrier binary that exists passes. Both need the lead's full build.
+  - Not run here, as the lead's: `test-moe-bf16-grouped-device` (8 cases), every other device test, and the two fixed
+    sweeps.
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
