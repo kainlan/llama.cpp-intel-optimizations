@@ -545,7 +545,7 @@ def test_rejected_publication_cleanup_and_retirement_ordering() -> None:
         # The retired-flag write moved into a helper that also maintains the
         # pending-GC counter; the mirror handle became a scalar so retirement
         # cannot fail allocating a vector after withdrawal has begun.
-        "transition_to_retired_locked(pair.second)",
+        "transition_to_retired_locked(pair.first, pair.second)",
         "direct_expert_entries_.erase",
         "released_mirror_handle.reset()",
         "finalize_retired_entries_locked",
