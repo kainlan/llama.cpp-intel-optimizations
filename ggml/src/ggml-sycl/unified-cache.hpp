@@ -8276,10 +8276,12 @@ enum class unified_cache_mode {
     AUTO         // Auto-detect: per_device if multiple GPUs, global otherwise
 };
 
-// Get current cache mode (from env var or auto-detection)
+// Get current cache mode: GGML_SYCL_UNIFIED_CACHE_MODE (read once per process) when it names one, else the value
+// set_unified_cache_mode() set (AUTO by default).
 unified_cache_mode get_unified_cache_mode();
 
-// Set cache mode (call before first cache access)
+// Set cache mode (call before first cache access). Has no effect while GGML_SYCL_UNIFIED_CACHE_MODE names a mode, or
+// once the cache has locked the mode.
 void set_unified_cache_mode(unified_cache_mode mode);
 
 // Set the scheduler-filtered device count (call from ggml_sycl_init after device map filtering)

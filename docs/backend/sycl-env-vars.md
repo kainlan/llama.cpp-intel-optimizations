@@ -433,7 +433,7 @@ GGML_SYCL_PERSISTENT_TG=1 ONEAPI_DEVICE_SELECTOR=level_zero:0 \
 | Variable | Effect |
 |----------|--------|
 | ~~`GGML_SYCL_UNIFIED_CACHE=0`~~ | **Removed by `9a0670712` with optional cache enablement and its enable/disable branches.** Setting this name no longer disables anything; there is no replacement opt-out. |
-| `GGML_SYCL_UNIFIED_CACHE_MODE=<mode>` | Select cache topology (`auto`, `global`, or `per_device`) only; it cannot disable the cache. |
+| `GGML_SYCL_UNIFIED_CACHE_MODE=<mode>` | Select cache topology (`auto`, `global`, or `per_device`) only; it cannot disable the cache. Read once per process, by `get_unified_cache_mode()` (`unified-cache.cpp`); any other value leaves the mode `set_unified_cache_mode()` set (`auto` by default). |
 | `GGML_SYCL_NO_PINNED=1` | Disable pinned host memory |
 | `GGML_SYCL_WEIGHTS_EVICTABLE=1` | Allow weight eviction under memory pressure |
 | `GGML_SYCL_MEM_BUDGET=<MB>` | Set VRAM budget in MB |

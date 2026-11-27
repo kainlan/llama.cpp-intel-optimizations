@@ -1074,6 +1074,13 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-graph-prologue-memo-source.py --self-test)
     set_tests_properties(test-sycl-graph-prologue-memo-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
+    # GGML_SYCL_UNIFIED_CACHE_MODE is read once per process (every cache lookup asks for the mode) while
+    # set_unified_cache_mode() keeps working. Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-unified-cache-mode-env-once-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-unified-cache-mode-env-once-source.py --self-test)
+    set_tests_properties(test-sycl-unified-cache-mode-env-once-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
     # CPU expert job joins go on the cache's join-only queue behind GGML_SYCL_MOE_JOIN_QUEUE, after the latest
     # recorded host task, and the scatter still depends on them (llama.cpp-wfsl). Run WITH --self-test so each
     # pin is proven to catch its mutant.

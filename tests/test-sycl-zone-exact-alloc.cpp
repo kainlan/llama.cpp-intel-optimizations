@@ -74,7 +74,8 @@ void settle() {
 }
 
 // The mock's environment, set before anything reads it. A 1 MiB compute and runtime arena keep the zone tail small
-// enough for the budget.
+// enough for the budget. get_unified_cache_mode() latches GGML_SYCL_UNIFIED_CACHE_MODE on its first call, so a setenv
+// after any cache lookup is ignored; use set_unified_cache_mode() before the cache locks the mode instead.
 void set_mock_environment() {
     setenv("GGML_SYCL_UNIFIED_CACHE_MODE", "per_device", 1);
     setenv("GGML_SYCL_COMPUTE_ARENA_MB", "1", 1);

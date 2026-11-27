@@ -18922,9 +18922,8 @@ void unified_cache::clear_hot_experts(int layer_id) {
 
 // === Mode and Global Functions ===
 
-unified_cache_mode get_unified_cache_mode() {
-    // Check environment variable
-    const char * env = std::getenv("GGML_SYCL_UNIFIED_CACHE_MODE");
+// The mode GGML_SYCL_UNIFIED_CACHE_MODE names, or none when it is unset or names no mode.
+static std::optional<unified_cache_mode> unified_cache_mode_from_env(const char * env) {
     if (env) {
         if (strcmp(env, "global") == 0) {
             return unified_cache_mode::GLOBAL;
@@ -18935,6 +18934,18 @@ unified_cache_mode get_unified_cache_mode() {
         if (strcmp(env, "auto") == 0) {
             return unified_cache_mode::AUTO;
         }
+    }
+    return std::nullopt;
+}
+
+unified_cache_mode get_unified_cache_mode() {
+    // Read once per process: every cache lookup asks for the mode, the decode path looks a cache up per op, and a
+    // getenv on each call showed in decode profiles. Only the override is held, so without one the setter's value is
+    // returned and set_unified_cache_mode() keeps working until the cache locks the mode.
+    static const std::optional<unified_cache_mode> env_mode =
+        unified_cache_mode_from_env(std::getenv("GGML_SYCL_UNIFIED_CACHE_MODE"));
+    if (env_mode) {
+        return *env_mode;
     }
     return g_cache_mode;
 }
