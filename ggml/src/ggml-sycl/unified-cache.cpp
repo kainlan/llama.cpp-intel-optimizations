@@ -36395,7 +36395,9 @@ static void plan_moe_mmid_workspaces(placement_plan &                           
             }
         }
         std::map<int, bool> actual_owners;
-        for (const placement_entry & entry : plan.entries) {
+        // Read through a const view: the plan is writable here, and the runtime replan hands it a copy that shares
+        // the live plan's entry chunks, which the mutable begin() would clone one by one.
+        for (const placement_entry & entry : std::as_const(plan.entries)) {
             if (entry.name != item.name || entry.expert_id < 0) {
                 continue;
             }

@@ -4943,6 +4943,46 @@ def test_mutant_entry_position_by_pointer_arithmetic_fails():
     mutant = norm(CACHE) + " size_t i = static_cast<size_t>(p - &plan.entries[0]);"
     assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, mutant, SYCL)
 
+
+# --- the runtime workspace replan shares its demand copy's entries ---------------------------------------------------
+
+# The runtime replan sizes the MMID workspaces on a copy of the live plan (its demand), which shares the entries'
+# chunks like any plan copy. The workspace planner takes that copy writable to record the workspaces on it, so a
+# range-for over its entries would take the mutable begin() and clone every chunk: an O(entries) copy on each KV
+# refresh that the chunked store exists to avoid. The planner reads the entries only through std::as_const, and the
+# replan hands the copy to nothing else that reaches its entries.
+REPLAN_SIG = "bool replan_moe_mmid_workspaces_for_runtime(placement_plan & plan,"
+REPLAN_COPY = "placement_plan demand = plan;"
+REPLAN_PLANS = "plan_moe_mmid_workspaces(demand, tensor_inventory, n_expert_used);"
+WORKSPACE_PLAN_SIG = "static void plan_moe_mmid_workspaces(placement_plan & plan,"
+WORKSPACE_PLAN_READ = "std::as_const(plan.entries)"
+
+
+def claim_the_runtime_replan_shares_its_demand_entries(cache: str) -> bool:
+    c = norm(cache)
+    replan = body(c, REPLAN_SIG)
+    planner = body(c, WORKSPACE_PLAN_SIG)
+    return (replan.count(REPLAN_COPY) == 1 and replan.count(REPLAN_PLANS) == 1
+            and len(re.findall(r"\bdemand\b(?!\.moe_mmid_)", replan)) == 2
+            and planner.count(WORKSPACE_PLAN_READ) >= 1
+            and len(ENTRIES_WORD_RE.findall(planner)) == planner.count(WORKSPACE_PLAN_READ))
+
+
+def test_the_runtime_replan_shares_its_demand_entries():
+    assert claim_the_runtime_replan_shares_its_demand_entries(CACHE)
+
+
+def test_mutant_workspace_planner_iterates_the_entries_mutably_fails():
+    """A range-for over the writable plan takes the mutable begin(), which clones every chunk of the demand copy."""
+    mutant = _once_in(CACHE, WORKSPACE_PLAN_SIG, WORKSPACE_PLAN_READ, "plan.entries")
+    assert not claim_the_runtime_replan_shares_its_demand_entries(mutant)
+
+
+def test_mutant_replan_hands_the_demand_copy_to_another_writer_fails():
+    mutant = _once_in(CACHE, REPLAN_SIG, REPLAN_PLANS, REPLAN_PLANS + " demand.build_index();")
+    assert not claim_the_runtime_replan_shares_its_demand_entries(mutant)
+
+
 if __name__ == "__main__":
     import sys
 
