@@ -1841,11 +1841,15 @@ static bool mxfp4_moe_ptr_table_handle_for_tensor(const ggml_tensor *           
         *table_handle_out = extra->weight_ext->moe_expert_ptrs_handle[device];
     }
     if (retained_leases_out) {
-        // weight_ext is confirmed non-null by the guard above.
-        const auto & leases = !extra->weight_ext->moe_expert_ptrs_leases[device].empty() ?
-                                  extra->weight_ext->moe_expert_ptrs_leases[device] :
-                                  extra->weight_ext->moe_expert_handles[device];
-        retained_leases_out->insert(retained_leases_out->end(), leases.begin(), leases.end());
+        // weight_ext is confirmed non-null by the guard above. The table's leases are a keyed bag and the per-expert
+        // handles a vector, so each is copied out on its own branch.
+        const auto & table_leases = extra->weight_ext->moe_expert_ptrs_leases[device];
+        if (!table_leases.empty()) {
+            retained_leases_out->insert(retained_leases_out->end(), table_leases.begin(), table_leases.end());
+        } else {
+            const auto & handles = extra->weight_ext->moe_expert_handles[device];
+            retained_leases_out->insert(retained_leases_out->end(), handles.begin(), handles.end());
+        }
     }
     return true;
 }
