@@ -8,7 +8,7 @@
 // produces, and the host time of one submission. A third, the token count from which the arm beats the BF16 direct
 // kernel on a whole node, sets the arm's minimum width.
 //
-// Two parts, on Inkling's expert shapes (gate_up: K 2304, M 4608, one activation row per token; down: K 2304, M 2304,
+// Two parts, on Inkling's expert shapes (gate_up: K 2304, M 2304, one activation row per token; down: K 1152, M 2304,
 // one row per slot), with 128 experts whose weights are all distinct, so no call finds another's weight in a cache:
 //   - Per call. For n = 16, 32, 64 and 128 rows per expert: one primitive, then PASSES passes of 128 back-to-back
 //     calls, one per expert, each on its own weight, activation slot and output slot. Every call builds its memory
@@ -27,7 +27,7 @@
 // backend, no unified cache. The raw sycl::malloc_device below is a bench fixture, not a backend allocation (the
 // unified-cache rule governs backend code, and this binary never links the backend). Weights and activations are
 // filled on the device from an integer hash that the host evaluates again for the reference, so host memory stays
-// small. Device memory peaks at about 3.2 GB (gate_up: 2.7 GB of weights, 0.4 GB of activation and output slots).
+// small. Device memory peaks at about 1.6 GB (gate_up: 1.4 GB of weights, 0.2 GB of activation and output slots).
 //
 // Output:
 //   bench=bf16_expert_gemm device="..." driver=... dnnl=X.Y.Z deterministic=0|1 smoke=0|1 passes=P experts=E top_k=K
@@ -116,8 +116,8 @@ struct bench_shape {
 };
 
 constexpr bench_shape SHAPES[] = {
-    { "gate_up", 2304, 4608, false },
-    { "down",    2304, 2304, true  },
+    { "gate_up", 2304, 2304, false },
+    { "down",    1152, 2304, true  },
 };
 constexpr bench_shape SMOKE_SHAPES[] = {
     { "gate_up", 256, 192, false },

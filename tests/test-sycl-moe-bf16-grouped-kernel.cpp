@@ -405,8 +405,8 @@ int main() {
     const grouped_case cases[] = {
         // name                                            k     m     slt tok s1 exp xp xg yp yg
         { "rounding table and random bits, row per slot", 40,   24,   2, 3,  2, 3,  0, 0, 0, 0 },
-        { "Inkling gate_up shape, broadcast row",         2304, 4608, 8, 9,  1, 16, 0, 0, 0, 0 },
-        { "Inkling down shape, row per slot",             2304, 2304, 8, 9,  8, 16, 0, 0, 0, 0 },
+        { "Inkling gate_up shape, broadcast row",         2304, 2304, 8, 9,  1, 16, 0, 0, 0, 0 },
+        { "Inkling down shape, row per slot",             1152, 2304, 8, 9,  8, 16, 0, 0, 0, 0 },
         { "padded strides everywhere",                    33,   17,   3, 5,  3, 4,  3, 5, 2, 7 },
         { "padded strides, broadcast row",                48,   20,   4, 70, 1, 6,  1, 2, 3, 4 },
         { "one token, one slot, one expert",              1,    1,    1, 1,  1, 1,  0, 0, 0, 0 },

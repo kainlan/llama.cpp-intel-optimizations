@@ -10,7 +10,7 @@
 //
 // The cases, each compared with the CPU backend on every output row (the largest per-row NMSE must be <= 5e-4, the
 // bound of the other planned-model prompt tests):
-//   * gate_up (k 2304, m 4608), one activation row broadcast to every slot: 512 tokens over all 128 experts; 512 tokens
+//   * gate_up (k 2304, m 2304), one activation row broadcast to every slot: 512 tokens over all 128 experts; 512 tokens
 //     over 40 experts, so 88 are selected by no token; 512 tokens whose slot 0 picks one expert in every token, so that
 //     expert routes 512 rows and each other expert 28 or 29, and the node's GEMMs take two widths, 512 and 64; and 64
 //     tokens, the arm's minimum. Each must show the arm's line, "[MOE-ROUTE] bf16 grouped tensor=<name> ...
@@ -18,7 +18,7 @@
 //     are counted here from the ids (each active expert's rows rounded up to 64), not asked of the arm's plan;
 //   * 63 tokens on the same tensor, one below the minimum: the arm's decline line with reason=tokens and the direct
 //     route's line;
-//   * down (k 2304, m 2304), one activation row per slot: 512 tokens over all 128 experts, on the arm;
+//   * down (k 1152, m 2304), one activation row per slot: 512 tokens over all 128 experts, on the arm;
 //   * GGML_SYCL_MOE_BF16_GROUPED=0, which the backend reads once, so in a child process (this binary as --opt-out): the
 //     gate_up 512-token case on the direct route, with the arm's decline line reason=opt_out;
 //   * the gate_up 512-token case with the private failpoint armed that throws at the arm's GEMM stage, after its gather
@@ -77,13 +77,15 @@ using moe_planned_fixture::require;
 
 constexpr int      k_experts    = 128;
 constexpr int      k_used       = 8;
-constexpr int      k_in         = 2304;
-constexpr int      k_gate_up    = 4608;  // m of the fused gate_up tensor
-constexpr int      k_down       = 2304;  // m of the down tensor
-constexpr int      k_subset     = 40;    // the experts the subset case selects
-constexpr int      k_min_tokens = 64;    // moe_bf16_grouped_min_tokens
-constexpr int      k_row_align  = 64;    // moe_bf16_grouped_row_align
-constexpr int32_t  k_hot_expert = 5;     // slot 0 of every token in the hot-expert case
+// Inkling 2 Mini's expert shapes, from its GGUF (embedding_length 2304, expert_feed_forward_length 1152).
+constexpr int      k_gate_up_k  = 2304;      // embedding_length
+constexpr int      k_gate_up_m  = 2 * 1152;  // the fused gate and up rows: 2 x expert_feed_forward_length
+constexpr int      k_down_k     = 1152;      // expert_feed_forward_length
+constexpr int      k_down_m     = 2304;      // embedding_length
+constexpr int      k_subset     = 40;        // the experts the subset case selects
+constexpr int      k_min_tokens = 64;        // moe_bf16_grouped_min_tokens
+constexpr int      k_row_align  = 64;        // moe_bf16_grouped_row_align
+constexpr int32_t  k_hot_expert = 5;         // slot 0 of every token in the hot-expert case
 constexpr uint32_t k_n_ctx      = 512;
 constexpr uint32_t k_n_ubatch   = 512;
 constexpr double   k_nmse_tol   = 5e-4;
@@ -91,10 +93,10 @@ constexpr double   k_nmse_tol   = 5e-4;
 const char * const k_gate_up_names[] = { "blk.0.ffn_gate_up_exps.weight" };
 const char * const k_down_names[]    = { "blk.0.ffn_down_exps.weight" };
 
-// A model of one BF16 expert tensor of `n_out` rows per expert, `names[0]`, beside its NVFP4 companion `companion`, the
-// tensor of the other role in the same block.
-moe_planned_fixture::planned_shape bf16_shape(int n_out, const char * const * names, const char * companion) {
-    moe_planned_fixture::planned_shape shape = { GGML_TYPE_BF16, k_experts, k_used,  k_in,      n_out,
+// A model of one BF16 expert tensor of `n_out` rows of `n_in` values per expert, `names[0]`, beside its NVFP4 companion
+// `companion` of the same shape, named as the tensor of the other role in the same block.
+moe_planned_fixture::planned_shape bf16_shape(int n_in, int n_out, const char * const * names, const char * companion) {
+    moe_planned_fixture::planned_shape shape = { GGML_TYPE_BF16, k_experts, k_used,  n_in,      n_out,
                                                  names,          1,         k_n_ctx, k_n_ubatch };
     shape.companion_type                     = GGML_TYPE_NVFP4;
     shape.companion_name                     = companion;
@@ -102,9 +104,9 @@ moe_planned_fixture::planned_shape bf16_shape(int n_out, const char * const * na
 }
 
 const moe_planned_fixture::planned_shape k_gate_up_shape =
-    bf16_shape(k_gate_up, k_gate_up_names, "blk.0.ffn_down_exps.weight");
+    bf16_shape(k_gate_up_k, k_gate_up_m, k_gate_up_names, "blk.0.ffn_down_exps.weight");
 const moe_planned_fixture::planned_shape k_down_shape =
-    bf16_shape(k_down, k_down_names, "blk.0.ffn_gate_up_exps.weight");
+    bf16_shape(k_down_k, k_down_m, k_down_names, "blk.0.ffn_gate_up_exps.weight");
 
 // Every log chunk the backend emits, in order, so a case can count what appeared while it ran. Also echoed to stderr,
 // so the run's log carries the backend's own lines.
@@ -182,6 +184,7 @@ struct cpu_weights {
 
 struct case_data {
     const char *         label;
+    int                  k;       // the activation's width: k of the model the case runs on
     int                  n_tokens;
     int                  ne11;    // 1: one activation row broadcast to every slot; k_used: one row per slot
     int                  active;  // the distinct experts the ids select
@@ -193,7 +196,7 @@ struct case_data {
 // BF16-representable activations, one row per slot of `ne11` and token.
 void fill_input(case_data & c, std::mt19937 & rng) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    c.input.resize(size_t(k_in) * c.ne11 * c.n_tokens);
+    c.input.resize(size_t(c.k) * c.ne11 * c.n_tokens);
     for (float & v : c.input) {
         v = ggml_bf16_to_fp32(ggml_fp32_to_bf16(dist(rng)));
     }
@@ -218,10 +221,10 @@ void count_routing(case_data & c) {
 }
 
 // k_used distinct experts per token drawn from `n_select` experts spread over all k_experts: slots stride the selected
-// experts from a moving base, as the BF16 direct device test routes.
-case_data make_case(const char * label, int n_tokens, int ne11, int n_select, std::mt19937 & rng) {
+// experts from a moving base, as the BF16 direct device test routes. `k` is the width of the model's activations.
+case_data make_case(const char * label, int k, int n_tokens, int ne11, int n_select, std::mt19937 & rng) {
     require(n_select % k_used == 0 && n_select <= k_experts, "the selected experts must split evenly over the slots");
-    case_data c{ label, n_tokens, ne11, 0, 0, {}, {} };
+    case_data c{ label, k, n_tokens, ne11, 0, 0, {}, {} };
     fill_input(c, rng);
     const int stride = n_select / k_used;
     const int spread = k_experts / n_select;
@@ -240,9 +243,9 @@ case_data make_case(const char * label, int n_tokens, int ne11, int n_select, st
 // other 127 experts from a moving base (18 apart, so a token's seven are distinct). At 512 tokens the hot expert holds
 // 512 rows (a width of 512) and every other expert 28 or 29 (a width of 64): one node, two GEMM widths, every expert
 // active, 8640 packed rows (within the 16256 the ring is planned for).
-case_data make_hot_case(const char * label, int n_tokens, std::mt19937 & rng) {
+case_data make_hot_case(const char * label, int k, int n_tokens, std::mt19937 & rng) {
     constexpr int others = k_experts - 1;
-    case_data     c{ label, n_tokens, 1, 0, 0, {}, {} };
+    case_data     c{ label, k, n_tokens, 1, 0, 0, {}, {} };
     fill_input(c, rng);
     c.ids.resize(size_t(k_used) * n_tokens);
     for (int t = 0; t < n_tokens; ++t) {
@@ -285,6 +288,8 @@ ggml_status run_backend(ggml_backend_t backend, ggml_tensor * weights, const cas
     ggml_tensor * dst   = build_op(ctx.get(), weights, c);
     ggml_tensor * input = dst->src[1];
     ggml_tensor * ids   = dst->src[2];
+    require(c.input.size() == size_t(ggml_nelements(input)),
+            std::string(c.label) + "'s activations are not the width of " + weights->name + "'s k");
 
     ggml_backend_buffer_type_t         buft    = ggml_backend_get_default_buffer_type(backend);
     std::vector<ggml_backend_buffer_t> buffers = {
@@ -384,6 +389,7 @@ bool run_case(const moe_planned_fixture::planned_model & model,
               const char *                               decline,
               ggml_sycl_q1_nvfp4_test_failure            failpoint = GGML_SYCL_Q1_NVFP4_TEST_FAILURE_NONE) {
     const char * name     = model.gate->name;
+    const size_t k        = size_t(model.gate->ne[0]);
     const size_t m        = size_t(model.gate->ne[1]);
     const bool   admitted = supports(model.backend, model.gate, c);
     const char * reason   = decline ? decline : "tokens";
@@ -468,11 +474,11 @@ bool run_case(const moe_planned_fixture::planned_model & model,
         why += " failpoint-consumed";
     }
     std::fprintf(stderr,
-                 "CASE %s tensor=%s k=%d m=%zu experts=%d used=%d ne11=%d tokens=%d active=%d widths=%d want=%s "
+                 "CASE %s tensor=%s k=%zu m=%zu experts=%d used=%d ne11=%d tokens=%d active=%d widths=%d want=%s "
                  "supports_op=%d status=%d max_row_nmse=%.3e arm_lines=%zu arm_experts_lines=%zu arm_widths_lines=%zu "
                  "direct_lines=%zu decline_lines=%zu refusals=%zu failpoint_consumed=%llu runs+=%llu declines+=%llu "
                  "%s+=%llu -> %s%s\n",
-                 c.label, name, k_in, m, k_experts, k_used, c.ne11, c.n_tokens, c.active, c.widths,
+                 c.label, name, k, m, k_experts, k_used, c.ne11, c.n_tokens, c.active, c.widths,
                  decline ? decline : "arm", admitted ? 1 : 0, static_cast<int>(status), err, arm_lines, arm_experts,
                  arm_widths, direct_lines, decline_lines, refusals, (unsigned long long) consumed,
                  (unsigned long long) moved.runs, (unsigned long long) moved.declines, reason,
@@ -619,7 +625,7 @@ int main(int argc, char ** argv) {
         if (opt_out) {
             moe_planned_fixture::planned_model model(k_gate_up_shape, "test-moe-bf16-grouped-device-gate_up.gguf", rng);
             const cpu_weights                  reference(cpu.get(), model);
-            const case_data                    c = make_case("opt-out", 512, 1, k_experts, rng);
+            const case_data                    c = make_case("opt-out", k_gate_up_k, 512, 1, k_experts, rng);
             return run_case(model, cpu.get(), reference, c, "opt_out") ? 0 : 1;
         }
 
@@ -635,28 +641,32 @@ int main(int argc, char ** argv) {
             moe_planned_fixture::planned_model model(k_gate_up_shape, "test-moe-bf16-grouped-device-gate_up.gguf", rng);
             const cpu_weights                  reference(cpu.get(), model);
             const auto run = [&](const char * label, int n_tokens, int n_select, const char * decline) {
-                tally(run_case(model, cpu.get(), reference, make_case(label, n_tokens, 1, n_select, rng), decline));
+                tally(run_case(model, cpu.get(), reference, make_case(label, k_gate_up_k, n_tokens, 1, n_select, rng),
+                               decline));
             };
             run("gate_up-all", 512, k_experts, nullptr);
             run("gate_up-subset", 512, k_subset, nullptr);
             // Its own generator, so every other case keeps the inputs it had before this case existed.
             std::mt19937 hot_rng(512);
-            tally(run_case(model, cpu.get(), reference, make_hot_case("gate_up-hot-expert", 512, hot_rng), nullptr));
+            tally(run_case(model, cpu.get(), reference, make_hot_case("gate_up-hot-expert", k_gate_up_k, 512, hot_rng),
+                           nullptr));
             run("gate_up-min-tokens", k_min_tokens, k_experts, nullptr);
             run("gate_up-below-min", k_min_tokens - 1, k_experts, "tokens");
             // A thrown submission fails the graph by name; the process and the arm go on.
-            tally(run_thrown_case(model, make_case("gate_up-thrown-after-gather", 512, 1, k_experts, rng)));
+            tally(
+                run_thrown_case(model, make_case("gate_up-thrown-after-gather", k_gate_up_k, 512, 1, k_experts, rng)));
             run("gate_up-after-thrown", 512, k_experts, nullptr);
             // A GEMM run that declines after the gather declines the node SUBMIT, and the direct route runs it.
             tally(run_case(model, cpu.get(), reference,
-                           make_case("gate_up-declined-after-gather", 512, 1, k_experts, rng), "submit",
+                           make_case("gate_up-declined-after-gather", k_gate_up_k, 512, 1, k_experts, rng), "submit",
                            GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_DECLINE_AFTER_GATHER));
             run("gate_up-after-declined", 512, k_experts, nullptr);
         }
         {
             moe_planned_fixture::planned_model model(k_down_shape, "test-moe-bf16-grouped-device-down.gguf", rng);
             const cpu_weights                  reference(cpu.get(), model);
-            tally(run_case(model, cpu.get(), reference, make_case("down-all", 512, k_used, k_experts, rng), nullptr));
+            tally(run_case(model, cpu.get(), reference, make_case("down-all", k_down_k, 512, k_used, k_experts, rng),
+                           nullptr));
         }
         if (failed != 0) {
             std::fprintf(stderr, "FAIL: %d of %d cases failed\n", failed, cases);

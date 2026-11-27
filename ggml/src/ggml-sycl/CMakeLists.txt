@@ -5180,7 +5180,7 @@ set_tests_properties(test-sycl-bf16-onednn-probe PROPERTIES
 # Task 24, step 0 (Inkling 2 Mini plan): the device and host cost of one oneDNN bf16 x bf16 -> f32 strict GEMM per
 # active expert, on 128 distinct experts at Inkling's two expert shapes and n = 16 to 128 rows, and a whole prompt node
 # against the BF16 direct kernel (moe-bf16-direct.cpp, compiled in) from 16 to 512 tokens. Standalone like the probe
-# above: SYCL, oneDNN, the deterministic attribute header and the backend-free kernel, no backend. About 3.2 GB of
+# above: SYCL, oneDNN, the deterministic attribute header and the backend-free kernel, no backend. About 1.6 GB of
 # device memory. A measurement for the lead, not a gate, so it registers no ctest and is not part of `all`: the lead
 # builds it by name and runs it once on the B70 (the command is in the file header).
 add_executable(test-sycl-bf16-expert-gemm-bench EXCLUDE_FROM_ALL
@@ -6619,9 +6619,10 @@ endif() # static SYCL backend fixture
 # the arm again. Every output row a case computes within NMSE 5e-4 of the CPU backend, no refusal, every arm case's
 # route line naming its experts and GEMM widths, and every case moves the arm's run and decline counters by exactly
 # what it should. The counters and the failpoints exist only in the private backend objects, so it links
-# ggml-sycl-private-fixtures (not the ordinary DSO). Each model holds ~4.5 GB on the card with its ring and ~9 GB of
-# host memory (~12 GB while its experts are quantized), so the label is `model`, which keeps it out of the full sweep
-# (CLAUDE.md, .claude/rules/ctest-registration.md): run it alone. Pinned to the B70; a run with no SYCL GPU exits 77.
+# ggml-sycl-private-fixtures (not the ordinary DSO). The gate_up model holds ~2.3 GB on the card with its ring and
+# ~4.5 GB of host memory (~6 GB while its experts are quantized), the down model about half that, so the label is
+# `model`, which keeps it out of the full sweep (CLAUDE.md, .claude/rules/ctest-registration.md): run it alone. Pinned
+# to the B70; a run with no SYCL GPU exits 77.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-bf16-grouped-device
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-bf16-grouped-device.cpp
