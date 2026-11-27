@@ -25947,7 +25947,9 @@ std::vector<test_plan_placement> test_plan_placements(const lifecycle_plan_snaps
 //   - the copy cloned at least one chunk, since its first flip writes a chunk the replaced plan still shares, and at
 //     most one per member it flipped, 3 * triplets, since a chunk once cloned is the copy's own and a second member in
 //     it clones nothing; nor more chunks than the plan has. These fixtures' plans fit one 32-entry chunk, so here the
-//     bound is exactly 1, where a whole-plan copy would clone every chunk.
+//     bound is exactly 1, which a copy that cloned every chunk would also meet: on these plans the lower bound and the
+//     unchanged entries are what can fail, and the upper bound's teeth are the chunked store's host test and the loan
+//     source gate's ban on mutable walks of the copy.
 std::string test_txn_plan_cost(const lifecycle_plan_snapshot &          published,
                                const std::vector<test_plan_placement> & placements,
                                uint64_t                                 chunks_cloned,
