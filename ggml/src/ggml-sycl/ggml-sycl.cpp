@@ -10413,7 +10413,7 @@ static ggml_sycl_execution_result ggml_sycl_execution_c_result(ggml_sycl::execut
     return GGML_SYCL_EXECUTION_INTERNAL_ERROR;
 }
 
-// Diagnostic-only mapping (llama.cpp-cnre): the internal registry error name,
+// Diagnostic-only mapping: the internal registry error name,
 // for logs/exception text. Distinct from ggml_sycl_execution_c_result() above,
 // which maps to the public ggml_sycl_execution_result C enum for the
 // lifecycle-context ABI; this one stays local to ggml-sycl.cpp.

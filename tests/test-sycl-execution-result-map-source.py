@@ -22,9 +22,12 @@ With comments blanked, in ggml-sycl.cpp:
 What this does not prove:
   - It reads source text; it never executes the mapping. The clang -Wswitch error pragma is the executable guard:
     the compiler, not this test, rejects a switch with a missing enumerator.
-  - It does not see enumerators produced by a macro, or a `case` that returns through a helper or a ternary: the
-    case pattern is `case E::X: return <expr>;`, and a different shape reads as a missing case (the test fails
-    closed, it does not pass).
+  - It does not see enumerators produced by a macro. A case is `case E::X: return <expr>;` and any `<expr>` is
+    accepted, so `return helper(e);` and `return a ? b : c;` pass C and N; M pins only the two mappings it names.
+    A braced case `{ return ...; }`, grouped fallthrough labels and assign-then-break are not that shape and read
+    as missing cases (the test fails closed, it does not pass).
+  - P sees only pragmas that name -Wswitch. `#pragma clang diagnostic ignored "-Wall"` or the `_Pragma(...)`
+    operator form would relax it unseen; the compiler-side pragma is still the guard.
   - Preprocessor conditionals are not evaluated: a pragma or an enumerator under `#if` counts as present. Lines
     starting with `#` inside the enum body are skipped.
   - GCC ignores clang pragmas; the pragma guard holds only for clang/icpx, the compilers of this translation unit.
@@ -212,6 +215,9 @@ def mutants():
     def on_header(*edit):
         return lambda h, s: (sub(h, *edit), s)
 
+    def move_pop(h, s):
+        return h, sub(sub(s, re.escape(POP) + "\n", ""), re.escape(NAME_FN), POP + "\n" + NAME_FN)
+
     return [
         ("drop the ALLOCATION_FAILED case of c_result", {C_PIN, M_ALLOC},
          on_sycl(case("ALLOCATION_FAILED", "GGML_SYCL_EXECUTION_ALLOCATION_FAILURE"), "")),
@@ -230,16 +236,19 @@ def mutants():
          on_sycl(case("ALLOCATION_FAILED", '"ALLOCATION_FAILED"'), 'case E::ALLOCATION_FAILED: return "UNKNOWN";')),
         ("c_result gets a default in place of the NOT_FOUND case", {D_C, C_PIN},
          on_sycl(case("NOT_FOUND", "GGML_SYCL_EXECUTION_NOT_FOUND"), "default: return GGML_SYCL_EXECUTION_NOT_FOUND;")),
-        ("error_name gets a default in place of the NOT_FOUND case", {D_N, N_PIN}, on_sycl(case("NOT_FOUND", '"NOT_FOUND"'), 'default: return "NOT_FOUND";')),
+        ("error_name gets a default in place of the NOT_FOUND case", {D_N, N_PIN},
+         on_sycl(case("NOT_FOUND", '"NOT_FOUND"'), 'default: return "NOT_FOUND";')),
         ("the error pragma is removed", {P_PIN}, on_sycl(re.escape(ERROR_SWITCH), "")),
-        ("the pop moves before error_name", {P_PIN}, on_sycl(re.escape(NAME_FN), POP + "\n" + NAME_FN)),
+        ("the pop moves before error_name", {P_PIN}, move_pop),
         ("an inner ignored pragma relaxes c_result", {P_PIN},
-         on_sycl(r"(" + re.escape(C_RESULT) + r"\s*using E = [^;]*;\s*)switch \(e\) \{", r"\1" + IGNORE_SWITCH + "\nswitch (e) {")),
+         on_sycl(r"(" + re.escape(C_RESULT) + r"\s*using E = [^;]*;\s*)switch \(e\) \{",
+                 r"\1" + IGNORE_SWITCH + "\nswitch (e) {")),
         ("an ignored pragma between the functions relaxes error_name", {P_PIN},
          on_sycl(re.escape(NAME_FN), IGNORE_SWITCH + "\n" + NAME_FN)),
         ("an inner warning pragma relaxes error_name", {P_PIN},
          on_sycl(re.escape(NAME_FN), WARN_SWITCH + "\n" + NAME_FN)),
-        ("the enum is renamed", {E_ENUM, C_PIN, N_PIN, N_OWN}, on_header(r"enum class error \{", "enum class errors {")),
+        ("the enum is renamed", {E_ENUM, C_PIN, N_PIN, N_OWN},
+         on_header(r"enum class error \{", "enum class errors {")),
         ("an enumerator is not an identifier", {E_ENUM},
          lambda h, s: (enum_edit(h, "    42,\n"), s)),
         ("c_result is renamed", {E_C, C_PIN, M_ALLOC, M_LOCK, M_TAIL, D_C, P_PIN},
@@ -279,27 +288,28 @@ def self_test(header, sycl):
         try:
             h, s = build(header, sycl)
         except MutantNotApplied as e:
-            print(f"FAIL: mutant '{name}': {e}")
+            print(f"FAIL: mutant '{name}': {e}", file=sys.stderr)
             failed.append(name)
             continue
         got = {pin for pin, why in claims(h, s).items() if why}
         if got != expected:
-            print(f"FAIL: mutant '{name}': pins that failed {sorted(got)}, expected {sorted(expected)}")
+            print(f"FAIL: mutant '{name}': pins that failed {sorted(got)}, expected {sorted(expected)}",
+                  file=sys.stderr)
             failed.append(name)
     for name, build in controls():
         try:
             h, s = build(header, sycl)
         except MutantNotApplied as e:
-            print(f"FAIL: control '{name}': {e}")
+            print(f"FAIL: control '{name}': {e}", file=sys.stderr)
             failed.append(name)
             continue
         broke = [f"{pin} ({why})" for pin, why in claims(h, s).items() if why]
         if broke:
-            print(f"FAIL: control '{name}' is legal but broke: {'; '.join(broke)}")
+            print(f"FAIL: control '{name}' is legal but broke: {'; '.join(broke)}", file=sys.stderr)
             failed.append(name)
     try:
         sub("nothing here", "absent anchor", "")
-        print("FAIL: a stale mutant anchor is not reported NOT APPLIED")
+        print("FAIL: a stale mutant anchor is not reported NOT APPLIED", file=sys.stderr)
         failed.append("stale-anchor")
     except MutantNotApplied:
         pass
@@ -312,11 +322,14 @@ def main():
     failed = []
     for pin, why in claims(header, sycl).items():
         if why:
-            print(f"FAIL: {pin} ({why})")
+            print(f"FAIL: {pin} ({why})", file=sys.stderr)
             failed.append(pin)
     if "--self-test" in sys.argv and not failed:
         failed += self_test(header, sycl)
-    print("FAIL" if failed else "PASS")
+    if failed:
+        print("execution result map source contract: FAIL", file=sys.stderr)
+    else:
+        print("execution result map source contract: PASS")
     return 1 if failed else 0
 
 
