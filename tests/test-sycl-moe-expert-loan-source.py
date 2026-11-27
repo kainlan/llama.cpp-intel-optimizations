@@ -789,7 +789,7 @@ def claim_lent_views_mark_the_table_stale(sycl: str, common: str) -> bool:
                         BUMP_GENERATION, MARK_STALE))
 
 
-# No view is found by a walk (llama.cpp-hgm4): the pointer table's leases come out of a bag keyed by (device, entry
+# No view is found by a walk: the pointer table's leases come out of a bag keyed by (device, entry
 # key), the same pair the drop's match reads, and the route table and the hybrid decode record are asked at the moved
 # expert's own slot, where its retired entry is (an expert move refuses a device copy that shares storage). A table or
 # record whose slot does not hold the entry is still walked whole, so no view is missed, and each such walk counts in
@@ -4836,9 +4836,10 @@ ENTRIES_WORD_RE = re.compile(r"\bentries\b")
 # allocate. The plan held one (expert_device, a collapsed summary nothing read); the entries and their shared index are
 # the one per-expert record.
 PER_EXPERT_MAP = "std::unordered_map<int, std::unordered_map<int, int>>"
-# An entry's address taken from the store's data or subtracted from an indexed entry, through an object or not (inside
-# a plan member the store is the bare `entries`).
-ENTRY_POINTER_ARITH_RE = re.compile(r"entries\s*\.\s*data\s*\(|-\s*&\s*(?:\w+\s*(?:\.|->)\s*)?entries\s*\[")
+# An entry's address taken from the store's data or subtracted from an indexed entry, through any chain of objects
+# (the backend reaches the store as `published.plan->entries` and `current->plan->entries`) or none (inside a plan
+# member the store is the bare `entries`).
+ENTRY_POINTER_ARITH_RE = re.compile(r"entries\s*\.\s*data\s*\(|-\s*&\s*(?:\w+\s*(?:\.|->)\s*)*entries\s*\[")
 # Any backend source can hold a plan and position an entry, so the pointer-arithmetic ban covers every C++ file under
 # ggml-sycl; the four sources the claim takes as arguments are scanned from those arguments instead, so their mutants
 # count. Normalized once here, because the claim runs for every mutant.
@@ -4963,6 +4964,12 @@ def test_mutant_entry_position_by_bare_store_arithmetic_fails():
     """Inside a plan member the store is the bare `entries`, with no object to name."""
     mutant = norm(CACHE_HPP) + " size_t i = static_cast<size_t>(&e - &entries[0]);"
     assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_entry_position_through_a_snapshots_plan_fails():
+    """Two object steps to the store, as the backend reaches a published plan's entries."""
+    mutant = norm(SYCL) + " size_t i = static_cast<size_t>(&e - &current->plan->entries[0]);"
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, mutant)
 
 
 def test_mutant_entry_position_by_arithmetic_elsewhere_in_the_backend_fails():
