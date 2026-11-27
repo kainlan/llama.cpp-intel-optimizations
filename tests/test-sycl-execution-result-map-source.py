@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Every ggml_sycl::execution::error maps to a C result and a name (llama.cpp-ppjj).
+"""Every ggml_sycl::execution::error maps to a C result and a name.
 
 With comments blanked, in ggml-sycl.cpp:
   C. ggml_sycl_execution_c_result has a `case E::<X>:` that returns a value for every enumerator of
@@ -55,8 +55,9 @@ def body(text, signature):
 
 
 def enumerators(header):
-    inner = body(header, "enum class error {")
-    return [n for n in re.findall(r"\b([A-Z][A-Z0-9_]*)\b\s*,", inner)]
+    inner = body(header, "enum class error {")[1:-1]
+    items = [item.strip() for item in inner.split(",")]
+    return [re.match(r"[A-Za-z_]\w*", item).group(0) for item in items if item]
 
 
 def cases(fn_body):
@@ -109,7 +110,15 @@ def mutants(header, sycl):
     def case(name, value):
         return r"case\s+E::" + name + r":\s*return\s+" + value + ";"
 
-    extra = lambda h: sub(h, r"LOCK_HELD_ALLOCATION,\n", "LOCK_HELD_ALLOCATION,\n    NEW_VALUE,\n")
+    def extra(text):
+        return sub(text, r"LOCK_HELD_ALLOCATION,\n", "LOCK_HELD_ALLOCATION,\n    NEW_VALUE,\n")
+
+    def extra_no_comma(text):
+        return sub(text, r"LOCK_HELD_ALLOCATION,\n", "LOCK_HELD_ALLOCATION,\n    NEW_VALUE\n")
+
+    def extra_initialized(text):
+        return sub(text, r"LOCK_HELD_ALLOCATION,\n", "LOCK_HELD_ALLOCATION,\n    NEW_VALUE = 11,\n")
+
     return [
         ("C every enumerator has a c_result case", header,
          sub(sycl, case("ALLOCATION_FAILED", "GGML_SYCL_EXECUTION_ALLOCATION_FAILURE"), "")),
@@ -134,6 +143,10 @@ def mutants(header, sycl):
         ("P -Wswitch is an error across both functions", header, sub(sycl, re.escape(NAME_FN), POP + "\n" + NAME_FN)),
         ("C every enumerator has a c_result case", extra(header), sycl),
         ("N every enumerator has a name case", extra(header), sycl),
+        ("C every enumerator has a c_result case", extra_no_comma(header), sycl),
+        ("N every enumerator has a name case", extra_no_comma(header), sycl),
+        ("C every enumerator has a c_result case", extra_initialized(header), sycl),
+        ("N every enumerator has a name case", extra_initialized(header), sycl),
     ]
 
 
