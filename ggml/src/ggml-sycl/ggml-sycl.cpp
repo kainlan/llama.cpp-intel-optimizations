@@ -91149,7 +91149,8 @@ static bool ggml_sycl_moe_hybrid_decode_table_fill(sycl::queue &                
 
 // GGML_SYCL_MOE_HYBRID_RECORD_TRACE: 1 prints, per token, one WARN line of what keeping the hybrid decode records
 // current cost the submitting thread (the fields are moe_hybrid_record_counts'); 2 adds one WARN line per record
-// build. Read once, so a lookup with the trace off tests one cached value and reads no name.
+// build and one per generation miss the patch was asked about, with the reason a patch declined. Read once, so a
+// lookup with the trace off tests one cached value and reads no name.
 static int ggml_sycl_moe_hybrid_record_trace_level() {
     static const int level = [] {
         const char * env = std::getenv("GGML_SYCL_MOE_HYBRID_RECORD_TRACE");
@@ -91255,6 +91256,27 @@ static const char * ggml_sycl_moe_hybrid_decode_record_plan_refusal(const ggml_t
     return ggml_sycl::moe_hybrid_record_plan_refusal(has_host, counts->on_device, counts->on_target);
 }
 
+// The frame's refusal of a record of src0 on ctx, or nullptr: what refuses the record whatever its experts' slots say,
+// beyond the plan, decided once the record's all-host mode and layout are known. The build and the patch both take it
+// from here, so a patch never publishes a record of a frame the build refuses.
+static const char * ggml_sycl_moe_hybrid_decode_record_frame_refusal(const ggml_backend_sycl_context & ctx,
+                                                                     const ggml_tensor *               src0,
+                                                                     bool                              all_host,
+                                                                     layout_mode                       layout) {
+    // The record places every device expert on ctx.device and its table is that device's.
+    if (ggml_sycl_routable_device_count() != 1) {
+        return "more than one routable card";
+    }
+    // The MMID direct block in ggml_sycl_mul_mat_id runs after this route declines, and it runs the card and host
+    // experts of a tensor of a type it runs, with its card experts in AOS, itself, in one node: no hybrid record is
+    // built for such a tensor. An all-host tensor has no card expert for that block to run, so its record is built.
+    if (!all_host && layout == GGML_LAYOUT_AOS && ggml_sycl_moe_mmid_route_reachable(ctx) &&
+        moe_mmid_direct_route_runs_type(src0->type)) {
+        return "the MMID direct route runs this tensor's card and host experts";
+    }
+    return nullptr;
+}
+
 // Builds the record of src0 on ctx.device (llama.cpp-7pvo). Each expert's executor is the retained decode route's
 // choice for it (choose_moe_batch_executor over the same resolved batch), so the record and that route place every
 // expert alike. Two shapes:
@@ -91281,9 +91303,8 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     const int     device = ctx.device;
     const auto *  extra  = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     const int64_t n_as   = src0->ne[2];
-    if (n_as <= 0 || ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT ||
-        ggml_sycl_routable_device_count() != 1) {
-        return refuse("not an expert weight tensor, or more than one routable card");
+    if (n_as <= 0 || ggml_sycl_get_tensor_usage(src0) != tensor_usage::MOE_EXPERT_WEIGHT) {
+        return refuse("not an expert weight tensor");
     }
     ggml_sycl::expert_residency_counts counts;
     if (const char * why = ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, n_as, &counts)) {
@@ -91322,12 +91343,8 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     // A host-planned expert resolves in AOS whatever layout is requested (ggml_sycl_moe_resolve_layouts), and AOS is
     // what the CPU job reads, so an all-host record requests it.
     const layout_mode layout = all_host ? GGML_LAYOUT_AOS : static_cast<layout_mode>(materialized);
-    // The MMID direct block in ggml_sycl_mul_mat_id runs after this route declines, and it runs the card and host
-    // experts of a tensor of a type it runs, with its card experts in AOS, itself, in one node: no hybrid record is
-    // built for such a tensor. An all-host tensor has no card expert for that block to run, so its record is built.
-    if (!all_host && layout == GGML_LAYOUT_AOS && ggml_sycl_moe_mmid_route_reachable(ctx) &&
-        moe_mmid_direct_route_runs_type(src0->type)) {
-        return refuse("the MMID direct route runs this tensor's card and host experts");
+    if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, all_host, layout)) {
+        return refuse(why);
     }
 
     std::vector<int32_t> all_experts(static_cast<size_t>(n_as));
@@ -91407,52 +91424,63 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
 // copy gets a table of its own, filled from every slot: the held table may be the source of a copy still on the queue,
 // which reads it when it runs, so it is never written again. Hands back in `replaced` the leases of the slots it
 // replaced and the held table, for the caller to keep until the queue has passed the copy's publication. Declines,
-// returning false with nothing published and no count moved, when the build would decide the record another way now
-// (the plan refuses it, or names another all-host mode, or a moved expert could move the layout the build takes) or a
-// moved expert no longer fits the held record's shape (another layout, a device expert in an all-host record, no host
-// expert left), and the caller builds the record again over every expert. `held` is the patch's own reference, so a
-// resolve that replaces the tensor's record cannot release the one it copies.
+// returning false with nothing published and no count moved and its reason in *reason, when the build would decide
+// the record another way now (the plan refuses it, or names another all-host mode, a moved expert could move the
+// layout the build takes, or the frame rule refuses the held mode and layout) or a moved expert no longer fits the
+// held record's shape (another layout, a device expert in an all-host record, no host expert left), and the caller
+// builds the record again over every expert. `held` is the patch's own reference, so a resolve that replaces the
+// tensor's record cannot release the one it copies.
 static bool ggml_sycl_moe_hybrid_decode_record_patch(ggml_backend_sycl_context &                       ctx,
                                                      const ggml_tensor *                               src0,
                                                      std::shared_ptr<const moe_hybrid_decode_record>   held,
                                                      const std::vector<int32_t> &                      changed,
                                                      std::shared_ptr<const moe_hybrid_decode_record> * out,
-                                                     std::vector<ggml_sycl::mem_handle> *              replaced) {
+                                                     std::vector<ggml_sycl::mem_handle> *              replaced,
+                                                     const char **                                     reason) {
+    // Each decline names its reason, for the level-2 patch line.
+    const auto decline = [reason](const char * why) {
+        *reason = why;
+        return false;
+    };
     const int    device = ctx.device;
     const auto * extra  = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     // Everything the build checks of the tensor, its plan and the context rather than of each expert, again. The
     // tensor's own facts (an expert weight of n_as experts) do not move, but an expert move rewrites the plan without
     // moving the replan epoch, so the plan rule is asked again, and a refusal, another all-host mode or a move that
     // could stop the build's layout scan elsewhere sends the record to the build, which decides.
-    if (!held || changed.empty() || held->lease.size() != held->n_as || ggml_sycl_routable_device_count() != 1) {
-        return false;
+    if (!held || changed.empty() || held->lease.size() != held->n_as) {
+        return decline("the held record has no slot per expert, or nothing moved");
     }
     ggml_sycl::expert_residency_counts counts;
-    if (ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, static_cast<int64_t>(held->n_as), &counts) !=
-            nullptr ||
-        !ggml_sycl::moe_hybrid_record_patch_frame_holds(held->all_host, held->layout_expert, counts.on_device == 0,
-                                                        changed.front())) {
-        return false;
+    if (const char * why =
+            ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, static_cast<int64_t>(held->n_as), &counts)) {
+        return decline(why);
     }
-    if (!held->all_host && held->layout == GGML_LAYOUT_AOS && ggml_sycl_moe_mmid_route_reachable(ctx) &&
-        moe_mmid_direct_route_runs_type(src0->type)) {
-        return false;
+    if (!ggml_sycl::moe_hybrid_record_patch_frame_holds(held->all_host, held->layout_expert, counts.on_device == 0,
+                                                        changed.front())) {
+        return decline(
+            "the plan names the other all-host mode, or a move could stop the build's layout scan elsewhere");
+    }
+    if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, held->all_host, held->layout)) {
+        return decline(why);
     }
     const ggml_sycl::moe_resolved_batch_result resolved = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
         src0, device, changed.data(), changed.size(), changed.size(), held->layout,
         /*allow_materialize=*/false, &ctx, ctx.stream(), nullptr);
     if (!resolved || resolved.batch.operands.size() != changed.size()) {
-        return false;
+        return decline("the moved experts did not resolve");
     }
     std::vector<ggml_sycl::moe_hybrid_record_slot<ggml_sycl::mem_handle>> fresh(changed.size());
     std::vector<sycl::event>                                              ready;
-    const char *                                                          why = nullptr;
     for (size_t i = 0; i < changed.size(); ++i) {
         const ggml_sycl::moe_resolved_operand & operand = resolved.batch.operands[i];
-        if (operand.expert_id != changed[i] ||
-            ggml_sycl_moe_hybrid_decode_record_slot(operand, device, held->layout, held->all_host, &fresh[i], ready,
+        if (operand.expert_id != changed[i]) {
+            return decline("the resolved batch is not in the moved experts' order");
+        }
+        const char * why = nullptr;
+        if (ggml_sycl_moe_hybrid_decode_record_slot(operand, device, held->layout, held->all_host, &fresh[i], ready,
                                                     &why) != ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE) {
-            return false;
+            return decline(why);
         }
     }
 
@@ -91460,21 +91488,22 @@ static bool ggml_sycl_moe_hybrid_decode_record_patch(ggml_backend_sycl_context &
     std::vector<ggml_sycl::mem_handle> leases;
     if (!ggml_sycl::moe_hybrid_record_install(patched->device_weight, patched->host_weight, patched->lease, changed,
                                               fresh, &leases)) {
-        return false;
+        return decline("a moved expert has no slot in the record");
     }
     const ggml_sycl::moe_hybrid_record_shape shape =
         ggml_sycl::moe_hybrid_record_shape_of(patched->device_weight, patched->host_weight, patched->lease);
-    if (ggml_sycl::moe_hybrid_record_shape_refusal(patched->all_host, shape) != nullptr) {
-        return false;
+    if (const char * why = ggml_sycl::moe_hybrid_record_shape_refusal(patched->all_host, shape)) {
+        return decline(why);
     }
     // The rule found no empty slot, so every slot a loan or evict withdrew was refilled.
     patched->n_withdrawn = 0;
+
     sycl::queue & queue = *ctx.stream();
     if (!patched->all_host) {
         patched->table = {};
         if (!ggml_sycl_moe_hybrid_decode_table_fill(queue, device, extra->model_id, patched->device_weight,
                                                     shape.substitute, &patched->table)) {
-            return false;
+            return decline("the copy's table could not be allocated");
         }
     }
     if (!ready.empty()) {
@@ -91548,29 +91577,31 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
     if (trace > 0 && held && held->n_withdrawn > 0) {
         g_moe_hybrid_record_trace.withdrawn(held->n_withdrawn);
     }
-    std::vector<int32_t>                              changed;
-    const ggml_sycl::moe_hybrid_record_patch_plan     plan =
+    std::vector<int32_t>                          changed;
+    const ggml_sycl::moe_hybrid_record_patch_plan plan =
         ggml_sycl_moe_hybrid_record_patch_enabled() ?
-                ggml_sycl::moe_hybrid_record_plan_patch(miss, stamp, held != nullptr, weight.moe_expert_storage_changes,
-                                                        storage_generation, &changed) :
-                ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_NONE;
+            ggml_sycl::moe_hybrid_record_plan_patch(miss, stamp, held != nullptr, weight.moe_expert_storage_changes,
+                                                    storage_generation, &changed) :
+            ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_NONE;
     std::shared_ptr<const moe_hybrid_decode_record> patched;
     std::vector<ggml_sycl::mem_handle>              replaced;
     bool                                            patched_ok = false;
+    const char *                                    declined   = nullptr;  // why the patch declined, when it did
     if (plan == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_EXPERTS) {
-        patched_ok = ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, held, changed, &patched, &replaced);
+        patched_ok = ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, held, changed, &patched, &replaced, &declined);
     }
     if (trace > 0 && plan != ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_NONE) {
         g_moe_hybrid_record_trace.patch(plan, patched_ok, changed.size());
         if (trace >= 2) {
             GGML_LOG_WARN(
                 "[MOE-HYBRID-RECORD-PATCH] token=%llu tensor=%s device=%d generation=%llu->%llu experts=%zu "
-                "outcome=%s\n",
+                "outcome=%s%s%s\n",
                 (unsigned long long) g_moe_hybrid_record_trace.token, src0->name, device,
                 (unsigned long long) decided_generation, (unsigned long long) storage_generation, changed.size(),
                 plan == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_UNLOGGED ? "unlogged" :
                 patched_ok                                               ? "patched" :
-                                                                           "declined");
+                                                                           "declined",
+                declined ? ": " : "", declined ? declined : "");
         }
     }
     if (patched_ok) {
