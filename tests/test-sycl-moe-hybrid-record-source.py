@@ -42,11 +42,13 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
   T10 the patch holds its own shared pointer to const of the held record; every way it declines names its reason
       through one helper, into the caller's reason parameter; it asks the build's plan rule again (an expert move
       rewrites the plan without moving the replan epoch) and declines unless the frame the build would take now is the
-      held record's and the build's frame rule stands for the held mode and layout; resolves only the changed experts,
-      takes each slot from the build's slot rule, writes a copy of the held record (never the held one), checks the
-      copy's shape with the build's rule, gives it a table of its own filled from every slot, a ready barrier over the
-      held one's and the new events, records the block's residency only after every way out, hands the replaced leases
-      and the held table back for retention, and waits for nothing;
+      held record's, the build's frame rule stands for the held mode and layout, and the held route-count table is
+      still the device's; resolves only the changed experts and declines unless every one resolved, each operand
+      answering for its moved expert; takes each slot from the build's slot rule, writes a copy of the held record
+      (never the held one), declines when the install into it refuses, checks the copy's shape with the build's rule,
+      gives it a table of its own filled from every slot (the one table it fills; the held table it only hands back),
+      a ready barrier over the held one's and the new events, records the block's residency only after every way out,
+      hands the replaced leases and the held table back for retention, and waits for nothing;
   T11 the build takes its plan, its frame, its slots, its shape check and its table from those same helpers and
       records the expert its layout came from; the plan is asked in the plan rule alone, the routable cards and the
       MMID direct route in the frame rule alone, the executor in the slot rule alone; and
@@ -59,7 +61,9 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
       withdrawn slot's empty lease;
   T13 a patch or a build that the expert storage moved under (a loan or evict its own allocations set off) is not
       served: the patch counts as declined, with that reason, and the build ends as a retry, each checked before its
-      count, and the discarded record's handles wait for a barrier on the queue as a replaced record's do.
+      count, and the discarded record's handles wait for a barrier on the queue as a replaced record's do;
+  T14 a build that replaces the held record retains the replaced record's handles to a barrier on the queue before
+      it replaces or drops it, as a published patch retains what it replaced.
 
 Checks run on comment-blanked text (string literals kept). NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if another pin
@@ -136,6 +140,9 @@ PATCH_DECL = ("static bool ggml_sycl_moe_hybrid_decode_record_patch(ggml_backend
 PATCH_REASON_PARAM = "std::vector<ggml_sycl::mem_handle> * replaced, const char ** reason) {"
 # Every decline goes through the one helper that names its reason, so the level-2 line can say why.
 PATCH_DECLINE = "const auto decline = [reason](const char * why) { *reason = why; return false; };"
+# The held table's one use in the patch: handed back for retention, never resolved or filled.
+PATCH_HELD_TABLE = "if (held->table.valid()) { replaced->push_back(held->table); }"
+TABLE_FILL = "ggml_sycl_moe_hybrid_decode_table_fill("
 PATCH_STEPS = (
     ("decline helper", PATCH_DECLINE),
     ("the build's plan rule, asked again",
@@ -153,13 +160,17 @@ PATCH_STEPS = (
     ("its resolve of the changed experts alone",
      "ggml_sycl::ggml_sycl_build_moe_resolved_batch(src0, device, changed.data(), changed.size(), changed.size(), "
      "held->layout,"),
+    ("check that every moved expert resolved, in a batch of their count",
+     "if (!resolved || resolved.batch.operands.size() != changed.size()) { return decline("),
+    ("check of each resolved operand against the moved expert it answers for",
+     'if (operand.expert_id != changed[i]) { return decline("'),
     ("each slot from the build's slot rule, its refusal named",
      "if (ggml_sycl_moe_hybrid_decode_record_slot(operand, device, held->layout, held->all_host, &fresh[i], ready, "
      "&why) != ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE) { return decline(why); }"),
     ("its copy of the held record", "auto patched = std::make_shared<moe_hybrid_decode_record>(*held);"),
-    ("the install of the moved slots into the copy",
-     "ggml_sycl::moe_hybrid_record_install(patched->device_weight, patched->host_weight, patched->lease, changed, "
-     "fresh, &leases)"),
+    ("the install of the moved slots into the copy, a refusal declining",
+     "if (!ggml_sycl::moe_hybrid_record_install(patched->device_weight, patched->host_weight, patched->lease, changed, "
+     "fresh, &leases)) { return decline("),
     ("the copy's shape",
      "const ggml_sycl::moe_hybrid_record_shape shape = ggml_sycl::moe_hybrid_record_shape_of(patched->device_weight, "
      "patched->host_weight, patched->lease);"),
@@ -178,7 +189,7 @@ PATCH_STEPS = (
     ("the replaced leases handed back",
      "replaced->insert(replaced->end(), std::make_move_iterator(leases.begin()), "
      "std::make_move_iterator(leases.end()));"),
-    ("the held table handed back", "if (held->table.valid()) { replaced->push_back(held->table); }"),
+    ("the held table handed back", PATCH_HELD_TABLE),
     ("the copy's publication", "*out = std::move(patched);"),
 )
 
@@ -326,6 +337,14 @@ BUILD_MOVED = ("if (weight.moe_expert_storage_generation != storage_generation) 
                "ggml_sycl_moe_hybrid_decode_record_append_handles(*built, handles); "
                "ggml_sycl::retain_handles_until_event(std::move(handles), ctx.stream()->ext_oneapi_submit_barrier()); "
                "built.reset(); } outcome = ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY; }")
+
+# T14: a build that replaces the held record retains the replaced record's handles to a barrier before it drops it.
+BUILD_REPLACED_RETAIN = ("if (held) { std::vector<ggml_sycl::mem_handle> handles; "
+                         "ggml_sycl_moe_hybrid_decode_record_append_handles(*held, handles); "
+                         "ggml_sycl::retain_handles_until_event(std::move(handles), "
+                         "ctx.stream()->ext_oneapi_submit_barrier()); }")
+BUILD_REPLACE = ("if (settled == ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE) { held = std::move(built); } else { "
+                 "held.reset(); }")
 
 
 class ContractError(AssertionError):
@@ -582,6 +601,12 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str, log
                             "leaving the count of a record it did not publish")
     if WAIT_CALLS.search(patch):
         raise ContractError("FAIL [pin T10]: the patch waits on the device")
+    # The held table may be the source of a table copy still on the queue: the patch only hands it back.
+    if "held->table.resolve" in patch or patch.count("held->table") != PATCH_HELD_TABLE.count("held->table"):
+        raise ContractError("FAIL [pin T10]: the patch names the held table other than to hand it back for retention, "
+                            "so it could write a table a queued copy still reads")
+    if patch.count(TABLE_FILL) != 1:
+        raise ContractError("FAIL [pin T10]: the patch fills a table besides the copy's own")
 
     # T11: one slot rule, one shape rule and one table fill for the build and the patch; the switch read once.
     slot_rule = body(code, SLOT_SIG, "T11")
@@ -694,6 +719,13 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str, log
     if not at_build < at_build_moved < at_outcome:
         raise ContractError("FAIL [pin T13]: the build's storage check is not between the build and its outcome count, "
                             "so a record built before a move could be served or cached, or counted as it ended")
+
+    # T14: the build's replacement retains the record it replaces.
+    at_replaced_retain = once(current, BUILD_REPLACED_RETAIN, "T14", "the replaced record's retention to a barrier")
+    at_replace = once(current, BUILD_REPLACE, "T14", "the build's replacement of the held record")
+    if not at_build_moved < at_replaced_retain < at_replace:
+        raise ContractError("FAIL [pin T14]: the replaced record's handles are not retained before the build replaces "
+                            "it, so a table copy or kernel still on the queue could read storage the cache reused")
 
 
 def self_test(raws: dict[str, str]) -> int:
@@ -833,6 +865,24 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("patch-takes-no-reason", "T10", B,
                 [("replaced,\n" + " " * 53 + "const char **" + " " * 37 + "reason) {",
                   "replaced) {\n    const char *  local_reason = nullptr;\n    const char ** reason       = &local_reason;")])
+    expect_fail("patch-skips-batch-size", "T10", B,
+                [("    if (!resolved || resolved.batch.operands.size() != changed.size()) {", "    if (!resolved) {")])
+    expect_fail("patch-skips-order-check", "T10", B,
+                [("        if (operand.expert_id != changed[i]) {\n"
+                  "            return decline(\"the resolved batch is not in the moved experts' order\");\n        }\n", "")])
+    expect_fail("patch-ignores-install-failure", "T10", B,
+                [("    if (!ggml_sycl::moe_hybrid_record_install(patched->device_weight,",
+                  "    if (false && !ggml_sycl::moe_hybrid_record_install(patched->device_weight,")])
+    expect_fail("patch-writes-held-table", "T10", B,
+                [("    patched->n_withdrawn = 0;\n\n    sycl::queue & queue = *ctx.stream();\n",
+                  "    patched->n_withdrawn = 0;\n\n    sycl::queue & queue = *ctx.stream();\n    if (held->table.valid()) {\n"
+                  "        static_cast<const void **>(held->table.resolve().ptr)[0] = nullptr;\n    }\n")])
+    expect_fail("patch-fills-held-table", "T10", B,
+                [("    if (!ready.empty()) {\n        // The unchanged slots' weights",
+                  "    (void) ggml_sycl_moe_hybrid_decode_table_fill(queue, device, extra->model_id, patched->device_weight,\n"
+                  "                                                  shape.substitute,\n"
+                  "                                                  const_cast<ggml_sycl::mem_handle *>(&held->table));\n"
+                  "    if (!ready.empty()) {\n        // The unchanged slots' weights")])
     expect_fail("patch-ignores-layout-expert", "T10", B,
                 [("held->layout_expert, counts.on_device == 0,", "-1, counts.on_device == 0,")])
     expect_fail("patch-resolves-every-expert", "T10", B,
@@ -988,8 +1038,8 @@ def self_test(raws: dict[str, str]) -> int:
                   "        ggml_sycl::retain_handles_until_event(std::move(replaced), "
                   "ctx.stream()->ext_oneapi_submit_barrier());\n", "")])
     build_moved_if = "    if (weight.moe_expert_storage_generation != storage_generation) {\n        if (built) {\n"
-    build_moved = (build_moved_if +
-                   "            std::vector<ggml_sycl::mem_handle> handles;\n"
+    build_moved = (build_moved_if
+                   + "            std::vector<ggml_sycl::mem_handle> handles;\n"
                    "            ggml_sycl_moe_hybrid_decode_record_append_handles(*built, handles);\n"
                    "            ggml_sycl::retain_handles_until_event(std::move(handles), "
                    "ctx.stream()->ext_oneapi_submit_barrier());\n"
@@ -1007,6 +1057,20 @@ def self_test(raws: dict[str, str]) -> int:
                 [("            ggml_sycl_moe_hybrid_decode_record_append_handles(*built, handles);\n"
                   "            ggml_sycl::retain_handles_until_event(std::move(handles), "
                   "ctx.stream()->ext_oneapi_submit_barrier());\n", "")])
+    # T14: the build's replacement of the held record.
+    build_retain = ("        ggml_sycl_moe_hybrid_decode_record_append_handles(*held, handles);\n"
+                    "        ggml_sycl::retain_handles_until_event(std::move(handles), "
+                    "ctx.stream()->ext_oneapi_submit_barrier());\n")
+    expect_fail("build-replaced-unretained", "T14", B,
+                [(build_retain, "        ggml_sycl_moe_hybrid_decode_record_append_handles(*held, handles);\n")])
+    build_replace = ("    if (settled == ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE) {\n"
+                     "        held = std::move(built);\n    } else {\n        held.reset();\n    }\n")
+    retain_block = ("    if (held) {\n"
+                    "        // The replaced record's table and device leases may back a table copy or kernel still on "
+                    "the queue.\n"
+                    "        std::vector<ggml_sycl::mem_handle> handles;\n" + build_retain + "    }\n")
+    expect_fail("build-retains-after-replace", "T14", B,
+                [(retain_block, ""), (build_replace, build_replace + retain_block)])
     expect_fail("docs-row-lacks-withdrawn", "T7", D,
                 [("patch_unlogged= withdrawn=` line", "patch_unlogged=` line"), (" `withdrawn=` counts", " counts")])
 
