@@ -7833,6 +7833,67 @@ real expert shapes, gate_up K 2304 by M 2304 and down K 1152 by M 2304.**
   - The nine contracts that read the plan, run through ctest after this record (`plan-readers.log`): all nine pass.
   - Not run here: the device test and the bench. Both are the lead's.
 
+**Lead acceptance (2026-11-27).** Each device run ran once, B70 = `level_zero:0`, B50 = `level_zero:1`, and pp / tg
+are in t/s. The long arms and the profile ran at `992568b6f8`. Since then the backend has changed only in comments.
+Everything else ran at `fc66837e4b`.
+- *Long real-text arm, B70, 4,737-token prompt, `-c 8192` (the baselines' context; the default 1M context is refused
+  by LOAD-PLAN at 150 GB of compute buffer):*
+  - 312.27 / 28.02, against 251.6 / 28.2 at `2a69aea88b`. That is 1.24x, above the 1.15x bar.
+  - The text is byte-equal to `2a69aea88b`'s and `753da57b1b`'s.
+  - Peak host backing is 18 GiB, against 17 GiB at the base. The sampler reads whole GiB. The merged-tree round reads
+    it again.
+- *Kernel profiler on the same prompt:*
+  - Device time is 6.21 s per pass, against 9.96 s.
+  - The BF16 experts are 8,824 bf16 GEMMs at m = 2304, 193 ms in all, against 3.97 s for `bf16_direct`. That is below
+    the 0.6 s bar.
+  - The profiled run gives pp 270.8.
+  - What is left: the NVFP4 executor's GEMMs take 1.84 s, prompt attention 2.13 s, and 398,636 submissions per pass.
+    About 193,000 of those submissions are the per-expert stage kernels (`moe.pp.stage.act`, `moe.pp.stage.scatter`,
+    96,556 each). The wall time is bound by that host submission tail.
+- *Device test, B70, at the real shapes:* all eleven cases pass. The NMSE of the arm cases is at most 6.4e-14.
+  `gate_up-below-min` takes the token route, the two failpoint cases fall back by name, and the hot-expert case has
+  two widths.
+- *Step-0 bench at the real shapes:* verdict PROCEED, `suggested_min_tokens=64`, so the 64-token minimum stands.
+  - At the gate_up node, the arm loses at 16 and 32 tokens (3.48 ms and 5.00 ms, against 2.29 ms and 4.55 ms
+    direct).
+  - It wins from 64 tokens on: 5.51 ms against 9.07 ms at 64, and 5.62 ms against 72.4 ms at 512.
+- *Gates:* Inkling passes on the B70, the B50 and both cards. The Mistral B70 gate passes, and the GPT-OSS count is 1
+  on the B50 and on the B70.
+- *Perplexity, B70, `-c 2048`:* 7.5957 +/- 0.248, against 7.5959 at `2a69aea88b`. The original 7.5792 is 0.017 away,
+  well inside the 0.25 bound.
+- *Long arm, B50 alone:*
+  - pp is 20.28, against 20.6 at `2a69aea88b`, and the text is byte-equal to the base's.
+  - tg is 3.98, against 7.5. That figure is invalid: a build in another checkout (ninja 1, icpx 24) ran across the
+    decode. The B50's host-expert decode collapses under any concurrent build. The merged-tree round measures it again
+    on a quiet host.
+- *`test-backend-ops -o MUL_MAT_ID`:*
+  - 1306 / 1418 on each card. The 112 failures are the same set on the B70, on the B50, and on the B70 at
+    `2a69aea88b`, so no case changed.
+  - All 31 BF16 cases pass on both cards.
+  - The failures are the pre-existing `skip=1` prompt-admission refusals (`route_unavailable`), filed as
+    `llama.cpp-bxxh`.
+- *Sweeps:* the static-storage audit returns rc 0. Sweep 1 shows three reds and sweep 2 shows one, all four also red at
+  `2a69aea88b`. The alloc-zone contract family, red in the base record, is green.
+- *Interleaved ABBA against `2a69aea88b`, 8 repetitions per arm, medians a / b / b2 / a2:*
+
+  | model, card | pp | tg | verdict |
+  |---|---|---|---|
+  | Mistral, B70 | 3350.3 / 3326.3 / 3340.5 / 3344.8 | 111.66 / 101.07 / 95.58 / 111.73 | invalid: a build ran across b and b2 |
+  | GPT-OSS, B50 | 865.0 / 865.5 / 860.6 / 858.1 | 40.10 / 40.06 / 39.96 / 40.07 | equal, within 0.4% |
+  | Inkling, B70 | 402.6 / 586.2 / 587.7 / 400.9 | 30.45 / 30.47 / 30.38 / 30.33 | pp +46%, tg equal |
+  | Inkling, B50 tg | | 11.28 / 10.97 / 11.31 / 11.53 | MIXED; a build ran across a and b |
+
+  - The Mistral arms b and b2 ran under that build (icpx 24, load 18-29). Their tg stddev is about 10, against 0.35
+    on the quiet a arm.
+  - The task does not touch a dense Q4_0 path, and the merged-tree ABBA measures this row again.
+  - The scorer flags GPT-OSS tg as "REAL": both merged medians are 0.04-0.14 t/s below both base medians. That is
+    well inside run-to-run noise, and the task does not touch an MXFP4 path.
+- *Host waits, memory and placement:*
+  - The arm adds no wait beyond the ids D2H and the ring claim (`llama.cpp-uop2`).
+  - It allocates through the unified cache only, has no `-ngl`, does not shrink the context, and keeps one layout per
+    weight.
+  - The RAII hold's leak-on-failure path is the one allowlisted exemption (`E-MOE-BF16-GROUPED-HOLD`).
+
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
 *Left by Task 21, step 1d (2026-11-24):*
