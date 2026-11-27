@@ -90649,13 +90649,21 @@ static bool ggml_sycl_mul_mat_id_bf16_grouped(ggml_backend_sycl_context & ctx, g
     const int        ki          = static_cast<int>(k);
     const dnnl_dim_t w_row       = static_cast<dnnl_dim_t>(src0->nb[1] / sizeof(uint16_t));
     const auto       expert_gemm = [&](size_t i, bool query_only, const std::vector<sycl::event> & deps) {
+#    ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
+        // One run declines once, as a primitive the query admitted and oneDNN cannot create at execute would
+        // (GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE). The query itself is never failed.
+        if (!query_only && ggml_sycl_q1_nvfp4_test_consume_failure(
+                               GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_DECLINE_AFTER_GATHER)) {
+            return std::optional<sycl::event>();
+        }
+#    endif
         const ggml_sycl::moe_bf16_grouped_expert & expert = plan.experts[i];
         const int                                  n      = static_cast<int>(expert.gemm_rows);
         return DnnlGemmWrapper::gemm(ctx, mi, n, ki, weights[i], bf16, 1, w_row, w_row * mi,
-                                           act + expert.base_row * static_cast<size_t>(k), bf16, 1, ki,
-                                           static_cast<dnnl_dim_t>(ki) * n, out + expert.base_row * static_cast<size_t>(m),
-                                           f32, stream, 1, 1, mi, deps, "bf16_expert", query_only,
-                                           GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT, GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE);
+                                     act + expert.base_row * static_cast<size_t>(k), bf16, 1, ki,
+                                     static_cast<dnnl_dim_t>(ki) * n, out + expert.base_row * static_cast<size_t>(m),
+                                     f32, stream, 1, 1, mi, deps, "bf16_expert", query_only,
+                                     GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT, GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE);
     };
     for (const size_t width : plan.gemm_widths) {
         size_t first = 0;
@@ -90731,7 +90739,7 @@ static bool ggml_sycl_mul_mat_id_bf16_grouped(ggml_backend_sycl_context & ctx, g
 
         stage = "expert GEMM";
 #    ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING
-        if (ggml_sycl_q1_nvfp4_test_consume_failure(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_AFTER_GATHER)) {
+        if (ggml_sycl_q1_nvfp4_test_consume_failure(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_THROW_AFTER_GATHER)) {
             throw std::runtime_error("private-testing failpoint after the gather");
         }
 #    endif

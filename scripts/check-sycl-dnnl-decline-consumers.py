@@ -177,9 +177,12 @@ MAIN_PINS = (
     # the BF16 grouped prompt arm of MUL_MAT_ID (Inkling 2 Mini Task 24): one gemm per active expert from one lambda,
     # asked with query_only once per GEMM width before anything is submitted (a decline leaves the node to the BF16
     # direct route with nothing written), then run per expert after the gather, whose decline abandons the node behind
-    # a marker before its event is read
+    # a marker before its event is read. The lambda opens with a private-testing failpoint that declines one run, never
+    # the query, as a primitive oneDNN cannot create at execute would (test-moe-bf16-grouped-device)
     ("const auto expert_gemm = [&](size_t i, bool query_only, const std::vector<sycl::event> & deps) { "
-     "const ggml_sycl::moe_bf16_grouped_expert & expert = plan.experts[i]; "
+     "# ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING if (!query_only && ggml_sycl_q1_nvfp4_test_consume_failure("
+     "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_DECLINE_AFTER_GATHER)) { return std::optional<sycl::event>(); } "
+     "# endif const ggml_sycl::moe_bf16_grouped_expert & expert = plan.experts[i]; "
      "const int n = static_cast<int>(expert.gemm_rows); return DnnlGemmWrapper::gemm(", 1),
     ('"bf16_expert", query_only, GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT, GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE);', 1),
     ("if (!expert_gemm(first, true, {})) { return decline(moe_bf16_grouped_decline::PRIMITIVE); }", 1),

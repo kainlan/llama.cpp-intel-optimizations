@@ -197,7 +197,16 @@ ARM_FIRST_SUBMIT = "ggml_sycl_safe_memcpy(*stream, rows_dev.get(), plan.rows.dat
 # What submits work: none of it may come before the try. The marker inside the hold lambda is defined there, not run.
 ARM_SUBMITTERS = ("ggml_sycl_safe_memcpy(", "ggml_sycl_profile_submit(", "expert_gemm(i, false,", "_gather_submit(",
                   "_scatter_submit(", ".submit(", "->submit(")
-ARM_FAILPOINT = ("ggml_sycl_q1_nvfp4_test_consume_failure(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_AFTER_GATHER)")
+ARM_FAILPOINT = ("ggml_sycl_q1_nvfp4_test_consume_failure("
+                 "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_THROW_AFTER_GATHER)")
+# The failpoint that declines: the expert GEMM lambda opens with it, private builds only, on a run and never on the
+# query, and it returns no event, as a primitive oneDNN cannot create at execute would.
+ARM_GEMM_HEAD = "const auto expert_gemm = [&](size_t i, bool query_only, const std::vector<sycl::event> & deps) {"
+ARM_DECLINE_FAILURE = "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_DECLINE_AFTER_GATHER"
+ARM_DECLINE_FAILPOINT = ("#ifdefGGML_SYCL_Q1_NVFP4_ROUTE_TESTING"
+                         f"if(!query_only&&ggml_sycl_q1_nvfp4_test_consume_failure({ARM_DECLINE_FAILURE})){{"
+                         "returnstd::optional<sycl::event>();}#endif"
+                         "constggml_sycl::moe_bf16_grouped_expert&expert=plan.experts[i];")
 ARM_FORBIDDEN = (".wait(", "->wait(", "::wait(", "wait_and_throw", "getenv", "GGML_ABORT", "malloc_", "sycl::free(",
                  "return false;", "ggml_sycl_ensure_weight_on_device", "ids_host", "ggml_sycl_copy_ids_to_host")
 EXECUTOR_HEAD = "auto try_pp_onednn_f16_batched = [&]() -> bool {"
@@ -704,6 +713,12 @@ def claim_j_failure_after_submission(s):
     point = body.find(ARM_FAILPOINT)
     if sycl.count(ARM_FAILPOINT) != 1 or not (body.find(ARM_GATHER) < point < body.find(ARM_GEMM_RUN)):
         fails.append("the private-testing failpoint is not the one in the try after the gather and before the GEMMs")
+    # The failpoint that declines: once, opening the expert GEMM lambda, so a run after the gather reaches the
+    # `return abandon();` a oneDNN decline reaches.
+    gemm = braced_body(arm, ARM_GEMM_HEAD) if arm.count(ARM_GEMM_HEAD) == 1 else None
+    if gemm is None or not tight(gemm).startswith(ARM_DECLINE_FAILPOINT) or sycl.count(ARM_DECLINE_FAILURE) != 1:
+        fails.append("the expert GEMM lambda does not open with the private-testing failpoint that declines a run, "
+                     "never the query, by returning no event")
     # The handlers: the rethrow clause the catch contract requires, then the std::exception handler: the hold first,
     # the WARN naming tensor, device and stage, the named fallback error thrown, and no way back to the direct route.
     after = arm[end:]
@@ -898,6 +913,14 @@ MUTANTS = [
     # The failpoint before the gather, or gone.
     ("j", "sycl", ARM_FN_HEAD, 'stage = "gather";', f'stage = "gather"; if ({ARM_FAILPOINT}) {{ throw 1; }}'),
     ("j", "sycl", ARM_FN_HEAD, f"if ({ARM_FAILPOINT})", "if (false)"),
+    # The failpoint that declines: failing the query too, returning an event, consumed without declining, unguarded,
+    # or gone.
+    ("j", "sycl", ARM_GEMM_HEAD, "if (!query_only && ", "if ("),
+    ("j", "sycl", ARM_GEMM_HEAD, "return std::optional<sycl::event>();",
+     "return std::optional<sycl::event>(sycl::event());"),
+    ("j", "sycl", ARM_GEMM_HEAD, "return std::optional<sycl::event>(); } # endif", "(void) 0; } # endif"),
+    ("j", "sycl", ARM_GEMM_HEAD, "# ifdef GGML_SYCL_Q1_NVFP4_ROUTE_TESTING if (!query_only", "if (!query_only"),
+    ("j", "sycl", ARM_GEMM_HEAD, ARM_DECLINE_FAILURE, "GGML_SYCL_Q1_NVFP4_TEST_FAILURE_NONE"),
     # The handler: missing, catching everything, without the hold, falling through to the direct route, rethrowing
     # the raw error, or throwing an error that names no stage.
     ("j", "sycl", ARM_FN_HEAD, ARM_RETHROW + " ", ""),

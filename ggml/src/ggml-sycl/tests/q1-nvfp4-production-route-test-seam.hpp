@@ -54,9 +54,12 @@ enum ggml_sycl_q1_nvfp4_test_failure {
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_ROW_MAP_STAGING,
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_DST_STAGING,
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_SRC1_F32_STAGING,
-    // The BF16 grouped prompt arm of MUL_MAT_ID (Inkling 2 Mini plan, Task 24) throws once at its GEMM stage, after its
-    // gather was submitted, as a oneDNN execute that throws would (test-moe-bf16-grouped-device).
-    GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_AFTER_GATHER,
+    // The BF16 grouped prompt arm of MUL_MAT_ID (Inkling 2 Mini plan, Task 24), at its GEMM stage after its gather was
+    // submitted (test-moe-bf16-grouped-device). THROW throws once, as a oneDNN execute that throws would: the graph
+    // fails by name. DECLINE makes one expert GEMM's run return no event, as a primitive the query admitted and oneDNN
+    // cannot create at execute would: the arm declines the node and the BF16 direct route runs it.
+    GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_THROW_AFTER_GATHER,
+    GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_DECLINE_AFTER_GATHER,
 };
 
 // The BF16 grouped prompt arm's counters: the nodes it ran, the nodes it declined under every reason, and those it
