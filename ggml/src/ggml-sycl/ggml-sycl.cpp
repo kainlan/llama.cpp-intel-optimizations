@@ -90513,8 +90513,9 @@ static bool ggml_sycl_moe_bf16_grouped_query_widths(const ggml_sycl::moe_bf16_gr
 // a submission that declines or throws. The hold happens once. The destructor holds to a marker on any exit that has
 // not held, an exception the handler passes on included, and lets nothing escape: a publication that throws leaves the
 // leases as they were (retain_handles_until_event_or_keep), so when the marker or the publication throws there the
-// leases are kept, never released (keep_handles_after_failed_wait), and the claim's own destructor settles the slot.
-// Nothing here waits.
+// leases are kept (keep_handles_after_failed_wait parks them, or leaks them when they cannot be parked); only when that
+// allocation fails too are the leases left whole and released with the arm's vector, which the handler reports at
+// ERROR. The claim's own destructor settles the slot. Nothing here waits.
 struct moe_bf16_grouped_hold {
     sycl::queue &                        queue;
     std::vector<ggml_sycl::mem_handle> & leases;
