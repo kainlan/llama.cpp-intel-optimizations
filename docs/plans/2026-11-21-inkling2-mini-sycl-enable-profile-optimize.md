@@ -8176,6 +8176,65 @@ temporary, `packed_rows_dev`, as Task 24's BF16 arm admits its row map; the scra
 (`tests/test-sycl-moe-pp-pack-source.py`) admits one pinned row-0 read of `batched_acts` in the gather and one of
 `batched_out` in the scatter, with a mutant that a third bare reader fails.
 
+**Lead acceptance (2026-11-27), on `wt-t25`'s full build at `e972a43867`.**
+- *Commits.* Four, `96c006f337..e972a43867`, on top of this plan's `447e952caf`.
+- *Reviews.*
+  - The spec review passed, with five minor findings.
+  - The code-quality review passed, with seven minor findings.
+  - A re-review of the two fix commits passed.
+- *Device runs.* Each ran once. B70 = `level_zero:0`, B50 = `level_zero:1`, pp / tg in t/s.
+  - `test-moe-pp-batched-dequant` passes on the B50 and the B70 at `0f3dd9e8cb`: 44 cases, covering NVFP4, nine IQ
+    types and the Q types, with 2 capped and 2 skewed groupings. The later commits change comments and tests only.
+  - The B70 long-prompt profile:
+
+    | | `992568b6f8` | `e972a43867` |
+    |---|---|---|
+    | `moe.pp.stage.act` count / ms | 96,556 / 255.3 | 880 / 45.0 |
+    | `moe.pp.stage.scatter` count / ms | 96,556 / 397.2 | 880 / 105.5 |
+    | submissions per pass | 398,636 | 208,164 |
+    | device ms | 6210 | 5719 |
+    | profiled prompt eval | 270.8 | 303.3 |
+
+    `moe.pp.gemm.execute` is unchanged, at 9,995 calls and 1842.8 ms. `moe.pp.dequant.nvfp4` still counts 96,556
+    and 768.8 GB.
+  - *Long prompts.*
+    - The B70 runs at 322.1 / 27.95, against 313.2 / 28.17 at `d69cbe7985`. Its text is byte-equal.
+    - The B50 alone runs at 18.86 / 7.47, against 18.84 / 7.08. Its text is byte-equal.
+  - *Perplexity.* Inkling on the B70 gives 7.5957, the same as at `d69cbe7985`.
+  - *Gates.*
+    - Inkling passes on the B70, the B50 and both cards.
+    - The Mistral B70 gate passes, and the GPT-OSS count gate is 1 on the B50.
+    - GPT-OSS on the B70 passes.
+  - *Qwen arms*, run by the Qwen session on this tree on the B70:
+    - QD gives `4c9e55fa81`, which matches. It runs at 188.7 / 20.82, a single run while a build ran.
+    - QS gives `faacbed8de`, which matches.
+  - *Sweeps.* The audit returns rc 0. Sweep 1 has three reds and sweep 2 has one, the same four as at `d69cbe7985`.
+- *Interleaved ABBA against `d69cbe7985`.* 8 repetitions per arm, and no builder or ctest in any of 252 samples.
+  Medians a / b / b2 / a2:
+
+  | model, card | pp | tg | reading |
+  |---|---|---|---|
+  | Mistral, B70 | 3341.1 / 3338.3 / 3344.1 / 3335.0 | 111.72 / 111.71 / 111.89 / 111.84 | equal |
+  | GPT-OSS, B50 | 871.1 / 878.8 / 873.7 / 861.2 | 40.12 / 39.90 / 39.81 / 39.91 | pp equal; tg see below |
+  | Inkling, B70 | 587.8 / 617.4 / 615.7 / 591.4 | 30.38 / 30.45 / 30.40 / 30.66 | pp +4.7%, tg equal |
+  | Inkling, B50 tg | | 11.09 / 11.38 / 11.02 / 11.10 | equal |
+
+  - The scorer flags GPT-OSS B50 tg as "REAL": both Task 25 medians are below both base medians, by 0.01-0.31 t/s.
+  - I read it as noise, for two reasons:
+    - The base's own drift from a to a2 is 0.21 t/s, which exceeds the gap from b2 to a2.
+    - The task changes nothing a decode token runs. A one-token-per-expert node never enters the batched executor
+      (`DECODE` refusal).
+  - Task 24's ABBA flagged the same row the same way, and the merged ABBA then measured it equal.
+- *What the task bought.*
+  - It halves the submissions per pass.
+  - It takes 0.5 s of device time out of the gather and scatter.
+  - Inkling's B70 prompt runs about 4.7% faster at pp512 and about 3% faster on the long prompt.
+- *Next.* The remaining per-expert submission is the dequant, 96,556 per pass with 768.8 GB written. The profile
+  does not time its kernel. The next task measures that time and removes the per-micro-batch dequant (see "Not in
+  scope" above).
+- *Follow-ups on `llama.cpp-cl5q`* (comment `c-pkth`): the table could carry `{i1, i2, packed_row}` directly, and the
+  table's upload could share the row map's stage.
+
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
 *Left by Task 21, step 1d (2026-11-24):*
