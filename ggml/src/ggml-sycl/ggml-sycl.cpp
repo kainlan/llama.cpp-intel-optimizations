@@ -25922,6 +25922,63 @@ std::string test_evict_landed(const test_loan_fixture & fx, int layer, int exper
     return {};
 }
 
+// One entry's placement, as a transaction's flips write it.
+struct test_plan_placement {
+    bool                   on_device     = false;
+    int                    target_device = -1;
+    placement_host_backing host_backing  = placement_host_backing::PINNED;
+};
+
+// Every entry's placement in a published plan, read through the plan's const view, which clones nothing.
+std::vector<test_plan_placement> test_plan_placements(const lifecycle_plan_snapshot & published) {
+    std::vector<test_plan_placement> out;
+    out.reserve(published.plan->entries.size());
+    for (const placement_entry & e : published.plan->entries) {
+        out.push_back({ e.on_device, e.target_device, e.host_backing });
+    }
+    return out;
+}
+
+// What one accepted transaction that moved `triplets` triplets must leave behind, against the plan it replaced
+// (`published`, whose `placements` the caller read before the call):
+//   - the replaced plan's entries read as they did: the copy the transaction published shares that plan's entry
+//     chunks, so a flip that wrote a shared chunk would move the expert in the plan its readers still hold;
+//   - no lent-view drop walked a whole table: each moved expert's own slot held the view it retired;
+//   - the copy cloned at least one chunk, since its first flip writes a chunk the replaced plan still shares, and at
+//     most one per member it flipped, 3 * triplets, since a chunk once cloned is the copy's own and a second member in
+//     it clones nothing; nor more chunks than the plan has. These fixtures' plans fit one 32-entry chunk, so here the
+//     bound is exactly 1, where a whole-plan copy would clone every chunk.
+std::string test_txn_plan_cost(const lifecycle_plan_snapshot &          published,
+                               const std::vector<test_plan_placement> & placements,
+                               uint64_t                                 chunks_cloned,
+                               uint64_t                                 view_scan_fallbacks,
+                               uint32_t                                 triplets) {
+    const std::vector<test_plan_placement> after = test_plan_placements(published);
+    if (after.size() != placements.size()) {
+        return test_loan_fail("the replaced plan holds %zu entries after the transaction, not %zu", after.size(),
+                              placements.size());
+    }
+    for (size_t i = 0; i < after.size(); ++i) {
+        if (after[i].on_device != placements[i].on_device || after[i].target_device != placements[i].target_device ||
+            after[i].host_backing != placements[i].host_backing) {
+            return test_loan_fail("the replaced plan's entry %zu reads on_device=%d target=%d backing=%d, was %d %d %d",
+                                  i, (int) after[i].on_device, after[i].target_device, (int) after[i].host_backing,
+                                  (int) placements[i].on_device, placements[i].target_device,
+                                  (int) placements[i].host_backing);
+        }
+    }
+    if (view_scan_fallbacks != 0) {
+        return test_loan_fail("%llu lent-view drops walked a whole table, not 0",
+                              (unsigned long long) view_scan_fallbacks);
+    }
+    const uint64_t most = std::min<uint64_t>(3ull * triplets, published.plan->entries.chunk_count());
+    if (chunks_cloned < 1 || chunks_cloned > most) {
+        return test_loan_fail("the plan copy cloned %llu chunks for %u triplets, not 1 to %llu",
+                              (unsigned long long) chunks_cloned, triplets, (unsigned long long) most);
+    }
+    return {};
+}
+
 }  // namespace
 
 int test_expert_loan_take_teardown_failures() {
@@ -26007,9 +26064,13 @@ std::string test_expert_loan_lends_two_triplets() {
         return why;
     }
     ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/3));
-    const auto   published = ::ggml_sycl_global_plan_snapshot();
-    const auto   before    = fx.sample();
-    const size_t charge    = placement_vram_charge_bytes(test_loan_expert_bytes());
+    const auto published = ::ggml_sycl_global_plan_snapshot();
+    if (!published || !published->plan) {
+        return "the fixture's plan was not published";
+    }
+    const std::vector<test_plan_placement> placements = test_plan_placements(*published);
+    const auto                             before     = fx.sample();
+    const size_t                           charge     = placement_vram_charge_bytes(test_loan_expert_bytes());
 
     // c-tdra: an in-graph caller records a request and the graph boundary runs it. The largest request wins.
     ::ggml_sycl_request_expert_loan(fx.device, 3 * charge, /*slot_bytes=*/0);
@@ -26034,6 +26095,11 @@ std::string test_expert_loan_lends_two_triplets() {
     if (result.n_triplets != 2 || result.bytes_freed != 6 * fx.staged_bytes) {
         return test_loan_fail("the loan lent %u triplets and %zu bytes, not 2 and %zu", result.n_triplets,
                               result.bytes_freed, 6 * fx.staged_bytes);
+    }
+    if (std::string why = test_txn_plan_cost(*published, placements, result.plan_chunks_cloned,
+                                             result.view_scan_fallbacks, result.n_triplets);
+        !why.empty()) {
+        return "the loan: " + why;
     }
     const std::pair<int, int> lent_first{ 1, 2 };
     const std::pair<int, int> lent_second{ 1, 1 };
@@ -28773,6 +28839,10 @@ std::string test_expert_evict_moves_a_resident_triplet() {
     }
     ::ggml_sycl_publish_test_plan(fx.plan(/*host_expert=*/2));
     const auto published = ::ggml_sycl_global_plan_snapshot();
+    if (!published || !published->plan) {
+        return "the fixture's plan was not published";
+    }
+    const std::vector<test_plan_placement> placements = test_plan_placements(*published);
     // Each result's lease goes with it at the end of its iteration, so the evict meets entries held by their records
     // alone, as an evict without this control would.
     for (int s = 0; s < 3; ++s) {
@@ -28793,6 +28863,11 @@ std::string test_expert_evict_moves_a_resident_triplet() {
     }
     if (::ggml_sycl_global_plan_snapshot().get() == published.get()) {
         return "the evict published no plan";
+    }
+    if (std::string why = test_txn_plan_cost(*published, placements, result.plan_chunks_cloned,
+                                             result.view_scan_fallbacks, result.n_evicted);
+        !why.empty()) {
+        return "the evict: " + why;
     }
     // Nothing has run a deferred-free pass since the call, so its retired device entries are all still there.
     if (test_evict_device_entries(fx, 0, 0) != 3) {
