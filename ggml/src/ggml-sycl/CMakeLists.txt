@@ -5177,6 +5177,37 @@ set_tests_properties(test-sycl-bf16-onednn-probe PROPERTIES
     TIMEOUT 300
 )
 
+# Task 24, step 0 (Inkling 2 Mini plan): the device and host cost of one oneDNN bf16 x bf16 -> f32 strict GEMM per
+# active expert, on 128 distinct experts at Inkling's two expert shapes and n = 16 to 128 rows, and a whole prompt node
+# against the BF16 direct kernel (moe-bf16-direct.cpp, compiled in) from 16 to 512 tokens. Standalone like the probe
+# above: SYCL, oneDNN, the deterministic attribute header and the backend-free kernel, no backend. About 3.2 GB of
+# device memory. A measurement for the lead, not a gate, so it registers no ctest: the lead builds it by name and runs
+# it once on the B70 (the command is in the file header).
+add_executable(test-sycl-bf16-expert-gemm-bench
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-bf16-expert-gemm-bench.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe-bf16-direct.cpp
+)
+target_include_directories(test-sycl-bf16-expert-gemm-bench PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-sycl-bf16-expert-gemm-bench PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-bf16-expert-gemm-bench PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_compile_definitions(test-sycl-bf16-expert-gemm-bench PRIVATE
+    GGML_SYCL_DNNL=${GGML_SYCL_DNNL}
+)
+target_link_libraries(test-sycl-bf16-expert-gemm-bench PRIVATE ggml-base)
+if (GGML_SYCL_DNNL)
+    target_link_libraries(test-sycl-bf16-expert-gemm-bench PRIVATE DNNL::dnnl)
+endif()
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-sycl-bf16-expert-gemm-bench PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-sycl-bf16-expert-gemm-bench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
 # llama.cpp-asdt (plan task L2b): the tiered KV buffer's per-VIEW-tensor
 # extras must stay bounded across repeated graph rebuilds, the same property
 # test-sycl-compute-buffer-extra-reuse checks for the COMPUTE buffer above.
