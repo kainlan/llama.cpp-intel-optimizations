@@ -25500,7 +25500,8 @@ struct test_loan_fixture {
 
     // A loan of bytes_wanted run at the graph boundary, which must lend n_expected triplets; then each lent device
     // entry is reclaimed and its storage handed back, so a refill meets no withdrawn entry under the ids it re-admits.
-    // `freed`, when given, receives the loan's bytes_freed; `check` says how the reclaim is checked.
+    // `freed`, when given, receives the loan's bytes_freed; `check` says how the reclaim is checked; `loaned`, when
+    // given, receives the loan's whole result, of which `freed` duplicates bytes_freed for the cases that need no more.
     std::string lend(size_t                           bytes_wanted,
                      uint32_t                         n_expected,
                      int                              host_expert,

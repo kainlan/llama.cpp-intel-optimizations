@@ -244,7 +244,8 @@ struct throwing_element {
     }
 };
 
-// An append whose element constructor throws leaves the store as it was, at a chunk boundary as well as inside a chunk.
+// An append whose element constructor throws leaves the store's elements and size as they were, at a chunk boundary
+// and inside a chunk; inside a shared last chunk the clone is already taken and counted.
 static int test_throwing_append_leaves_the_store() {
     ggml_sycl::cow_chunked_vector<throwing_element, 4> s;
     for (int i = 0; i < 4; ++i) {
