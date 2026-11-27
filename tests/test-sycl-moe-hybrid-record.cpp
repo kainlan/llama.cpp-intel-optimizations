@@ -1,7 +1,9 @@
 // Host-side bookkeeping of the event-chained hybrid decode route's per-tensor record: why a held decision is stale,
-// and the per-token count GGML_SYCL_MOE_HYBRID_RECORD_TRACE prints. ggml-sycl/moe-hybrid-record.hpp is SYCL-free,
-// so these run without a device and link nothing.
+// and the per-token count GGML_SYCL_MOE_HYBRID_RECORD_TRACE prints. ggml-sycl/moe-hybrid-record.hpp and the weight's
+// change log it reads (ggml-sycl/moe-storage-change-log.hpp) are SYCL-free, so these run without a device and link
+// nothing.
 #include "ggml-sycl/moe-hybrid-record.hpp"
+#include "ggml-sycl/moe-storage-change-log.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -60,7 +62,7 @@ static int test_miss_classify() {
         log.note(7, 1);
         std::vector<int32_t> changed;
         CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, s, true, log, 7,
-                                                      &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_UNLOGGED &&
+                                                      &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_UNLOGGED &&
                   changed.empty(),
               "a withdrawn record under a current stamp is built again");
     }
@@ -268,7 +270,7 @@ static int test_patch_plan() {
     std::vector<int32_t> changed;
 
     CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, held, true, log, 9,
-                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_EXPERTS &&
+                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_EXPERTS &&
               changed == std::vector<int32_t>({ 2, 5 }),
           "a generation miss over a held record re-checks the experts the log names");
     const moe_hybrid_record_miss full[] = { ggml_sycl::MOE_HYBRID_RECORD_MISS_EPOCH,
@@ -278,17 +280,17 @@ static int test_patch_plan() {
                                             ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE };
     for (moe_hybrid_record_miss m : full) {
         CHECK(ggml_sycl::moe_hybrid_record_plan_patch(m, held, true, log, 9, &changed) ==
-                      ggml_sycl::MOE_HYBRID_RECORD_PATCH_NONE &&
+                      ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_NONE &&
                   changed.empty(),
               "a replan, a new row count or no decision builds the record again, whatever the log says");
     }
     CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, held, false, log, 9,
-                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_NONE,
+                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_NONE,
           "no held record: nothing to patch");
     moe_decode_direct_stamp refused{};
     ggml_sycl::moe_decode_direct_stamp_settle(refused, 3, 7, 8, 0, ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED);
     CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, refused, true, log, 9,
-                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_NONE,
+                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_NONE,
           "a refusal at the old generation is decided again, not patched");
 
     // The log overflowed: more moves since the decision than it holds.
@@ -298,13 +300,13 @@ static int test_patch_plan() {
         overflowed.note(g, 1);
     }
     CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, held, true, overflowed,
-                                                  now, &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_UNLOGGED &&
+                                                  now, &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_UNLOGGED &&
               changed.empty(),
           "an overflowed log cannot name the moved experts: the record is built again");
     moe_storage_change_log cleared = log;
     cleared.note(10, moe_storage_change_log::ALL);
     CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, held, true, cleared, 10,
-                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_UNLOGGED,
+                                                  &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_UNLOGGED,
           "a move that changed every expert: the record is built again");
     return 0;
 }
@@ -496,9 +498,9 @@ static int test_withdraw() {
 // lookups replaced: the one sign on a device that a drop matched a record slot by the entry it retired.
 static int test_trace_patches() {
     moe_hybrid_record_trace t;
-    t.patch(ggml_sycl::MOE_HYBRID_RECORD_PATCH_EXPERTS, /*patched=*/true, 2);
-    t.patch(ggml_sycl::MOE_HYBRID_RECORD_PATCH_EXPERTS, /*patched=*/false, 3);
-    t.patch(ggml_sycl::MOE_HYBRID_RECORD_PATCH_UNLOGGED, /*patched=*/false, 0);
+    t.patch(ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_EXPERTS, /*patched=*/true, 2);
+    t.patch(ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_EXPERTS, /*patched=*/false, 3);
+    t.patch(ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_UNLOGGED, /*patched=*/false, 0);
     CHECK(t.counts.patches == 1 && t.counts.patch_declined == 1 && t.counts.patch_unlogged == 1,
           "one patch stood, one declined, one found the log silent");
     CHECK(t.counts.patch_experts == 5, "the attempts asked for five experts");

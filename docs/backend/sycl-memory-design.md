@@ -485,8 +485,9 @@ runs. The replaced slots' leases and the held table are kept until the queue
 passes a barrier behind the copy's publication (`retain_handles_until_event`);
 nothing waits on the host. An expert move rewrites the placement plan without
 moving the replan epoch, so the patch first asks the plan again through the
-build's own plan rule (`ggml_sycl_moe_hybrid_decode_record_plan`). A log that no
-longer holds every move, a replan, another selected-row count, a plan that now
+build's own plan rule
+(`ggml_sycl_moe_hybrid_decode_record_plan_refusal`). A log that no longer
+holds every move, a replan, another selected-row count, a plan that now
 refuses the record or names the other all-host mode, a moved expert at or before
 the one whose layouts gave the record its layout (the build's layout scan could
 stop elsewhere), or a moved expert that no longer fits the record (another

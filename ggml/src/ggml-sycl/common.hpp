@@ -31,9 +31,9 @@
 #include "moe-graph-preload-stamp.hpp"
 #include "moe-graph-retention.hpp"
 #include "moe-host-scatter.hpp"
-#include "moe-hybrid-record.hpp"
 #include "moe-layer-plan.hpp"
 #include "moe-route-table.hpp"
+#include "moe-storage-change-log.hpp"
 #include "orchestrator.hpp"
 #include "presets.hpp"
 #include "q8-dense-layout-rule.hpp"
@@ -4425,6 +4425,13 @@ struct ggml_tensor_extra_gpu_weight_ext {
         }
     }
 
+    // Moves the expert storage generation and logs the expert the move changed: moe_storage_change_log::ALL when it
+    // changed every expert (a cleared store).
+    void note_moe_storage_change(int32_t expert_id) {
+        ++moe_expert_storage_generation;
+        moe_expert_storage_changes.note(moe_expert_storage_generation, expert_id);
+    }
+
     // MoE expert pointer table for per-expert layout access.
     // moe_expert_handles is the canonical table view and lifetime source.
     // moe_expert_ptr_payload is only the resolved raw-pointer kernel ABI payload
@@ -4445,13 +4452,6 @@ struct ggml_tensor_extra_gpu_weight_ext {
     // Which expert each recent generation move changed, so a decision made at an older generation can re-check only
     // those experts (the hybrid decode record). Every move goes through note_moe_storage_change(), so the log sees each.
     ggml_sycl::moe_storage_change_log                                    moe_expert_storage_changes;
-
-    // Moves the expert storage generation and logs the expert the move changed: moe_storage_change_log::ALL when it
-    // changed every expert (a cleared store).
-    void note_moe_storage_change(int32_t expert_id) {
-        ++moe_expert_storage_generation;
-        moe_expert_storage_changes.note(moe_expert_storage_generation, expert_id);
-    }
     uint64_t                           moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES]          = {};
     ggml_layout_mode                   moe_full_local_probe_layout[GGML_SYCL_MAX_DEVICES]              = {};
     bool                               moe_full_local_probe_ok[GGML_SYCL_MAX_DEVICES]                  = {};

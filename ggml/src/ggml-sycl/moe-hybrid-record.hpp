@@ -6,69 +6,23 @@
 // The route looks its tensor's record up at every decode op. The record is held under the stamp of the decision that
 // built it (moe_decode_direct_stamp: replan epoch, the weight's expert storage generation, selected rows), and a lookup
 // whose stamp misses builds the record again, resolving every expert of the tensor. This header says why a stamp
-// misses, counts per token what the lookups cost, for GGML_SYCL_MOE_HYBRID_RECORD_TRACE, and keeps the weight's log of
-// which expert each storage move changed, so a miss on the generation alone can re-check only those experts.
+// misses, counts per token what the lookups cost, for GGML_SYCL_MOE_HYBRID_RECORD_TRACE, and reads the weight's log of
+// which expert each storage move changed (moe-storage-change-log.hpp), so a miss on the generation alone can re-check
+// only those experts.
 //
-// SYCL-free on purpose so tests/test-sycl-moe-hybrid-record.cpp runs it without a device.
+// SYCL-free on purpose so tests/test-sycl-moe-hybrid-record.cpp runs it without a device. Only the backend and that
+// test include it; common.hpp includes the change log's header alone.
 
 #include "moe-decode-hostpath.hpp"
+#include "moe-storage-change-log.hpp"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <utility>
 #include <vector>
 
 namespace ggml_sycl {
-
-// Which expert each recent move of a weight's expert storage generation changed. A holder of a decision made at an
-// older generation (the hybrid decode record) asks which experts changed since then and re-checks only those. The log
-// keeps the last `capacity` moves: it answers only for a window it saw whole, in which every move named one expert, so
-// a move older than the log, one made without a note, or one that changed every expert leaves the caller to decide
-// again from scratch.
-struct moe_storage_change_log {
-    static constexpr int32_t ALL      = -1;  // a move that changed every expert, or named none
-    static constexpr size_t  capacity = 64;
-
-    struct entry {
-        uint64_t generation = 0;
-        int32_t  expert     = ALL;
-    };
-
-    entry  ring[capacity] = {};
-    size_t next           = 0;  // where the next move is logged
-    size_t held           = 0;  // moves logged, up to capacity
-
-    // The generation moved to `generation`, changing `expert` (ALL: every expert).
-    void note(uint64_t generation, int32_t expert) {
-        ring[next] = { generation, expert };
-        next       = (next + 1) % capacity;
-        held       = held < capacity ? held + 1 : capacity;
-    }
-
-    // The experts whose storage changed after generation `since` up to `now`, ascending and each once, into *out.
-    // False when the log cannot say: the window is longer than the log holds, a move in it was not noted, or one
-    // changed every expert.
-    bool changed_since(uint64_t since, uint64_t now, std::vector<int32_t> * out) const {
-        out->clear();
-        if (now < since || now - since > held) {
-            return false;
-        }
-        size_t at = next;
-        for (uint64_t g = now; g > since; --g) {
-            at              = (at + capacity - 1) % capacity;
-            const entry & e = ring[at];
-            if (e.generation != g || e.expert < 0) {
-                out->clear();
-                return false;
-            }
-            out->push_back(e.expert);
-        }
-        std::sort(out->begin(), out->end());
-        out->erase(std::unique(out->begin(), out->end()), out->end());
-        return true;
-    }
-};
 
 // Why a lookup's stamp does not answer for the op. A stamp that misses on several inputs names the first in this
 // order: the epoch before the rows, the rows before the generation.
@@ -140,9 +94,9 @@ inline const char * moe_hybrid_record_outcome_name(moe_decode_direct_outcome out
 
 // Whether a lookup whose stamp missed can patch the held record, and over which experts.
 enum moe_hybrid_record_patch_plan : int {
-    MOE_HYBRID_RECORD_PATCH_NONE = 0,  // not a miss a patch answers: the record is built again
-    MOE_HYBRID_RECORD_PATCH_UNLOGGED,  // only the generation moved, but the log cannot name the experts that did
-    MOE_HYBRID_RECORD_PATCH_EXPERTS,   // re-check the experts the log names
+    MOE_HYBRID_RECORD_PATCH_PLAN_NONE = 0,  // not a miss a patch answers: the record is built again
+    MOE_HYBRID_RECORD_PATCH_PLAN_UNLOGGED,  // only the generation moved, but the log cannot name the experts that did
+    MOE_HYBRID_RECORD_PATCH_PLAN_EXPERTS,   // re-check the experts the log names
 };
 
 // A patch keeps everything the held decision was made under except the moved experts' storage, so only a miss on
@@ -157,13 +111,13 @@ inline moe_hybrid_record_patch_plan moe_hybrid_record_plan_patch(moe_hybrid_reco
                                                                  std::vector<int32_t> *          changed) {
     changed->clear();
     if (miss != MOE_HYBRID_RECORD_MISS_GENERATION || !stamp.eligible || !held) {
-        return MOE_HYBRID_RECORD_PATCH_NONE;
+        return MOE_HYBRID_RECORD_PATCH_PLAN_NONE;
     }
     if (!log.changed_since(stamp.expert_storage_generation, storage_generation, changed) || changed->empty()) {
         changed->clear();
-        return MOE_HYBRID_RECORD_PATCH_UNLOGGED;
+        return MOE_HYBRID_RECORD_PATCH_PLAN_UNLOGGED;
     }
-    return MOE_HYBRID_RECORD_PATCH_EXPERTS;
+    return MOE_HYBRID_RECORD_PATCH_PLAN_EXPERTS;
 }
 
 // One expert's slot in a hybrid decode record: the weight its executor reads, on the record's device or in host
@@ -378,11 +332,11 @@ struct moe_hybrid_record_trace {
     // What a lookup's patch plan came to: a patch over `experts` experts that stood or not, or a log that could not
     // name them.
     void patch(moe_hybrid_record_patch_plan plan, bool patched, size_t experts) {
-        if (plan == MOE_HYBRID_RECORD_PATCH_UNLOGGED) {
+        if (plan == MOE_HYBRID_RECORD_PATCH_PLAN_UNLOGGED) {
             ++counts.patch_unlogged;
             return;
         }
-        if (plan != MOE_HYBRID_RECORD_PATCH_EXPERTS) {
+        if (plan != MOE_HYBRID_RECORD_PATCH_PLAN_EXPERTS) {
             return;
         }
         counts.patch_experts += experts;

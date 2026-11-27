@@ -542,9 +542,9 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
 endif()
 
 # The event-chained hybrid decode route's record bookkeeping: why a held record's stamp misses, and the per-token
-# count GGML_SYCL_MOE_HYBRID_RECORD_TRACE prints. ggml-sycl/moe-hybrid-record.hpp includes the standard library and
-# moe-decode-hostpath.hpp (which needs ggml.h for its types only), so the test links nothing: no SYCL runtime is
-# loaded and no device is opened.
+# count GGML_SYCL_MOE_HYBRID_RECORD_TRACE prints. ggml-sycl/moe-hybrid-record.hpp includes the standard library,
+# moe-storage-change-log.hpp (the standard library alone) and moe-decode-hostpath.hpp (which needs ggml.h for its
+# types only), so the test links nothing: no SYCL runtime is loaded and no device is opened.
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     add_executable(test-sycl-moe-hybrid-record test-sycl-moe-hybrid-record.cpp)
     target_include_directories(test-sycl-moe-hybrid-record PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src

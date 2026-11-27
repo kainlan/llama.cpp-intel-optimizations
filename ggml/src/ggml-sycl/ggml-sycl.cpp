@@ -91245,10 +91245,10 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_s
 // The plan's part of the decision on a record of src0 on `device`, which the build and the patch both take from here:
 // the plan's refusal, or nullptr with the tensor's planned residency in *counts. An expert move rewrites the plan
 // without moving the replan epoch, so the patch asks it again rather than trust what the held record was built under.
-static const char * ggml_sycl_moe_hybrid_decode_record_plan(const ggml_tensor *                  src0,
-                                                            int                                  device,
-                                                            int64_t                              n_as,
-                                                            ggml_sycl::expert_residency_counts * counts) {
+static const char * ggml_sycl_moe_hybrid_decode_record_plan_refusal(const ggml_tensor *                  src0,
+                                                                    int                                  device,
+                                                                    int64_t                              n_as,
+                                                                    ggml_sycl::expert_residency_counts * counts) {
     const auto plan     = ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(device));
     const bool has_host = plan->has_host_experts(src0->name, n_as, device);
     *counts = has_host ? plan->count_planned_experts(src0->name, n_as, device) : ggml_sycl::expert_residency_counts{};
@@ -91286,7 +91286,7 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
         return refuse("not an expert weight tensor, or more than one routable card");
     }
     ggml_sycl::expert_residency_counts counts;
-    if (const char * why = ggml_sycl_moe_hybrid_decode_record_plan(src0, device, n_as, &counts)) {
+    if (const char * why = ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, n_as, &counts)) {
         return refuse(why);
     }
     const bool all_host = counts.on_device == 0;
@@ -91428,7 +91428,8 @@ static bool ggml_sycl_moe_hybrid_decode_record_patch(ggml_backend_sycl_context &
         return false;
     }
     ggml_sycl::expert_residency_counts counts;
-    if (ggml_sycl_moe_hybrid_decode_record_plan(src0, device, static_cast<int64_t>(held->n_as), &counts) != nullptr ||
+    if (ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, static_cast<int64_t>(held->n_as), &counts) !=
+            nullptr ||
         !ggml_sycl::moe_hybrid_record_patch_frame_holds(held->all_host, held->layout_expert, counts.on_device == 0,
                                                         changed.front())) {
         return false;
@@ -91552,14 +91553,14 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
         ggml_sycl_moe_hybrid_record_patch_enabled() ?
                 ggml_sycl::moe_hybrid_record_plan_patch(miss, stamp, held != nullptr, weight.moe_expert_storage_changes,
                                                         storage_generation, &changed) :
-                ggml_sycl::MOE_HYBRID_RECORD_PATCH_NONE;
+                ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_NONE;
     std::shared_ptr<const moe_hybrid_decode_record> patched;
     std::vector<ggml_sycl::mem_handle>              replaced;
     bool                                            patched_ok = false;
-    if (plan == ggml_sycl::MOE_HYBRID_RECORD_PATCH_EXPERTS) {
+    if (plan == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_EXPERTS) {
         patched_ok = ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, held, changed, &patched, &replaced);
     }
-    if (trace > 0 && plan != ggml_sycl::MOE_HYBRID_RECORD_PATCH_NONE) {
+    if (trace > 0 && plan != ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_NONE) {
         g_moe_hybrid_record_trace.patch(plan, patched_ok, changed.size());
         if (trace >= 2) {
             GGML_LOG_WARN(
@@ -91567,9 +91568,9 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
                 "outcome=%s\n",
                 (unsigned long long) g_moe_hybrid_record_trace.token, src0->name, device,
                 (unsigned long long) decided_generation, (unsigned long long) storage_generation, changed.size(),
-                plan == ggml_sycl::MOE_HYBRID_RECORD_PATCH_UNLOGGED ? "unlogged" :
-                patched_ok                                          ? "patched" :
-                                                                      "declined");
+                plan == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_UNLOGGED ? "unlogged" :
+                patched_ok                                               ? "patched" :
+                                                                           "declined");
         }
     }
     if (patched_ok) {

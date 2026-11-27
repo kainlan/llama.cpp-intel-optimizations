@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Source contract: how the event-chained hybrid decode route keeps its per-tensor record current, and what it counts.
 
-Host-only: reads ggml-sycl.cpp, common.hpp, moe-hybrid-record.hpp and docs/backend/sycl-env-vars.md, builds nothing,
-loads no model and touches no device.
+Host-only: reads ggml-sycl.cpp, common.hpp, moe-hybrid-record.hpp, moe-storage-change-log.hpp and
+docs/backend/sycl-env-vars.md, and lists which sources include moe-hybrid-record.hpp; builds nothing, loads no model
+and touches no device.
 
 The route (ggml_sycl_moe_hybrid_decode_event_chained) looks its tensor's record up at every decode op
 (ggml_sycl_moe_hybrid_decode_record_current). The record is cached under a stamp of (replan epoch, the weight's expert
@@ -22,7 +23,10 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
   T4  the build counts the experts it resolves at its one resolve, right before the call that resolves them;
   T5  the per-token line and the per-build line are WARN, each printed from one site, the per-build one only at
       level 2 and above; the per-token line's buffer is the 768 bytes the host test proves the widest line fits;
-  T6  the header is plain host code: standard includes and moe-decode-hostpath.hpp only, no SYCL;
+  T6  both headers are plain host code, no SYCL: moe-hybrid-record.hpp includes the standard library,
+      moe-decode-hostpath.hpp and moe-storage-change-log.hpp, which defines the weight's change log and includes the
+      standard library alone; common.hpp includes the change log's header and not the record's, which only
+      ggml-sycl.cpp and the host test include;
   T7  the env-var row names the variable, both line tags, the read-once rule and the token rule; the patch switch's
       row says that `=0` builds the whole record instead of patching it and that the withdrawal still runs, and
       never that `=0` is the tree before the patch;
@@ -68,6 +72,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "ggml/src/ggml-sycl/ggml-sycl.cpp"
 HEADER = ROOT / "ggml/src/ggml-sycl/moe-hybrid-record.hpp"
+LOG_HEADER = ROOT / "ggml/src/ggml-sycl/moe-storage-change-log.hpp"
 COMMON = ROOT / "ggml/src/ggml-sycl/common.hpp"
 DOCS = ROOT / "docs/backend/sycl-env-vars.md"
 
@@ -103,8 +108,8 @@ WAIT_CALLS = re.compile(r"\.wait\(|wait_and_throw\(|get_info<")
 PATCH_HELD = "std::shared_ptr<const moe_hybrid_decode_record> & held = weight.moe_hybrid_decode[device];"
 PATCH_PLAN = ("const ggml_sycl::moe_hybrid_record_patch_plan plan = ggml_sycl_moe_hybrid_record_patch_enabled() ? "
               "ggml_sycl::moe_hybrid_record_plan_patch(miss, stamp, held != nullptr, weight.moe_expert_storage_changes, "
-              "storage_generation, &changed) : ggml_sycl::MOE_HYBRID_RECORD_PATCH_NONE;")
-PATCH_CALL = ("if (plan == ggml_sycl::MOE_HYBRID_RECORD_PATCH_EXPERTS) { patched_ok = "
+              "storage_generation, &changed) : ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_NONE;")
+PATCH_CALL = ("if (plan == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_EXPERTS) { patched_ok = "
               "ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, held, changed, &patched, &replaced); }")
 PATCH_COUNT = "g_moe_hybrid_record_trace.patch(plan, patched_ok, changed.size());"
 PATCH_WARN = 'GGML_LOG_WARN("[MOE-HYBRID-RECORD-PATCH] '
@@ -121,7 +126,7 @@ PATCH_DECL = ("static bool ggml_sycl_moe_hybrid_decode_record_patch(ggml_backend
               "const std::vector<int32_t> & changed,")
 PATCH_STEPS = (
     ("the build's plan rule, asked again, and the frame the build would take now",
-     "if (ggml_sycl_moe_hybrid_decode_record_plan(src0, device, static_cast<int64_t>(held->n_as), &counts) != nullptr "
+     "if (ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, static_cast<int64_t>(held->n_as), &counts) != nullptr "
      "|| !ggml_sycl::moe_hybrid_record_patch_frame_holds(held->all_host, held->layout_expert, counts.on_device == 0, "
      "changed.front())) { return false; }"),
     ("its resolve of the changed experts alone",
@@ -159,7 +164,7 @@ SLOT_SIG = "static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_dec
 BUILD_STEPS = (
     ("plan from the plan rule, and its all-host mode from the plan's counts",
      "ggml_sycl::expert_residency_counts counts; if (const char * why = "
-     "ggml_sycl_moe_hybrid_decode_record_plan(src0, device, n_as, &counts)) { return refuse(why); } "
+     "ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, n_as, &counts)) { return refuse(why); } "
      "const bool all_host = counts.on_device == 0;"),
     ("record of the expert its layout came from", "record->layout_expert = layout_expert;"),
     ("each slot from the slot rule",
@@ -175,7 +180,7 @@ BUILD_STEPS = (
      "shape.substitute, &record->table)"),
 )
 # The plan rule the build and the patch share: the plan's two queries, decided by the header's rule.
-PLAN_SIG = "static const char * ggml_sycl_moe_hybrid_decode_record_plan("
+PLAN_SIG = "static const char * ggml_sycl_moe_hybrid_decode_record_plan_refusal("
 PLAN_STEPS = (
     ("query of the host experts", "const bool has_host = plan->has_host_experts(src0->name, n_as, device);"),
     ("query of the planned residency",
@@ -196,7 +201,15 @@ PATCH_DOC_NEEDLES = ("`GGML_SYCL_MOE_HYBRID_RECORD_PATCH=0`", "Read once", "ever
 # `=0` keeps the loan and evict withdrawal, so it is not the tree before the patch, and the row must not say it is.
 PATCH_DOC_FORBIDDEN = ("as before the patch",)
 HEADER_INCLUDE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]', re.M)
-HEADER_ALLOWED = {"moe-decode-hostpath.hpp"}
+HEADER_ALLOWED = {"moe-decode-hostpath.hpp", "moe-storage-change-log.hpp"}
+# The weight's change log is a member of every weight extra, so common.hpp includes its header; the record's
+# bookkeeping is the backend's alone, so common.hpp, which every SYCL source includes, does not.
+LOG_DEF = "struct moe_storage_change_log {"
+LOG_INCLUDE = "moe-storage-change-log.hpp"
+RECORD_INCLUDE = "moe-hybrid-record.hpp"
+RECORD_INCLUDERS = {"ggml/src/ggml-sycl/ggml-sycl.cpp", "tests/test-sycl-moe-hybrid-record.cpp"}
+# Where an include of the record's header could hide: every SYCL source and header, and the tests' C++ sources.
+INCLUDER_GLOBS = ("ggml/src/ggml-sycl/**/*.cpp", "ggml/src/ggml-sycl/**/*.hpp", "tests/*.cpp")
 
 # T8: the one function that moves the generation, and what each site that calls it names.
 NOTE_SIG = "void note_moe_storage_change(int32_t expert_id) {"
@@ -354,6 +367,11 @@ def definition_spans(sq: str, sig: str) -> list[tuple[int, int]]:
     return spans
 
 
+def included_headers(code: str) -> set[str]:
+    """The file names (without directories) of the project headers `code` includes."""
+    return {Path(m.group(2)).name for m in HEADER_INCLUDE.finditer(code) if m.group(1) == '"'}
+
+
 def once(text: str, needle: str, pin: str, what: str) -> int:
     n = text.count(needle)
     if n != 1:
@@ -361,7 +379,7 @@ def once(text: str, needle: str, pin: str, what: str) -> int:
     return text.find(needle)
 
 
-def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str) -> None:
+def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str, log_raw: str, includers_raw: str) -> None:
     code = blank_comments(backend_raw)
     current = body(code, CURRENT_SIG, "T1")
     build = body(code, BUILD_SIG, "T4")
@@ -422,16 +440,31 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str) -> 
     if WAIT_CALLS.search(lookup):
         raise ContractError("FAIL [pin T5]: the per-token count waits on the device")
 
-    # T6: the header stays plain host code.
+    # T6: both headers stay plain host code, and only the change log reaches every SYCL source through common.hpp.
     header = blank_comments(header_raw)
-    for m in HEADER_INCLUDE.finditer(header):
-        kind, name = m.group(1), m.group(2)
-        if kind == '"' and name not in HEADER_ALLOWED:
-            raise ContractError(f"FAIL [pin T6]: moe-hybrid-record.hpp includes the project header `{name}`")
-        if kind == "<" and ("sycl" in name or "/" in name):
-            raise ContractError(f"FAIL [pin T6]: moe-hybrid-record.hpp includes `<{name}>`")
-    if re.search(r"\bsycl::", header):
-        raise ContractError("FAIL [pin T6]: moe-hybrid-record.hpp names a SYCL type")
+    log_header = blank_comments(log_raw)
+    for file, text, allowed in (("moe-hybrid-record.hpp", header, HEADER_ALLOWED),
+                                ("moe-storage-change-log.hpp", log_header, set())):
+        for m in HEADER_INCLUDE.finditer(text):
+            kind, name = m.group(1), m.group(2)
+            if kind == '"' and name not in allowed:
+                raise ContractError(f"FAIL [pin T6]: {file} includes the project header `{name}`")
+            if kind == "<" and ("sycl" in name or "/" in name):
+                raise ContractError(f"FAIL [pin T6]: {file} includes `<{name}>`")
+        if re.search(r"\bsycl::", text):
+            raise ContractError(f"FAIL [pin T6]: {file} names a SYCL type")
+    if squash(log_header).count(LOG_DEF) != 1 or LOG_DEF in squash(header):
+        raise ContractError("FAIL [pin T6]: moe_storage_change_log is not defined once, in moe-storage-change-log.hpp")
+    common_includes = included_headers(blank_comments(common_raw))
+    if LOG_INCLUDE not in common_includes or RECORD_INCLUDE in common_includes:
+        raise ContractError("FAIL [pin T6]: common.hpp does not include the change log's header alone: every SYCL "
+                            "source would see the hybrid record's bookkeeping, which only the backend uses")
+    if RECORD_INCLUDE not in included_headers(code):
+        raise ContractError("FAIL [pin T6]: ggml-sycl.cpp does not include moe-hybrid-record.hpp itself")
+    others = sorted(set(includers_raw.split()) - RECORD_INCLUDERS)
+    if others:
+        raise ContractError(f"FAIL [pin T6]: moe-hybrid-record.hpp is included from {others}, not only from "
+                            f"{sorted(RECORD_INCLUDERS)}")
 
     # T7: the env-var row.
     rows = [line for line in docs_raw.splitlines() if line.startswith(f"| `{ENV_NAME}")]
@@ -604,7 +637,7 @@ def self_test(raws: dict[str, str]) -> int:
             print(f"  mutant {name}: NOT APPLIED ({e})")
             return
         try:
-            check(mutated["backend"], mutated["header"], mutated["docs"], mutated["common"])
+            check_all(mutated)
         except ContractError as e:
             if f"[pin {pin}]" not in str(e):
                 failures.append(f"{name}: caught, but not by pin {pin}: {str(e)[:140]}")
@@ -652,6 +685,14 @@ def self_test(raws: dict[str, str]) -> int:
                   "        if (trace >= 1) {\n            GGML_LOG_WARN(\n                \"[MOE-HYBRID-RECORD-BUILD] ")])
     expect_fail("header-includes-sycl", "T6", H, [("#include <cstdio>", "#include <sycl/sycl.hpp>\n#include <cstdio>")])
     expect_fail("header-includes-common", "T6", H, [("#include <cstdio>", '#include "common.hpp"\n#include <cstdio>')])
+    expect_fail("log-header-includes-sycl", "T6", "log",
+                [("#include <vector>", "#include <sycl/sycl.hpp>\n#include <vector>")])
+    expect_fail("common-includes-record-header", "T6", "common",
+                [('#include "moe-storage-change-log.hpp"', '#include "moe-hybrid-record.hpp"')])
+    expect_fail("record-header-included-elsewhere", "T6", "includers",
+                [("tests/test-sycl-moe-hybrid-record.cpp",
+                  "tests/test-sycl-moe-hybrid-record.cpp\nggml/src/ggml-sycl/fattn.cpp")])
+    expect_fail("backend-leans-on-common-for-record", "T6", B, [('#include "ggml-sycl/moe-hybrid-record.hpp"\n', "")])
     expect_fail("docs-row-dropped", "T7", D, [(f"| `{ENV_NAME}=1\\|2`", f"| `{ENV_NAME}_OLD=1\\|2`")])
     expect_fail("docs-row-lacks-build-line", "T7", D, [("`[MOE-HYBRID-RECORD-BUILD]", "`[MOE-HYBRID-BUILD]")])
     expect_fail("docs-row-lacks-patch-line", "T7", D,
@@ -688,8 +729,8 @@ def self_test(raws: dict[str, str]) -> int:
                 [(held_param, "std::shared_ptr<moe_hybrid_decode_record>         held,")])
     expect_fail("patch-borrows-held", "T10", B, [(held_param, "const moe_hybrid_decode_record &                  held,")])
     expect_fail("patch-skips-plan-rule", "T10", B,
-                [("    if (ggml_sycl_moe_hybrid_decode_record_plan(src0, device, static_cast<int64_t>(held->n_as), "
-                  "&counts) != nullptr ||", "    if (false ||")])
+                [("    if (ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, static_cast<int64_t>(held->n_as), "
+                  "&counts) !=\n            nullptr ||", "    if (false ||")])
     expect_fail("patch-ignores-layout-expert", "T10", B,
                 [("held->layout_expert, counts.on_device == 0,", "-1, counts.on_device == 0,")])
     expect_fail("patch-resolves-every-expert", "T10", B,
@@ -731,13 +772,13 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    if (!all_host && !ggml_sycl_moe_hybrid_decode_table_fill(queue,",
                   "    if (!all_host && !ggml_sycl_moe_hybrid_decode_table_allocate(queue,")])
     expect_fail("patch-asks-plan-itself", "T11", B,
-                [("    ggml_sycl::expert_residency_counts counts;\n    if (ggml_sycl_moe_hybrid_decode_record_plan(src0, "
+                [("    ggml_sycl::expert_residency_counts counts;\n    if (ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, "
                   "device, static_cast<int64_t>",
                   "    ggml_sycl::expert_residency_counts counts;\n    (void) ggml_sycl_cache_plan_owner(ggml_sycl::"
                   "get_unified_cache_for_device(device))->has_host_experts(src0->name, 1, device);\n"
-                  "    if (ggml_sycl_moe_hybrid_decode_record_plan(src0, device, static_cast<int64_t>")])
+                  "    if (ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, static_cast<int64_t>")])
     expect_fail("build-asks-plan-itself", "T11", B,
-                [("    if (const char * why = ggml_sycl_moe_hybrid_decode_record_plan(src0, device, n_as, &counts)) {",
+                [("    if (const char * why = ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, n_as, &counts)) {",
                   "    if (const char * why = ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(device))"
                   "->has_host_experts(src0->name, n_as, device) ? nullptr : \"no host expert\") {")])
     expect_fail("plan-rule-skips-residency", "T11", B,
@@ -816,7 +857,7 @@ def self_test(raws: dict[str, str]) -> int:
         print("  self-test: a stale mutant anchor is reported")
 
     try:
-        check(raws["backend"], raws["header"], raws["docs"], raws["common"])
+        check_all(raws)
         print("  self-test: unmodified tree passes")
     except ContractError as e:
         print(f"  self-test: unmodified tree FAILS: {e}")
@@ -829,18 +870,34 @@ def self_test(raws: dict[str, str]) -> int:
     return 0
 
 
+def check_all(raws: dict[str, str]) -> None:
+    check(raws["backend"], raws["header"], raws["docs"], raws["common"], raws["log"], raws["includers"])
+
+
+def record_includers() -> str:
+    """The sources that include moe-hybrid-record.hpp, one repo-relative path per line."""
+    found = set()
+    for pattern in INCLUDER_GLOBS:
+        for path in ROOT.glob(pattern):
+            if RECORD_INCLUDE in included_headers(blank_comments(path.read_text(errors="replace"))):
+                found.add(path.relative_to(ROOT).as_posix())
+    return "\n".join(sorted(found))
+
+
 def main(argv: list[str]) -> int:
     raws = {}
-    for key, path in (("backend", BACKEND), ("header", HEADER), ("docs", DOCS), ("common", COMMON)):
+    for key, path in (("backend", BACKEND), ("header", HEADER), ("docs", DOCS), ("common", COMMON),
+                      ("log", LOG_HEADER)):
         try:
             raws[key] = path.read_text()
         except FileNotFoundError:
             print(f"FAIL: {path.relative_to(ROOT)} does not exist")
             return 1
+    raws["includers"] = record_includers()
     if "--self-test" in argv:
         return self_test(raws)
     try:
-        check(raws["backend"], raws["header"], raws["docs"], raws["common"])
+        check_all(raws)
     except ContractError as e:
         print(e)
         return 1
