@@ -7210,8 +7210,134 @@ reference kernels and must not be used.
 - The Inkling gates on the B70, the B50 and both cards. The Mistral B70 and GPT-OSS B50 gates.
 - `test-backend-ops -o MUL_MAT_ID` with no case changing on either card.
 - The two fixed sweeps with no new red. The interleaved ABBA against `2a69aea88b`.
-- No `-ngl`, no context shrink, no new host wait, no allocation outside the unified cache, and no second layout of
-  any weight.
+- No `-ngl`, no context shrink, no allocation outside the unified cache, and no second layout of any weight.
+- Host waits (amended after the checkpoint, 2026-11-26): the arm reuses the executor's prompt ids D2H cache and its
+  ring-slot claim, the same entry points, waits and count as an NVFP4 node: 88 per long-prompt pass (4 BF16 layers x
+  11 micro-batches x the ids wait and down's claim). That is the existing debt the 2026-08-20 no-host-waits ruling
+  names, not a new mechanism, and its removal is `llama.cpp-uop2`. The arm adds no other wait: no drain and no
+  `wait()` in the gather, GEMM and scatter chain, where every ordering is an event edge, the oneDNN execute deps
+  included.
+
+**Checkpoint result (implementer, read-only, 2026-11-26, base `a09e879982`) and what it corrects above.** Cites are
+`ggml-sycl.cpp` unless a file is named.
+- *The executor end to end (item 1).* For a type in its f16 table (`moe_pp_batched_f16_supports_layout`,
+  `moe-mmvq-tables.hpp:330-360`, which has no BF16 entry) the executor claims a prompt node (`:90118-90152`,
+  `:90747-90831`). `moe_mmid_direct_defers_to_executor` (`moe-mmvq-tables.hpp:468-470`) is the Q1_0/NVFP4 direct
+  route stepping aside, and it asks for a planned ring weight slot because those types write a weight plane. The
+  BF16 block (`:92401`) returns before any of it.
+  - ids and sort. The ids come through the graph-local D2H cache (`:75315`, its `entry.wait()` at `:75239` and
+    `:75251`). The host counting sort builds the row maps (`:99336-99358`), and one H2D puts them in a scoped
+    unified temp (`:99359-99398`).
+  - Scratch. The slot is admitted (`:100035`), reserved at the planned sizes (`:100063`) and claimed (`:100069`,
+    then `:1709`). The claim waits at `:1767` while the slot of the depth-1 ring (`src/llama-model.cpp:561`) is
+    busy, and `take_owners` moves the weight, activation and output owners into the claim (`:1974-1982`).
+  - Per active expert:
+    - a gather to f16 (`:84724-84745`, submitted at `:100290-100313`, `moe.pp.stage.act`);
+    - a dequant into the weight plane (`:100319-100346`, `moe.pp.dequant.<type>`);
+    - `gemm_batch_strided` per group and phase (`:100563-100705`), then a barrier (`:100709`);
+    - a scatter (`:84747-84764`, `:100903-100938`).
+  - Completion. The done marker and the claim's record (`:100984-100986`), with the leases held to it (`:101004`).
+  - A bf16 arm skips the weight plane, the dequant, the resolved-batch admission and the group split. It changes
+    the gather's output to bf16 (round to nearest even) and the GEMM to one bf16 x bf16 -> f32 strict call per
+    expert on the loaded weight. It keeps the ids path, the sort, the 64-row rounding, the ring's activation and
+    output slots and their claim, the row-map H2D, the scatter, the done marker and the lease retention.
+- *Correction: a separate arm beside the direct route, not the executor's body.*
+  - Today a BF16 node in the body would fail its graph: the route capability falls through to
+    `local-layout-unsupported` (`:42319`), and the retained prompt admission throws (`:93713`).
+  - Adding BF16 to the f16 table would make `:42309-42314` answer, but membership fans out further, to:
+    - `admits_op` in `supports_op` (`:133769-133772`);
+    - the ring-consumer and ring-use tables (`moe-mmvq-tables.hpp:410-450`), and through them the ring plan and
+      Task 21's B50 ring drop (d);
+    - the weight-slot logic;
+    - the Q1_0/NVFP4 typing of `pp_direct_deferred` (`:95560-95574`);
+    - source-contract claim (h) (`tests/test-sycl-moe-bf16-direct-source.py:451`).
+  - So the arm sits beside the direct route and reuses the executor's pieces.
+- *DnnlGemmWrapper (item 2).*
+  - `gemm()` (`gemm.hpp:374-399`) takes a weight pointer per call. The arm calls it with:
+    - m = ne01, n = the expert's rounded rows, k = ne00;
+    - stra1 = nb01 / 2, which is K for the contiguous weight the predicate requires.
+    This is Task 22's call (`:81963-81968`).
+  - The primitive key holds m, n, k, the strides and ldc (`gemm.hpp:410-428`) in an unbounded map with no
+    eviction (`gemm.hpp:230-283`). 64-row rounding gives at most 8 n values per (m, k) at a 512-token micro-batch,
+    so 16 primitives for Inkling.
+  - Correction: the AOS table is a device-side pointer array (`:73604`, `:74142-74195`). The host takes each
+    active expert's pointer from `resolve_moe_storage_record`, the record the table is built from, after
+    `ggml_sycl_moe_direct_ensure_aos_table` (`:90181-90204`) has made sure the records exist.
+  - Each GEMM's deps are the gather's event, on the in-order compute queue.
+- *The seam (item 3).*
+  - Order: the BF16 block runs the arm first and the direct route on any decline, and nothing after the block
+    computes a BF16 op.
+  - `supports_op` keeps `ggml_sycl_moe_bf16_direct_route_available` alone (`:90214`, `:133770`), so the admitted
+    set is unchanged and the direct kernel is a route for every admitted op.
+  - The arm's predicate is a strict subset of it: a prompt of at least the minimum token count, no recording, a
+    planned ring on the device, oneDNN built.
+  - At run time it also declines on:
+    - an id outside `[0, n_experts)`, which leaves the direct kernel's -1 and bad-id rows;
+    - an expert record that does not resolve;
+    - an admission, claim or `query_only` failure.
+  - Only the scatter writes dst, so a decline before the scatter writes nothing to dst.
+- *The ring (item 4).*
+  - No weight slot is written, but the arm needs the planned ring's activation and output slots. They already fit
+    the arm:
+    - the loader sizes the row widths over every MoE expert name, BF16 included (`src/llama-model.cpp:538-547`,
+      `:579-580`);
+    - per-expert 64-row slots need at most routed + 63 x active rows, under `pp_moe_onednn_packed_rows_at`
+      (`moe-scratch-admission.cpp:32-55`): 12,160 of 16,256 rows for Inkling at ub 512.
+  - The reservation asks for the planned sizes the NVFP4 nodes already reserve, and the claim hands the existing
+    weight owner over unwritten, so the planner is asked for nothing new.
+  - The admission refuses a zero weight request (`moe-scratch-admission.cpp:107-110`), so the arm takes a
+    weightless admission of its own.
+  - A model whose only MoE experts are BF16 plans no ring, and the arm declines there.
+- *Host cost (item 5).*
+  - Every `moe.pp.stage.*` and `moe.pp.dequant.*` row is its own queue submission:
+    - `ggml_sycl_profile_submit` wraps one submit and adds none (`sycl-kernel-profiler.hpp:125-155`);
+    - `.act` and `.scatter` are one `queue.submit` per expert;
+    - `.dequant.nvfp4` is one converter kernel per expert (`convert.cpp:500-506`), plus a barrier only under the
+      profiler when `ext_oneapi_get_last_event` is empty (`:100342-100344`).
+  - The record's ~96,500 rows per stage per pass are 44 NVFP4 layer applications x 2 nodes x 11 micro-batches x
+    ~100 active experts.
+  - Submissions per node:
+    - an NVFP4 node: about 310, so about 300,000 per pass;
+    - the bf16 arm, with one batched gather and one batched scatter: about 104 per node (1 H2D, 1 gather, ~100
+      GEMMs, 1 scatter, 1 marker), so about 9,150 per pass;
+    - the direct kernel: 88 per pass.
+- *Recording, the B50 alone, both cards (item 6).*
+  - Recording: `check_graph_compatibility` keeps a non-quantized `MUL_MAT_ID` out of capture (`:122005-122092`),
+    the arm declines under recording, and the direct route still throws there (`:90256-90261`).
+  - B50 alone: its plan puts the BF16 experts on the host, so the CPU runs them and the arm is unreachable.
+  - Both cards: the card whose plan holds every expert at AOS takes the op, through the arm if its ring is planned
+    and the width passes, else through the direct kernel.
+  - `test-backend-ops` has no plan, so it never reaches the arm; the new device test is the positive control.
+
+**Lead rulings after the checkpoint (2026-11-26).**
+1. Host waits: option (a), with conditions. The arm reuses the executor's ids D2H cache and ring-slot claim, the
+   same entry points, waits and count as an NVFP4 node; the 2026-08-20 no-host-waits ruling names the prompt ids
+   D2H as existing debt, and this reuses it. It adds no other wait: no drain and no `wait()` in the gather, GEMM and
+   scatter chain, and every ordering is an event edge, the oneDNN execute deps included. The count, 88 per
+   long-prompt pass, is stated here, and removal is `llama.cpp-uop2`, cited in a one-line comment at the arm's
+   claim. The acceptance bullet above says exactly this.
+2. The separate arm beside the direct route, reusing the executor's pieces, is approved. The NVFP4 executor, the
+   MMVQ tables and `moe-mmvq-tables.hpp` stay BF16-free, and source-contract claim (h) stays.
+3. A step 0 bench before GREEN: `tests/test-sycl-bf16-expert-gemm-bench.cpp`, built alone, with no ctest, run once
+   by the lead on the B70. It exits nonzero on a failed primitive creation and prints, per n, the device time per
+   call (mean and median), the host time per submit and the oneDNN implementation name. Thresholds: a mean device
+   time per call at n = 64 above 60 us, or a host submit above 100 us, stops the task with a report; a host submit
+   between 40 and 100 us is marginal. GREEN waits for the lead's verdict on it. The B50 does not matter here: on
+   the B50 alone the arm is unreachable.
+4. One batched gather and one batched scatter launch over all routed rows. The 64-row rounding is the default, a
+   named constant, unless step 0 says otherwise. The minimum token count is a named constant set from step 0's
+   table.
+5. An opt-out, `GGML_SYCL_MOE_BF16_GROUPED=0`, read once and documented in `docs/backend/sycl-env-vars.md`. A
+   decline under it counts as a decline, so the arm's run counter shows it.
+6. The device test loads a planned model onto a GPU, so it carries the label `model` (with `sycl;moe;device`,
+   `level_zero:0`, `RUN_SERIAL`, `SKIP_RETURN_CODE 77`, `TIMEOUT 600`). That keeps it out of Form 2 through
+   `-LE '^model$'` with no `-E` change, and `check-ctest-safety-net.sh` must print "safety net intact" after it is
+   registered.
+- Each per-expert record handle is held until the done event with the leases, and so is the row-map temp.
+- The primitive cache stays bounded by construction (the distinct n values at the row rounding, at most 16 for
+  Inkling), and a host test checks the planner's distinct-n count.
+- RED first: the host planner test and the weightless admission test, each red by a failed assertion, not only by
+  a compile failure.
 
 ---
 
