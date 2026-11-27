@@ -1,0 +1,24 @@
+bench=bf16_expert_gemm device="Intel(R) Arc(TM) Pro B70 Graphics" driver=1.18.40734+8 dnnl=3.13.2 deterministic=1 smoke=0 passes=3 experts=128 top_k=8
+bench=bf16_expert_gemm shape=gate_up K=2304 M=4608 n=16 calls=384 created=yes impl=jit:gemm:any scratch=0 dev_us_mean=40.7 dev_us_median=40.6 span_us_per_call=41.3 host_us_mean=22.6 host_us_median=21.3 err=5.74e-09 match=Y
+bench=bf16_expert_gemm shape=gate_up K=2304 M=4608 n=32 calls=384 created=yes impl=jit:gemm:any scratch=0 dev_us_mean=41.7 dev_us_median=41.7 span_us_per_call=42.1 host_us_mean=22.2 host_us_median=21.2 err=5.84e-09 match=Y
+bench=bf16_expert_gemm shape=gate_up K=2304 M=4608 n=64 calls=384 created=yes impl=jit:gemm:any scratch=0 dev_us_mean=47.0 dev_us_median=46.9 span_us_per_call=47.4 host_us_mean=20.7 host_us_median=20.5 err=1.49e-08 match=Y
+bench=bf16_expert_gemm shape=gate_up K=2304 M=4608 n=128 calls=384 created=yes impl=jit:gemm:any scratch=0 dev_us_mean=54.0 dev_us_median=53.8 span_us_per_call=54.4 host_us_mean=19.5 host_us_median=18.7 err=1.85e-08 match=Y
+bench=bf16_expert_node shape=gate_up tokens=16 active=86 distinct_n=1 packed_rows=5504 direct_us=4558.2 arm_gemm_us=4243.9 arm_host_us=1683.2 arm_total_us=5927.0 arm_wins=N
+bench=bf16_expert_node shape=gate_up tokens=32 active=112 distinct_n=1 packed_rows=7168 direct_us=9087.7 arm_gemm_us=5339.7 arm_host_us=2175.7 arm_total_us=7515.4 arm_wins=Y
+bench=bf16_expert_node shape=gate_up tokens=64 active=125 distinct_n=1 packed_rows=8000 direct_us=18107.6 arm_gemm_us=5956.4 arm_host_us=2437.4 arm_total_us=8393.8 arm_wins=Y
+bench=bf16_expert_node shape=gate_up tokens=128 active=128 distinct_n=1 packed_rows=8192 direct_us=36248.1 arm_gemm_us=6104.0 arm_host_us=2502.6 arm_total_us=8606.6 arm_wins=Y
+bench=bf16_expert_node shape=gate_up tokens=256 active=128 distinct_n=1 packed_rows=8192 direct_us=72422.4 arm_gemm_us=6096.0 arm_host_us=2498.1 arm_total_us=8594.1 arm_wins=Y
+bench=bf16_expert_node shape=gate_up tokens=512 active=128 distinct_n=1 packed_rows=8192 direct_us=144796.2 arm_gemm_us=6096.2 arm_host_us=2507.6 arm_total_us=8603.8 arm_wins=Y
+bench=bf16_expert_gemm shape=down K=2304 M=2304 n=16 calls=384 created=yes impl=jit:gemm:any scratch=0 dev_us_mean=21.0 dev_us_median=21.0 span_us_per_call=21.3 host_us_mean=18.5 host_us_median=18.3 err=1.61e-08 match=Y
+bench=bf16_expert_gemm shape=down K=2304 M=2304 n=32 calls=384 created=yes impl=jit:gemm:any scratch=0 dev_us_mean=21.9 dev_us_median=21.9 span_us_per_call=22.2 host_us_mean=18.4 host_us_median=18.1 err=1.43e-08 match=Y
+bench=bf16_expert_gemm shape=down K=2304 M=2304 n=64 calls=384 created=yes impl=jit:gemm:any scratch=0 dev_us_mean=25.4 dev_us_median=25.4 span_us_per_call=25.8 host_us_mean=18.6 host_us_median=18.3 err=1.68e-08 match=Y
+bench=bf16_expert_gemm shape=down K=2304 M=2304 n=128 calls=384 created=yes impl=jit:gemm:any scratch=0 dev_us_mean=36.6 dev_us_median=36.6 span_us_per_call=36.9 host_us_mean=18.5 host_us_median=18.4 err=1.15e-08 match=Y
+bench=bf16_expert_node shape=down tokens=16 active=79 distinct_n=1 packed_rows=5056 direct_us=2327.8 arm_gemm_us=2046.0 arm_host_us=1426.4 arm_total_us=3472.4 arm_wins=N
+bench=bf16_expert_node shape=down tokens=32 active=114 distinct_n=1 packed_rows=7296 direct_us=4632.1 arm_gemm_us=2935.5 arm_host_us=2071.6 arm_total_us=5007.1 arm_wins=N
+bench=bf16_expert_node shape=down tokens=64 active=126 distinct_n=1 packed_rows=8064 direct_us=9235.9 arm_gemm_us=3246.5 arm_host_us=2283.9 arm_total_us=5530.4 arm_wins=Y
+bench=bf16_expert_node shape=down tokens=128 active=128 distinct_n=1 packed_rows=8192 direct_us=18483.2 arm_gemm_us=3298.1 arm_host_us=2314.9 arm_total_us=5612.9 arm_wins=Y
+bench=bf16_expert_node shape=down tokens=256 active=128 distinct_n=1 packed_rows=8192 direct_us=36985.4 arm_gemm_us=3290.7 arm_host_us=2313.1 arm_total_us=5603.8 arm_wins=Y
+bench=bf16_expert_node shape=down tokens=512 active=128 distinct_n=1 packed_rows=8192 direct_us=73804.0 arm_gemm_us=3291.4 arm_host_us=2315.2 arm_total_us=5606.5 arm_wins=Y
+summary n64_span_us=36.6 n64_dev_us=36.2 n64_host_us=20.7 verdict=PROCEED suggested_min_tokens=64
+PASS: bf16_expert_gemm.bench completed
+rc=0
