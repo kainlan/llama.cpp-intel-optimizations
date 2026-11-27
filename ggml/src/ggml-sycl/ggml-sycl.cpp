@@ -91426,9 +91426,9 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
 // replaced and the held table, for the caller to keep until the queue has passed the copy's publication. Declines,
 // returning false with nothing published and no count moved and its reason in *reason, when the build would decide
 // the record another way now (the plan refuses it, or names another all-host mode, a moved expert could move the
-// layout the build takes, or the frame rule refuses the held mode and layout) or a moved expert no longer fits the
-// held record's shape (another layout, a device expert in an all-host record, no host expert left), and the caller
-// builds the record again over every expert. `held` is the patch's own reference, so a resolve that replaces the
+// layout the build takes, the frame rule refuses the held mode and layout, or the device's route-count table is no
+// longer the held one) or a moved expert no longer fits the held record's shape (another layout, a device expert in
+// an all-host record, no host expert left), and the caller builds the record again over every expert. `held` is the patch's own reference, so a resolve that replaces the
 // tensor's record cannot release the one it copies.
 static bool ggml_sycl_moe_hybrid_decode_record_patch(ggml_backend_sycl_context &                       ctx,
                                                      const ggml_tensor *                               src0,
@@ -91463,6 +91463,13 @@ static bool ggml_sycl_moe_hybrid_decode_record_patch(ggml_backend_sycl_context &
     }
     if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, held->all_host, held->layout)) {
         return decline(why);
+    }
+    // The copy keeps the held record's route-count table and records the block's residency in it. A later model's
+    // table replaces the device's, and the build installs that one, so a held table that is no longer the device's
+    // is the build's to replace.
+    if (ggml_sycl_moe_route_counts_tensor(src0->name) &&
+        held->route_counts != ggml_sycl::moe_route_counts_current(device)) {
+        return decline("the device's route-count table was replaced since the held record's build");
     }
     const ggml_sycl::moe_resolved_batch_result resolved = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
         src0, device, changed.data(), changed.size(), changed.size(), held->layout,

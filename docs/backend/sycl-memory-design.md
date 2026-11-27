@@ -490,9 +490,13 @@ build's own plan rule
 holds every move, a replan, another selected-row count, a plan that now
 refuses the record or names the other all-host mode, a moved expert at or before
 the one whose layouts gave the record its layout (the build's layout scan could
-stop elsewhere), or a moved expert that no longer fits the record (another
-layout, a device expert in an all-host record, no host expert left) builds the
-record again over every expert. An expert loan's or evict's view drop
+stop elsewhere), a moved expert that no longer fits the record (another layout,
+a device expert in an all-host record, no host expert left), the build's frame
+rule refusing the record (`ggml_sycl_moe_hybrid_decode_record_frame_refusal`:
+more than one routable card, a tensor the MMID direct route runs), or a later
+model's route-count table in the device's place builds the record again over
+every expert. A level-2 `GGML_SYCL_MOE_HYBRID_RECORD_TRACE` line names the rule
+that declined a patch. An expert loan's or evict's view drop
 (`ggml_sycl_drop_lent_expert_views`) does not drop the record: it withdraws,
 from a copy it publishes in the record's place, only the slots that lease the
 entry it retired, retains their leases with the other views it drops, and notes

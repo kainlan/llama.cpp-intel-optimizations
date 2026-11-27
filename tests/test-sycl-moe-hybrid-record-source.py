@@ -144,6 +144,9 @@ PATCH_STEPS = (
     ("the build's frame rule over the held record's mode and layout",
      "if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, held->all_host, "
      "held->layout)) { return decline(why); }"),
+    ("the held record's route-count table, still the device's",
+     "if (ggml_sycl_moe_route_counts_tensor(src0->name) && "
+     "held->route_counts != ggml_sycl::moe_route_counts_current(device)) { return decline("),
     ("its resolve of the changed experts alone",
      "ggml_sycl::ggml_sycl_build_moe_resolved_batch(src0, device, changed.data(), changed.size(), changed.size(), "
      "held->layout,"),
@@ -793,6 +796,11 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("patch-skips-frame-rule", "T10", B,
                 [("    if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, held->all_host, "
                   "held->layout)) {\n        return decline(why);\n    }\n", "")])
+    route_check = ("    if (ggml_sycl_moe_route_counts_tensor(src0->name) &&\n"
+                   "        held->route_counts != ggml_sycl::moe_route_counts_current(device)) {\n")
+    expect_fail("patch-keeps-replaced-route-counts", "T10", B, [(route_check, "    if (false) {\n")])
+    expect_fail("patch-checks-route-counts-on-every-tensor", "T10", B,
+                [(route_check, "    if (held->route_counts != ggml_sycl::moe_route_counts_current(device)) {\n")])
     expect_fail("patch-declines-unnamed", "T10", B,
                 [('            return decline("the resolved batch is not in the moved experts\' order");',
                   "            return false;")])
