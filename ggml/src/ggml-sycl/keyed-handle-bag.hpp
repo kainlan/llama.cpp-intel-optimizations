@@ -51,19 +51,20 @@ template <typename Handle, typename Key, typename KeyHash, typename KeyOf> class
             return;
         }
 
+        // Dismissed once the index entry is made; until then its destructor pops the handle again.
         struct pop_unless_indexed {
             std::vector<Handle> & items;
-            bool                  indexed = false;
+            bool                  dismissed = false;
 
             ~pop_unless_indexed() {
-                if (!indexed) {
+                if (!dismissed) {
                     items.pop_back();
                 }
             }
         } appended{ items_ };
 
         index_.emplace(std::move(key), items_.size() - 1);
-        appended.indexed = true;
+        appended.dismissed = true;
     }
 
     // Replaces the bag's handles with `handles`: a move, and the index is dropped.

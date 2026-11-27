@@ -231,22 +231,50 @@ static int test_random_operations_match_a_reference() {
     return 0;
 }
 
-// A key hash that throws for one key, so a test can fail the index entry an append to an indexed bag makes.
-static int g_hash_throw_on = -1;
+// A key whose move constructor throws while g_key_move_throws is set. The bag moves the key into its index entry, so a
+// test can fail that entry with a failure a single-element emplace's no-effect guarantee covers; a throwing hash
+// function is exempt from that guarantee, so it could leave the index changed.
+static bool g_key_move_throws = false;
 
-struct throwing_hash {
-    size_t operator()(int key) const {
-        if (key == g_hash_throw_on) {
-            throw std::runtime_error("index hash");
+struct throwing_key {
+    int v = -1;
+
+    throwing_key() = default;
+
+    throwing_key(int value) : v(value) {}  // implicit, so the tests ask by an int key
+
+    throwing_key(const throwing_key &) = default;
+
+    throwing_key(throwing_key && other) : v(other.v) {
+        if (g_key_move_throws) {
+            throw std::runtime_error("index key move");
         }
-        return std::hash<int>{}(key);
+    }
+
+    throwing_key & operator=(const throwing_key &) = default;
+    throwing_key & operator=(throwing_key &&)      = default;
+
+    bool operator==(const throwing_key & other) const { return v == other.v; }
+};
+
+struct throwing_key_hash {
+    size_t operator()(const throwing_key & k) const { return std::hash<int>{}(k.v); }
+};
+
+struct throwing_key_of {
+    bool operator()(const fake_handle & h, throwing_key * key) const {
+        if (h.key < 0) {
+            return false;
+        }
+        key->v = h.key;
+        return true;
     }
 };
 
-using throwing_bag = ggml_sycl::keyed_handle_bag<fake_handle, int, throwing_hash, fake_key_of>;
+using throwing_bag = ggml_sycl::keyed_handle_bag<fake_handle, throwing_key, throwing_key_hash, throwing_key_of>;
 
 // An append to an indexed bag whose index entry throws pops the handle again: the bag never holds a keyed handle its
-// index does not name, and every handle it held is still found where it is.
+// index does not name, and every handle it held is still found where it is. The next append is held and indexed.
 static int test_append_whose_index_entry_throws_pops_the_handle() {
     throwing_bag             b;
     std::vector<fake_handle> out;
@@ -254,14 +282,14 @@ static int test_append_whose_index_entry_throws_pops_the_handle() {
         b.push_back({ i % 3, i });
     }
     CHECK(b.take_key(1, out) == 2 && b.size() == 3, "the first take_key builds the index");
-    g_hash_throw_on = 9;
-    bool threw      = false;
+    g_key_move_throws = true;
+    bool threw        = false;
     try {
         b.push_back({ 9, 100 });
     } catch (const std::runtime_error &) {
         threw = true;
     }
-    g_hash_throw_on = -1;
+    g_key_move_throws = false;
     CHECK(threw && b.size() == 3, "an append whose index entry throws leaves the bag's size");
     for (size_t i = 0; i < b.size(); ++i) {
         CHECK(b[i].serial != 100, "the handle whose index entry threw is not held");
@@ -269,18 +297,21 @@ static int test_append_whose_index_entry_throws_pops_the_handle() {
     }
     CHECK(b.indexed() == b.keyed_count(), "the index names every keyed handle and nothing else");
     b.push_back({ 9, 101 });
-    CHECK(b.take_key(9, out) == 1 && out.back().serial == 101, "the next append under that key is indexed");
+    CHECK(b.size() == 4 && b[3].serial == 101 && b.holds_at(9, 3),
+          "the next append under that key is held and indexed");
+    CHECK(b.take_key(9, out) == 1 && out.back().serial == 101 && b.size() == 3,
+          "the next append under that key comes out by its key");
     return 0;
 }
 
 int main() {
-    int (*const tests[])() = { test_append_whose_index_entry_throws_pops_the_handle,
-                               test_take_key_moves_every_lease_on_the_key,
+    int (*const tests[])() = { test_take_key_moves_every_lease_on_the_key,
                                test_take_key_with_the_last_element_on_the_key,
                                test_assign_take_all_and_clear,
                                test_remove_if_keeps_the_rest_findable,
                                test_index_is_built_lazily,
-                               test_random_operations_match_a_reference };
+                               test_random_operations_match_a_reference,
+                               test_append_whose_index_entry_throws_pops_the_handle };
     for (int (*t)() : tests) {
         if (t() != 0) {
             return 1;
