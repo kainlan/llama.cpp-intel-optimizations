@@ -91597,6 +91597,16 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
     if (plan == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_EXPERTS) {
         patched_ok = ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, held, changed, &patched, &replaced, &declined);
     }
+    // A loan or evict that the patch's own allocations set off moves the generation, and may publish a withdrawn
+    // copy in the held record's place: a copy made before it is not published, and the build below decides. The
+    // copy's fresh leases may still be filling on the queue, so they wait for it with the ones it replaced.
+    if (patched_ok && weight.moe_expert_storage_generation != storage_generation) {
+        ggml_sycl_moe_hybrid_decode_record_append_handles(*patched, replaced);
+        ggml_sycl::retain_handles_until_event(std::move(replaced), ctx.stream()->ext_oneapi_submit_barrier());
+        patched.reset();
+        patched_ok = false;
+        declined   = "the expert storage moved while the patch ran";
+    }
     if (trace > 0 && plan != ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_NONE) {
         g_moe_hybrid_record_trace.patch(plan, patched_ok, changed.size());
         if (trace >= 2) {
@@ -91625,8 +91635,20 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
 
     std::shared_ptr<const moe_hybrid_decode_record> built;
     const char *                                    refusal = "unnamed";
-    const ggml_sycl::moe_decode_direct_outcome      outcome =
+    ggml_sycl::moe_decode_direct_outcome            outcome =
         ggml_sycl_moe_hybrid_decode_record_build(ctx, src0, &built, &refusal);
+    // The same move under the build: whatever the build decided over storage that moved is neither served nor cached,
+    // so it ends as a retry, the held record is dropped below, and the next lookup builds again. Its record's leases
+    // wait for the queue as a replaced record's do.
+    if (weight.moe_expert_storage_generation != storage_generation) {
+        if (built) {
+            std::vector<ggml_sycl::mem_handle> handles;
+            ggml_sycl_moe_hybrid_decode_record_append_handles(*built, handles);
+            ggml_sycl::retain_handles_until_event(std::move(handles), ctx.stream()->ext_oneapi_submit_barrier());
+            built.reset();
+        }
+        outcome = ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY;
+    }
     if (trace > 0) {
         g_moe_hybrid_record_trace.build_outcome(outcome);
         if (trace >= 2) {

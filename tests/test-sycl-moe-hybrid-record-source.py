@@ -56,7 +56,10 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
       copy and moving their leases into the drop's retention; it keeps the stamp, and notes every expert it emptied,
       so the next lookup is a generation miss the patch serves. That lookup counts the withdrawn slots in the trace,
       once, between the held record's binding and the patch plan, and the replaced record's retained handles skip a
-      withdrawn slot's empty lease.
+      withdrawn slot's empty lease;
+  T13 a patch or a build that the expert storage moved under (a loan or evict its own allocations set off) is not
+      served: the patch counts as declined, with that reason, and the build ends as a retry, each checked before its
+      count, and the discarded record's handles wait for a barrier on the queue as a replaced record's do.
 
 Checks run on comment-blanked text (string literals kept). NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if another pin
@@ -311,6 +314,18 @@ WITHDRAW_STEPS = (
 # The fixture's store clear, inside a lambda of a private test function: matched in the squashed file text.
 FIXTURE_CLEAR = ("extra.weight().moe_expert_storage_handles.clear(); extra.weight().note_moe_storage_change("
                  + ALL + ");")
+
+# T13: a patch or build the expert storage moved under is not served. A loan or evict that its own allocations set off
+# moves the generation and may publish a withdrawn copy in the held record's place.
+PATCH_MOVED = ("if (patched_ok && weight.moe_expert_storage_generation != storage_generation) { "
+               "ggml_sycl_moe_hybrid_decode_record_append_handles(*patched, replaced); "
+               "ggml_sycl::retain_handles_until_event(std::move(replaced), ctx.stream()->ext_oneapi_submit_barrier()); "
+               "patched.reset(); patched_ok = false; declined = \"")
+BUILD_MOVED = ("if (weight.moe_expert_storage_generation != storage_generation) { if (built) { "
+               "std::vector<ggml_sycl::mem_handle> handles; "
+               "ggml_sycl_moe_hybrid_decode_record_append_handles(*built, handles); "
+               "ggml_sycl::retain_handles_until_event(std::move(handles), ctx.stream()->ext_oneapi_submit_barrier()); "
+               "built.reset(); } outcome = ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY; }")
 
 
 class ContractError(AssertionError):
@@ -670,6 +685,16 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str, log
         raise ContractError("FAIL [pin T12]: the replaced record's handle list does not skip a withdrawn slot's empty "
                             "lease")
 
+    # T13: what the expert storage moved under is not served: a patch declines, a build is retried, before its count.
+    at_patch_moved = once(current, PATCH_MOVED, "T13", "the patch's discard when the expert storage moved under it")
+    if not at_call < at_patch_moved < at_count:
+        raise ContractError("FAIL [pin T13]: the patch's storage check is not between the patch and its count, so a "
+                            "copy made before a move could be published, or counted as patched")
+    at_build_moved = once(current, BUILD_MOVED, "T13", "the build's retry when the expert storage moved under it")
+    if not at_build < at_build_moved < at_outcome:
+        raise ContractError("FAIL [pin T13]: the build's storage check is not between the build and its outcome count, "
+                            "so a record built before a move could be served or cached, or counted as it ended")
+
 
 def self_test(raws: dict[str, str]) -> int:
     failures: list[str] = []
@@ -777,8 +802,9 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("patch-reason-unprinted", "T9", B,
                 [('declined ? ": " : "", declined ? declined : "");', '"", "");')])
     expect_fail("patch-published-unretained", "T9", B,
-                [("        ggml_sycl::retain_handles_until_event(std::move(replaced), ctx.stream()->ext_oneapi_submit_"
-                  "barrier());\n", "")])
+                [("hold their leases through it.\n"
+                  "        ggml_sycl::retain_handles_until_event(std::move(replaced), ctx.stream()->ext_oneapi_submit_"
+                  "barrier());\n", "hold their leases through it.\n")])
     expect_fail("patch-published-unsettled", "T9", B,
                 [("        (void) ggml_sycl::moe_decode_direct_stamp_settle(stamp,", "        (void) (stamp,")])
     expect_fail("lookup-returns-true-elsewhere", "T9", B,
@@ -946,6 +972,41 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    for (const ggml_sycl::mem_handle & h : record.lease) {\n        if (h.valid()) {\n"
                   "            out.push_back(h);\n        }\n    }\n",
                   "    out.insert(out.end(), record.lease.begin(), record.lease.end());\n")])
+    # T13: what the expert storage moved under.
+    patch_moved = ("    if (patched_ok && weight.moe_expert_storage_generation != storage_generation) {\n"
+                   "        ggml_sycl_moe_hybrid_decode_record_append_handles(*patched, replaced);\n"
+                   "        ggml_sycl::retain_handles_until_event(std::move(replaced), "
+                   "ctx.stream()->ext_oneapi_submit_barrier());\n"
+                   "        patched.reset();\n        patched_ok = false;\n"
+                   "        declined   = \"the expert storage moved while the patch ran\";\n    }\n")
+    patch_count = "        g_moe_hybrid_record_trace.patch(plan, patched_ok, changed.size());\n"
+    expect_fail("patch-served-after-storage-moved", "T13", B, [(patch_moved, "")])
+    expect_fail("patch-storage-checked-after-count", "T13", B,
+                [(patch_moved, ""), (patch_count, patch_count + patch_moved)])
+    expect_fail("patch-discard-unretained", "T13", B,
+                [("        ggml_sycl_moe_hybrid_decode_record_append_handles(*patched, replaced);\n"
+                  "        ggml_sycl::retain_handles_until_event(std::move(replaced), "
+                  "ctx.stream()->ext_oneapi_submit_barrier());\n", "")])
+    build_moved_if = "    if (weight.moe_expert_storage_generation != storage_generation) {\n        if (built) {\n"
+    build_moved = (build_moved_if +
+                   "            std::vector<ggml_sycl::mem_handle> handles;\n"
+                   "            ggml_sycl_moe_hybrid_decode_record_append_handles(*built, handles);\n"
+                   "            ggml_sycl::retain_handles_until_event(std::move(handles), "
+                   "ctx.stream()->ext_oneapi_submit_barrier());\n"
+                   "            built.reset();\n        }\n"
+                   "        outcome = ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY;\n    }\n")
+    outcome_count = "        g_moe_hybrid_record_trace.build_outcome(outcome);\n"
+    expect_fail("build-served-after-storage-moved", "T13", B, [(build_moved, "")])
+    expect_fail("build-storage-checked-after-count", "T13", B,
+                [(build_moved, ""), (outcome_count, outcome_count + build_moved)])
+    expect_fail("build-storage-check-eligible-only", "T13", B,
+                [(build_moved_if,
+                  "    if (outcome == ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE &&\n"
+                  "        weight.moe_expert_storage_generation != storage_generation) {\n        if (built) {\n")])
+    expect_fail("build-discard-unretained", "T13", B,
+                [("            ggml_sycl_moe_hybrid_decode_record_append_handles(*built, handles);\n"
+                  "            ggml_sycl::retain_handles_until_event(std::move(handles), "
+                  "ctx.stream()->ext_oneapi_submit_barrier());\n", "")])
     expect_fail("docs-row-lacks-withdrawn", "T7", D,
                 [("patch_unlogged= withdrawn=` line", "patch_unlogged=` line"), (" `withdrawn=` counts", " counts")])
 
