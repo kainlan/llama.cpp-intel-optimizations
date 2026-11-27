@@ -133,7 +133,7 @@ void run_one(sycl::queue & q, const grouped_case & c, std::mt19937 & rng) {
         }
     }
     ggml_sycl::moe_bf16_grouped_plan              plan;
-    const ggml_sycl::moe_bf16_grouped_plan_status status = ggml_sycl::moe_bf16_grouped_build_plan(
+    const ggml_sycl::moe_bf16_grouped_plan_status status = ggml_sycl::moe_bf16_grouped_plan_build(
         ids.data(), size_t(c.n_tokens), size_t(c.n_slots), size_t(c.n_experts), &plan);
     CHECK(status == ggml_sycl::moe_bf16_grouped_plan_status::OK, "%s: the plan did not build (%s)", c.name,
           ggml_sycl::moe_bf16_grouped_plan_status_name(status));

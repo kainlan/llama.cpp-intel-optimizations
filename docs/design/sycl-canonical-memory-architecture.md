@@ -71,6 +71,17 @@ reservation takes `pp_moe_onednn_scratch_mutex_` or calls the allocator (§12.5)
 `unified_cache::reserve_pp_moe_onednn_scratch` applies the same cap on its own
 entry, so an executor that skipped the check cannot reach the ring through it.
 
+A node that stages no weight is admitted by the same cap on its activation and
+output planes alone: `ggml_sycl::pp_moe_onednn_admit_weightless_scratch`, the
+entry point of the BF16 grouped prompt arm of MUL_MAT_ID, which reads each expert
+where it is loaded. It still requires the whole plan, weight plane included,
+because the slot it claims is one the plan sized; `pp_moe_onednn_admit_scratch`
+would refuse the zero-byte weight request such a node has. Its one quiet refusal
+is MISSING_PLAN: the arm plans no ring of its own, so on a device where no other
+consumer planned one the direct route is the planned path, and the arm counts the
+decline (`scratch_unplanned`) without the WARN. Every other refusal of the arm is
+a plan that missed the node and takes its latched WARN.
+
 The cap is compared at slot-allocation granularity: both the plan and the request
 are rounded up to the ring's slot alignment with checked arithmetic, and the
 aligned plan is the ceiling. A size too large to align is refused rather than

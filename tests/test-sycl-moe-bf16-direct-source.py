@@ -146,7 +146,7 @@ ARM_ENABLED = "ggml_sycl_moe_bf16_grouped_enabled()"
 ARM_ENABLED_HEAD = f"static bool {ARM_ENABLED} {{"
 ARM_ENABLED_PARTS = ("static const bool enabled = [", 'std::getenv("GGML_SYCL_MOE_BF16_GROUPED")', "return enabled;")
 ARM_OPT_OUT_ENV = '"GGML_SYCL_MOE_BF16_GROUPED"'
-ARM_DECLINE_HEAD = ("static bool ggml_sycl_moe_bf16_grouped_decline(const ggml_tensor * src0, int device, "
+ARM_DECLINE_HEAD = ("static bool ggml_sycl_moe_bf16_grouped_note_decline(const ggml_tensor * src0, int device, "
                     "moe_bf16_grouped_decline decline) {")
 ARM_DECLINE_COUNT = "g_moe_bf16_grouped_declines[reason].fetch_add(1, std::memory_order_relaxed)"
 ARM_IDS = "ggml_sycl_get_moe_ids_d2h_cache_entry(ctx, ids, "
@@ -158,7 +158,7 @@ ARM_ADMIT_DECLINE = "return decline(moe_bf16_grouped_decline::SCRATCH_UNPLANNED)
 ARM_ADMIT_ROUTED = ("if (!admit_planes(io.n_rows * static_cast<size_t>(k) * sizeof(uint16_t), "
                     f"io.n_rows * static_cast<size_t>(m) * sizeof(float))) {{ {ARM_ADMIT_DECLINE}")
 ARM_ADMIT_PACKED = f"if (!admit_planes(act_bytes, out_bytes)) {{ {ARM_ADMIT_DECLINE}"
-ARM_PLAN = "ggml_sycl::moe_bf16_grouped_build_plan("
+ARM_PLAN = "ggml_sycl::moe_bf16_grouped_plan_build("
 ARM_RESERVE = "cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)"
 ARM_CLAIM = "if (!pp_moe_onednn_claim_scratch_slot(ctx.device, ring_depth, scratch_slot)) {"
 ARM_UOP2 = "// llama.cpp-uop2:"
@@ -603,7 +603,7 @@ def claim_i_grouped_arm(s):
         fails.append("GGML_SYCL_MOE_BF16_GROUPED is read somewhere other than the arm's one helper")
     if arm.count(ARM_ENABLED) != 1 or not tight(arm).startswith(
             "constggml_tensor*src0=dst->src[0];constggml_tensor*src1=dst->src[1];constggml_tensor*ids=dst->src[2];"
-            "constautodecline=[&](moe_bf16_grouped_declinereason){returnggml_sycl_moe_bf16_grouped_decline(src0,"
+            "constautodecline=[&](moe_bf16_grouped_declinereason){returnggml_sycl_moe_bf16_grouped_note_decline(src0,"
             f"ctx.device,reason);}};if(!{ARM_ENABLED}){{returndecline(moe_bf16_grouped_decline::OPT_OUT);}}"):
         fails.append("the grouped arm does not ask the opt-out first, as a counted decline")
     # Every way out short of running the node is a counted decline.

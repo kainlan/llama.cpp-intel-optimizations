@@ -3293,21 +3293,34 @@ rectangle's 16,384: slots of 33.6 MB and 67.1 MB instead of 90 MB and 180 MB.
 
 **Which models plan a ring.** The loader sizes a ring for every MoE model, from
 its gate, up, down and fused gate_up experts (`llama_sycl_is_moe_expert_weight_name`
-in `src/llama-sycl-expert-names.h`). Only two consumers claim its slots: the
-batched prompt executor (its WOQ and f16 tables) and the MXFP4 SOA per-expert
-staging. The load-time publish therefore plans no ring, weight slot and depth 0,
-when no gate, up, down or gate_up expert has a type one of them runs
+in `src/llama-sycl-expert-names.h`). Two consumers plan it and claim its slots:
+the batched prompt executor (its WOQ and f16 tables) and the MXFP4 SOA
+per-expert staging. The load-time publish therefore plans no ring, weight slot
+and depth 0, when no gate, up, down or gate_up expert has a type one of them runs
 (`moe_pp_onednn_ring_serves_type` in `moe-mmvq-tables.hpp`, asked by
 `ggml_sycl_inventory_ring_has_consumer`). It asks no runtime knob, so the ring a
 load plans does not change with a knob that turns an executor off for one run.
 A model with no ring logs "[SYCL-PLAN] no PP MoE oneDNN scratch ring on device N"
 and no ring line.
 
+A third claimant plans nothing: the BF16 grouped prompt arm of MUL_MAT_ID
+(`ggml_sycl_mul_mat_id_bf16_grouped`, Task 24 of the Inkling plan below) claims a
+slot of a ring the other two planned and writes no weight plane. It reads each
+BF16 expert where it is loaded, uses only the slot's activation and output
+planes, and is admitted on those two alone
+(`pp_moe_onednn_admit_weightless_scratch` in `moe-scratch-admission.hpp`). BF16
+is not a type the ring serves, so a model whose only MoE experts are BF16 plans
+no ring, and there the arm declines every node quietly: the admission's
+MISSING_PLAN is no WARN, the arm counts a `scratch_unplanned` decline before it
+reads the ids, and the BF16 direct route runs the node.
+
 Inkling 2 Mini plans one since its NVFP4 experts joined the executor's f16 table
 (Task 21 of `docs/plans/2026-11-21-inkling2-mini-sycl-enable-profile-optimize.md`):
 the MMID direct route steps aside for a prompt the executor claims while the ring
-is planned (`moe_mmid_direct_defers_to_executor`), and its BF16 experts stay on
-the BF16 direct route. Its widest expert is the fused gate_up weight (K 2304,
+is planned (`moe_mmid_direct_defers_to_executor`). Its BF16 experts ride that
+ring: a prompt node of at least 64 tokens runs on the BF16 grouped arm, and a
+decode node, a shorter prompt node or a node the arm declines runs on the BF16
+direct route. Its widest expert is the fused gate_up weight (K 2304,
 N 2304, 128 experts, 8 used), so at `-ub 512` the ring is 558.6 MB: a 344.3 MB
 weight slot (128 experts in the MXFP4 WOQ shape the loader sizes for), and
 activation and output slots of 71.4 MB and 142.9 MB (16,256 packed rows of 4,608

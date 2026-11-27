@@ -90429,7 +90429,9 @@ static std::atomic<uint64_t> g_moe_bf16_grouped_declines[static_cast<size_t>(moe
 
 // Counts a decline and names it in the route log, the first 16 times per reason (a decode node declines on every
 // token, which would otherwise use up a shared cap). A decline is not a fault: the direct route runs the node.
-static bool ggml_sycl_moe_bf16_grouped_decline(const ggml_tensor * src0, int device, moe_bf16_grouped_decline decline) {
+static bool ggml_sycl_moe_bf16_grouped_note_decline(const ggml_tensor *      src0,
+                                                    int                      device,
+                                                    moe_bf16_grouped_decline decline) {
     const size_t   reason   = static_cast<size_t>(decline);
     const uint64_t declines = g_moe_bf16_grouped_declines[reason].fetch_add(1, std::memory_order_relaxed) + 1;
     if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
@@ -90475,7 +90477,7 @@ static bool ggml_sycl_mul_mat_id_bf16_grouped(ggml_backend_sycl_context & ctx, g
     const ggml_tensor * src1    = dst->src[1];
     const ggml_tensor * ids     = dst->src[2];
     const auto          decline = [&](moe_bf16_grouped_decline reason) {
-        return ggml_sycl_moe_bf16_grouped_decline(src0, ctx.device, reason);
+        return ggml_sycl_moe_bf16_grouped_note_decline(src0, ctx.device, reason);
     };
 
     if (!ggml_sycl_moe_bf16_grouped_enabled()) {
@@ -90570,7 +90572,7 @@ static bool ggml_sycl_mul_mat_id_bf16_grouped(ggml_backend_sycl_context & ctx, g
         return decline(moe_bf16_grouped_decline::IDS);
     }
     ggml_sycl::moe_bf16_grouped_plan plan;
-    if (ggml_sycl::moe_bf16_grouped_build_plan(ids_entry.host_ids.data(), static_cast<size_t>(n_tokens),
+    if (ggml_sycl::moe_bf16_grouped_plan_build(ids_entry.host_ids.data(), static_cast<size_t>(n_tokens),
                                                static_cast<size_t>(n_slots), static_cast<size_t>(n_experts),
                                                &plan) != ggml_sycl::moe_bf16_grouped_plan_status::OK) {
         return decline(moe_bf16_grouped_decline::PLAN);
