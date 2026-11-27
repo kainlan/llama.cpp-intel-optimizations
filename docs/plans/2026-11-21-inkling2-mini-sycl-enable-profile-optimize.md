@@ -7151,6 +7151,68 @@ B50 = `level_zero:1`, and pp / tg are in t/s.
     written for it.
   - Next task: the BF16 experts take a prompt GEMM (Task 24).
 
+### Task 24: A BF16 expert prompt node is grouped oneDNN bf16 GEMMs on the experts as loaded (written 2026-11-26)
+
+**Track:** S3-prompt. **Base:** `5fe78f15ac` (`feat/inkling2`). **Found by:** the long-prompt profile above.
+`mulmat.moe.bf16_direct` is 3.97 s of the 9.96 s of device time on the B70: 88 prompt nodes (Inkling's blocks
+20-23, gate_up and down, over 11 micro-batches) at about 45 ms each. The NVFP4 nodes of the same shapes cost about
+1.9 ms of GEMM each on the grouped executor.
+
+**What exists.** `ggml_sycl_mul_mat_id` sends every BF16 `MUL_MAT_ID` to `ggml_sycl_mul_mat_id_bf16_direct`
+(`ggml-sycl.cpp:92399-92404` at the base) ahead of every other route. That route is one kernel launch with one
+work-group per (token, expert-slot) pair, reading the experts through the full-local AOS table
+(`ggml_sycl_moe_direct_ensure_aos_table`). Its predicate `ggml_sycl_moe_bf16_direct_route_available`
+(`:90214`) is shared with `supports_op` (`:133770`). The grouped executor (`try_pp_onednn_f16_batched`, Task 21)
+serves NVFP4 and about twenty other types: a host counting sort of the ids, then per active expert a gather of its
+rows, a weight plane in the planned ring slot, one oneDNN GEMM, and a scatter. Task 22's probe
+(`docs/backend/data/inkling2/t22-probe-b{70,50}-4a0b8b6d2.txt`) shows oneDNN 3.13.2 creating bf16 x bf16 -> f32
+strict as `jit:gemm:any` with a 0 B scratchpad, in either orientation. The mixed f32 x bf16 primitives are
+reference kernels and must not be used.
+
+**Intended design, to be confirmed or corrected at the checkpoint.**
+- A prompt BF16 node (`ne12 > 1` tokens) whose every expert the plan puts on this card at AOS takes the grouped
+  executor with a bf16 weight arm.
+- No weight plane and no conversion of the weight. The GEMM reads each active expert where it is loaded, through
+  the AOS table's per-expert pointer: layout follows residency, and the loaded layout is the answer.
+- The gather writes the expert's activation rows as bf16, rounded to nearest even with
+  `ggml_sycl_bf16::f32_to_bf16_rne`, as Task 22 does. The GEMM is bf16 x bf16 -> f32 strict. The scatter writes f32
+  to dst as for the other types.
+- Decode, and any node the arm declines, keep the BF16 direct kernel unchanged. That kernel stays the only BF16
+  route for a decode node and for widths the arm does not take.
+- A weight with any expert on the host or on the other card does not change route.
+
+**Checkpoint before any GREEN code (report to the lead, then wait). Read on the base; cite file:line:**
+1. The executor end to end for one F16-dequant type: the claim (`moe_mmid_direct_defers_to_executor`, the ring
+   weight-slot condition), the ids sort and what it waits on, the per-expert stage kernels (gather, act, dequant,
+   scatter), the GEMM call and its orientation, and every allocation and its owner. Say which stages a bf16 arm
+   skips, which it changes (the gather's output type), and which it keeps.
+2. Whether `DnnlGemmWrapper` (the one Task 22 uses) can take a weight pointer per expert straight from the AOS table
+   with the expert's `nb[1]` as its leading dimension, and what the GEMM's dependency on the gather's event is.
+3. The seam with the BF16 direct route. Its BF16 short-circuit at `:92399` runs ahead of the executor today, and the
+   direct route promises that nothing after it computes a BF16 op. Write the new order and the predicate both routes
+   and `supports_op` read, so that an admitted op is still an op some route runs.
+4. Whether the ring weight slot is still needed when the arm writes no weight plane. If the claim requires a planned
+   slot, how the bf16 arm is admitted without asking the planner for VRAM it does not use.
+5. Host cost: the submissions per node for about 110 active experts in this arm, against the direct kernel's one.
+   Read the stage labels and say whether each `moe.pp.stage.*` and `moe.pp.dequant.*` profiler row is its own queue
+   submission. That is the input to the separate question about the long prompt's host time.
+6. Graph recording, the B50 alone (BF16 experts host-pinned), and both cards: what each takes after the change.
+
+**Acceptance (each lead run once, B70 first):**
+- The long real-text arm on the B70: pp at least 1.15x the 251.6 t/s of the record above, or the task stops and
+  reports why.
+- The BF16 expert device time per pass, from the kernel profiler, at most 0.6 s against 3.97 s.
+- Text byte-equal run to run. Decode not slower. Peak host backing not higher.
+- Inkling perplexity on the B70 within 0.25 of the original 7.5792, not of 7.5959.
+- A device test of the arm against the CPU reference at the same NMSE bound as `test-moe-pp-batched-dequant`, on
+  Inkling's shapes (2304 x 4608 gate_up and 2304 x 2304 down, 128 experts, top-8, 512 tokens) and on a node with
+  experts no token selects.
+- The Inkling gates on the B70, the B50 and both cards. The Mistral B70 and GPT-OSS B50 gates.
+- `test-backend-ops -o MUL_MAT_ID` with no case changing on either card.
+- The two fixed sweeps with no new red. The interleaved ABBA against `2a69aea88b`.
+- No `-ngl`, no context shrink, no new host wait, no allocation outside the unified cache, and no second layout of
+  any weight.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
