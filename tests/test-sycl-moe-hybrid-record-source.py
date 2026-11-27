@@ -11,9 +11,10 @@ every expert of the tensor. GGML_SYCL_MOE_HYBRID_RECORD_TRACE counts that work p
 many records a token rebuilds, why, and how many experts each rebuild resolves. The host test
 (tests/test-sycl-moe-hybrid-record.cpp) proves the bookkeeping; this gate holds where the backend calls it:
 
-  T1  the lookup classifies its stamp with moe_hybrid_record_miss_classify, once, and only a NONE miss returns the
-      held decision, and never a record a loan or an evict withdrew a slot from; the stamp's own current test is not
-      asked a second time beside it;
+  T1  the lookup classifies its stamp with moe_hybrid_record_miss_classify, once, telling it whether the held record
+      has a slot a loan or an evict withdrew (the classifier names a current stamp over one a generation miss, so the
+      record is patched or built, never served and never stalled on), and only a NONE miss returns the held decision;
+      the stamp's own current test is not asked a second time beside it;
   T2  the trace level is read once, in a function-local static of ggml_sycl_moe_hybrid_record_trace_level(), from
       GGML_SYCL_MOE_HYBRID_RECORD_TRACE; the name appears nowhere else in the backend;
   T3  every lookup is counted, with its miss, before the held decision returns; the lookup that finds no published
@@ -74,10 +75,11 @@ LEVEL_SIG = "static int ggml_sycl_moe_hybrid_record_trace_level() {"
 LOOKUP_SIG = "static void ggml_sycl_moe_hybrid_record_trace_lookup("
 ENV_NAME = "GGML_SYCL_MOE_HYBRID_RECORD_TRACE"
 
+# The held record's withdrawn slots go to the classifier, which names a current stamp over them a generation miss.
 CLASSIFY = ("const ggml_sycl::moe_hybrid_record_miss miss = ggml_sycl::moe_hybrid_record_miss_classify(stamp, "
-            "replan_epoch, storage_generation, selected_rows);")
-HELD_RETURN = ("if (miss == ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE) { *out = weight.moe_hybrid_decode[device]; "
-               "return stamp.eligible && *out && (*out)->n_withdrawn == 0; }")
+            "replan_epoch, storage_generation, selected_rows, held && held->n_withdrawn > 0);")
+HELD_RETURN = ("if (miss == ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE) { *out = held; "
+               "return stamp.eligible && *out != nullptr; }")
 TRACE_READ = "const int trace = ggml_sycl_moe_hybrid_record_trace_level();"
 TRACE_LOOKUP = "if (trace > 0) { ggml_sycl_moe_hybrid_record_trace_lookup(src0, miss,"
 NO_PLAN = ("if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) { if (trace > 0) { "
@@ -446,7 +448,10 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str) -> 
     at_count = once(current, PATCH_COUNT, "T9", "the patch's count")
     at_patch_warn = once(current, PATCH_WARN, "T9", "the per-patch WARN line")
     at_publish = once(current, PATCH_PUBLISH, "T9", "the patched record's publication")
-    if not at_no_plan < at_patch_held < at_plan < at_call < at_count < at_patch_warn < at_publish < at_build:
+    if not at_patch_held < at_classify:
+        raise ContractError("FAIL [pin T1]: the held record is bound after the stamp is classified, so the classifier "
+                            "cannot be told of its withdrawn slots")
+    if not at_no_plan < at_plan < at_call < at_count < at_patch_warn < at_publish < at_build:
         raise ContractError("FAIL [pin T9]: the patch path is not plan, patch, count, line, publish, between the "
                             "no-plan return and the build")
     patch_guard = current.find(BUILD_GUARD, at_count)
@@ -557,9 +562,9 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str) -> 
     if "const_cast" in withdraw or WAIT_CALLS.search(withdraw):
         raise ContractError("FAIL [pin T12]: the withdrawal writes the published record or waits on the device")
     at_withdrawn = once(current, WITHDRAWN_COUNT, "T12", "the lookup's count of the withdrawn slots it refills")
-    if not at_patch_held < at_withdrawn < at_plan:
-        raise ContractError("FAIL [pin T12]: the withdrawn slots are not counted between the held record's binding and "
-                            "the patch plan, the one place every lookup that replaces the record passes exactly once")
+    if not at_no_plan < at_withdrawn < at_plan:
+        raise ContractError("FAIL [pin T12]: the withdrawn slots are not counted between the no-plan return and the "
+                            "patch plan, the one place every lookup that replaces the record passes exactly once")
     appends = definition_spans(backend_sq, APPEND_SIG)
     if len(appends) != 1 or APPEND_LEASES not in backend_sq[appends[0][0] : appends[0][1] + 1]:
         raise ContractError("FAIL [pin T12]: the replaced record's handle list does not skip a withdrawn slot's empty "
@@ -756,9 +761,8 @@ def self_test(raws: dict[str, str]) -> int:
                   "    if (expert_count == 0) {\n        extra->weight().note_moe_storage_change(" + ALL + ");\n    }\n")])
 
     # T1, T10, T12: the drop's withdrawal, and the two places that refuse or clear a withdrawn record.
-    expect_fail("held-return-serves-withdrawn", "T1", B,
-                [("        return stamp.eligible && *out && (*out)->n_withdrawn == 0;",
-                  "        return stamp.eligible && *out;")])
+    expect_fail("lookup-classifies-without-withdrawn", "T1", B,
+                [("selected_rows, held && held->n_withdrawn > 0);", "selected_rows, false);")])
     expect_fail("patch-keeps-withdrawn-count", "T10", B, [("    patched->n_withdrawn = 0;\n", "")])
     expect_fail("drop-resets-stamp", "T12", B,
                 [("    if (stored && std::find(emptied.begin(),",

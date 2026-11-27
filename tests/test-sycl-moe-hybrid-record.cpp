@@ -32,28 +32,46 @@ static moe_decode_direct_stamp settled_stamp() {
 
 static int test_miss_classify() {
     const moe_decode_direct_stamp s = settled_stamp();
-    CHECK(moe_hybrid_record_miss_classify(s, 3, 7, 8) == ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE,
+    CHECK(moe_hybrid_record_miss_classify(s, 3, 7, 8, false) == ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE,
           "the inputs the decision was made for: the stamp answers");
-    CHECK(moe_hybrid_record_miss_classify(s, 4, 7, 8) == ggml_sycl::MOE_HYBRID_RECORD_MISS_EPOCH,
+    CHECK(moe_hybrid_record_miss_classify(s, 4, 7, 8, false) == ggml_sycl::MOE_HYBRID_RECORD_MISS_EPOCH,
           "a mid-load replan moved the epoch");
-    CHECK(moe_hybrid_record_miss_classify(s, 3, 7, 4) == ggml_sycl::MOE_HYBRID_RECORD_MISS_ROWS,
+    CHECK(moe_hybrid_record_miss_classify(s, 3, 7, 4, false) == ggml_sycl::MOE_HYBRID_RECORD_MISS_ROWS,
           "the op selects another number of rows");
-    CHECK(moe_hybrid_record_miss_classify(s, 3, 9, 8) == ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION,
+    CHECK(moe_hybrid_record_miss_classify(s, 3, 9, 8, false) == ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION,
           "only the expert storage generation moved");
     // A miss on several inputs names the one a held record cannot be kept across: the epoch before the rows, the
     // rows before the generation.
-    CHECK(moe_hybrid_record_miss_classify(s, 4, 9, 4) == ggml_sycl::MOE_HYBRID_RECORD_MISS_EPOCH,
+    CHECK(moe_hybrid_record_miss_classify(s, 4, 9, 4, false) == ggml_sycl::MOE_HYBRID_RECORD_MISS_EPOCH,
           "epoch and generation and rows moved: the epoch is named");
-    CHECK(moe_hybrid_record_miss_classify(s, 3, 9, 4) == ggml_sycl::MOE_HYBRID_RECORD_MISS_ROWS,
+    CHECK(moe_hybrid_record_miss_classify(s, 3, 9, 4, false) == ggml_sycl::MOE_HYBRID_RECORD_MISS_ROWS,
           "rows and generation moved: the rows are named");
 
+    // A current stamp over a record an expert loan or evict withdrew a slot from is the generation move the drop made,
+    // never the held decision: its table still names a retired weight. A replan is still named first.
+    CHECK(
+        moe_hybrid_record_miss_classify(s, 3, 7, 8, /*withdrawn=*/true) == ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION,
+        "a withdrawn record under a current stamp is a generation miss");
+    CHECK(moe_hybrid_record_miss_classify(s, 4, 7, 8, /*withdrawn=*/true) == ggml_sycl::MOE_HYBRID_RECORD_MISS_EPOCH,
+          "a withdrawn record under a replan is still the replan");
+    // The log names nothing since the stamp's generation, so the lookup builds the record: it never stalls on it.
+    {
+        ggml_sycl::moe_storage_change_log log;
+        log.note(7, 1);
+        std::vector<int32_t> changed;
+        CHECK(ggml_sycl::moe_hybrid_record_plan_patch(ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION, s, true, log, 7,
+                                                      &changed) == ggml_sycl::MOE_HYBRID_RECORD_PATCH_UNLOGGED &&
+                  changed.empty(),
+              "a withdrawn record under a current stamp is built again");
+    }
+
     const moe_decode_direct_stamp fresh{};
-    CHECK(moe_hybrid_record_miss_classify(fresh, 3, 7, 8) == ggml_sycl::MOE_HYBRID_RECORD_MISS_UNDECIDED,
+    CHECK(moe_hybrid_record_miss_classify(fresh, 3, 7, 8, false) == ggml_sycl::MOE_HYBRID_RECORD_MISS_UNDECIDED,
           "a tensor never decided (or a dropped decision) has no stamp to compare");
 
     moe_decode_direct_stamp retried{};
     ggml_sycl::moe_decode_direct_stamp_settle(retried, 3, 7, 8, 0, ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_RETRY);
-    CHECK(moe_hybrid_record_miss_classify(retried, 3, 7, 8) == ggml_sycl::MOE_HYBRID_RECORD_MISS_RETRY,
+    CHECK(moe_hybrid_record_miss_classify(retried, 3, 7, 8, false) == ggml_sycl::MOE_HYBRID_RECORD_MISS_RETRY,
           "a build that asked to be retried leaves no decision, and the miss says so");
 
     // The classifier agrees with the stamp's own test on every input it is asked about.
@@ -61,9 +79,12 @@ static int test_miss_classify() {
         for (uint64_t gen = 6; gen <= 8; ++gen) {
             for (int64_t rows = 7; rows <= 9; ++rows) {
                 const bool current = ggml_sycl::moe_decode_direct_stamp_current(s, epoch, gen, rows);
-                const bool none =
-                    moe_hybrid_record_miss_classify(s, epoch, gen, rows) == ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE;
+                const bool none    = moe_hybrid_record_miss_classify(s, epoch, gen, rows, false) ==
+                                  ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE;
                 CHECK(current == none, "NONE is exactly the stamp being current");
+                CHECK(moe_hybrid_record_miss_classify(s, epoch, gen, rows, true) !=
+                          ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE,
+                      "a withdrawn record is never held, whatever the stamp");
             }
         }
     }

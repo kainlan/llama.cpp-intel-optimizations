@@ -82,11 +82,15 @@ enum moe_hybrid_record_miss : int {
     MOE_HYBRID_RECORD_MISS_COUNT,
 };
 
-// NONE exactly when moe_decode_direct_stamp_current() holds for the same inputs.
+// NONE exactly when moe_decode_direct_stamp_current() holds for the same inputs and the held record has no slot an
+// expert loan or evict withdrew (`withdrawn`). Such a record's table still names a retired weight, and the drop that
+// emptied the slot moved the generation, so a current stamp over one is named the generation miss it is: the lookup
+// patches or builds the record, and never serves it or stays on the retained route because of it.
 inline moe_hybrid_record_miss moe_hybrid_record_miss_classify(const moe_decode_direct_stamp & s,
                                                               uint64_t                        replan_epoch,
                                                               uint64_t                        storage_generation,
-                                                              int64_t                         selected_rows) {
+                                                              int64_t                         selected_rows,
+                                                              bool                            withdrawn) {
     if (!s.valid) {
         return s.retries > 0 ? MOE_HYBRID_RECORD_MISS_RETRY : MOE_HYBRID_RECORD_MISS_UNDECIDED;
     }
@@ -96,7 +100,7 @@ inline moe_hybrid_record_miss moe_hybrid_record_miss_classify(const moe_decode_d
     if (s.selected_rows != selected_rows) {
         return MOE_HYBRID_RECORD_MISS_ROWS;
     }
-    if (s.expert_storage_generation != storage_generation) {
+    if (s.expert_storage_generation != storage_generation || withdrawn) {
         return MOE_HYBRID_RECORD_MISS_GENERATION;
     }
     return MOE_HYBRID_RECORD_MISS_NONE;

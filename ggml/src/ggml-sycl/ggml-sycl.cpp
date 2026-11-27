@@ -91507,8 +91507,13 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
     ggml_sycl::moe_decode_direct_stamp & stamp        = weight.moe_hybrid_decode_stamp[device];
     const uint64_t                       replan_epoch = ggml_sycl::moe_route_table_current_replan_epoch();
     const uint64_t                       storage_generation = weight.moe_expert_storage_generation;
-    const ggml_sycl::moe_hybrid_record_miss miss =
-        ggml_sycl::moe_hybrid_record_miss_classify(stamp, replan_epoch, storage_generation, selected_rows);
+
+    std::shared_ptr<const moe_hybrid_decode_record> & held = weight.moe_hybrid_decode[device];
+    // A record a loan or evict withdrew a slot from is never served: its table still names the retired weight. The
+    // classifier names a current stamp over one a generation miss, so it is patched or built below, never left to
+    // keep the tensor on the retained route.
+    const ggml_sycl::moe_hybrid_record_miss           miss = ggml_sycl::moe_hybrid_record_miss_classify(
+        stamp, replan_epoch, storage_generation, selected_rows, held && held->n_withdrawn > 0);
     const int trace = ggml_sycl_moe_hybrid_record_trace_level();
     if (trace > 0) {
         ggml_sycl_moe_hybrid_record_trace_lookup(src0, miss,
@@ -91517,10 +91522,8 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
                                                      0);
     }
     if (miss == ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE) {
-        *out = weight.moe_hybrid_decode[device];
-        // A withdrawn slot always moves the generation, so a current stamp never holds such a record; the test keeps
-        // its table, which names a retired weight, from being served if one ever did.
-        return stamp.eligible && *out && (*out)->n_withdrawn == 0;
+        *out = held;
+        return stamp.eligible && *out != nullptr;
     }
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
     if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
@@ -91538,7 +91541,6 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
     // A generation miss on an eligible held record whose moves the tensor's change log still names is patched over
     // the experts that moved. A replan, a change of selected rows, a log that lost a move or named every expert, or a
     // patch that declines, builds the record again over every expert below.
-    std::shared_ptr<const moe_hybrid_decode_record> & held = weight.moe_hybrid_decode[device];
     // Every way on from here replaces the held record, by a patch or a build, so its withdrawn slots count once. On a
     // device this is the trace's one sign that a loan or evict matched a slot by the entry it retired.
     if (trace > 0 && held && held->n_withdrawn > 0) {
