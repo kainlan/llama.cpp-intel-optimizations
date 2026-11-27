@@ -2384,8 +2384,9 @@ static bool runtime_registry_row_indexed(const alloc_metadata & h) noexcept {
 static size_t g_test_registry_rows_scanned = 0;  // guarded by g_runtime_alloc_mutex
 #endif
 
-// Registry rows visited by the settle queries and their refusal enumerations; only the tests read it, to pin that a clean
-// settle visits none.
+// Registry rows visited by the settle queries and their refusal enumerations, and by the promotion-cleanup questions the
+// deferred-free pass asks on every synchronize; only the tests read it, to pin that a clean settle visits none and that
+// those questions visit only the rows still waiting for their cleanup.
 static void runtime_registry_note_row_scanned_locked() noexcept {
 #if defined(GGML_SYCL_PRIVATE_TESTING)
     g_test_registry_rows_scanned++;
@@ -16977,6 +16978,7 @@ size_t unified_cache::erase_entry_locked(const unified_cache_key & key) noexcept
 size_t unified_cache::finalize_retired_entries_locked() {
     size_t finalized = 0;
     for (auto it = entries_.begin(); it != entries_.end();) {
+        retired_entry_visits_.fetch_add(1, std::memory_order_relaxed);
         unified_cache_entry & entry = it->second;
         if (!entry.retired || entry.in_use_count.load() != 0 || entry.state == cache_entry_state::EVICTING) {
             ++it;
@@ -17642,6 +17644,10 @@ void unified_cache::test_reset_evictions_latch() noexcept {
 
 uint64_t unified_cache::test_id_remap_walks() const noexcept {
     return id_remap_walks_.load(std::memory_order_relaxed);
+}
+
+uint64_t unified_cache::test_retired_entry_visits() const noexcept {
+    return retired_entry_visits_.load(std::memory_order_relaxed);
 }
 
 bool unified_cache::test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const {
@@ -22762,6 +22768,7 @@ static size_t process_pending_legacy_promotion_cleanup(int device) noexcept {
             std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
             pending.reserve(g_runtime_alloc_registry.size());
             for (const auto & item : g_runtime_alloc_registry) {
+                runtime_registry_note_row_scanned_locked();
                 const runtime_alloc_record & row = item.second;
                 if (row.ownership == runtime_alloc_ownership::LEGACY && row.promotion_cleanup_pending &&
                     (device < 0 || row.handle.device == device)) {
@@ -22819,9 +22826,10 @@ static bool has_pending_legacy_promotion_cleanup(int device) noexcept {
         std::lock_guard<std::mutex> lock(g_runtime_alloc_mutex);
         return std::any_of(g_runtime_alloc_registry.begin(), g_runtime_alloc_registry.end(),
                            [device](const auto & item) {
-            const runtime_alloc_record & row = item.second;
-            return row.promotion_cleanup_pending && (device < 0 || row.handle.device == device);
-        });
+                               runtime_registry_note_row_scanned_locked();
+                               const runtime_alloc_record & row = item.second;
+                               return row.promotion_cleanup_pending && (device < 0 || row.handle.device == device);
+                           });
     } catch (...) {
         return true;
     }
@@ -23058,6 +23066,10 @@ bool allocation_registry_test_unhold_physical_release(const alloc_metadata & met
 
 size_t allocation_registry_test_process_promotion_retries(int device) noexcept {
     return process_pending_legacy_promotion_cleanup(device);
+}
+
+bool allocation_registry_test_has_promotion_cleanup_pending(int device) noexcept {
+    return has_pending_legacy_promotion_cleanup(device);
 }
 
 registered_release_status allocation_registry_test_release_exact(

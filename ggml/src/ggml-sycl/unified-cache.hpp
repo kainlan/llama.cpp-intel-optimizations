@@ -5816,6 +5816,8 @@ class unified_cache {
     // Test-only: the last clears the eviction latch, which production code must never do outside a reclaim.
     // The walks of entries_ the id remap has made over the cache's life (id_remap_walks_).
     uint64_t test_id_remap_walks() const noexcept;
+    // The entries the retired-entry finalize has visited over the cache's life (retired_entry_visits_).
+    uint64_t test_retired_entry_visits() const noexcept;
     // The key `id` maps to, in *out; false when the id maps to nothing.
     bool     test_id_mapping(ggml_sycl_cache_id id, unified_cache_key * out) const;
     // Clear has_evictions_, as reclaim_weight_entries() does, so a case starts from a clean latch.
@@ -6908,6 +6910,10 @@ class unified_cache {
     // under GGML_SYCL_PRIVATE_TESTING: one relaxed add costs nothing beside the walk it counts, and a member that one
     // build variant has and another lacks would give the class two layouts.
     std::atomic<uint64_t> id_remap_walks_{ 0 };
+    // How many entries finalize_retired_entries_locked() has visited over the cache's life. The deferred-free pass
+    // runs on every backend synchronize, several times per decoded token, so the device tests read the count across
+    // one to pin that a pass with nothing retired visits no entry. Kept in every build, as id_remap_walks_ is.
+    std::atomic<uint64_t> retired_entry_visits_{ 0 };
 
     // Slots held by llama_model objects that are still alive (llama.cpp-0qlw).
     // Guarded by rw_mutex_ like entries_, so a reclaim decision and the liveness
@@ -9085,6 +9091,9 @@ bool allocation_registry_test_release_exact_lease(const alloc_metadata & metadat
 bool                      allocation_registry_test_hold_physical_release(const alloc_metadata & metadata) noexcept;
 bool                      allocation_registry_test_unhold_physical_release(const alloc_metadata & metadata) noexcept;
 size_t allocation_registry_test_process_promotion_retries(int device) noexcept;
+// What the cache teardown asks before it dismantles: is any registry row on `device` (any device when negative) still
+// waiting for its promotion cleanup.
+bool                      allocation_registry_test_has_promotion_cleanup_pending(int device) noexcept;
 registered_release_status allocation_registry_test_release_exact(
     const alloc_metadata & metadata, registered_release_mode mode) noexcept;
 registered_release_status allocation_registry_test_claim(const alloc_metadata & metadata, bool intrusive) noexcept;
