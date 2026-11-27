@@ -8235,6 +8235,124 @@ temporary, `packed_rows_dev`, as Task 24's BF16 arm admits its row map; the scra
 - *Follow-ups on `llama.cpp-cl5q`* (comment `c-pkth`): the table could carry `{i1, i2, packed_row}` directly, and the
   table's upload could share the row map's stage.
 
+### Task 26a: Measure the NVFP4 weight-only GEMM against today's dequant and f16 GEMM at Inkling's shapes (written 2026-11-27)
+
+**Track:** A. **Depends on:** Task 25 (merged in fork/master `c6805bfb75`). **Base:** `c6805bfb75`.
+
+**File scope:**
+- Modify: `tests/test-sycl-onednn-woq-nvfp4.cpp` (add a `--bench` mode; the probe arms stay as they are).
+- Modify: `tests/CMakeLists.txt:722-729`, the comment block above `llama_build(test-sycl-onednn-woq-nvfp4.cpp)`: one
+  sentence naming the `--bench` mode and its output lines. The target stays built and not registered.
+
+**Why.** On the B70 long prompt the batched executor runs a dequant for each of 96,556 experts per pass. The dequant
+writes 768.8 GB of f16, and `moe.pp.gemm.execute` (1842.8 ms) then reads that f16 back. Those f16 bytes are
+3.6 times the NVFP4 bytes they came from. Task 25 left this as the largest per-expert cost the profile does not time.
+
+The lead ran the probe once on the B70 at `e972a43867` (2026-11-27, `inkling/t26-probe-nvfp4-b70/out.txt`). oneDNN
+3.13.2 builds and runs f16 x `f4_e2m1` with NVFP4's scales grouped `{16,1}`:
+- in 2-D and in 3-D (batched);
+- with the `f8_e4m3` scale bytes, and with the scales widened to f16;
+- with `worst_rel` at or below 7e-7 on every scale class.
+
+The probe's wall-clock figures at M = 32 cannot decide the question:
+- 2-D gate_up: 121 µs per execute (90 µs with f16 scales).
+- 3-D down, B = 4: 237 µs (66 µs with f16 scales).
+- Today's f16 GEMM: about 19 µs per expert.
+
+The probe has no f16 arm on its own harness, it times on the host, and it uses one batch size. This task adds the
+measurement that decides Task 26b. It changes no backend code.
+
+**What `--bench` runs.** It runs with `argv[1] == "--bench"`; without it the binary runs exactly the probe arms it runs
+today. The bench runs these arms, each at every point in the grid below:
+
+1. `f16-gemm`: a 3-D oneDNN matmul with f16 src `{B,M,K}`, weights and f32 dst. The f16 weights are stored the way the
+   executor's dequant writes them: expert b, row n holds K contiguous halves, so `{B,K,N}` with strides
+   `{K*N, 1, K}`. The dst is `{B,M,N}`. Use the same attribute `make_pd` uses, minus `set_scales`.
+2. `f16-dequant`: a SYCL kernel that reads B experts of stored NVFP4 and writes their f16 in the layout `f16-gemm`
+   reads. Stored NVFP4 is `block_nvfp4`, 36 bytes per 64 values; `make_nvfp4_problem` at `:201` builds its bytes.
+   Decode with `ue4m3_half_sycl` and `k_kvalues_doubled`, the decode the reference uses. One work-item per output
+   pair of halves, with work-items consecutive along K so reads and writes coalesce. This is a stand-in for
+   `convert.cpp`'s NVFP4 converter at equal bytes. Record its measured device time, not a bound.
+3. `woq-repack`: a SYCL kernel that reads B experts of stored NVFP4 and writes the WOQ planes `make_descs` (`:338`)
+   declares: nibbles at `k * N + n`, with the even offset in the low nibble, and scales at `g * N + n`. Write the
+   `f8_e4m3` bytes `ue4m3_sanitize` gives, and also the f16-widened scales of `with_f16_scales` (`:296`) for the
+   f16-scale arms.
+   - It is a transpose from n-major blocks to k-major nibbles. Tile it through local memory: a work-group owns 64 n
+     by 64 k, reads its 64 rows' blocks with consecutive work-items on consecutive bytes, and writes each output
+     row's 32 bytes consecutively.
+   - Task 0vqt measured a naive gather repack for MXFP4 at 16-37 GB/s on ~450 GB/s cards, so the tiling is the point.
+4. `woq-3d-e4m3` and `woq-3d-f16s`: the 3-D WOQ matmul of `run_numerics_arm` (`:444`) with the forms `nvfp4_3d` and
+   `nvfp4_3d_f16` (`:542`, `:574`). It reads the planes `woq-repack` wrote.
+5. `woq-2d-e4m3` and `woq-2d-f16s`: the 2-D form, executed B times, once per expert, as the executor's MXFP4 arm
+   does (`woq_gemm_batch_mxfp4`'s default 2-D loop).
+6. `woq-3d-ba-diag`: diagnostic only. The 3-D f16-scale form with the weights declared `{B,K,N}` with strides
+   `{K*N, 1, K}` in nibbles, that is K-contiguous per n, the stored order once blocks are unpacked. Task 4nlr found
+   that on oneDNN 3.11.4 transposed sub-byte weights are accepted and silently compute garbage. So this arm always runs
+   the numerics check, and prints `BADNUM` when the check fails. Nothing may rely on it unless it prints `PASS` at
+   speed.
+
+**Grid.** Shapes `gate_up` (K 2304, N 2304) and `down` (K 1152, N 2304). M in {32, 64, 128}; the executor pads a
+group's rows to a multiple of 64, so 64 is its common case. B in {8, 32, 128}. Allocate with `sycl::malloc_device`
+through `dev_buffer`, as the probe does: the binary links no backend. B 128 gate_up needs 1.36 GB of f16 weights,
+which fits both cards.
+
+**Timing (device time).**
+- Create the queue with `sycl::property::queue::in_order` and `sycl::property::queue::enable_profiling`. Make the
+  oneDNN engine and stream from it.
+- For each arm and grid point: 3 warm-up executes, then a `q.single_task` marker kernel, then R executes, then a
+  second marker. Device µs per expert = (marker2 `command_start` − marker1 `command_end`) / R / B.
+- Choose R so the timed span is at least 50 ms.
+- Also print the host wall-clock µs per expert over the same R. A gap between the two shows submission cost.
+- Do not time with `ext_oneapi_submit_barrier` events. Barrier events need not carry profiling data. This plan's
+  Task 25 profile already met one profiler row that timed the wrong event.
+
+**Numerics.** Before timing each WOQ arm at B 8, M 32, run it once, apply `check_columns` (`:392`) against the
+reference, and print `PASS` or `FAIL` with `worst_rel`. A FAIL arm still prints its timing, marked `BADNUM`.
+`f16-gemm` checks against the same reference, fed by `f16-dequant`'s output. This also checks `f16-dequant`.
+
+**Output.** One line per arm and grid point:
+
+```
+BENCH <arm> shape=<gate_up|down> B=<b> M=<m> K=<k> N=<n> dev_us_per_expert=<x.xx> wall_us_per_expert=<x.xx> GBps=<x> numerics=<PASS|FAIL|BADNUM|-> impl=<impl_info_str or kernel>
+```
+
+- `GBps` is bytes read plus bytes written per expert, divided by device time:
+  - `f16-gemm`: f16 weights plus activations plus f32 dst.
+  - WOQ arms: the nibble and scale planes plus activations plus dst.
+  - `f16-dequant` and `woq-repack`: NVFP4 in plus their planes out.
+- After the grid, print one `PIPELINE` line per shape, B and M:
+  `PIPELINE shape=.. B=.. M=.. f16=<dequant+gemm> woq_best=<repack+best passing 3-D or 2-D form> form=<arm> ratio=<woq_best/f16>`.
+
+**Decision rule (fixed now, applied by the lead to the B70 and B50 runs).**
+- Task 26b moves the executor's NVFP4 experts to a WOQ arm in the best passing form if, at B 32 and M 64:
+  - on the B70, `ratio` ≤ 0.80 for both shapes;
+  - on the B50, `ratio` ≤ 1.00 for both shapes.
+- Otherwise, Task 26b is a fused NVFP4 kernel: decode in registers, XMX/DPAS on the stored layout, with today's
+  dequant plus GEMM as the bar to beat. In that case this task's numbers are its baseline.
+- If `woq-3d-ba-diag` passes numerics and is within 10% of the best 3-D form, Task 26b repacks with a per-block
+  nibble reorder instead of a transpose.
+
+**Acceptance criteria.**
+- `./scripts/sycl-build.sh test-sycl-onednn-woq-nvfp4` builds with no new warning.
+- Without `--bench`, the binary prints the same seven `PROBE` arms as before. The lead checks this on the device.
+- `--bench` prints one `BENCH` line per arm and grid point (7 arms x 2 shapes x 3 M x 3 B = 126) and 18 `PIPELINE`
+  lines. It exits 0, or 77 with no GPU.
+- `clang-format-19 --dry-run -Werror tests/test-sycl-onednn-woq-nvfp4.cpp` is clean on the lines you touched.
+- The implementer runs no GPU binary. The lead runs `--bench` once per card.
+
+**Gotchas.**
+- Nibble order: `make_nvfp4_problem` places stored block values the way the SYCL decode reads them. Copy its indexing
+  into both kernels; do not re-derive it. `f16-gemm`'s numerics check is what proves `f16-dequant` right.
+- Sub-byte weights in oneDNN must be declared exactly as `make_descs` declares them. Any other strides are the
+  diagnostic arm's business only.
+- The two kernels need distinct kernel names (`class nvfp4_bench_dequant`, `class nvfp4_bench_repack`).
+- Keep the probe arms byte-identical in what they run. The bench is added after them, behind the flag.
+- Free device buffers between grid points (each `dev_buffer` is scoped to its grid point), so peak device memory
+  stays one grid point's worth.
+
+**Commit:** `tests: the NVFP4 oneDNN probe gains a --bench mode that times dequant+f16 GEMM against repack+WOQ GEMM at
+Inkling's shapes`, staging `tests/test-sycl-onednn-woq-nvfp4.cpp` and `tests/CMakeLists.txt` only.
+
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
 *Left by Task 21, step 1d (2026-11-24):*
