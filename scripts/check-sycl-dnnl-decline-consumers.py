@@ -67,7 +67,9 @@ Since S3-4 the gate also reads gemm.hpp, common.hpp, ggml-sycl.cpp and outprod.c
     unified PP fall-through, the MoE group break and stage failure, the mul_mat_id `return false`, the batched F32
     route's held gemm() result, returned as its has_value(), with the dispatch going on to the orchestrator on false,
     and the BF16 weight's oneDNN route, likewise held and returned, with its executor going on to the native tiled
-    kernel on false; that route is the one caller that passes GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE.
+    kernel on false, and the BF16 grouped prompt arm of MUL_MAT_ID, whose per-width query declines the node to the BF16
+    direct route before anything is submitted and whose per-expert GEMM's decline abandons the node before its event is
+    read; that route and that arm are the two callers that pass GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE.
 
 Every check is also run against mutants of the same text and each must fail there, so a regex that stopped matching
 fails the gate instead of passing it. A mutant whose anchor text has moved is an assertion error, not a skip. Exit 0 on
@@ -153,24 +155,36 @@ MAIN_PINS = (
     # the polarity of every guard: a decline is the falsy result of a consumer, so each reads `if (!consumer(...))`
     ("if (!DnnlGemmWrapper::row_gemm(", 5),
     ("if (!DnnlGemmWrapper::gemm(", 3),
-    # the three consumers whose polarity r2 left unpinned (review r3 Minor-1), one head each; the second
-    # `return DnnlGemmWrapper::gemm(` is the BF16 route's gemm lambda, whose two uses are pinned below
-    ("return DnnlGemmWrapper::gemm(", 2),
+    # the three consumers whose polarity r2 left unpinned (review r3 Minor-1), one head each; the second and third
+    # `return DnnlGemmWrapper::gemm(` are the BF16 route's gemm lambda and the BF16 grouped arm's expert_gemm lambda,
+    # whose uses are pinned below
+    ("return DnnlGemmWrapper::gemm(", 3),
     ("used_onednn_fp16 = DnnlGemmWrapper::row_gemm(", 1),
     # the batched F32 route: its one gemm's decline is false, and the dispatch goes on to the orchestrator's loop
     ("const std::optional<sycl::event> batched_gemm = DnnlGemmWrapper::gemm(", 1),
     ("return batched_gemm.has_value();", 1),
     ("src0_resolved, src1_resolved, dst_resolved, f32_batched_route)) { return; } else {", 1),
     # the BF16 weight's route: its gemm's decline (a scratchpad, or a primitive oneDNN cannot create) is false, and the
-    # executor goes on to the native tiled kernel; it is the one caller that asks gemm() to decline on a creation. It
-    # asks one descriptor twice: with query_only before its conversion (a decline returns before anything is written),
-    # then to run, whose decline is the route's result
+    # executor goes on to the native tiled kernel; it and the BF16 grouped arm below are the two callers that ask gemm()
+    # to decline on a creation. It asks one descriptor twice: with query_only before its conversion (a decline returns
+    # before anything is written), then to run, whose decline is the route's result
     ("const auto bf16_gemm = [&](bool query_only, const std::vector<sycl::event> & deps) { return DnnlGemmWrapper::gemm(", 1),
     ("if (!bf16_gemm(true, {})) { return false; }", 1),
     ("return bf16_gemm(false, { converted }).has_value();", 1),
     ("&& ggml_sycl_mul_mat_bf16_onednn(ctx, src0, static_cast<const uint16_t *>(weight.ptr), src1_ddf, dst_ddf, n_vecs, "
      "ldx, ldy, act_bytes)) { return; }", 1),
-    ("GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE", 1),
+    ("GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE", 2),
+    # the BF16 grouped prompt arm of MUL_MAT_ID (Inkling 2 Mini Task 24): one gemm per active expert from one lambda,
+    # asked with query_only once per GEMM width before anything is submitted (a decline leaves the node to the BF16
+    # direct route with nothing written), then run per expert after the gather, whose decline abandons the node behind
+    # a marker before its event is read
+    ("const auto expert_gemm = [&](size_t i, bool query_only, const std::vector<sycl::event> & deps) { "
+     "const ggml_sycl::moe_bf16_grouped_expert & expert = plan.experts[i]; "
+     "const int n = static_cast<int>(expert.gemm_rows); return DnnlGemmWrapper::gemm(", 1),
+    ('"bf16_expert", query_only, GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT, GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE);', 1),
+    ("if (!expert_gemm(first, true, {})) { return decline(moe_bf16_grouped_decline::PRIMITIVE); }", 1),
+    ("const std::optional<sycl::event> gemm_event = expert_gemm(i, false, { gather_event }); "
+     "if (!gemm_event) { return abandon(); } gemm_events.push_back(*gemm_event);", 1),
     # one push of the group event, after the decline check (review r3 Nit-2)
     ("gemm_events.push_back(*group_event)", 1),
     ("DnnlGemmWrapper::to_dt<float>(), queue, batcha, batchb) .has_value();", 1),
@@ -731,9 +745,30 @@ def gemm_mutants(files, edit):
                 edit_pin(m, "&& ggml_sycl_mul_mat_bf16_onednn(ctx, src0,", "&& !ggml_sycl_mul_mat_bf16_onednn(ctx, src0,")))
     out.append(("the BF16 route throws on a failed creation",
                 edit_pin(m, "GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE", "GGML_SYCL_DNNL_CREATE_FAILURE_THROW")))
-    out.append(("a second caller asks gemm() to decline on a failed creation",
+    out.append(("a third caller asks gemm() to decline on a failed creation",
                 edit_pin(m, "return batched_gemm.has_value();",
                          "(void) GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE; return batched_gemm.has_value();")))
+    # the BF16 grouped arm (Task 24)
+    arm_query = "if (!expert_gemm(first, true, {})) { return decline(moe_bf16_grouped_decline::PRIMITIVE); }"
+    arm_run = ("const std::optional<sycl::event> gemm_event = expert_gemm(i, false, { gather_event }); "
+               "if (!gemm_event) { return abandon(); } gemm_events.push_back(*gemm_event);")
+    for label, pin, new in (
+            ("the BF16 grouped arm goes on after a declined query", arm_query, "(void) expert_gemm(first, true, {});"),
+            ("the BF16 grouped arm reads a passed query as a decline", arm_query,
+             "if (expert_gemm(first, true, {})) { return decline(moe_bf16_grouped_decline::PRIMITIVE); }"),
+            ("the BF16 grouped arm goes on after a declined GEMM", arm_run,
+             "const std::optional<sycl::event> gemm_event = expert_gemm(i, false, { gather_event }); "
+             "gemm_events.push_back(*gemm_event);"),
+            ("the BF16 grouped arm reads a GEMM's event before its decline", arm_run,
+             "const std::optional<sycl::event> gemm_event = expert_gemm(i, false, { gather_event }); "
+             "gemm_events.push_back(*gemm_event); if (!gemm_event) { return abandon(); }"),
+            ("the BF16 grouped arm abandons the node after a GEMM that ran", arm_run,
+             "const std::optional<sycl::event> gemm_event = expert_gemm(i, false, { gather_event }); "
+             "if (gemm_event) { return abandon(); } gemm_events.push_back(*gemm_event);"),
+            ("the BF16 grouped arm throws on a failed creation",
+             '"bf16_expert", query_only, GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT, GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE);',
+             '"bf16_expert", query_only, GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT, GGML_SYCL_DNNL_CREATE_FAILURE_THROW);')):
+        out.append((label, edit_pin(m, pin, new)))
     memo_lookup = ("        if (decline_on_create_failure && cache.creation_failed(key, eng)) {\n"
                    "            return std::nullopt;\n        }\n")
     memo_return = "            return std::nullopt;\n        }\n\n        if (!cached) {"

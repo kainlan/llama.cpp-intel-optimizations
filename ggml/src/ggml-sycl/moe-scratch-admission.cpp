@@ -151,11 +151,12 @@ pp_moe_onednn_scratch_admission pp_moe_onednn_admit_scratch(const pp_moe_onednn_
 pp_moe_onednn_scratch_admission pp_moe_onednn_admit_weightless_scratch(const pp_moe_onednn_scratch_shape & planned,
                                                                        size_t activation_bytes,
                                                                        size_t output_bytes) {
-    // RED (Task 24): not decided yet.
-    (void) planned;
-    (void) activation_bytes;
-    (void) output_bytes;
-    return { false, pp_moe_onednn_scratch_admission_reason::MISSING_PLAN };
+    // The weight plane asked for is the plan's own, so it is never the plane that refuses; the ring depth is the one
+    // slot the node claims. The preflight's order then holds: an incomplete plan is MISSING_PLAN, a zero or
+    // unrepresentable plane INVALID_REQUEST, and a plane past its aligned plan ACTIVATION_CAP or OUTPUT_CAP.
+    const pp_moe_onednn_scratch_shape required = { planned.weight_slot_bytes, activation_bytes, output_bytes, 1 };
+    pp_moe_onednn_scratch_shape       aligned_required;
+    return pp_moe_onednn_preflight_scratch(planned, required, &aligned_required);
 }
 
 const char * pp_moe_onednn_scratch_admission_reason_name(pp_moe_onednn_scratch_admission_reason reason) {

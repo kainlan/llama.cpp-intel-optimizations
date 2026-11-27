@@ -17,7 +17,7 @@ ready event. These claims pin that shape:
   (c) the route sits in ggml_sycl_mul_mat_id after the BF16 route and ahead of MMID_SCHED, the yx28 decode-direct
       request and the weight ensure, keyed on the NVFP4 expert type; when it takes the node the caller only marks the
       guard published, so the guard's queue-sync event is not submitted; a decline falls through unchanged;
-  (d) the route takes the AOS full-local table through the helper the BF16 route asks (which publishes AOS slices on
+  (d) the route takes the AOS full-local table through the helper the BF16 routes ask (which publishes AOS slices on
       a miss only from this card's own buffer, and not again at a storage generation where the publish failed or an
       expert still did not resolve after it; a table upload that failed is retried, and the table probe passes the
       build's answer out so the helper can tell the two apart),
@@ -521,8 +521,9 @@ def claim_d_route_body(s):
     if probe is None or not probe.lstrip().startswith(PROBE_CLEAR) or probe.count(PROBE_FORWARD) != 1:
         fails.append("the table probe does not answer false until the build answers, and pass the build's answer on")
     asks = len(re.findall(rf"\b{ENSURE_HELPER}\(", sycl))
-    if asks != 3:
-        fails.append(f"{ENSURE_HELPER} appears {asks} times; want its definition, the BF16 route's ask and this one")
+    if asks != 4:
+        fails.append(f"{ENSURE_HELPER} appears {asks} times; want its definition, the BF16 direct route's ask, the "
+                     "BF16 grouped arm's ask and this one")
     if common.count(STAMP_FIELD) != 1:
         fails.append("the weight does not carry one failed-publish generation per device")
 

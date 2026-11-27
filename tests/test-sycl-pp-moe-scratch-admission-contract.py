@@ -15,6 +15,17 @@ unconditionally and once per process rather than only under a debug flag, and
 that the generation/rollback protocol the 32dg lifecycle work established
 survives at both sites.
 
+A third site reserves the same ring: the BF16 grouped prompt arm of MUL_MAT_ID
+(Inkling 2 Mini plan, Task 24), which stages no weight and uses one slot's
+activation and output planes. It reads the planned sizes under the batched
+executor's names, admits through the weightless admission before it reserves and
+claims, declines (never upsizes) on a refusal, reports a ring that does not fit
+it at WARN once, stages its activations and outputs only in the claimed slot
+(its one temporary is the row map) and binds and rolls back by generation. It
+precedes the batched executor in ggml-sycl.cpp and spells the same reserve call,
+admission shape and ring depth, so the mutants written for the batched executor
+are applied inside it (mutate_once).
+
 The checks that read ggml-sycl.cpp and unified-cache.cpp fail against the pre-ijla tree, and 18 of them do when run that
 way (the others read the admission module, its header and the canonical contract, which that tree never had, so they
 pass there by construction and are covered by --self-test's mutants instead):
@@ -78,7 +89,7 @@ def reserve_call_arguments(source):
 # tokens (no `(` needed, so an address-taken or member-pointer form counts) are counted over the whole ggml-sycl
 # directory, with token pasting banned, so a new reservation site (or one that raises the ceiling and reads it back)
 # cannot appear without editing this gate. A count failure says which pin to bump after review.
-RESERVE_CALLS_IN_FILE = 5   # plan, replan x2, the two executors
+RESERVE_CALLS_IN_FILE = 6   # plan, replan x2, the two executors, the BF16 grouped arm
 # plan (ggml_sycl_inventory_publish_planner_inputs, which the stage and the plan dry run both publish through), the
 # explicit micro-batch's load placement (ggml_sycl_publish_load_ubatch_scratch: the same planner-sized ring, published
 # at the micro-batch the caller named), replan x2, and, fifth, the plan dry run's write-back
@@ -93,7 +104,7 @@ RESERVE_CALLS_IN_FILE = 5   # plan, replan x2, the two executors
 # write-back puts the dry run's call back.
 SET_PLANNED_CALLS_IN_FILE = 6
 # Whole ggml-sycl directory, comments and strings removed: reserve is definition + the wrapper's call + hpp declaration
-# + 5 calls + the dry run device test's arms (f) and (h), each of which reserves exactly the 1 MiB depth-1 ring it
+# + 6 calls + the dry run device test's arms (f) and (h), each of which reserves exactly the 1 MiB depth-1 ring it
 # planned, (f) so the ring holds KV-zone bytes a load refused in its early pass must leave alone and (h) so the ring
 # alone holds the arena a load must release it from (neither raises a ceiling or reads one back) + the runtime-alloc
 # device test's reserve_ring_and_pair, which reserves the same 1 MiB depth-1 ring it planned on a hand-built cache, so
@@ -106,7 +117,7 @@ SET_PLANNED_CALLS_IN_FILE = 6
 # publishes the ring at the planning shape, at the room's micro-batch, and at the planning shape again, and
 # reserve_ring_and_pair plans the ring it reserves). None of the test uses reads back a ceiling. The write-back and the
 # dry run test's first two uses follow llama.cpp-kj90; its fix revisits all three.
-DIRECTORY_TOKENS = {"reserve": 11, "wrapper": 2, "setter": 20}
+DIRECTORY_TOKENS = {"reserve": 12, "wrapper": 2, "setter": 20}
 _DIRECTORY_TOKEN_PATTERNS = {
     "reserve": r"(?<!\w)reserve_pp_moe_onednn_scratch\b",
     "wrapper": r"\bunified_cache_reserve_pp_moe_onednn_scratch\b",
@@ -147,7 +158,8 @@ def shape_declaration(name, site):
 
 
 _COMPARISON = r"(?:==|!=|<=|>=|(?<![-<])<(?!<)|(?<!-)>(?!>))"
-ALLOWED_CALLEES = {"reserve_pp_moe_onednn_scratch", "pp_moe_onednn_admit_scratch", "pp_moe_onednn_runtime_ring_depth",
+ALLOWED_CALLEES = {"reserve_pp_moe_onednn_scratch", "pp_moe_onednn_admit_scratch",
+                   "pp_moe_onednn_admit_weightless_scratch", "pp_moe_onednn_runtime_ring_depth",
                    "pp_moe_onednn_claim_scratch_slot", "pp_moe_onednn_rollback_unbound_scratch_slot", "activate",
                    "GGML_LOG_WARN", "GGML_LOG_INFO", "GGML_LOG_DEBUG", "GGML_LOG_ERROR", "fprintf"}
 
@@ -397,6 +409,9 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
     # keeps its transient staging but must not enlarge the planned ring.
     staging_start = sycl.find("scoped_unified_queue_temp<sycl::half> pp_mxfp4_src0_f16;")
     staging = region_until_matching_endif(sycl, staging_start) if staging_start >= 0 else ""
+    # The BF16 grouped prompt arm of MUL_MAT_ID: the weightless third site, which declines where the ring is not
+    # planned or does not fit and never grows it.
+    arm = between(sycl, "static bool ggml_sycl_mul_mat_id_bf16_grouped(", "enum class moe_resident_decode_decline")
     reserve = between(cache, "bool unified_cache::reserve_pp_moe_onednn_scratch(",
                       "bool unified_cache::claim_pp_moe_onednn_scratch_slot(")
 
@@ -408,13 +423,15 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
         "canonical memory architecture contract": doc,
         "batched PP MoE oneDNN executor body": batched,
         "non-batched PP MXFP4 f16 staging body": staging,
+        "BF16 grouped prompt arm of MUL_MAT_ID body": arm,
         "unified_cache::reserve_pp_moe_onednn_scratch body": reserve,
         "moe-scratch-admission module": module,
         "moe-scratch-admission header": header,
     }
 
     count_problems = call_count_problems(sycl, "\n".join((cache, module, header, others)))
-    uses = [pinned_uses(batched, PLANNED_SITES[0]), pinned_uses(staging, PLANNED_SITES[1])]
+    uses = [pinned_uses(batched, PLANNED_SITES[0]), pinned_uses(staging, PLANNED_SITES[1]),
+            pinned_uses(arm, PLANNED_SITES[0])]
     if count_problems:
         NOTES["the reserve and set-planned sites are the pinned ones"] = count_problems
     if any(uses):
@@ -462,13 +479,48 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
         # budgeted zone into a high-water mark of every shape ever seen.
         # The reservation's own arguments may not carry a max ...
         "no PP MoE scratch reservation upsizes past the plan":
-            reservation_passes_the_plan(batched, PLANNED_SITES[0]) and reservation_passes_the_plan(staging, PLANNED_SITES[1]),
+            reservation_passes_the_plan(batched, PLANNED_SITES[0]) and reservation_passes_the_plan(staging, PLANNED_SITES[1])
+            and reservation_passes_the_plan(arm, PLANNED_SITES[0]),
         # ... and a new site, a free-wrapper call, an address-taken or token-pasted form cannot appear unreviewed.
         "the reserve and set-planned sites are the pinned ones":
             not count_problems,
         # ... and what it passes is the planner's own values, read once and never written (see PLANNED_SITES).
         "the planned slot sizes are read once, const, and never reassigned":
-            site_is_pinned(batched, PLANNED_SITES[0]) and site_is_pinned(staging, PLANNED_SITES[1]),
+            site_is_pinned(batched, PLANNED_SITES[0]) and site_is_pinned(staging, PLANNED_SITES[1])
+            and site_is_pinned(arm, PLANNED_SITES[0]),
+
+        # --- the BF16 grouped arm: the planned ring's activation and output planes, or the BF16 direct route ---
+        "the BF16 grouped arm admits weightless before it reserves, claims and submits":
+            ordered(arm, "pp_moe_onednn_admit_weightless_scratch(planned_shape, act_bytes, out_bytes)",
+                    "reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)",
+                    "pp_moe_onednn_claim_scratch_slot(ctx.device, ring_depth, scratch_slot)",
+                    "claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved)",
+                    "DnnlGemmWrapper::gemm(", "moe_bf16_grouped_gather_submit(", "moe_bf16_grouped_scatter_submit("),
+        "the BF16 grouped arm declines, never grows the ring, on a refusal":
+            ordered(arm, "if (!admission.allowed) {", "return decline(moe_bf16_grouped_decline::SCRATCH_UNPLANNED);",
+                    "reserve_pp_moe_onednn_scratch("),
+        # Quiet on a card with no ring planned (a model whose only experts are BF16: the direct route is its plan), at
+        # WARN once on a ring the plan sized too small for the node.
+        "the BF16 grouped arm warns unconditionally, once, on a ring that does not fit it":
+            latched_warn(arm, "bf16_grouped_refusal_latch")
+            and ordered(arm, "if (admission.reason != ggml_sycl::pp_moe_onednn_scratch_admission_reason::MISSING_PLAN &&",
+                        "ggml_sycl::pp_moe_onednn_should_report_refusal(admission, bf16_grouped_refusal_latch)) {",
+                        "GGML_LOG_WARN(", "(reported once per", "required=[%zu,%zu] planned=[%zu,%zu]",
+                        "pp_moe_onednn_scratch_admission_reason_name(admission.reason)"),
+        "the BF16 grouped arm stages its activations and outputs only in the planned ring slot":
+            "uint16_t * const act = static_cast<uint16_t *>(reserved.activation);" in arm
+            and "float * const out = static_cast<float *>(reserved.output);" in arm
+            and arm.count("scoped_unified_queue_temp") == 1
+            and "scoped_unified_queue_temp<ggml_sycl::moe_bf16_grouped_row> rows_dev;" in arm,
+        "the BF16 grouped arm binds the slot generation it claimed and rolls back a slot it could not bind":
+            ordered(arm, "pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, ring_depth, scratch_slot);",
+                    "claim.activate(ctx.device, ring_depth, scratch_slot, reserved.generation",
+                    "claim.release_unused();"),
+        "the weightless admission is the preflight with the plan's own weight slot and one slot of depth":
+            ordered(module, "pp_moe_onednn_admit_weightless_scratch(",
+                    "const pp_moe_onednn_scratch_shape required = { planned.weight_slot_bytes, activation_bytes, "
+                    "output_bytes, 1 };",
+                    "return pp_moe_onednn_preflight_scratch(planned, required, &aligned_required);"),
         # ABSENCE: with a general fallback present, refusing costs nothing and
         # the cap is decorative -- the batch simply allocates its own scratch.
         "the batched executor keeps no general temporary fallback":
@@ -602,6 +654,33 @@ ABSENCE_MUTANTS = {
         "sycl",
         "static ggml_sycl::pp_moe_onednn_scratch_refusal_latch staging_scratch_refusal_latch;",
         "ggml_sycl::pp_moe_onednn_scratch_refusal_latch staging_scratch_refusal_latch;"),
+    # The BF16 grouped arm's latch, rebuilt per node, and its activation plane moved off the ring into a temporary.
+    "the BF16 grouped arm warns unconditionally, once, on a ring that does not fit it": (
+        "sycl",
+        "static ggml_sycl::pp_moe_onednn_scratch_refusal_latch bf16_grouped_refusal_latch;",
+        "ggml_sycl::pp_moe_onednn_scratch_refusal_latch bf16_grouped_refusal_latch;"),
+    "the BF16 grouped arm stages its activations and outputs only in the planned ring slot": (
+        "sycl",
+        "    uint16_t * const act = static_cast<uint16_t *>(reserved.activation);",
+        "    scoped_unified_queue_temp<uint16_t> act_temp;\n"
+        "    uint16_t * const act = act_temp.alloc(*stream, ctx.device, plan.packed_rows * k, \"moe_bf16_grouped_act\");"),
+    "the BF16 grouped arm declines, never grows the ring, on a refusal": (
+        "sycl",
+        "        return decline(moe_bf16_grouped_decline::SCRATCH_UNPLANNED);",
+        "        (void) cache->reserve_pp_moe_onednn_scratch(planned_weight, act_bytes, out_bytes, 1);"),
+    "the BF16 grouped arm admits weightless before it reserves, claims and submits": (
+        "sycl",
+        "        ggml_sycl::pp_moe_onednn_admit_weightless_scratch(planned_shape, act_bytes, out_bytes);",
+        "        ggml_sycl::pp_moe_onednn_admit_scratch(planned_shape, planned_shape);"),
+    "the BF16 grouped arm binds the slot generation it claimed and rolls back a slot it could not bind": (
+        "sycl",
+        "        pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, ring_depth, scratch_slot);\n"
+        "        return decline(moe_bf16_grouped_decline::SCRATCH_SLOT);",
+        "        return decline(moe_bf16_grouped_decline::SCRATCH_SLOT);"),
+    "the weightless admission is the preflight with the plan's own weight slot and one slot of depth": (
+        "module",
+        "    const pp_moe_onednn_scratch_shape required = { planned.weight_slot_bytes, activation_bytes, output_bytes, 1 };",
+        "    const pp_moe_onednn_scratch_shape required = { 0, activation_bytes, output_bytes, 1 };"),
 }
 
 
@@ -634,6 +713,27 @@ _ELSEWHERE = "static const char * ggml_sycl_planned_weight_residency_name("
 _SHAPE = "            const ggml_sycl::pp_moe_onednn_scratch_shape planned_shape = {\n                planned_weight,\n                planned_act,"
 _RING = "            const uint32_t ring_depth = pp_moe_onednn_runtime_ring_depth(planned_ring_depth);"
 _DECL_W = "            const size_t planned_weight =\n                " + PLANNED_W
+# The BF16 grouped arm's own statements (unique: it declines where the executors return false).
+_CALL_ARM = ("    if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {\n"
+             "        return decline(moe_bf16_grouped_decline::SCRATCH_RESERVE);")
+_ADMIT_ARM = "        ggml_sycl::pp_moe_onednn_admit_weightless_scratch(planned_shape, act_bytes, out_bytes);"
+# The BF16 grouped arm precedes the batched executor in ggml-sycl.cpp and spells the same reserve call, admission shape
+# and ring depth, so an edit written for the batched executor is made at the anchor's first occurrence inside that
+# executor; an anchor it does not hold is edited at its first occurrence in the file.
+_BATCHED_HEAD = "auto try_pp_onednn_f16_batched = "
+
+
+def mutate_once(squeezed, anchor, replacement):
+    """`squeezed` (a whitespace-squeezed ggml-sycl.cpp) with `anchor` replaced once, inside the batched executor when
+    the executor holds it. Both strings are squeezed here. None when the anchor is not there at all."""
+    anchor, replacement = squeeze(anchor), squeeze(replacement)
+    head = squeezed.find(_BATCHED_HEAD)
+    at = squeezed.find(anchor, head) if head >= 0 else -1
+    if at < 0:
+        at = squeezed.find(anchor)
+    if at < 0:
+        return None
+    return squeezed[:at] + replacement + squeezed[at + len(anchor):]
 ESCAPES = (
     ("third-site-std-max-elsewhere", [(_ELSEWHERE, "static bool third_site(ggml_sycl::unified_cache * c, size_t pw, size_t wb, "
       "size_t pa, size_t po, uint32_t rd) {\n    return c->reserve_pp_moe_onednn_scratch(std::max(pw, wb), pa, po, rd);\n}\n" + _ELSEWHERE)]),
@@ -701,6 +801,14 @@ ESCAPES = (
          "ring_depth);\n" + _CALL_BATCHED)]),
     ("helper-lambda-around-the-reserve", [(_CALL_BATCHED, "            auto do_reserve = [&](size_t w, size_t a, size_t o, uint32_t d) { return cache->reserve_pp_moe_onednn_"
       "scratch(w, a, o, d); };\n            if (!do_reserve(std::max(planned_weight, weight_bytes), planned_act, planned_out, ring_depth)) {")]),
+    # The BF16 grouped arm: its reservation grown, a planned name written, a second reservation, a shape of its own.
+    ("bf16-arm-activation-slot-grown", [(_CALL_ARM, _CALL_ARM.replace("planned_act, planned_out, ring_depth",
+                                                                      "std::max(planned_act, act_bytes), planned_out, ring_depth"))]),
+    ("bf16-arm-planned-output-written", [(_CALL_ARM, "    planned_out += out_bytes;\n" + _CALL_ARM)]),
+    ("bf16-arm-second-reserve", [(_CALL_ARM, "    (void) cache->reserve_pp_moe_onednn_scratch(planned_weight, act_bytes, out_bytes, "
+                                             "ring_depth);\n" + _CALL_ARM)]),
+    ("bf16-arm-admits-a-shape-of-its-own", [(_ADMIT_ARM, _ADMIT_ARM.replace("(planned_shape, act_bytes, out_bytes)",
+                                                                            "({ planned_weight, act_bytes, out_bytes, 1 }, act_bytes, out_bytes)"))]),
 )
 
 
@@ -718,7 +826,7 @@ def self_test(sycl, cache, module, header, doc, others):
                 break
             if unconst:
                 base = base.replace(declaration, declaration.replace("const size_t", "size_t", 1), 1)
-            mutated = base.replace(call_site, squeeze("            " + statement + "\n" + call_site), 1)
+            mutated = mutate_once(base, call_site, "            " + statement + "\n" + call_site)
             _, failed, _ = evaluate(mutated, cache, module, header, doc, others)
             if check not in failed:
                 problems.append("planned-slot pin did not fire on: %s (%s)" % (label, "const dropped" if unconst else "const kept"))
@@ -731,8 +839,8 @@ def self_test(sycl, cache, module, header, doc, others):
     # Computed under another name and passed to the reservation: the planned names are untouched, the call is not.
     for label, hoist in (("std-max-under-another-name", "const size_t grown_w = std::max(planned_weight, weight_bytes);"),
                          ("alias-then-std-max", "const size_t cap_w = planned_weight; const size_t grown_w = std::max(cap_w, weight_bytes);")):
-        mutated = squeeze(sycl).replace(
-            call_site, squeeze("            " + hoist + "\n" + call_site.replace("(planned_weight,", "(grown_w,")), 1)
+        mutated = mutate_once(squeeze(sycl), call_site,
+                              "            " + hoist + "\n" + call_site.replace("(planned_weight,", "(grown_w,"))
         _, failed, _ = evaluate(mutated, cache, module, header, doc, others)
         if "no PP MoE scratch reservation upsizes past the plan" not in failed:
             problems.append("reservation pin did not fire on: " + label)
@@ -745,7 +853,7 @@ def self_test(sycl, cache, module, header, doc, others):
             problems.append("mutation anchor missing for the escape: " + label)
             continue
         for anchor, replacement in edits:
-            mutated = mutated.replace(squeeze(anchor), squeeze(replacement), 1)
+            mutated = mutate_once(mutated, anchor, replacement)
         _, failed, _ = evaluate(mutated, cache, module, header, doc, others)
         if not failed:
             problems.append("no check fired on the escape: " + label)
@@ -759,19 +867,23 @@ def self_test(sycl, cache, module, header, doc, others):
         _, failed, _ = evaluate(sycl, cache, module, header, doc, others + "\n" + extra)
         if "the reserve and set-planned sites are the pinned ones" not in failed:
             problems.append("no count failed with " + label)
-    # A legitimate 6th reserve must say what to do, not only fail.
-    _ = evaluate(squeeze(sycl).replace(squeeze(_ELSEWHERE), squeeze("static bool sixth(ggml_sycl::unified_cache * c) { "
+    # A legitimate new reserve must say what to do, not only fail.
+    _ = evaluate(squeeze(sycl).replace(squeeze(_ELSEWHERE), squeeze("static bool another(ggml_sycl::unified_cache * c) { "
                  "return c->reserve_pp_moe_onednn_scratch(1, 2, 3, 4); }\n" + _ELSEWHERE), 1), cache, module, header, doc, others)
-    if not any("found 6, pinned RESERVE_CALLS_IN_FILE=5" in note and "bump the pin" in note
+    pin_message = "found %d, pinned RESERVE_CALLS_IN_FILE=%d" % (RESERVE_CALLS_IN_FILE + 1, RESERVE_CALLS_IN_FILE)
+    if not any(pin_message in note and "bump the pin" in note
                for note in NOTES.get("the reserve and set-planned sites are the pinned ones", [])):
-        problems.append("a 6th reserve call did not produce the actionable pin message")
+        problems.append("a new reserve call did not produce the actionable pin message")
     for name, (target, anchor, replacement) in ABSENCE_MUTANTS.items():
         sources = {"sycl": sycl, "cache": cache, "module": module, "header": header}
         anchor, replacement = squeeze(anchor), squeeze(replacement)
         if anchor not in squeeze(sources[target]):
             problems.append("mutation anchor missing for: " + name)
             continue
-        sources[target] = squeeze(sources[target]).replace(anchor, replacement, 1)
+        if target == "sycl":
+            sources[target] = mutate_once(squeeze(sources[target]), anchor, replacement)
+        else:
+            sources[target] = squeeze(sources[target]).replace(anchor, replacement, 1)
         _, failed, _ = evaluate(sources["sycl"], sources["cache"], sources["module"], sources["header"], doc, others)
         if name not in failed:
             problems.append("check did not fire on its mutant: " + name)

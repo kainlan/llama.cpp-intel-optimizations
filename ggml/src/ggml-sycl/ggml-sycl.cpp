@@ -130,6 +130,7 @@
 #include "ggml-sycl/mmq.hpp"
 #include "ggml-sycl/model-lifecycle-probe.hpp"
 #include "ggml-sycl/moe-bf16-direct.hpp"
+#include "ggml-sycl/moe-bf16-grouped.hpp"
 #include "ggml-sycl/moe-exec-cost.hpp"
 #include "ggml-sycl/moe-host-island.hpp"
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
@@ -16327,8 +16328,9 @@ static std::vector<ggml_sycl::placement_tensor_info> ggml_sycl_inventory_planner
 // oneDNN ring from (llama_sycl_is_moe_expert_weight_name), of a type a ring consumer runs
 // (moe_pp_onednn_ring_serves_type). The loader sizes the ring for every MoE model, but only the batched prompt
 // executor and the MXFP4 SOA per-expert staging claim its slots: Q1_0 experts run on the MMID direct route and BF16
-// experts on the BF16 direct route. The question asks no runtime knob, so the ring a load plans does not depend on a
-// knob that turns an executor off for one run.
+// experts on the BF16 direct route. The BF16 grouped prompt arm claims a slot of a ring planned for another type and
+// declines where none is, so it plans none of its own. The question asks no runtime knob, so the ring a load plans
+// does not depend on a knob that turns an executor off for one run.
 static bool ggml_sycl_inventory_ring_has_consumer(const ggml_sycl_tensor_inventory * inventory) {
     for (size_t i = 0; i < inventory->count; ++i) {
         const ggml_sycl_tensor_info & t = inventory->tensors[i];
@@ -90355,6 +90357,386 @@ static void ggml_sycl_mul_mat_id_bf16_direct(ggml_backend_sycl_context & ctx, gg
     }
 }
 
+// Why the BF16 grouped prompt arm (ggml_sycl_mul_mat_id_bf16_grouped) left a node to the BF16 direct route. Each
+// reason has its own count, so the arm's run counter shows every node that did not take it, the opt-out included.
+enum class moe_bf16_grouped_decline : uint8_t {
+    OPT_OUT,            // GGML_SYCL_MOE_BF16_GROUPED=0
+    TOKENS,             // fewer than moe_bf16_grouped_min_tokens tokens: decode, and a short prompt tail
+    NO_DNNL,            // a build without oneDNN
+    RECORDING,          // a command graph records: no primitive is created inside one
+    PREDICATE,          // the BF16 direct route's predicate declines the op on this card
+    SHAPE,              // a shape the GEMMs or the two kernels do not take
+    OPERANDS,           // src1 or dst is not in this card's own memory
+    IDS,                // the ids did not reach the host
+    PLAN,               // an id outside [0, n_experts), or a row past int32
+    TABLE,              // not every expert resolves at AOS on this card
+    EXPERT,             // an active expert's record does not resolve on this card
+    SCRATCH_UNPLANNED,  // the ring's plan does not admit the node; a card with no ring planned is one
+    SCRATCH_RESERVE,    // the ring could not be reserved at its planned sizes
+    SCRATCH_SLOT,       // no ring slot was claimed, or the claimed slot is smaller than the node
+    PRIMITIVE,          // oneDNN declines a GEMM width: its scratchpad, or a primitive it cannot create
+    ROW_MAP,            // the row map's device copy could not be allocated
+    SUBMIT,             // a submission declined after the first one; dst is still unwritten
+    COUNT,
+};
+
+static const char * moe_bf16_grouped_decline_name(moe_bf16_grouped_decline decline) {
+    switch (decline) {
+        case moe_bf16_grouped_decline::OPT_OUT:
+            return "opt_out";
+        case moe_bf16_grouped_decline::TOKENS:
+            return "tokens";
+        case moe_bf16_grouped_decline::NO_DNNL:
+            return "no_dnnl";
+        case moe_bf16_grouped_decline::RECORDING:
+            return "recording";
+        case moe_bf16_grouped_decline::PREDICATE:
+            return "predicate";
+        case moe_bf16_grouped_decline::SHAPE:
+            return "shape";
+        case moe_bf16_grouped_decline::OPERANDS:
+            return "operands";
+        case moe_bf16_grouped_decline::IDS:
+            return "ids";
+        case moe_bf16_grouped_decline::PLAN:
+            return "plan";
+        case moe_bf16_grouped_decline::TABLE:
+            return "table";
+        case moe_bf16_grouped_decline::EXPERT:
+            return "expert";
+        case moe_bf16_grouped_decline::SCRATCH_UNPLANNED:
+            return "scratch_unplanned";
+        case moe_bf16_grouped_decline::SCRATCH_RESERVE:
+            return "scratch_reserve";
+        case moe_bf16_grouped_decline::SCRATCH_SLOT:
+            return "scratch_slot";
+        case moe_bf16_grouped_decline::PRIMITIVE:
+            return "primitive";
+        case moe_bf16_grouped_decline::ROW_MAP:
+            return "row_map";
+        case moe_bf16_grouped_decline::SUBMIT:
+            return "submit";
+        case moe_bf16_grouped_decline::COUNT:
+            break;
+    }
+    return "unknown";
+}
+
+// The arm's run counter: the nodes it ran, and per reason the nodes it declined. Process-wide and relaxed, since they
+// order nothing; the route log prints them.
+static std::atomic<uint64_t> g_moe_bf16_grouped_runs{ 0 };
+static std::atomic<uint64_t> g_moe_bf16_grouped_declines[static_cast<size_t>(moe_bf16_grouped_decline::COUNT)] = {};
+
+// Counts a decline and names it in the route log, the first 16 times per reason (a decode node declines on every
+// token, which would otherwise use up a shared cap). A decline is not a fault: the direct route runs the node.
+static bool ggml_sycl_moe_bf16_grouped_decline(const ggml_tensor * src0, int device, moe_bf16_grouped_decline decline) {
+    const size_t   reason   = static_cast<size_t>(decline);
+    const uint64_t declines = g_moe_bf16_grouped_declines[reason].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+        static std::atomic<uint32_t> logged[static_cast<size_t>(moe_bf16_grouped_decline::COUNT)] = {};
+        if (logged[reason].fetch_add(1, std::memory_order_relaxed) < 16) {
+            GGML_LOG_INFO("[MOE-ROUTE] bf16 grouped declined tensor=%s device=%d reason=%s declines=%llu\n",
+                          src0 != nullptr ? src0->name : "?", device, moe_bf16_grouped_decline_name(decline),
+                          (unsigned long long) declines);
+        }
+    }
+    return false;
+}
+
+// GGML_SYCL_MOE_BF16_GROUPED (default 1): 0 sends every BF16 MUL_MAT_ID to the BF16 direct route. Read once.
+static bool ggml_sycl_moe_bf16_grouped_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_BF16_GROUPED");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+struct moe_bf16_grouped_abandon_marker;
+
+// The BF16 grouped prompt arm of MUL_MAT_ID (Inkling 2 Mini plan, Task 24). A prompt node of at least
+// moe_bf16_grouped_min_tokens tokens that the BF16 direct route's predicate admits on this card runs as one oneDNN
+// bf16 x bf16 -> f32 strict GEMM per active expert, on the expert's weight where it is loaded (its AOS record, no
+// weight plane and no conversion), between one batched gather of every routed row into the activation plane of a
+// ring slot and one batched scatter of every output row into dst (moe-bf16-grouped.hpp; the layout and the 64-row
+// rounding that bounds the primitive cache are moe-bf16-grouped-plan.hpp). The ring is the one the load planned for
+// the PP MoE oneDNN consumers; the arm uses only its activation and output planes (a weightless admission) and
+// declines on a card where none is planned.
+//
+// Its host waits are the executor's: the graph-local ids snapshot (the layer's first MUL_MAT_ID pays the D2H wait) and
+// the ring-slot claim. The gather, the GEMMs and the scatter wait on nothing: each depends on the one before through
+// its event, the oneDNN execute deps included. Each expert's record handle and the row map are held until the
+// scatter's event, and the slot's owners with it. Only the scatter writes dst, so a decline, before or after the first
+// submission, has written nothing there, and the caller runs the BF16 direct route. True when the node ran; dst's
+// ready event is then the scatter's.
+static bool ggml_sycl_mul_mat_id_bf16_grouped(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0    = dst->src[0];
+    const ggml_tensor * src1    = dst->src[1];
+    const ggml_tensor * ids     = dst->src[2];
+    const auto          decline = [&](moe_bf16_grouped_decline reason) {
+        return ggml_sycl_moe_bf16_grouped_decline(src0, ctx.device, reason);
+    };
+
+    if (!ggml_sycl_moe_bf16_grouped_enabled()) {
+        return decline(moe_bf16_grouped_decline::OPT_OUT);
+    }
+    const int64_t n_tokens = ids != nullptr ? ids->ne[1] : 0;
+    if (n_tokens < ggml_sycl::moe_bf16_grouped_min_tokens) {
+        return decline(moe_bf16_grouped_decline::TOKENS);
+    }
+#if !GGML_SYCL_DNNL
+    return decline(moe_bf16_grouped_decline::NO_DNNL);
+#else
+    const queue_ptr stream = ctx.stream();
+    if (ggml_sycl_graph_recording_active() ||
+        stream->ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) {
+        return decline(moe_bf16_grouped_decline::RECORDING);
+    }
+    if (!ggml_sycl_moe_bf16_direct_route_available(dst, ctx.device)) {
+        return decline(moe_bf16_grouped_decline::PREDICATE);
+    }
+
+    const int64_t k         = src0->ne[0];
+    const int64_t m         = src0->ne[1];
+    const int64_t n_experts = src0->ne[2];
+    const int64_t n_slots   = ids->ne[0];
+    if (src1->ne[0] != k || src1->ne[1] <= 0 || src1->ne[2] != n_tokens || src1->ne[3] != 1 || dst->ne[0] != m ||
+        dst->ne[1] != n_slots || dst->ne[2] != n_tokens || dst->ne[3] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+        n_slots <= 0 || n_experts <= 0 || k > INT_MAX || m > INT_MAX || src0->nb[1] % sizeof(uint16_t) != 0) {
+        return decline(moe_bf16_grouped_decline::SHAPE);
+    }
+    ggml_sycl::moe_bf16_grouped_io_shape io;
+    io.k         = k;
+    io.m         = m;
+    io.src1_rows = src1->ne[1];
+    io.src1_nb1  = src1->nb[1];
+    io.src1_nb2  = src1->nb[2];
+    io.dst_nb1   = dst->nb[1];
+    io.dst_nb2   = dst->nb[2];
+    io.n_rows    = static_cast<size_t>(n_tokens) * static_cast<size_t>(n_slots);
+    if (!ggml_sycl::moe_bf16_grouped_io_shape_ok(io)) {
+        return decline(moe_bf16_grouped_decline::SHAPE);
+    }
+
+    const float * src1_dev = static_cast<const float *>(ggml_sycl_moe_direct_device_operand(src1, ctx.device));
+    float *       dst_dev  = static_cast<float *>(ggml_sycl_moe_direct_device_operand(dst, ctx.device));
+    if (src1_dev == nullptr || dst_dev == nullptr) {
+        return decline(moe_bf16_grouped_decline::OPERANDS);
+    }
+
+    // The executor's graph-local ids snapshot: the layer's first MUL_MAT_ID pays the D2H wait, and its sibling nodes
+    // read the same snapshot (llama.cpp-uop2 removes the wait).
+    moe_ids_cache_entry   uncached_ids_entry{};
+    moe_ids_cache_entry & ids_entry = ggml_sycl_get_moe_ids_d2h_cache_entry(ctx, ids, uncached_ids_entry);
+    if (!ggml_sycl_refresh_moe_ids_cache(ctx, ids, ids_entry) || ids_entry.host_ids.size() != io.n_rows) {
+        return decline(moe_bf16_grouped_decline::IDS);
+    }
+    ggml_sycl::moe_bf16_grouped_plan plan;
+    if (ggml_sycl::moe_bf16_grouped_build_plan(ids_entry.host_ids.data(), static_cast<size_t>(n_tokens),
+                                               static_cast<size_t>(n_slots), static_cast<size_t>(n_experts),
+                                               &plan) != ggml_sycl::moe_bf16_grouped_plan_status::OK) {
+        return decline(moe_bf16_grouped_decline::PLAN);
+    }
+
+    // The table helper publishes the weight's AOS expert records when this card's own buffer holds them; the arm reads
+    // each active expert through its record, the one the table is built from.
+    if (src0->extra == nullptr || ggml_sycl_moe_direct_ensure_aos_table(ctx, src0) == nullptr) {
+        return decline(moe_bf16_grouped_decline::TABLE);
+    }
+    const auto *                  extra        = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    const size_t                  expert_bytes = ggml_sycl_moe_expert_layout_bytes(src0, GGML_LAYOUT_AOS, ctx.device);
+    std::vector<const uint16_t *> weights(plan.experts.size(), nullptr);
+    std::vector<ggml_sycl::mem_handle> leases;
+    std::vector<sycl::event>           gather_deps;
+    leases.reserve(plan.experts.size() + 1);
+    for (size_t i = 0; i < plan.experts.size(); ++i) {
+        ggml_tensor_extra_gpu::resolved_moe_expert_storage_record logical{};
+        if (!extra->resolve_moe_storage_record(plan.experts[i].expert, GGML_LAYOUT_AOS, ctx.device, expert_bytes,
+                                               &logical) ||
+            !logical.on_device || logical.ptr == nullptr) {
+            return decline(moe_bf16_grouped_decline::EXPERT);
+        }
+        weights[i] = static_cast<const uint16_t *>(logical.ptr);
+        leases.push_back(std::move(logical.logical_handle));
+        if (logical.has_ready_event) {
+            gather_deps.push_back(logical.ready_event);
+        }
+    }
+
+    const size_t widest = static_cast<size_t>(k > m ? k : m);
+    if (plan.packed_rows > SIZE_MAX / (widest * sizeof(float))) {
+        return decline(moe_bf16_grouped_decline::SHAPE);
+    }
+    const size_t act_bytes = plan.packed_rows * static_cast<size_t>(k) * sizeof(uint16_t);
+    const size_t out_bytes = plan.packed_rows * static_cast<size_t>(m) * sizeof(float);
+
+    ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache(*stream);
+    if (!cache) {
+        return decline(moe_bf16_grouped_decline::SCRATCH_RESERVE);
+    }
+    const size_t   planned_weight = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_weight_slot_bytes(ctx.device);
+    const size_t   planned_act = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_activation_slot_bytes(ctx.device);
+    const size_t   planned_out = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_output_slot_bytes(ctx.device);
+    const uint32_t planned_ring_depth = ggml_sycl::unified_cache_get_planned_pp_moe_onednn_ring_depth(ctx.device);
+    const ggml_sycl::pp_moe_onednn_scratch_shape planned_shape = {
+        planned_weight,
+        planned_act,
+        planned_out,
+        planned_ring_depth,
+    };
+    const ggml_sycl::pp_moe_onednn_scratch_admission admission =
+        ggml_sycl::pp_moe_onednn_admit_weightless_scratch(planned_shape, act_bytes, out_bytes);
+    if (!admission.allowed) {
+        // A card with no ring planned (a model whose only MoE experts are BF16) is quiet: the direct route is its
+        // planned path. A ring too small for the node is a plan that missed it, visible at default verbosity once.
+        static ggml_sycl::pp_moe_onednn_scratch_refusal_latch bf16_grouped_refusal_latch;
+        if (admission.reason != ggml_sycl::pp_moe_onednn_scratch_admission_reason::MISSING_PLAN &&
+            ggml_sycl::pp_moe_onednn_should_report_refusal(admission, bf16_grouped_refusal_latch)) {
+            GGML_LOG_WARN(
+                "[SYCL] the BF16 grouped MUL_MAT_ID arm does not fit the planned PP MoE oneDNN ring (reported once per "
+                "process): device=%d tensor=%s reason=%s required=[%zu,%zu] planned=[%zu,%zu]; the BF16 direct route "
+                "runs the node\n",
+                ctx.device, src0->name, ggml_sycl::pp_moe_onednn_scratch_admission_reason_name(admission.reason),
+                act_bytes, out_bytes, planned_act, planned_out);
+        }
+        return decline(moe_bf16_grouped_decline::SCRATCH_UNPLANNED);
+    }
+    const uint32_t ring_depth = pp_moe_onednn_runtime_ring_depth(planned_ring_depth);
+    if (!cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)) {
+        return decline(moe_bf16_grouped_decline::SCRATCH_RESERVE);
+    }
+    pp_moe_onednn_scratch_claim                          claim;
+    uint32_t                                             scratch_slot = std::numeric_limits<uint32_t>::max();
+    ggml_sycl::unified_cache::pp_moe_onednn_scratch_slot reserved;
+    // llama.cpp-uop2: the claim waits while the slot's previous node runs, the executor's own wait, and uop2 removes it.
+    if (!pp_moe_onednn_claim_scratch_slot(ctx.device, ring_depth, scratch_slot)) {
+        return decline(moe_bf16_grouped_decline::SCRATCH_SLOT);
+    }
+    if (!cache->claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved)) {
+        pp_moe_onednn_rollback_unbound_scratch_slot(ctx.device, ring_depth, scratch_slot);
+        return decline(moe_bf16_grouped_decline::SCRATCH_SLOT);
+    }
+    claim.activate(ctx.device, ring_depth, scratch_slot, reserved.generation, stream);
+    claim.take_owners(reserved);
+    if (reserved.activation == nullptr || reserved.output == nullptr || reserved.activation_size < act_bytes ||
+        reserved.output_size < out_bytes) {
+        claim.release_unused();
+        return decline(moe_bf16_grouped_decline::SCRATCH_SLOT);
+    }
+    uint16_t * const act = static_cast<uint16_t *>(reserved.activation);
+    float * const    out = static_cast<float *>(reserved.output);
+
+    // One expert's GEMM: dst rows [base_row, base_row + gemm_rows) of the output plane = the expert's weight times the
+    // same rows of the activation plane. Asked once per width with query_only before anything is submitted.
+    const auto       bf16        = DnnlGemmWrapper::dt::bf16;
+    const auto       f32         = DnnlGemmWrapper::to_dt<float>();
+    const int        mi          = static_cast<int>(m);
+    const int        ki          = static_cast<int>(k);
+    const dnnl_dim_t w_row       = static_cast<dnnl_dim_t>(src0->nb[1] / sizeof(uint16_t));
+    const auto       expert_gemm = [&](size_t i, bool query_only, const std::vector<sycl::event> & deps) {
+        const ggml_sycl::moe_bf16_grouped_expert & expert = plan.experts[i];
+        const int                                  n      = static_cast<int>(expert.gemm_rows);
+        return DnnlGemmWrapper::gemm(ctx, mi, n, ki, weights[i], bf16, 1, w_row, w_row * mi,
+                                           act + expert.base_row * static_cast<size_t>(k), bf16, 1, ki,
+                                           static_cast<dnnl_dim_t>(ki) * n, out + expert.base_row * static_cast<size_t>(m),
+                                           f32, stream, 1, 1, mi, deps, "bf16_expert", query_only,
+                                           GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT, GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE);
+    };
+    for (const size_t width : plan.gemm_widths) {
+        size_t first = 0;
+        while (plan.experts[first].gemm_rows != width) {
+            ++first;
+        }
+        if (!expert_gemm(first, true, {})) {
+            return decline(moe_bf16_grouped_decline::PRIMITIVE);
+        }
+    }
+
+    scoped_unified_queue_temp<ggml_sycl::moe_bf16_grouped_row> rows_dev;
+    if (rows_dev.alloc(*stream, ctx.device, plan.rows.size(), "moe_bf16_grouped_rows") == nullptr) {
+        return decline(moe_bf16_grouped_decline::ROW_MAP);
+    }
+
+    // From the first submission on, a decline lets the leases and the slot go only after a marker behind what was
+    // submitted. dst is written by the scatter alone, so nothing has reached it.
+    claim.mark_used();
+    const auto abandon = [&]() {
+        const sycl::event passed = ggml_sycl_submit_marker<moe_bf16_grouped_abandon_marker>(*stream);
+        ggml_sycl::retain_handles_until_event(std::move(leases), passed);
+        claim.record(passed);
+        return decline(moe_bf16_grouped_decline::SUBMIT);
+    };
+    gather_deps.push_back(ggml_sycl_safe_memcpy(*stream, rows_dev.get(), plan.rows.data(),
+                                                plan.rows.size() * sizeof(ggml_sycl::moe_bf16_grouped_row), {}));
+
+    std::string profile_metadata;
+    if (ggml_sycl_kernel_profile_enabled()) {
+        profile_metadata = "ncols=" + std::to_string(k) + ";nrows_per_expert=" + std::to_string(m) +
+                           ";routed_rows=" + std::to_string(io.n_rows) +
+                           ";experts=" + std::to_string(plan.experts.size()) +
+                           ";packed_rows=" + std::to_string(plan.packed_rows);
+    }
+    ggml_sycl_profile_label profile_label{};
+    profile_label.name       = "mulmat.moe.bf16_grouped.gather";
+    profile_label.category   = "mulmat";
+    profile_label.queue_kind = "compute";
+    profile_label.metadata   = profile_metadata.c_str();
+    profile_label.device     = ctx.device;
+
+    bool              gathered     = false;
+    const sycl::event gather_event = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & queue) {
+        sycl::event event;
+        gathered =
+            ggml_sycl::moe_bf16_grouped_gather_submit(queue, rows_dev.get(), src1_dev, act, io, gather_deps, &event);
+        return event;
+    });
+    if (!gathered) {
+        return abandon();
+    }
+
+    std::vector<sycl::event> gemm_events;
+    gemm_events.reserve(plan.experts.size());
+    for (size_t i = 0; i < plan.experts.size(); ++i) {
+        const std::optional<sycl::event> gemm_event = expert_gemm(i, false, { gather_event });
+        if (!gemm_event) {
+            return abandon();
+        }
+        gemm_events.push_back(*gemm_event);
+    }
+
+    profile_label.name              = "mulmat.moe.bf16_grouped.scatter";
+    bool              scattered     = false;
+    const sycl::event scatter_event = ggml_sycl_profile_submit(*stream, profile_label, [&](sycl::queue & queue) {
+        sycl::event event;
+        scattered =
+            ggml_sycl::moe_bf16_grouped_scatter_submit(queue, rows_dev.get(), out, dst_dev, io, gemm_events, &event);
+        return event;
+    });
+    if (!scattered) {
+        return abandon();
+    }
+
+    leases.push_back(std::move(rows_dev.handle));
+    ggml_sycl::retain_handles_until_event(std::move(leases), scatter_event);
+    claim.record(scatter_event);
+    ggml_sycl_set_tensor_ready_event(dst, ctx.device, scatter_event, stream);
+    ctx.moe_graphs_disabled_once = true;
+
+    const uint64_t runs = g_moe_bf16_grouped_runs.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
+        static std::atomic<int> bf16_grouped_log{ 0 };
+        if (bf16_grouped_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+            GGML_LOG_INFO(
+                "[MOE-ROUTE] bf16 grouped tensor=%s device=%d tokens=%lld slots=%lld experts=%zu widths=%zu "
+                "packed_rows=%zu runs=%llu\n",
+                src0->name, ctx.device, (long long) n_tokens, (long long) n_slots, plan.experts.size(),
+                plan.gemm_widths.size(), plan.packed_rows, (unsigned long long) runs);
+        }
+    }
+    return true;
+#endif
+}
+
 // Why the NVFP4 resident decode route left a decode node to the admitted route. The route log names each reason once
 // per weight and device with one bit per reason on the weight, so COUNT must fit 32 bits.
 enum class moe_resident_decode_decline : uint8_t {
@@ -92395,10 +92777,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
         s_mul_mat_id_extras.push_back(std::move(new_extra));
     }
 
-    // BF16 experts (Inkling 2 Mini plan, Task 8g) have one route: the BF16 expert kernel, ahead of every route below,
-    // none of which has a BF16 kernel. Every BF16 op enters it; the route asks the predicate supports_op asked again
-    // and refuses by name when the answer has become no, so no BF16 op reaches a route below.
+    // BF16 experts (Inkling 2 Mini plan, Tasks 8g and 24) have two routes, ahead of every route below, none of which
+    // has a BF16 kernel. A prompt node takes the grouped arm, one oneDNN GEMM per active expert, when the arm takes it:
+    // the arm asks the direct route's predicate, its scatter's event is dst's ready event, and a decline has written
+    // nothing to dst. Every other BF16 op, and every node the arm declines, enters the BF16 expert kernel; that route
+    // asks the predicate supports_op asked again and refuses by name when the answer has become no, so no BF16 op
+    // reaches a route below.
     if (src0->type == GGML_TYPE_BF16) {
+        if (ggml_sycl_mul_mat_id_bf16_grouped(ctx, dst)) {
+            ready_guard.published = true;
+            return;
+        }
         ggml_sycl_mul_mat_id_bf16_direct(ctx, dst);
         return;
     }

@@ -253,6 +253,10 @@ EXCLUDED_FILES = {
                            "runs it only for a BF16 expert weight (ggml_sycl_moe_bf16_direct_route_available), and "
                            "the Qwen3.8-Flash-Next packs hold none (their ffn_*_exps are Q4_K, Q5_K, Q5_1, Q8_0 and "
                            "IQ4_NL)",
+    "moe-bf16-grouped.cpp": "the gather and scatter of the BF16 grouped prompt arm of MUL_MAT_ID: "
+                            "ggml_sycl_mul_mat_id_bf16_grouped (ggml-sycl.cpp) runs them only for a BF16 expert weight "
+                            "(ggml_sycl_moe_bf16_direct_route_available), which the Qwen3.8-Flash-Next packs hold none "
+                            "of",
     "moe-mmid-workspace.cpp": "no launch: its .fill( calls are std::array::fill in moe_mmid_workspace_registry::admit",
     "mxfp4-stored-gemm.cpp": "its header mxfp4-stored-gemm.hpp (besides this file): " + NOT_INCLUDED,
     "mmvq-rmsnorm.hpp": NOT_INCLUDED,

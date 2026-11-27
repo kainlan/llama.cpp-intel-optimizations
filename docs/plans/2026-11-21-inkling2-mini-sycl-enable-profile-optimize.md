@@ -7353,6 +7353,57 @@ reference kernels and must not be used.
 - The 64-row rounding stays. At n = 32 the device time per call is 41.7 us against 47.0 us at n = 64, about 11%
   less, which is not worth four times the primitives.
 
+**GREEN (implementer, 2026-11-26): host-verified only. Every device acceptance item above is the lead's.**
+- The arm is `ggml_sycl_mul_mat_id_bf16_grouped` (`ggml-sycl.cpp`), after the BF16 direct route. The kernels are
+  `moe-bf16-grouped.{hpp,cpp}`, one gather and one scatter submit, and the host plan is
+  `moe-bf16-grouped-plan.hpp`. At the seam, the BF16 block tries the arm, then the direct route.
+- Every way the arm leaves a node is a decline, and each decline is counted under a reason. The opt-out is the first
+  reason. The others:
+  - fewer than 64 tokens;
+  - no oneDNN;
+  - recording;
+  - the direct predicate;
+  - shape;
+  - operands;
+  - ids;
+  - plan;
+  - table;
+  - expert;
+  - ring unplanned or too small;
+  - reserve;
+  - slot;
+  - primitive;
+  - row map;
+  - a submit after the first one.
+- Declines and the route log:
+  - With `GGML_SYCL_MOE_ROUTE_LOG=1`, the route log names the first 16 declines of each reason.
+  - A ring the plan sized too small for the node is a WARN, once per process.
+  - No ring at all is quiet. That covers a model whose only experts are BF16: its plan is the direct route.
+- The device test is `test-moe-bf16-grouped-device`, with labels `sycl;moe;device;B70;model`.
+  - It loads planned models through `moe_planned_fixture`. The fixture gains an optional companion tensor, so a
+    BF16 model can carry an NVFP4 tensor of the other role in its block. The load then plans the ring, as Inkling's
+    NVFP4 layers make it. A BF16-only fixture plans none, and the arm would decline every node.
+  - Its cases:
+    - gate_up on all 128 experts;
+    - gate_up on 40 experts, so 88 experts are selected by no token;
+    - gate_up at 64 tokens;
+    - gate_up at 63 tokens, which goes to the direct route with `reason=tokens`;
+    - down on all experts;
+    - the opt-out, as a child process, which goes to the direct route with `reason=opt_out`.
+  - Each case is checked against the CPU backend at NMSE 5e-4 per row.
+- Contracts updated:
+  - `test-sycl-moe-bf16-direct-source.py`:
+    - (b) now counts four askers of the predicate;
+    - (c) is the block's new body;
+    - the new (i) pins the arm: the opt-out read once and asked first, every exit a counted decline, the uop2 comment
+      directly before the claim, no wait in the arm or its kernels, the event chain, and the leases, row map and
+      slot held to the scatter's event.
+  - `check-sycl-dnnl-decline-consumers.py`: the arm is the second `CREATE_FAILURE_DECLINE` caller, with its query
+    and run pins.
+  - `test-sycl-pp-moe-scratch-admission-contract.py`: the arm is a third reserve site, under the batched executor's
+    planned names. Mutants written for the batched executor are applied inside that executor (`mutate_once`),
+    because the arm, earlier in the file, spells the same statements.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)

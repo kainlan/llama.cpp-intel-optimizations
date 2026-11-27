@@ -1,6 +1,7 @@
 // What the planned-model MoE prompt device tests share: test-moe-pp-batched-dequant.cpp, which runs one MUL_MAT_ID
-// prompt op per expert type on such a model, and test-moe-pp-staging-refusal.cpp, whose --direct-reentry mode runs two
-// prompt nodes on its NVFP4 gate. It holds the model's shape, its quantized experts, the inventory libllama stages for
+// prompt op per expert type on such a model, test-moe-pp-staging-refusal.cpp, whose --direct-reentry mode runs two
+// prompt nodes on its NVFP4 gate, and test-moe-bf16-grouped-device.cpp, which runs BF16 prompt nodes on the grouped
+// arm beside an NVFP4 companion. It holds the model's shape, its quantized experts, the inventory libllama stages for
 // it with the PP MoE ring fields libllama computes for that shape, and the model's lifecycle as libllama drives it
 // through the public entry points. Each test keeps its own shape, tensor names, cases, main() and every skip path, and
 // includes it once.
@@ -33,6 +34,12 @@ inline size_t align_256(size_t n) {
 // A planned model's expert tensors and the context its load is planned for: `count` tensors (at most 3) named `names`,
 // each `n_experts` experts of `n_out` rows of `n_in` values of `type`, sharing one shape, so the first of them, the one
 // the tests run, is representative.
+//
+// A companion, when `companion_type` names one, is one more expert tensor of the same shape, named `companion_name`,
+// of that type, filled with zero bytes and never run. The load plans the PP MoE oneDNN ring only for a model with an
+// expert of a type a ring consumer runs (ggml_sycl_inventory_ring_has_consumer), so a model of BF16 experts, which no
+// consumer runs, plans none; a companion of such a type (NVFP4, say) makes the load plan the ring an Inkling 2 Mini
+// load plans for its NVFP4 layers. It draws nothing from the test's generator, so the experts' bytes do not change.
 struct planned_shape {
     ggml_type            type;
     int                  n_experts;
@@ -43,7 +50,31 @@ struct planned_shape {
     int                  count;
     uint32_t             n_ctx;
     uint32_t             n_ubatch;
+    ggml_type            companion_type = GGML_TYPE_COUNT;  // GGML_TYPE_COUNT: no companion
+    const char *         companion_name = nullptr;
 };
+
+inline bool planned_has_companion(const planned_shape & shape) {
+    return shape.companion_type != GGML_TYPE_COUNT;
+}
+
+// The expert tensors and the companion, if any.
+inline int planned_tensor_count(const planned_shape & shape) {
+    return shape.count + (planned_has_companion(shape) ? 1 : 0);
+}
+
+// Tensor `i` of the model, below planned_tensor_count: an expert tensor below `count`, the companion at `count`.
+inline ggml_type planned_tensor_type(const planned_shape & shape, int i) {
+    return i == shape.count ? shape.companion_type : shape.type;
+}
+
+inline const char * planned_tensor_name(const planned_shape & shape, int i) {
+    return i == shape.count ? shape.companion_name : shape.names[i];
+}
+
+inline size_t planned_tensor_bytes(const planned_shape & shape, int i) {
+    return ggml_row_size(planned_tensor_type(shape, i), shape.n_in) * shape.n_out * shape.n_experts;
+}
 
 // One expert tensor's quantized bytes at `shape`, from values drawn uniformly in [-0.5, 0.5) from `rng`, with no
 // importance matrix.
@@ -64,25 +95,26 @@ inline std::vector<uint8_t> planned_expert_bytes(const planned_shape & shape, st
 // for their shape with GGML_SYCL_MOE_PP_WOQ at its default (on): weight slots sized for the MXFP4 WOQ arm, about a
 // quarter of every expert in f16.
 struct planned_inventory {
-    ggml_sycl_tensor_info        tensors[3]{};
+    ggml_sycl_tensor_info        tensors[4]{};
     ggml_sycl_tensor_inventory   inventory{};
     ggml_sycl_placement_envelope envelope{};
 
     explicit planned_inventory(const planned_shape & shape) {
         require(shape.count >= 1 && shape.count <= 3, "a planned model holds one to three expert tensors");
+        require(!planned_has_companion(shape) || shape.companion_name != nullptr, "a companion tensor needs a name");
         envelope = ggml_sycl_placement_envelope{ shape.n_ctx, shape.n_ubatch, 1, -1 };
-        for (int i = 0; i < shape.count; ++i) {
-            tensors[i].name  = shape.names[i];
-            tensors[i].type  = shape.type;
+        for (int i = 0; i < planned_tensor_count(shape); ++i) {
+            tensors[i].name  = planned_tensor_name(shape, i);
+            tensors[i].type  = planned_tensor_type(shape, i);
             tensors[i].ne[0] = shape.n_in;
             tensors[i].ne[1] = shape.n_out;
             tensors[i].ne[2] = shape.n_experts;
             tensors[i].ne[3] = 1;
-            tensors[i].size  = ggml_row_size(shape.type, shape.n_in) * shape.n_out * shape.n_experts;
+            tensors[i].size  = planned_tensor_bytes(shape, i);
             inventory.total_size += tensors[i].size;
         }
         inventory.tensors       = tensors;
-        inventory.count         = shape.count;
+        inventory.count         = planned_tensor_count(shape);
         inventory.n_expert      = shape.n_experts;
         inventory.n_expert_used = shape.n_used;
         inventory.n_layer       = 1;
@@ -117,7 +149,8 @@ struct planned_model {
     ggml_context *            weight_ctx    = nullptr;
     ggml_backend_buffer_t     weight_buffer = nullptr;
     ggml_tensor *             gate          = nullptr;  // the first expert tensor, the one the tests run
-    std::vector<uint8_t>      gate_bytes;               // its quantized bytes, for the CPU reference
+    ggml_tensor *             companion     = nullptr;  // the companion tensor, when the shape names one
+    std::vector<uint8_t>      gate_bytes;               // the first expert tensor's bytes, for the CPU reference
 
     // `split_path` names the model's one split: a test that loads several models in one process names each its own, so
     // no two share a file identity. `rewrite`, where set, edits the quantized bytes before they fill the tensors.
@@ -168,23 +201,32 @@ struct planned_model {
                       const std::string &                                 split_path,
                       std::mt19937 &                                      rng,
                       const std::function<void(std::vector<uint8_t> &)> & rewrite) {
-        ggml_init_params params = { size_t(shape.count) * ggml_tensor_overhead(), nullptr, true };
-        weight_ctx              = ggml_init(params);
+        const int        n_tensors = planned_tensor_count(shape);
+        ggml_init_params params    = { size_t(n_tensors) * ggml_tensor_overhead(), nullptr, true };
+        weight_ctx                 = ggml_init(params);
         require(weight_ctx != nullptr, "ggml_init for the weights failed");
         ggml_backend_dev_t dev        = ggml_backend_get_device(backend);
-        ggml_tensor *      tensors[3] = {};
-        for (int i = 0; i < shape.count; ++i) {
-            tensors[i] = ggml_new_tensor_3d(weight_ctx, shape.type, shape.n_in, shape.n_out, shape.n_experts);
-            ggml_set_name(tensors[i], shape.names[i]);
+        ggml_tensor *      tensors[4] = {};
+        // The split holds the tensors one after another, the companion last.
+        uint64_t           file_size  = 0;
+        for (int i = 0; i < n_tensors; ++i) {
+            file_size += planned_tensor_bytes(shape, i);
+        }
+        size_t offset = 0;
+        for (int i = 0; i < n_tensors; ++i) {
+            const char * name = planned_tensor_name(shape, i);
+            tensors[i] =
+                ggml_new_tensor_3d(weight_ctx, planned_tensor_type(shape, i), shape.n_in, shape.n_out, shape.n_experts);
+            ggml_set_name(tensors[i], name);
             const size_t nbytes = ggml_nbytes(tensors[i]);
-            ggml_backend_sycl_register_gguf_file_identity(0, split_path.c_str(), uint64_t(shape.count) * nbytes);
-            ggml_backend_sycl_register_weight_identity(tensors[i], 0, size_t(i) * nbytes, nbytes, 0);
+            ggml_backend_sycl_register_gguf_file_identity(0, split_path.c_str(), file_size);
+            ggml_backend_sycl_register_weight_identity(tensors[i], 0, offset, nbytes, 0);
             if (ggml_backend_sycl_weights_evictable()) {
                 ggml_backend_sycl_register_host_weight_tensor(dev, tensors[i]);
             }
-            require(
-                ggml_backend_sycl_try_register_weight_usage(shape.names[i], GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT),
-                std::string("usage registration refused for ") + shape.names[i]);
+            require(ggml_backend_sycl_try_register_weight_usage(name, GGML_SYCL_TENSOR_USAGE_MOE_EXPERT_WEIGHT),
+                    std::string("usage registration refused for ") + name);
+            offset += nbytes;
         }
         ggml_backend_buffer_type_t buft = ggml_backend_sycl_host_buffer_type_for_device(dev);
         require(buft != nullptr, "no SYCL host buffer type for the pinned card");
@@ -199,6 +241,11 @@ struct planned_model {
             ggml_backend_tensor_set(tensors[i], gate_bytes.data(), 0, gate_bytes.size());
         }
         gate = tensors[0];
+        if (planned_has_companion(shape)) {
+            companion = tensors[shape.count];
+            const std::vector<uint8_t> zeros(ggml_nbytes(companion), 0);
+            ggml_backend_tensor_set(companion, zeros.data(), 0, zeros.size());
+        }
     }
 
     void cleanup() noexcept {
@@ -221,7 +268,8 @@ struct planned_model {
             ggml_free(weight_ctx);
             weight_ctx = nullptr;
         }
-        gate = nullptr;
+        gate      = nullptr;
+        companion = nullptr;
         if (model.model_id) {
             (void) ggml_backend_sycl_model_unloaded_token(model);
             model = {};

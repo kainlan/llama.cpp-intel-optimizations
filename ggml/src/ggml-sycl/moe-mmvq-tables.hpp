@@ -403,10 +403,13 @@ inline bool moe_pp_batched_takes_staged_type(enum ggml_type type) {
 // Whether an expert of `type` has a consumer of the PP MoE oneDNN scratch ring, in any layout: the batched prompt
 // executor (the WOQ and f16 tables above) or the MXFP4 SOA per-expert staging (the f16 table's MXFP4 row). The load
 // plans the ring only for a model with such an expert (ggml_sycl_inventory_ring_has_consumer). Q1_0 runs on its MMID
-// direct route and BF16 on the BF16 direct route, and neither draws on the ring, so a model whose experts are only
-// those types would otherwise hold a ring of several hundred MB in its RUNTIME zone that nothing uses. The answer
-// asks no runtime knob: the ring a load plans does not change with a knob that turns an executor off for a run, and
-// every type the ring stages for a host expert (moe_pp_batched_takes_staged_type) is served.
+// direct route and does not draw on the ring. BF16 has a route of its own for every node, the BF16 direct route; its
+// grouped prompt arm (ggml-sycl.cpp, Inkling 2 Mini plan Task 24) borrows the activation and output planes of a ring
+// planned for another type and declines where there is none, so a BF16 expert is not a ring consumer here. A model
+// whose experts are only Q1_0 or BF16 would otherwise hold a ring of several hundred MB in its RUNTIME zone that
+// nothing needs. The answer asks no runtime knob: the ring a load plans does not change with a knob that turns an
+// executor off for a run, and every type the ring stages for a host expert (moe_pp_batched_takes_staged_type) is
+// served.
 inline bool moe_pp_onednn_ring_serves_type(enum ggml_type type) {
     for (int layout = GGML_LAYOUT_AOS; layout <= GGML_LAYOUT_MXFP4_DPAS; ++layout) {
         const enum ggml_layout_mode mode = static_cast<enum ggml_layout_mode>(layout);

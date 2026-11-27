@@ -36,8 +36,9 @@ whitespace-canonical text:
   GGML_SYCL_DNNL_FPMATH_BUILD, is the build's choice (fpmath f16 under GGML_SYCL_F16, otherwise nothing set); only
   GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT sets fpmath strict; the primitive cache key carries the mode in a field its
   equality and its hash both read, so a strict and an f16 primitive of one shape are two entries; the route op passes
-  NO_DOWNCONVERT, and so does the BF16 weight's oneDNN route (ggml_sycl_mul_mat_bf16_onednn), which accumulates its
-  bf16 operands in F32 where the build's f16 float math would let oneDNN compute in f16; no other caller does. The
+  NO_DOWNCONVERT, and so do the BF16 weight's oneDNN route (ggml_sycl_mul_mat_bf16_onednn) and the BF16 expert
+  weight's grouped prompt arm (ggml_sycl_mul_mat_id_bf16_grouped), each of which accumulates its bf16 operands in F32
+  where the build's f16 float math would let oneDNN compute in f16; no other caller does. The
   value does not say STRICT: every GGML_SYCL_*STRICT* name is the one strict-leases abort switch or one of its named
   exceptions (test-sycl-context-tenant-plan-source.py, gate 22).
 
@@ -685,6 +686,7 @@ _BF16_ROUTE = (
     "const uint16_t * weight, const float * src1_ddf, float * dst_ddf, int64_t n_vecs, int64_t ldx, int64_t ldy, "
     "size_t act_bytes)"
 )
+_BF16_GROUPED = "static bool ggml_sycl_mul_mat_id_bf16_grouped(ggml_backend_sycl_context & ctx, ggml_tensor * dst)"
 _FPMATH_PARAM = re.compile(r"ggml_sycl_dnnl_fpmath (\w+)=(\w+)")
 
 
@@ -746,9 +748,11 @@ def fpmath_errors(gemm_code: str, sycl_code: str, others: dict) -> list:
         if re.findall(r"\bkey\." + field + r"=([^;]*);", gb) != [param]:
             errs.append("gemm() does not put its float-math parameter in its key")
 
-    # the route op and the BF16 route each pass STRICT at that parameter's place, and nothing else names STRICT
+    # the route op, the BF16 route and the BF16 grouped arm each pass STRICT at that parameter's place, and nothing
+    # else names STRICT
     strict_callers = [("the route op", function_body(sycl_code, _ROUTE_OP)),
-                      ("the BF16 route", function_body(sycl_code, _BF16_ROUTE))]
+                      ("the BF16 route", function_body(sycl_code, _BF16_ROUTE)),
+                      ("the BF16 grouped arm", function_body(sycl_code, _BF16_GROUPED))]
     for who, body in strict_callers:
         at = body.find("DnnlGemmWrapper::gemm(")
         args = call_args(body, at + len("DnnlGemmWrapper::gemm")) if at != -1 else []
@@ -756,7 +760,8 @@ def fpmath_errors(gemm_code: str, sycl_code: str, others: dict) -> list:
             errs.append("%s does not pass %s as gemm()'s float math: %r" % (who, _STRICT, args[index:]))
     if (any(body.count(_STRICT) != 1 for _, body in strict_callers)
             or sycl_code.count(_STRICT) != sum(body.count(_STRICT) for _, body in strict_callers)):
-        errs.append("ggml-sycl.cpp names %s outside the route op's and the BF16 route's one call each" % _STRICT)
+        errs.append("ggml-sycl.cpp names %s outside the route op's, the BF16 route's and the BF16 grouped arm's one "
+                    "call each" % _STRICT)
     if gemm_code.count(_STRICT) != 2:  # the enumerator and gemm()'s one test of it
         errs.append("gemm.hpp names %s %d times, not as the enumerator and its one test"
                     % (_STRICT, gemm_code.count(_STRICT)))
@@ -823,6 +828,9 @@ def test_fpmath_mutants():
     bf16_route = function_body(s, _BF16_ROUTE)
     bf16_call = bf16_route[bf16_route.index("DnnlGemmWrapper::gemm(") :]
     bf16_call = bf16_call[: balanced_end(bf16_call, len("DnnlGemmWrapper::gemm"), "(", ")") + 1]
+    arm = function_body(s, _BF16_GROUPED)
+    arm_call = arm[arm.index("DnnlGemmWrapper::gemm(") :]
+    arm_call = arm_call[: balanced_end(arm_call, len("DnnlGemmWrapper::gemm"), "(", ")") + 1]
     sycl_mutants = [
         ("the route passes the build's math", s.replace(route, mutate(route, route_call, route_call.replace(_STRICT, _BUILD)), 1)),
         ("the route omits the math", s.replace(route, mutate(route, route_call, route_call.replace("," + _STRICT, "")), 1)),
@@ -833,6 +841,12 @@ def test_fpmath_mutants():
          s.replace(bf16_route, mutate(bf16_route, bf16_call, bf16_call.replace("," + _STRICT, "")), 1)),
         ("the BF16 route names strict twice",
          s.replace(bf16_route, mutate(bf16_route, bf16_call, bf16_call + ";(void)" + _STRICT), 1)),
+        ("the BF16 grouped arm passes the build's math",
+         s.replace(arm, mutate(arm, arm_call, arm_call.replace(_STRICT, _BUILD)), 1)),
+        ("the BF16 grouped arm omits the math",
+         s.replace(arm, mutate(arm, arm_call, arm_call.replace("," + _STRICT, "")), 1)),
+        ("the BF16 grouped arm names strict twice",
+         s.replace(arm, mutate(arm, arm_call, arm_call + ";(void)" + _STRICT), 1)),
     ]
     for name, new_s in sycl_mutants:
         assert new_s != s, f"mutant {name!r} changed nothing"

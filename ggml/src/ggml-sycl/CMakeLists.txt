@@ -6607,6 +6607,42 @@ set_tests_properties(sycl-moe-bf16-direct-device PROPERTIES
 )
 endif() # static SYCL backend fixture
 
+# Task 24 (Inkling 2 Mini): a BF16 prompt MUL_MAT_ID of at least 64 tokens on a planned model, loaded the way libllama
+# loads one with Inkling's two expert shapes (128 experts, 8 used) beside an NVFP4 companion that makes the load plan
+# the PP MoE oneDNN ring, runs on the BF16 grouped arm: one batched gather, a oneDNN bf16 GEMM per active expert on the
+# expert as loaded, one batched scatter. Cases: all experts, 40 of them, the 64-token minimum, and the down shape on the
+# arm; 63 tokens and GGML_SYCL_MOE_BF16_GROUPED=0 (a child process of the test) on the BF16 direct route, with the
+# arm's decline line naming the reason. Every output row within NMSE 5e-4 of the CPU backend, no refusal. Each model
+# holds ~4.5 GB on the card with its ring and ~9 GB of host memory (~12 GB while its experts are quantized), so the
+# label is `model`, which keeps it out of the full sweep (CLAUDE.md, .claude/rules/ctest-registration.md): run it
+# alone. Pinned to the B70; a run with no SYCL GPU exits 77.
+if (NOT GGML_BACKEND_DL)
+add_executable(test-moe-bf16-grouped-device
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-bf16-grouped-device.cpp
+)
+target_include_directories(test-moe-bf16-grouped-device PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SYCL_INCLUDE_DIR}
+)
+target_compile_options(test-moe-bf16-grouped-device PRIVATE "-fsycl" "-Wno-narrowing")
+target_link_options(test-moe-bf16-grouped-device PRIVATE "-fsycl")
+target_link_libraries(test-moe-bf16-grouped-device PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
+if (IntelSYCL_FOUND)
+    target_link_libraries(test-moe-bf16-grouped-device PRIVATE IntelSYCL::SYCL_CXX)
+endif()
+set_target_properties(test-moe-bf16-grouped-device PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test-moe-bf16-grouped-device COMMAND test-moe-bf16-grouped-device)
+set_tests_properties(test-moe-bf16-grouped-device PROPERTIES
+    LABELS "sycl;moe;device;B70;model"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 600
+)
+endif() # static SYCL backend fixture
+
 # Task 8g (Inkling 2 Mini): the BF16 MUL_MAT_ID expert kernel (moe-bf16-direct.cpp) against a double-precision
 # reference: Inkling's k with a broadcast row and a row per slot, the scalar form (k 99, a broken row stride, an expert
 # base off 8 bytes), float4 defeated by a misaligned activation base, padded strides, and the slot semantics (id -1 a

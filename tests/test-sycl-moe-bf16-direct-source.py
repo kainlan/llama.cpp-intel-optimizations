@@ -11,12 +11,14 @@ expert table and the device ids, with src1 and dst read and written in place. Th
       asks supports_op before it allocates, then allocates on the backend it asked) and a placed weight counts only in
       this device's own buffer (an unsplit SYCL buffer of this device, in VRAM), asked through the one helper that
       holds that whole test; it reads no environment and has no row-multiple rule;
-  (b) supports_op asks that predicate as the MUL_MAT_ID gate's third term, and the route asks the same predicate
-      again at run time and refuses by name when it says no;
+  (b) supports_op asks that predicate as the MUL_MAT_ID gate's third term, the route asks the same predicate again at
+      run time and refuses by name when it says no, and the BF16 grouped prompt arm (Task 24) asks it too, before its
+      table, and declines to the route when it says no;
   (c) the route sits in ggml_sycl_mul_mat_id after the src0->extra ensure block and before the MMID_SCHED device
       schedule, the yx28 decode-direct request and ggml_sycl_ensure_weight_on_device(); its block is keyed on the BF16
-      expert type, not on the predicate, and is one call to ggml_sycl_mul_mat_id_bf16_direct() and a return, so no
-      BF16 op reaches the routes after it, none of which has a BF16 kernel;
+      expert type, not on the predicate, and is the grouped arm's try (dst's ready event published and a return when
+      the arm ran the node), then one call to ggml_sycl_mul_mat_id_bf16_direct() and a return, so no BF16 op reaches
+      the routes after it, none of which has a BF16 kernel;
   (d) ggml_sycl_mul_mat_id_bf16_direct() takes the AOS full-local table through one table helper (which publishes the
       weight's AOS slices on a miss only from this device's own buffer, through the same buffer test the predicate
       asks, and not again at a storage generation where the publish failed or an expert still did not resolve after
@@ -43,7 +45,18 @@ expert table and the device ids, with src1 and dst read and written in place. Th
       row strides, and the 8-byte weight load only on an 8-byte aligned weight row (opencl:cpu reads unaligned loads
       correctly, so the kernel test cannot see either guard go); the file allocates, frees and waits on nothing;
   (h) the MMVQ tables stay BF16-free and moe_type_has_immutable_host_recipe (the Q1_0/NVFP4 type predicate, which the
-      planner's MMID workspace pools and the host recipe chooser ask) stays Q1_0/NVFP4.
+      planner's MMID workspace pools and the host recipe chooser ask) stays Q1_0/NVFP4;
+  (i) the BF16 grouped prompt arm, ggml_sycl_mul_mat_id_bf16_grouped() (Task 24), is a separate arm beside the route:
+      called only from the route's block, and the NVFP4 batched prompt executor names no BF16. It asks the opt-out
+      first (GGML_SYCL_MOE_BF16_GROUPED, read once into a function-local static), and every way it leaves without
+      running the node is a counted decline, never a bare `return false`. Its host waits are the executor's alone: the
+      graph-local ids D2H snapshot and the ring-slot claim, which a `// llama.cpp-uop2:` comment directly precedes;
+      nothing in it or in moe-bf16-grouped.{hpp,cpp} waits. In order: the ids, the table, the weightless admission
+      against the planned ring, the reservation, the claim, one batched gather (profiled as
+      mulmat.moe.bf16_grouped.gather), one oneDNN bf16 GEMM per expert after the gather's event (op context
+      bf16_expert, no f32 down-conversion, a primitive that cannot be created declining), one batched scatter after the
+      GEMMs' events (mulmat.moe.bf16_grouped.scatter), the row map joining the record leases, which are held until the
+      scatter's event, the slot recorded on it and dst's ready event set to it. Only the scatter writes dst.
 """
 
 import re
@@ -58,6 +71,12 @@ FILES = {
     "hpp": SYCL_DIR / "moe-bf16-direct.hpp",
     "cpp": SYCL_DIR / "moe-bf16-direct.cpp",
     "tables": SYCL_DIR / "moe-mmvq-tables.hpp",
+    "arm_hpp": SYCL_DIR / "moe-bf16-grouped.hpp",
+    "arm_cpp": SYCL_DIR / "moe-bf16-grouped.cpp",
+}
+# Keys whose text keeps its comments (squeezed only), for the claims that pin a comment.
+RAW_FILES = {
+    "sycl_raw": FILES["sycl"],
 }
 
 PREDICATE = "ggml_sycl_moe_bf16_direct_route_available"
@@ -108,7 +127,39 @@ TOKENS_PER_LAUNCH_CALL = "ggml_sycl::moe_bf16_direct_tokens_per_launch(shape)"
 X_ALIGN_GUARD = ("const bool xvec = vec4 && reinterpret_cast<uintptr_t>(src1) % 16 == 0 && shape.src1_nb1 % 16 == 0 && "
                  "shape.src1_nb2 % 16 == 0;")
 W_ALIGN_GUARD = "if (VEC4 && (reinterpret_cast<uintptr_t>(w_row) & 7) == 0) {"
-ROUTE_BODY = f"{ROUTE_FN}(ctx,dst);return;"
+ARM_FN = "ggml_sycl_mul_mat_id_bf16_grouped"
+ARM_FN_HEAD = f"static bool {ARM_FN}(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {{"
+ARM_DECLINES_PREDICATE = "returndecline(moe_bf16_grouped_decline::PREDICATE);"
+ARM_TRY = f"if ({ARM_FN}(ctx, dst)) {{ ready_guard.published = true; return; }}"
+ROUTE_BODY = re.sub(r"\s+", "", ARM_TRY) + f"{ROUTE_FN}(ctx,dst);return;"
+ARM_ENABLED = "ggml_sycl_moe_bf16_grouped_enabled()"
+ARM_ENABLED_HEAD = f"static bool {ARM_ENABLED} {{"
+ARM_ENABLED_PARTS = ("static const bool enabled = [", 'std::getenv("GGML_SYCL_MOE_BF16_GROUPED")', "return enabled;")
+ARM_OPT_OUT_ENV = '"GGML_SYCL_MOE_BF16_GROUPED"'
+ARM_DECLINE_HEAD = ("static bool ggml_sycl_moe_bf16_grouped_decline(const ggml_tensor * src0, int device, "
+                    "moe_bf16_grouped_decline decline) {")
+ARM_DECLINE_COUNT = "g_moe_bf16_grouped_declines[reason].fetch_add(1, std::memory_order_relaxed)"
+ARM_IDS = "ggml_sycl_get_moe_ids_d2h_cache_entry(ctx, ids, "
+ARM_IDS_REFRESH = "ggml_sycl_refresh_moe_ids_cache(ctx, ids, ids_entry)"
+ARM_ADMIT = "ggml_sycl::pp_moe_onednn_admit_weightless_scratch(planned_shape, act_bytes, out_bytes)"
+ARM_RESERVE = "cache->reserve_pp_moe_onednn_scratch(planned_weight, planned_act, planned_out, ring_depth)"
+ARM_CLAIM = "if (!pp_moe_onednn_claim_scratch_slot(ctx.device, ring_depth, scratch_slot)) {"
+ARM_UOP2 = "// llama.cpp-uop2:"
+ARM_GEMM = "DnnlGemmWrapper::gemm("
+ARM_GEMM_ARGS = ('"bf16_expert"', "GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT", "GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE")
+ARM_GEMM_RUN = "expert_gemm(i, false, { gather_event })"
+ARM_GATHER = "ggml_sycl::moe_bf16_grouped_gather_submit(queue, rows_dev.get(), src1_dev, act, io, gather_deps, &event)"
+ARM_SCATTER = "ggml_sycl::moe_bf16_grouped_scatter_submit(queue, rows_dev.get(), out, dst_dev, io, gemm_events, &event)"
+ARM_GATHER_LABEL = 'profile_label.name = "mulmat.moe.bf16_grouped.gather";'
+ARM_SCATTER_LABEL = 'profile_label.name = "mulmat.moe.bf16_grouped.scatter";'
+ARM_ROWS_HELD = "leases.push_back(std::move(rows_dev.handle));"
+ARM_RETAIN = "ggml_sycl::retain_handles_until_event(std::move(leases), scatter_event);"
+ARM_RECORD = "claim.record(scatter_event);"
+ARM_READY = "ggml_sycl_set_tensor_ready_event(dst, ctx.device, scatter_event, stream);"
+ARM_ROUTE_LOG = "[MOE-ROUTE] bf16 grouped tensor="
+ARM_FORBIDDEN = (".wait(", "->wait(", "::wait(", "wait_and_throw", "getenv", "GGML_ABORT", "malloc_", "sycl::free(",
+                 "return false;", "ggml_sycl_ensure_weight_on_device", "ids_host", "ggml_sycl_copy_ids_to_host")
+EXECUTOR_HEAD = "auto try_pp_onednn_f16_batched = [&]() -> bool {"
 GATE = ("if (!moe_mmvq_admission_supports_type(indexed_a_type) && !ggml_sycl_moe_pp_batched_admits_op(op, device) && "
         f"!{PREDICATE}(op, device)) {{")
 MUL_MAT_ID_HEAD = "static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * dst) try {"
@@ -180,6 +231,8 @@ def load():
     out = {}
     for key, path in FILES.items():
         out[key] = squeeze(strip_comments(path.read_text(encoding="utf-8"))) if path.exists() else ""
+    for key, path in RAW_FILES.items():
+        out[key] = squeeze(path.read_text(encoding="utf-8")) if path.exists() else ""
     return out
 
 
@@ -274,17 +327,23 @@ def claim_b_one_predicate(s):
     if sycl.count(GATE) != 1:
         fails.append("the supports_op MUL_MAT_ID gate does not ask the BF16 predicate as its third term")
     calls = len(re.findall(rf"\b{PREDICATE}\(", sycl))
-    if calls != 3:
-        fails.append(f"{PREDICATE} appears {calls} times; want its definition, the gate and the route")
+    if calls != 4:
+        fails.append(f"{PREDICATE} appears {calls} times; want its definition, the gate, the route and the grouped arm")
     route = route_fn_body(sycl) or ""
-    if sycl.count(ROUTE_ASK) != 1 or ROUTE_ASK not in route:
-        fails.append(f"{ROUTE_FN} does not ask the predicate exactly once at run time")
+    arm = arm_fn_body(sycl) or ""
+    if sycl.count(ROUTE_ASK) != 2 or route.count(ROUTE_ASK) != 1 or arm.count(ROUTE_ASK) != 1:
+        fails.append(f"{ROUTE_FN} and {ARM_FN} do not each ask the predicate exactly once at run time")
     else:
         declined = braced_body(route, ROUTE_ASK) or ""
         if not tight(declined).startswith("refuse("):
             fails.append("a run-time `no` from the predicate is not a named refusal")
         if route.find(ROUTE_ASK) > route.find(TABLE_CALL) >= 0:
             fails.append("the run-time predicate is asked after the table is built")
+        # The arm's `no` leaves the node to the route, which asks again and refuses by name.
+        if tight(braced_body(arm, ROUTE_ASK) or "") != ARM_DECLINES_PREDICATE:
+            fails.append("a run-time `no` from the predicate is not the grouped arm's counted PREDICATE decline")
+        if arm.find(ROUTE_ASK) > arm.find(TABLE_CALL) >= 0 or arm.find(TABLE_CALL) < 0:
+            fails.append("the grouped arm asks the predicate after its table, or builds no table")
     return fails
 
 
@@ -304,7 +363,8 @@ def claim_c_route_position(s):
         fails.append("the route is not after the extra ensure block and ahead of MMID_SCHED, yx28 and the weight ensure")
     body = braced_body(sycl, ROUTE_IF, head)
     if body is None or tight(body) != ROUTE_BODY:
-        fails.append(f"the route block is not exactly `{ROUTE_FN}(ctx, dst); return;`")
+        fails.append(f"the route block is not exactly `if ({ARM_FN}(ctx, dst)) {{ ready_guard.published = true; "
+                     f"return; }} {ROUTE_FN}(ctx, dst); return;`")
     return fails
 
 
@@ -312,6 +372,12 @@ def route_fn_body(sycl):
     if sycl.count(ROUTE_FN_HEAD) != 1:
         return None
     return braced_body(sycl, ROUTE_FN_HEAD)
+
+
+def arm_fn_body(sycl):
+    if sycl.count(ARM_FN_HEAD) != 1:
+        return None
+    return braced_body(sycl, ARM_FN_HEAD)
 
 
 def claim_d_route_body(s):
@@ -456,6 +522,80 @@ def claim_h_tables(s):
     return fails
 
 
+def claim_i_grouped_arm(s):
+    sycl = s["sycl"]
+    arm = arm_fn_body(sycl)
+    if arm is None:
+        return [f"{ARM_FN} is not defined exactly once"]
+    fails = []
+    # A separate arm: asked from the route's block alone, and the NVFP4 batched prompt executor names no BF16.
+    calls = len(re.findall(rf"\b{ARM_FN}\(", sycl))
+    if calls != 2:
+        fails.append(f"{ARM_FN} appears {calls} times; want its definition and the route block's try")
+    executor = braced_body(sycl, EXECUTOR_HEAD)
+    if executor is None:
+        fails.append("the NVFP4 batched prompt executor (try_pp_onednn_f16_batched) was not found")
+    elif "bf16" in executor.lower():
+        fails.append("the NVFP4 batched prompt executor names BF16: the grouped arm is meant to stand beside it")
+    # The opt-out, read once, asked first.
+    enabled = braced_body(sycl, ARM_ENABLED_HEAD) if sycl.count(ARM_ENABLED_HEAD) == 1 else None
+    if enabled is None or any(part not in enabled for part in ARM_ENABLED_PARTS):
+        fails.append(f"{ARM_ENABLED} does not read GGML_SYCL_MOE_BF16_GROUPED once into a function-local static")
+    if sycl.count(ARM_OPT_OUT_ENV) != 1:
+        fails.append("GGML_SYCL_MOE_BF16_GROUPED is read somewhere other than the arm's one helper")
+    if arm.count(ARM_ENABLED) != 1 or not tight(arm).startswith(
+            "constggml_tensor*src0=dst->src[0];constggml_tensor*src1=dst->src[1];constggml_tensor*ids=dst->src[2];"
+            "constautodecline=[&](moe_bf16_grouped_declinereason){returnggml_sycl_moe_bf16_grouped_decline(src0,"
+            f"ctx.device,reason);}};if(!{ARM_ENABLED}){{returndecline(moe_bf16_grouped_decline::OPT_OUT);}}"):
+        fails.append("the grouped arm does not ask the opt-out first, as a counted decline")
+    # Every way out short of running the node is a counted decline.
+    decline = braced_body(sycl, ARM_DECLINE_HEAD) if sycl.count(ARM_DECLINE_HEAD) == 1 else None
+    if decline is None or ARM_DECLINE_COUNT not in decline or not tight(decline).endswith("returnfalse;"):
+        fails.append("the arm's decline helper does not count the reason and return false")
+    for needed in (ARM_IDS, ARM_IDS_REFRESH, TABLE_CALL, ARM_ADMIT, ARM_RESERVE, ARM_CLAIM, ARM_GEMM, *ARM_GEMM_ARGS,
+                   ARM_GEMM_RUN, ARM_GATHER, ARM_SCATTER, ARM_GATHER_LABEL, ARM_SCATTER_LABEL, ARM_ROWS_HELD,
+                   ARM_RETAIN, ARM_RECORD, ARM_READY, ARM_ROUTE_LOG, *OPERAND_CALLS, GRAPH_FLAG):
+        if needed not in arm:
+            fails.append(f"{ARM_FN} does not contain {needed}")
+    for once in (ARM_IDS, ARM_ADMIT, ARM_RESERVE, ARM_CLAIM, ARM_GEMM, ARM_GATHER, ARM_SCATTER, ARM_RETAIN, ARM_RECORD,
+                 ARM_READY, "ggml_sycl::moe_bf16_grouped_gather_submit(", "ggml_sycl::moe_bf16_grouped_scatter_submit("):
+        if arm.count(once) > 1:
+            fails.append(f"{ARM_FN} contains {once} more than once")
+    lowered = arm.lower()
+    for forbidden in ARM_FORBIDDEN:
+        if forbidden.lower() in lowered:
+            fails.append(f"{ARM_FN} contains {forbidden!r}")
+    # dst is written by the scatter alone: resolved, null-checked, handed to the scatter.
+    if arm.count("dst_dev") != 3:
+        fails.append("dst's device pointer is used somewhere other than its resolution, its check and the scatter")
+    order = [arm.find(text) for text in (ARM_ENABLED, ROUTE_ASK, ARM_IDS, TABLE_CALL, ARM_ADMIT, ARM_RESERVE,
+                                         ARM_CLAIM, ARM_GATHER_LABEL, ARM_GATHER, ARM_GEMM_RUN, ARM_SCATTER_LABEL,
+                                         ARM_SCATTER, ARM_ROWS_HELD, ARM_RETAIN, ARM_RECORD, ARM_READY)]
+    if min(order) >= 0 and order != sorted(order):
+        fails.append("the arm does not run opt-out, predicate, ids, table, admission, reservation, claim, gather, "
+                     "GEMMs, scatter, then hold the row map and leases to the scatter's event, record the slot on it "
+                     "and publish it as dst's ready event, in that order")
+    # The claim is the executor's wait, named for the task that removes it, by a comment directly before it.
+    raw = s["sycl_raw"]
+    head = raw.find(ARM_FN_HEAD)
+    claim_at = raw.find(ARM_CLAIM, head) if head >= 0 else -1
+    uop2_at = raw.rfind(ARM_UOP2, head, claim_at) if claim_at >= 0 else -1
+    if uop2_at < 0 or ";" in raw[uop2_at:claim_at]:
+        fails.append(f"the arm's ring-slot claim is not directly preceded by a `{ARM_UOP2}` comment")
+    # The arm's kernels: one submit each, ordered by their deps, allocating, freeing and waiting on nothing.
+    arm_hpp, arm_cpp = s["arm_hpp"], s["arm_cpp"]
+    if not arm_hpp or not arm_cpp:
+        fails.append("moe-bf16-grouped.hpp / moe-bf16-grouped.cpp do not exist")
+    else:
+        if arm_cpp.count("q.submit(") != 2 or arm_cpp.count("h.depends_on(deps);") != 2:
+            fails.append("moe-bf16-grouped.cpp does not submit the gather and the scatter once each after their deps")
+        lowered = (arm_hpp + arm_cpp).lower()
+        for forbidden in KERNEL_FORBIDDEN:
+            if forbidden.lower() in lowered:
+                fails.append(f"moe-bf16-grouped carries {forbidden!r}")
+    return fails
+
+
 CLAIMS = {
     "a": claim_a_predicate,
     "b": claim_b_one_predicate,
@@ -465,6 +605,7 @@ CLAIMS = {
     "f": claim_f_flush_first,
     "g": claim_g_kernel,
     "h": claim_h_tables,
+    "i": claim_i_grouped_arm,
 }
 
 
@@ -502,13 +643,19 @@ MUTANTS = [
      "if (src0->buffer == nullptr) { return false; }"),
     ("b", "sycl", None, f" && !{PREDICATE}(op, device)) {{", ") {"),
     ("c", "sycl", None, ROUTE_IF, "if (true) {"),
-    ("c", "sycl", None, ROUTE_IF + " " + ROUTE_FN + "(ctx, dst); return; }", ""),
+    ("c", "sycl", None, f"{ROUTE_IF} {ARM_TRY} {ROUTE_FN}(ctx, dst); return; }}", ""),
     ("c", "sycl", ROUTE_IF, ROUTE_FN + "(ctx, dst); return; }", ROUTE_FN + "(ctx, dst); }"),
+    # The arm never asked; the arm's node left without dst's ready event; the route run again after the arm ran.
+    ("c", "sycl", ROUTE_IF, ARM_TRY + " ", ""),
+    ("c", "sycl", ROUTE_IF, "ready_guard.published = true; return; }", "return; }"),
+    ("c", "sycl", ROUTE_IF, "ready_guard.published = true; return; }", "ready_guard.published = true; }"),
     # The fall-through this shape replaced: a block keyed on the predicate lets a run-time `no` reach MMID_SCHED.
     ("c", "sycl", None, ROUTE_IF, f"if ({PREDICATE}(dst, ctx.device)) {{"),
     ("b", "sycl", None, ROUTE_IF, f"if (src0->type == GGML_TYPE_BF16 && {PREDICATE}(dst, ctx.device)) {{"),
     ("b", "sycl", ROUTE_FN_HEAD, ROUTE_ASK, "if (false) {"),
     ("b", "sycl", ROUTE_ASK, "refuse(", "(void) ("),
+    ("b", "sycl", ARM_FN_HEAD, ROUTE_ASK, "if (false) {"),
+    ("b", "sycl", f"{ARM_FN_HEAD}|{ROUTE_ASK}", "return decline(moe_bf16_grouped_decline::PREDICATE);", "(void) 0;"),
     ("d", "sycl", ENSURE_HELPER_HEAD, f" || !{OWN_BUFFER}(src0->buffer, ctx.device)", ""),
     ("d", "sycl", ENSURE_HELPER_HEAD, HELPER_STAMP_SKIP, ""),
     ("d", "sycl", ENSURE_HELPER_HEAD, "GGML_LAYOUT_AOS);", "GGML_LAYOUT_SOA);"),
@@ -547,6 +694,50 @@ MUTANTS = [
     ("g", "cpp", None, "reqd_sub_group_size(16)", "reqd_sub_group_size(32)"),
     ("h", "tables", None, "return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4;",
      "return type == GGML_TYPE_Q1_0 || type == GGML_TYPE_NVFP4 || type == GGML_TYPE_BF16;"),
+    # The grouped arm asked from a second site; the NVFP4 executor taking BF16 itself.
+    ("i", "sycl", None, ROUTE_FN_HEAD, f"{ROUTE_FN_HEAD} (void) {ARM_FN}(ctx, dst);"),
+    ("i", "sycl", None, EXECUTOR_HEAD, f"{EXECUTOR_HEAD} if (src0->type == GGML_TYPE_BF16) {{ return false; }}"),
+    # The opt-out read per call, read a second time, asked late, or leaving uncounted.
+    ("i", "sycl", ARM_ENABLED_HEAD, "static const bool enabled = [", "const bool enabled = ["),
+    ("i", "sycl", ARM_FN_HEAD, "const int64_t n_tokens",
+     'if (getenv("GGML_SYCL_MOE_BF16_GROUPED")) { return decline(moe_bf16_grouped_decline::OPT_OUT); } '
+     "const int64_t n_tokens"),
+    ("i", "sycl", ARM_FN_HEAD, f"if (!{ARM_ENABLED}) {{ return decline(moe_bf16_grouped_decline::OPT_OUT); }}", ""),
+    ("i", "sycl", ARM_FN_HEAD, "return decline(moe_bf16_grouped_decline::OPT_OUT);", "return false;"),
+    ("i", "sycl", ARM_DECLINE_HEAD, ARM_DECLINE_COUNT, "0"),
+    # A host wait in the chain, in the arm or in its kernels.
+    ("i", "sycl", ARM_FN_HEAD, "bool scattered = false;", "stream->wait(); bool scattered = false;"),
+    ("i", "sycl", ARM_FN_HEAD, "gemm_events.push_back(*gemm_event);",
+     "gemm_event->wait(); gemm_events.push_back(*gemm_event);"),
+    ("i", "arm_cpp", None, "return true;", "event->wait(); return true;"),
+    ("i", "arm_cpp", None, "h.depends_on(deps);", ""),
+    # The chain's edges: the GEMMs not after the gather, the scatter not after the GEMMs.
+    ("i", "sycl", ARM_FN_HEAD, ARM_GEMM_RUN, "expert_gemm(i, false, {})"),
+    ("i", "sycl", ARM_FN_HEAD, "io, gemm_events, &event)", "io, {}, &event)"),
+    # A second gather or scatter, or the scatter's dst handed to the gather.
+    ("i", "sycl", ARM_FN_HEAD, "gathered = ggml_sycl::moe_bf16_grouped_gather_submit(",
+     "gathered = ggml_sycl::moe_bf16_grouped_gather_submit(queue, rows_dev.get(), src1_dev, act, io, {}, &event) && "
+     "ggml_sycl::moe_bf16_grouped_gather_submit("),
+    ("i", "sycl", ARM_FN_HEAD, "src1_dev, act, io, gather_deps", "src1_dev, reinterpret_cast<uint16_t *>(dst_dev), "
+     "io, gather_deps"),
+    # The leases, the row map and the slot let go before the scatter's event; dst's ready event left unset.
+    ("i", "sycl", ARM_FN_HEAD, ARM_RETAIN, "(void) leases;"),
+    ("i", "sycl", ARM_FN_HEAD, ARM_ROWS_HELD, ""),
+    ("i", "sycl", ARM_FN_HEAD, ARM_RECORD, ""),
+    ("i", "sycl", ARM_FN_HEAD, ARM_READY, ""),
+    ("i", "sycl", ARM_FN_HEAD, ARM_RETAIN, "ggml_sycl::retain_handles_until_event(std::move(leases), gather_event);"),
+    # The ring asked out of order, or with the weight-staging admission.
+    ("i", "sycl", ARM_FN_HEAD, ARM_ADMIT, "ggml_sycl::pp_moe_onednn_admit_scratch(planned_shape, planned_shape)"),
+    ("i", "sycl", ARM_FN_HEAD, "pp_moe_onednn_scratch_claim claim;",
+     f"pp_moe_onednn_scratch_claim claim; {ARM_RESERVE};"),
+    # The GEMM's contract: its profiler context, strict f32, and a primitive that cannot be created declining.
+    ("i", "sycl", ARM_FN_HEAD, '"bf16_expert"', '"onednn_gemm"'),
+    ("i", "sycl", ARM_FN_HEAD, "GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT", "GGML_SYCL_DNNL_FPMATH_DEFAULT"),
+    ("i", "sycl", ARM_FN_HEAD, "GGML_SYCL_DNNL_CREATE_FAILURE_DECLINE", "GGML_SYCL_DNNL_CREATE_FAILURE_ABORT"),
+    ("i", "sycl", ARM_FN_HEAD, ARM_GATHER_LABEL, 'profile_label.name = "mulmat.moe.bf16_grouped";'),
+    # The claim's wait unnamed, or a statement between the comment and the claim.
+    ("i", "sycl_raw", ARM_FN_HEAD, ARM_UOP2, "//"),
+    ("i", "sycl_raw", f"{ARM_FN_HEAD}|{ARM_UOP2}", ARM_CLAIM, f"(void) 0; {ARM_CLAIM}"),
 ]
 
 

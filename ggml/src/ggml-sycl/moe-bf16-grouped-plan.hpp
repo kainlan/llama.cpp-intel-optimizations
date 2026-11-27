@@ -21,8 +21,10 @@
 
 #include "moe-pp-pack.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace ggml_sycl {
@@ -30,6 +32,11 @@ namespace ggml_sycl {
 // The row rounding of an expert's GEMM. The batched executor's own (moe-pp-pack.hpp), so the ring's planned rows,
 // which are sized from that alignment, hold the arm's layout.
 constexpr size_t moe_bf16_grouped_row_align = moe_pp_gemm_row_align;
+
+// The fewest tokens a node needs to take the arm; below it the direct kernel runs. At 64 tokens both Inkling shapes
+// win on the B70 (the step 0 bench, docs/backend/data/inkling2/t24-bench-b70-3b132a14ed.txt: gate_up from 32 tokens,
+// down from 64), and a decode node, one token, never reaches the arm.
+constexpr int64_t moe_bf16_grouped_min_tokens = 64;
 
 // One routed row: ids slot `slot` of token `token`, the row the gather reads from src1 and the scatter writes to dst,
 // and the scratch row it occupies.
@@ -82,13 +89,62 @@ inline moe_bf16_grouped_plan_status moe_bf16_grouped_build_plan(const int32_t * 
                                                                 size_t                  n_slots,
                                                                 size_t                  n_experts,
                                                                 moe_bf16_grouped_plan * out) {
-    // RED (Task 24): the plan is not built yet.
-    (void) ids;
-    (void) n_tokens;
-    (void) n_slots;
-    (void) n_experts;
-    (void) out;
-    return moe_bf16_grouped_plan_status::BAD_ARGS;
+    constexpr size_t k_int32_max = static_cast<size_t>(INT32_MAX);
+    if (ids == nullptr || out == nullptr || n_tokens == 0 || n_slots == 0 || n_experts == 0 ||
+        n_experts > k_int32_max) {
+        return moe_bf16_grouped_plan_status::BAD_ARGS;
+    }
+    // Before any id is read: every routed row's flat index, token and slot must fit int32.
+    if (n_tokens > k_int32_max || n_slots > k_int32_max || n_tokens > k_int32_max / n_slots) {
+        return moe_bf16_grouped_plan_status::ROW_OVERFLOW;
+    }
+    const size_t n_routed = n_tokens * n_slots;
+
+    std::vector<size_t> counts(n_experts, 0);
+    for (size_t i = 0; i < n_routed; ++i) {
+        const int32_t id = ids[i];
+        if (id < 0 || static_cast<size_t>(id) >= n_experts) {
+            return moe_bf16_grouped_plan_status::BAD_ID;
+        }
+        ++counts[static_cast<size_t>(id)];
+    }
+
+    // Each active expert's slot, ascending id, and where its routed rows start in `rows`.
+    moe_bf16_grouped_plan plan;
+    std::vector<size_t>   next_packed(n_experts, 0);
+    std::vector<size_t>   next_entry(n_experts, 0);
+    size_t                base    = 0;
+    size_t                entries = 0;
+    for (size_t e = 0; e < n_experts; ++e) {
+        if (counts[e] == 0) {
+            continue;
+        }
+        const size_t gemm_rows =
+            (counts[e] + moe_bf16_grouped_row_align - 1) / moe_bf16_grouped_row_align * moe_bf16_grouped_row_align;
+        if (gemm_rows > k_int32_max - base) {
+            return moe_bf16_grouped_plan_status::ROW_OVERFLOW;
+        }
+        plan.experts.push_back({ static_cast<int32_t>(e), counts[e], gemm_rows, base });
+        plan.gemm_widths.push_back(gemm_rows);
+        next_packed[e] = base;
+        next_entry[e]  = entries;
+        base += gemm_rows;
+        entries += counts[e];
+    }
+    std::sort(plan.gemm_widths.begin(), plan.gemm_widths.end());
+    plan.gemm_widths.erase(std::unique(plan.gemm_widths.begin(), plan.gemm_widths.end()), plan.gemm_widths.end());
+
+    // Flat (token, slot) order, so one expert's rows keep the token order of the ids.
+    plan.rows.resize(n_routed);
+    for (size_t i = 0; i < n_routed; ++i) {
+        const size_t e             = static_cast<size_t>(ids[i]);
+        plan.rows[next_entry[e]++] = { static_cast<int32_t>(i % n_slots), static_cast<int32_t>(i / n_slots),
+                                       static_cast<int32_t>(next_packed[e]++) };
+    }
+    plan.packed_rows = base;
+
+    *out = std::move(plan);
+    return moe_bf16_grouped_plan_status::OK;
 }
 
 }  // namespace ggml_sycl
