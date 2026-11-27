@@ -156,7 +156,7 @@ F16_KNOB = "GGML_SYCL_MOE_PP_ONEDNN_F16"
 # refusal already warns at default verbosity with the sizes, once per process.
 POST_CLAIM = [
     "EXPERT_NOT_LOCAL", "EXPERT_LAYOUT", "XMX_TILE_CAPS", "F16_TILED", "NO_DEQUANT", "SCRATCH_SIZE", "SCRATCH_CACHE",
-    "SCRATCH_RESERVE", "SCRATCH_SLOT", "SCRATCH_SLOT_SIZE", "GEMM",
+    "SCRATCH_RESERVE", "SCRATCH_SLOT", "SCRATCH_SLOT_SIZE", "PACKED_ROW_STAGING", "GEMM",
 ]
 # A decline after the dispatch took a staged ring slot, or on a weight the ring staged in full for this executor, is
 # printed whatever its cause (llama.cpp-3460): its staged experts then run on the CPU path.

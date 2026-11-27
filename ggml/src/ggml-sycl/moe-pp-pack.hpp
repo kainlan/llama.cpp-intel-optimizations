@@ -9,13 +9,15 @@
 // The executor sorts the active experts by row count, largest first, and issues one strided GEMM batch per group of
 // experts with similar counts. Each group gets a strip of the scratch: one slot of `n_rows` rows per expert, the
 // slots one after another, the strips one after another. A strided batch needs equal slots only inside its own
-// group, so no group is padded to another group's row count.
+// group, so no group is padded to another group's row count. The row table (moe_pp_pack_row_table) names each routed
+// row's packed row, so the gather and the scatter each run as one launch over the node's rows.
 //
 // This header has no SYCL or backend dependency, so its test needs no device.
 
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -92,6 +94,60 @@ inline bool moe_pp_pack_gemm_groups(const std::vector<size_t> & rows_desc, moe_p
     }
     layout.packed_rows = next_row;
     *out               = std::move(layout);
+    return true;
+}
+
+// One routed row of the batched executor: the row-map entry its gather and scatter read, and the packed scratch
+// row they write and read. Padding rows of the scratch have no entry.
+struct moe_pp_packed_row {
+    int32_t map_row    = 0;  // index into the node's row map
+    int32_t packed_row = 0;  // row of the activation and output scratch
+};
+
+static_assert(sizeof(moe_pp_packed_row) == 2 * sizeof(int32_t), "the device reads the table as two ints");
+
+// spans[i] is the row-map range [first, second) of the expert at sorted position i (the order `layout` was built
+// from). Writes one entry per routed row, group by group, expert by expert, row by row: entry r of expert i is
+// { first + r, layout.slot_base_row[i] + r }. Returns false, leaving *out untouched, when out is null, spans is
+// empty or not the layout's size, a span is empty or inverted, a span holds more rows than its group's n_rows, the
+// groups do not cover every position once, or an index does not fit int32_t.
+inline bool moe_pp_pack_row_table(const std::vector<std::pair<size_t, size_t>> & spans,
+                                  const moe_pp_packed_layout &                   layout,
+                                  std::vector<moe_pp_packed_row> *               out) {
+    constexpr size_t k_i32 = static_cast<size_t>(std::numeric_limits<int32_t>::max());
+    if (out == nullptr || spans.empty() || spans.size() != layout.slot_base_row.size()) {
+        return false;
+    }
+    size_t total = 0;
+    for (const auto & span : spans) {
+        if (span.second <= span.first || span.second > k_i32) {
+            return false;
+        }
+        total += span.second - span.first;
+    }
+    std::vector<moe_pp_packed_row> table;
+    table.reserve(total);
+    size_t next = 0;  // the groups must visit positions 0..n-1 in order, each once
+    for (const moe_pp_gemm_group & group : layout.groups) {
+        if (group.begin != next || group.end <= group.begin || group.end > spans.size()) {
+            return false;
+        }
+        for (size_t i = group.begin; i < group.end; ++i) {
+            const size_t rows = spans[i].second - spans[i].first;
+            const size_t base = layout.slot_base_row[i];
+            if (rows > group.n_rows || base > k_i32 - rows) {
+                return false;
+            }
+            for (size_t r = 0; r < rows; ++r) {
+                table.push_back({ static_cast<int32_t>(spans[i].first + r), static_cast<int32_t>(base + r) });
+            }
+        }
+        next = group.end;
+    }
+    if (next != spans.size()) {
+        return false;
+    }
+    *out = std::move(table);
     return true;
 }
 

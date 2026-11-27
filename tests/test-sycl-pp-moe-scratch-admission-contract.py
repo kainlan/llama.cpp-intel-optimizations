@@ -9,8 +9,9 @@ It cannot see whether PRODUCTION asks the policy anything, which is what this
 gate covers: that both live PP MoE executor call sites admit before they reserve
 and pass the planned sizes verbatim rather than max(planned, required), that the
 batched executor has no general temporary fallback left to make an inadmissible
-batch fit, that unified_cache::reserve_pp_moe_onednn_scratch refuses before its
-mutex and before its allocator, that each refusal is reported at WARN
+batch fit (its one temporary is the packed-row table its gather and scatter read,
+Inkling Task 25), that unified_cache::reserve_pp_moe_onednn_scratch refuses
+before its mutex and before its allocator, that each refusal is reported at WARN
 unconditionally and once per process rather than only under a debug flag, and
 that the generation/rollback protocol the 32dg lifecycle work established
 survives at both sites.
@@ -562,8 +563,11 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
                     "return pp_moe_onednn_preflight_scratch(planned, required, &aligned_required);"),
         # ABSENCE: with a general fallback present, refusing costs nothing and
         # the cap is decorative -- the batch simply allocates its own scratch.
+        # Its one temporary is the packed-row table (Inkling Task 25), an index of
+        # every routed row's row-map entry and packed scratch row, not scratch.
         "the batched executor keeps no general temporary fallback":
-            "scoped_unified_queue_temp" not in batched
+            batched.count("scoped_unified_queue_temp") == 1
+            and "scoped_unified_queue_temp<ggml_sycl::moe_pp_packed_row> packed_rows_dev;" in batched
             and not any(cohort in batched for cohort in ("moe_pp_batched_f16_weights",
                                                          "moe_pp_batched_f16_acts",
                                                          "moe_pp_batched_f32_out")),
