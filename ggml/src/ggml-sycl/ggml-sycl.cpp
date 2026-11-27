@@ -91250,8 +91250,9 @@ static const char * ggml_sycl_moe_hybrid_decode_record_plan_refusal(const ggml_t
                                                                     int                                  device,
                                                                     int64_t                              n_as,
                                                                     ggml_sycl::expert_residency_counts * counts) {
-    const auto plan     = ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(device));
-    const bool has_host = plan->has_host_experts(src0->name, n_as, device);
+    ggml_sycl::unified_cache * cache    = ggml_sycl::get_unified_cache_for_device(device);
+    const auto                 plan     = ggml_sycl_cache_plan_owner(cache);
+    const bool                 has_host = plan->has_host_experts(src0->name, n_as, device);
     *counts = has_host ? plan->count_planned_experts(src0->name, n_as, device) : ggml_sycl::expert_residency_counts{};
     return ggml_sycl::moe_hybrid_record_plan_refusal(has_host, counts->on_device, counts->on_target);
 }
