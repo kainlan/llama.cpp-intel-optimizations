@@ -727,6 +727,9 @@ endif()
 # fail, and no shipped path relies on an arm yet (the NVFP4 prompt executor runs its F16 arm; the weight-only arm is
 # later work). The lead runs it by hand on the B50 and reads the PROBE lines:
 #   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-onednn-woq-nvfp4
+# With --bench it runs no probe arm and instead times dequant + f16 GEMM against repack + WOQ GEMM at Inkling's expert
+# shapes in device time, printing "NUMERICS <arm> ..." per arm and shape, "BENCH <arm> ..." per arm and grid point and
+# "PIPELINE ..." per shape, B and M (plan Task 26a).
 # Same build shape as test-onednn-woq-mxfp4 above (oneDNN and SYCL only, no backend).
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build(test-sycl-onednn-woq-nvfp4.cpp)
