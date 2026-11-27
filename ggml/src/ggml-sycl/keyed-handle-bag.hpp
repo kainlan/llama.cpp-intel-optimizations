@@ -40,20 +40,30 @@ template <typename Handle, typename Key, typename KeyHash, typename KeyOf> class
 
     // Appends `h`. An indexed bag indexes it too, after the append: an index entry that fails to allocate pops the
     // handle again, so the bag never indexes a position it does not hold and never holds an unindexed keyed handle.
+    // The pop is a guard's, not a handler's, so the failure goes on to the caller as it was raised.
     void push_back(Handle h) {
         items_.push_back(std::move(h));
         if (!indexed_) {
             return;
         }
         Key key;
-        if (KeyOf{}(items_.back(), &key)) {
-            try {
-                index_.emplace(std::move(key), items_.size() - 1);
-            } catch (...) {
-                items_.pop_back();
-                throw;
-            }
+        if (!KeyOf{}(items_.back(), &key)) {
+            return;
         }
+
+        struct pop_unless_indexed {
+            std::vector<Handle> & items;
+            bool                  indexed = false;
+
+            ~pop_unless_indexed() {
+                if (!indexed) {
+                    items.pop_back();
+                }
+            }
+        } appended{ items_ };
+
+        index_.emplace(std::move(key), items_.size() - 1);
+        appended.indexed = true;
     }
 
     // Replaces the bag's handles with `handles`: a move, and the index is dropped.

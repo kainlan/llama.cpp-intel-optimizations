@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -230,8 +231,51 @@ static int test_random_operations_match_a_reference() {
     return 0;
 }
 
+// A key hash that throws for one key, so a test can fail the index entry an append to an indexed bag makes.
+static int g_hash_throw_on = -1;
+
+struct throwing_hash {
+    size_t operator()(int key) const {
+        if (key == g_hash_throw_on) {
+            throw std::runtime_error("index hash");
+        }
+        return std::hash<int>{}(key);
+    }
+};
+
+using throwing_bag = ggml_sycl::keyed_handle_bag<fake_handle, int, throwing_hash, fake_key_of>;
+
+// An append to an indexed bag whose index entry throws pops the handle again: the bag never holds a keyed handle its
+// index does not name, and every handle it held is still found where it is.
+static int test_append_whose_index_entry_throws_pops_the_handle() {
+    throwing_bag             b;
+    std::vector<fake_handle> out;
+    for (int i = 0; i < 5; ++i) {
+        b.push_back({ i % 3, i });
+    }
+    CHECK(b.take_key(1, out) == 2 && b.size() == 3, "the first take_key builds the index");
+    g_hash_throw_on = 9;
+    bool threw      = false;
+    try {
+        b.push_back({ 9, 100 });
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    g_hash_throw_on = -1;
+    CHECK(threw && b.size() == 3, "an append whose index entry throws leaves the bag's size");
+    for (size_t i = 0; i < b.size(); ++i) {
+        CHECK(b[i].serial != 100, "the handle whose index entry threw is not held");
+        CHECK(b.holds_at(b[i].key, i), "every handle the bag held is found where it is");
+    }
+    CHECK(b.indexed() == b.keyed_count(), "the index names every keyed handle and nothing else");
+    b.push_back({ 9, 101 });
+    CHECK(b.take_key(9, out) == 1 && out.back().serial == 101, "the next append under that key is indexed");
+    return 0;
+}
+
 int main() {
-    int (*const tests[])() = { test_take_key_moves_every_lease_on_the_key,
+    int (*const tests[])() = { test_append_whose_index_entry_throws_pops_the_handle,
+                               test_take_key_moves_every_lease_on_the_key,
                                test_take_key_with_the_last_element_on_the_key,
                                test_assign_take_all_and_clear,
                                test_remove_if_keeps_the_rest_findable,
