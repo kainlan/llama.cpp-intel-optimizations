@@ -7583,6 +7583,8 @@ contracts. The builds and the host tests ran after the lead's "builds GO", and t
     there reaches the handler, which holds the leases until a marker.
   - When the marker or the publication throws in the destructor, the leases go to `keep_handles_after_failed_wait`.
     They are kept, never released. No drain and no wait was added.
+    - Corrected 2026-11-27 (review round 3): except when the leak allocation fails too; the leases are then released
+      with the arm's vector and the handler reports it at ERROR (see round 3's M1).
 - Q4. The ring-slot claim is a static helper, `ggml_sycl_moe_bf16_grouped_claim_slot`.
   - A one-line comment before it cites `llama.cpp-ff54`: one shared helper for the three ring-slot claim sequences,
     done with or after `llama.cpp-uop2`.
