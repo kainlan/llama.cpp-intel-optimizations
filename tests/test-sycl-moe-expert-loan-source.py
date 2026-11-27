@@ -4836,10 +4836,23 @@ ENTRIES_WORD_RE = re.compile(r"\bentries\b")
 # allocate. The plan held one (expert_device, a collapsed summary nothing read); the entries and their shared index are
 # the one per-expert record.
 PER_EXPERT_MAP = "std::unordered_map<int, std::unordered_map<int, int>>"
-ENTRY_POINTER_ARITH_RE = re.compile(r"entries\s*\.\s*data\s*\(|-\s*&\s*\w+(\.|->)entries\s*\[")
+# An entry's address taken from the store's data or subtracted from an indexed entry, through an object or not (inside
+# a plan member the store is the bare `entries`).
+ENTRY_POINTER_ARITH_RE = re.compile(r"entries\s*\.\s*data\s*\(|-\s*&\s*(?:\w+\s*(?:\.|->)\s*)?entries\s*\[")
+# Any backend source can hold a plan and position an entry, so the pointer-arithmetic ban covers every C++ file under
+# ggml-sycl; the four sources the claim takes as arguments are scanned from those arguments instead, so their mutants
+# count. Normalized once here, because the claim runs for every mutant.
+_ENTRY_ARITH_ARGS = ("ggml/src/ggml-sycl/unified-cache.hpp", "ggml/src/ggml-sycl/unified-cache.cpp",
+                     "ggml/src/ggml-sycl/ggml-sycl.cpp", "ggml/src/ggml-sycl/moe-stream-plan.hpp")
+SYCL_TREE_OTHERS = {
+    p.relative_to(ROOT).as_posix(): norm(p.read_text())
+    for p in sorted((ROOT / "ggml" / "src" / "ggml-sycl").rglob("*"))
+    if p.is_file() and p.suffix in (".cpp", ".hpp") and p.relative_to(ROOT).as_posix() not in _ENTRY_ARITH_ARGS
+}
 
 
-def claim_the_plan_copy_shares_its_entries(cache_hpp: str, cache: str, sycl: str, plan_hpp: str = PLAN_HPP) -> bool:
+def claim_the_plan_copy_shares_its_entries(cache_hpp: str, cache: str, sycl: str, plan_hpp: str = PLAN_HPP,
+                                           others: dict = SYCL_TREE_OTHERS) -> bool:
     h = norm(cache_hpp)
     by_file = {"plan_hpp": norm(plan_hpp), "cache_hpp": h}
     b = body(norm(sycl), TXN_SIG)
@@ -4858,7 +4871,9 @@ def claim_the_plan_copy_shares_its_entries(cache_hpp: str, cache: str, sycl: str
             and all(by_file[f].count(sig) == 1 for f, sig in TXN_PLAN_WHOLE_CONST)
             and all(f and len(ENTRIES_WORD_RE.findall(f)) == 1 and f.count(ENTRY_WRITE) == 1 for f in flips)
             and len(ENTRIES_WORD_RE.findall(unshare)) == 1 and unshare.count(UNSHARE_BODY) == 1
-            and not any(ENTRY_POINTER_ARITH_RE.search(norm(src)) for src in (cache_hpp, cache, sycl)))
+            and len(others) > 0
+            and not any(ENTRY_POINTER_ARITH_RE.search(norm(src)) for src in (cache_hpp, cache, sycl, plan_hpp))
+            and not any(ENTRY_POINTER_ARITH_RE.search(src) for src in others.values()))
 
 
 def test_the_plan_copy_shares_its_entries():
@@ -4942,6 +4957,21 @@ def test_mutant_entry_position_by_pointer_arithmetic_fails():
     assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, mutant, SYCL)
     mutant = norm(CACHE) + " size_t i = static_cast<size_t>(p - &plan.entries[0]);"
     assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, mutant, SYCL)
+
+
+def test_mutant_entry_position_by_bare_store_arithmetic_fails():
+    """Inside a plan member the store is the bare `entries`, with no object to name."""
+    mutant = norm(CACHE_HPP) + " size_t i = static_cast<size_t>(&e - &entries[0]);"
+    assert not claim_the_plan_copy_shares_its_entries(mutant, CACHE, SYCL)
+
+
+def test_mutant_entry_position_by_arithmetic_elsewhere_in_the_backend_fails():
+    """A backend file outside the four the claim names, positioning an entry by its address."""
+    slot = "ggml/src/ggml-sycl/expert-slot.hpp"
+    assert slot in SYCL_TREE_OTHERS
+    others = dict(SYCL_TREE_OTHERS)
+    others[slot] += " size_t i = static_cast<size_t>(&e - &plan->entries[0]);"
+    assert not claim_the_plan_copy_shares_its_entries(CACHE_HPP, CACHE, SYCL, PLAN_HPP, others)
 
 
 # --- the runtime workspace replan shares its demand copy's entries ---------------------------------------------------
