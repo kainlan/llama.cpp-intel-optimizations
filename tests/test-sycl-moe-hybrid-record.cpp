@@ -385,6 +385,35 @@ static int test_shape() {
     return 0;
 }
 
+// The plan's part of the build's decision, which a patch asks again, since an expert move rewrites the plan without
+// moving the replan epoch. A patch stands only on the frame the build would take now: the held record's all-host
+// mode, and for a split record no moved expert at or before the one whose layouts gave the record its layout.
+static int test_plan_frame() {
+    CHECK(ggml_sycl::moe_hybrid_record_plan_refusal(/*has_host=*/false, 2, 2) != nullptr,
+          "a tensor whose plan puts no expert on the host has no record");
+    CHECK(ggml_sycl::moe_hybrid_record_plan_refusal(/*has_host=*/true, 3, 2) != nullptr,
+          "a tensor whose plan puts an expert on another card has no record");
+    CHECK(ggml_sycl::moe_hybrid_record_plan_refusal(/*has_host=*/true, 0, 0) == nullptr,
+          "a plan with no device expert is the all-host shape, not a refusal");
+    CHECK(ggml_sycl::moe_hybrid_record_plan_refusal(/*has_host=*/true, 2, 2) == nullptr,
+          "a split plan on this card stands");
+
+    // A split record whose layout came from expert 3.
+    CHECK(ggml_sycl::moe_hybrid_record_patch_frame_holds(false, 3, false, 4),
+          "moves after the layout's expert leave the build's layout scan where it stopped");
+    CHECK(!ggml_sycl::moe_hybrid_record_patch_frame_holds(false, 3, false, 3),
+          "a move of the layout's own expert sends the record to the build");
+    CHECK(!ggml_sycl::moe_hybrid_record_patch_frame_holds(false, 3, false, 1),
+          "a move before it can stop the build's scan sooner: the build decides");
+    CHECK(!ggml_sycl::moe_hybrid_record_patch_frame_holds(false, 3, true, 5),
+          "a plan that now puts no expert on a device is the build's all-host record");
+    // An all-host record has no layout scan.
+    CHECK(ggml_sycl::moe_hybrid_record_patch_frame_holds(true, -1, true, 0), "any move of an all-host record stands");
+    CHECK(!ggml_sycl::moe_hybrid_record_patch_frame_holds(true, -1, false, 7),
+          "a plan that now puts an expert on the device is the build's split record");
+    return 0;
+}
+
 // A loan or an evict withdraws, from a copy of the held record, the slots that lease the device entry it retired. The
 // copy keeps every other slot and lease, and once the held record is released only the drop's retention leases the
 // retired entry, so its room comes back when the queue passes the retention's barrier.
@@ -460,8 +489,8 @@ static int test_trace_patches() {
 
 int main() {
     if (test_miss_classify() != 0 || test_trace_tokens() != 0 || test_trace_line() != 0 || test_change_log() != 0 ||
-        test_patch_plan() != 0 || test_install() != 0 || test_shape() != 0 || test_withdraw() != 0 ||
-        test_trace_patches() != 0) {
+        test_patch_plan() != 0 || test_install() != 0 || test_shape() != 0 || test_plan_frame() != 0 ||
+        test_withdraw() != 0 || test_trace_patches() != 0) {
         return 1;
     }
     std::printf("OK: moe hybrid decode record bookkeeping\n");

@@ -31,13 +31,16 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
       the experts the log names, patches the held record; a patch that stands is published by retaining what it
       replaced to a barrier on the queue, settling the stamp at the new generation and returning the patched record,
       ahead of the build; its count and its level-2 line come before that return;
-  T10 the patch resolves only the changed experts, takes each slot from the build's slot rule, writes a copy of the
-      held record (never the held one), checks the copy's shape with the build's rule, gives it a table of its own
-      filled from every slot, a ready barrier over the held one's and the new events, records the block's residency
-      only after every way out, hands the replaced leases and the held table back for retention, and waits for
-      nothing;
-  T11 the build takes its slots, its shape check and its table from those same helpers, the executor is chosen in the
-      slot rule alone, and GGML_SYCL_MOE_HYBRID_RECORD_PATCH is read once;
+  T10 the patch holds its own shared pointer to const of the held record; asks the build's plan rule again (an expert
+      move rewrites the plan without moving the replan epoch) and declines unless the frame the build would take now
+      is the held record's; resolves only the changed experts, takes each slot from the build's slot rule, writes a
+      copy of the held record (never the held one), checks the copy's shape with the build's rule, gives it a table of
+      its own filled from every slot, a ready barrier over the held one's and the new events, records the block's
+      residency only after every way out, hands the replaced leases and the held table back for retention, and waits
+      for nothing;
+  T11 the build takes its plan, its slots, its shape check and its table from those same helpers and records the
+      expert its layout came from; the plan is asked in the plan rule alone, the executor in the slot rule alone; and
+      GGML_SYCL_MOE_HYBRID_RECORD_PATCH is read once;
   T12 an expert loan or evict (ggml_sycl_drop_lent_expert_views) withdraws only the record's slots that lease the
       entry it retired, from a copy it publishes in the held record's place (never the held one), counting them on the
       copy and moving their leases into the drop's retention; it keeps the stamp, and notes every expert it emptied,
@@ -98,7 +101,7 @@ PATCH_PLAN = ("const ggml_sycl::moe_hybrid_record_patch_plan plan = ggml_sycl_mo
               "ggml_sycl::moe_hybrid_record_plan_patch(miss, stamp, held != nullptr, weight.moe_expert_storage_changes, "
               "storage_generation, &changed) : ggml_sycl::MOE_HYBRID_RECORD_PATCH_NONE;")
 PATCH_CALL = ("if (plan == ggml_sycl::MOE_HYBRID_RECORD_PATCH_EXPERTS) { patched_ok = "
-              "ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, *held, changed, &patched, &replaced); }")
+              "ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, held, changed, &patched, &replaced); }")
 PATCH_COUNT = "g_moe_hybrid_record_trace.patch(plan, patched_ok, changed.size());"
 PATCH_WARN = 'GGML_LOG_WARN("[MOE-HYBRID-RECORD-PATCH] '
 PATCH_PUBLISH = ("if (patched_ok) { ggml_sycl::retain_handles_until_event(std::move(replaced), "
@@ -110,14 +113,19 @@ PATCH_PUBLISH = ("if (patched_ok) { ggml_sycl::retain_handles_until_event(std::m
 # T10: the patch itself.
 PATCH_SIG = "static bool ggml_sycl_moe_hybrid_decode_record_patch("
 PATCH_DECL = ("static bool ggml_sycl_moe_hybrid_decode_record_patch(ggml_backend_sycl_context & ctx, "
-              "const ggml_tensor * src0, const moe_hybrid_decode_record & held, const std::vector<int32_t> & changed,")
+              "const ggml_tensor * src0, std::shared_ptr<const moe_hybrid_decode_record> held, "
+              "const std::vector<int32_t> & changed,")
 PATCH_STEPS = (
+    ("the build's plan rule, asked again, and the frame the build would take now",
+     "if (ggml_sycl_moe_hybrid_decode_record_plan(src0, device, static_cast<int64_t>(held->n_as), &counts) != nullptr "
+     "|| !ggml_sycl::moe_hybrid_record_patch_frame_holds(held->all_host, held->layout_expert, counts.on_device == 0, "
+     "changed.front())) { return false; }"),
     ("its resolve of the changed experts alone",
      "ggml_sycl::ggml_sycl_build_moe_resolved_batch(src0, device, changed.data(), changed.size(), changed.size(), "
-     "held.layout,"),
+     "held->layout,"),
     ("each slot from the build's slot rule",
-     "ggml_sycl_moe_hybrid_decode_record_slot(operand, device, held.layout, held.all_host, &fresh[i], ready, &why)"),
-    ("its copy of the held record", "auto patched = std::make_shared<moe_hybrid_decode_record>(held);"),
+     "ggml_sycl_moe_hybrid_decode_record_slot(operand, device, held->layout, held->all_host, &fresh[i], ready, &why)"),
+    ("its copy of the held record", "auto patched = std::make_shared<moe_hybrid_decode_record>(*held);"),
     ("the install of the moved slots into the copy",
      "ggml_sycl::moe_hybrid_record_install(patched->device_weight, patched->host_weight, patched->lease, changed, "
      "fresh, &leases)"),
@@ -130,7 +138,7 @@ PATCH_STEPS = (
     ("a table of the copy's own, filled from every slot",
      "patched->table = {}; if (!ggml_sycl_moe_hybrid_decode_table_fill(queue, device, extra->model_id, "
      "patched->device_weight, shape.substitute, &patched->table)) { return false; }"),
-    ("the held record's ready event among the barrier's", "if (held.has_ready) { ready.push_back(held.ready); }"),
+    ("the held record's ready event among the barrier's", "if (held->has_ready) { ready.push_back(held->ready); }"),
     ("the copy's ready barrier", "patched->ready = queue.ext_oneapi_submit_barrier(ready);"),
     ("the block's residency",
      "patched->route_counts->set_block_resident(patched->route_block, "
@@ -138,13 +146,18 @@ PATCH_STEPS = (
     ("the replaced leases handed back",
      "replaced->insert(replaced->end(), std::make_move_iterator(leases.begin()), "
      "std::make_move_iterator(leases.end()));"),
-    ("the held table handed back", "if (held.table.valid()) { replaced->push_back(held.table); }"),
+    ("the held table handed back", "if (held->table.valid()) { replaced->push_back(held->table); }"),
     ("the copy's publication", "*out = std::move(patched);"),
 )
 
 # T11: the rules the build and the patch share.
 SLOT_SIG = "static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_slot("
 BUILD_STEPS = (
+    ("plan from the plan rule, and its all-host mode from the plan's counts",
+     "ggml_sycl::expert_residency_counts counts; if (const char * why = "
+     "ggml_sycl_moe_hybrid_decode_record_plan(src0, device, n_as, &counts)) { return refuse(why); } "
+     "const bool all_host = counts.on_device == 0;"),
+    ("record of the expert its layout came from", "record->layout_expert = layout_expert;"),
     ("each slot from the slot rule",
      "if (ggml_sycl_moe_hybrid_decode_record_slot(operand, device, layout, all_host, &slot, ready, reason) != "
      "ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_ELIGIBLE) { return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED; }"),
@@ -157,6 +170,16 @@ BUILD_STEPS = (
      "ggml_sycl_moe_hybrid_decode_table_fill(queue, device, extra->model_id, record->device_weight, "
      "shape.substitute, &record->table)"),
 )
+# The plan rule the build and the patch share: the plan's two queries, decided by the header's rule.
+PLAN_SIG = "static const char * ggml_sycl_moe_hybrid_decode_record_plan("
+PLAN_STEPS = (
+    ("query of the host experts", "const bool has_host = plan->has_host_experts(src0->name, n_as, device);"),
+    ("query of the planned residency",
+     "*counts = has_host ? plan->count_planned_experts(src0->name, n_as, device) : ggml_sycl::expert_residency_counts{};"),
+    ("decision by the header's rule",
+     "return ggml_sycl::moe_hybrid_record_plan_refusal(has_host, counts->on_device, counts->on_target);"),
+)
+PLAN_QUERIES = ("has_host_experts(", "count_planned_experts(")
 PATCH_ENV = "GGML_SYCL_MOE_HYBRID_RECORD_PATCH"
 PATCH_LEVEL_SIG = "static bool ggml_sycl_moe_hybrid_record_patch_enabled() {"
 PATCH_LEVEL_BODY = ('{ static const bool enabled = [] { const char * env = std::getenv("' + PATCH_ENV + '"); '
@@ -435,15 +458,16 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str) -> 
     # T10: the patch.
     patch = body(code, PATCH_SIG, "T10")
     if PATCH_DECL not in squash(code):
-        raise ContractError("FAIL [pin T10]: the patch does not take the held record as a const reference, so it "
-                            "could write the record a CPU job or a queued copy still reads")
+        raise ContractError("FAIL [pin T10]: the patch does not hold its own shared pointer to const of the held "
+                            "record, so it could write the record a CPU job or a queued copy still reads, or copy one "
+                            "a resolve released under it")
     last = -1
     for what, needle in PATCH_STEPS:
         at = once(patch, needle, "T10", f"the patch's {what}")
         if at < last:
             raise ContractError(f"FAIL [pin T10]: the patch's {what} is out of order")
         last = at
-    at_resident = patch.find(PATCH_STEPS[9][1])
+    at_resident = patch.find(dict(PATCH_STEPS)["the block's residency"])
     if patch.rfind("return false;") > at_resident:
         raise ContractError("FAIL [pin T10]: the patch can still give up after it recorded the block's residency, "
                             "leaving the count of a record it did not publish")
@@ -458,6 +482,13 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str) -> 
             or "choose_moe_batch_executor(" in patch):
         raise ContractError("FAIL [pin T11]: an expert's executor is chosen outside the slot rule, so the build and "
                             "the patch could place a moved expert apart")
+    plan_rule = body(code, PLAN_SIG, "T11")
+    for what, needle in PLAN_STEPS:
+        once(plan_rule, needle, "T11", f"the plan rule's {what}")
+    for query in PLAN_QUERIES:
+        if query in build or query in patch:
+            raise ContractError(f"FAIL [pin T11]: the build or the patch asks the plan `{query}` itself, so the two "
+                                f"could decide a record from different plans")
     if body(code, PATCH_LEVEL_SIG, "T11") != PATCH_LEVEL_BODY:
         raise ContractError(f"FAIL [pin T11]: ggml_sycl_moe_hybrid_record_patch_enabled() is not the read-once "
                             f"static of {PATCH_ENV}")
@@ -632,15 +663,22 @@ def self_test(raws: dict[str, str]) -> int:
                   "    *out = held;\n    if (*out != nullptr) {\n        return true;\n    }\n    return *out != nullptr;")])
 
     # T10: the patch.
+    held_param = "std::shared_ptr<const moe_hybrid_decode_record>   held,"
     expect_fail("patch-takes-held-mutable", "T10", B,
-                [("    const moe_hybrid_decode_record &                  held,",
-                  "    moe_hybrid_decode_record &                        held,")])
+                [(held_param, "std::shared_ptr<moe_hybrid_decode_record>         held,")])
+    expect_fail("patch-borrows-held", "T10", B, [(held_param, "const moe_hybrid_decode_record &                  held,")])
+    expect_fail("patch-skips-plan-rule", "T10", B,
+                [("    if (ggml_sycl_moe_hybrid_decode_record_plan(src0, device, static_cast<int64_t>(held->n_as), "
+                  "&counts) != nullptr ||", "    if (false ||")])
+    expect_fail("patch-ignores-layout-expert", "T10", B,
+                [("held->layout_expert, counts.on_device == 0,", "-1, counts.on_device == 0,")])
     expect_fail("patch-resolves-every-expert", "T10", B,
-                [("        src0, device, changed.data(), changed.size(), changed.size(), held.layout,",
-                  "        src0, device, all.data(), all.size(), all.size(), held.layout,")])
+                [("        src0, device, changed.data(), changed.size(), changed.size(), held->layout,",
+                  "        src0, device, all.data(), all.size(), all.size(), held->layout,")])
     expect_fail("patch-writes-held-in-place", "T10", B,
-                [("std::make_shared<moe_hybrid_decode_record>(held);",
-                  "std::shared_ptr<moe_hybrid_decode_record>(const_cast<moe_hybrid_decode_record *>(&held), "
+                [("patched = std::make_shared<moe_hybrid_decode_record>(*held);",
+                  "patched = std::shared_ptr<moe_hybrid_decode_record>("
+                  "const_cast<moe_hybrid_decode_record *>(held.get()), "
                   "[](moe_hybrid_decode_record *) {});")])
     expect_fail("patch-skips-shape-rule", "T10", B,
                 [("    if (ggml_sycl::moe_hybrid_record_shape_refusal(patched->all_host, shape) != nullptr) {",
@@ -649,7 +687,7 @@ def self_test(raws: dict[str, str]) -> int:
                 [("        patched->table = {};\n        if (!ggml_sycl_moe_hybrid_decode_table_fill(",
                   "        if (false && !ggml_sycl_moe_hybrid_decode_table_fill(")])
     expect_fail("patch-drops-held-ready", "T10", B,
-                [("        if (held.has_ready) {\n            ready.push_back(held.ready);\n        }\n", "")])
+                [("        if (held->has_ready) {\n            ready.push_back(held->ready);\n        }\n", "")])
     expect_fail("patch-gives-up-after-residency", "T10", B,
                 [("    replaced->insert(replaced->end(),",
                   "    if (leases.empty()) {\n        return false;\n    }\n    replaced->insert(replaced->end(),")])
@@ -657,7 +695,7 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    replaced->insert(replaced->end(), std::make_move_iterator(leases.begin()), "
                   "std::make_move_iterator(leases.end()));\n", "")])
     expect_fail("patch-drops-held-table", "T10", B,
-                [("    if (held.table.valid()) {\n        replaced->push_back(held.table);\n    }\n", "")])
+                [("    if (held->table.valid()) {\n        replaced->push_back(held->table);\n    }\n", "")])
     expect_fail("patch-waits", "T10", B,
                 [("    *out = std::move(patched);", "    queue.wait();\n    *out = std::move(patched);")])
 
@@ -672,6 +710,20 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("build-own-table", "T11", B,
                 [("    if (!all_host && !ggml_sycl_moe_hybrid_decode_table_fill(queue,",
                   "    if (!all_host && !ggml_sycl_moe_hybrid_decode_table_allocate(queue,")])
+    expect_fail("patch-asks-plan-itself", "T11", B,
+                [("    ggml_sycl::expert_residency_counts counts;\n    if (ggml_sycl_moe_hybrid_decode_record_plan(src0, "
+                  "device, static_cast<int64_t>",
+                  "    ggml_sycl::expert_residency_counts counts;\n    (void) ggml_sycl_cache_plan_owner(ggml_sycl::"
+                  "get_unified_cache_for_device(device))->has_host_experts(src0->name, 1, device);\n"
+                  "    if (ggml_sycl_moe_hybrid_decode_record_plan(src0, device, static_cast<int64_t>")])
+    expect_fail("build-asks-plan-itself", "T11", B,
+                [("    if (const char * why = ggml_sycl_moe_hybrid_decode_record_plan(src0, device, n_as, &counts)) {",
+                  "    if (const char * why = ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(device))"
+                  "->has_host_experts(src0->name, n_as, device) ? nullptr : \"no host expert\") {")])
+    expect_fail("plan-rule-skips-residency", "T11", B,
+                [("    *counts = has_host ? plan->count_planned_experts(src0->name, n_as, device) : "
+                  "ggml_sycl::expert_residency_counts{};", "    *counts = ggml_sycl::expert_residency_counts{};")])
+    expect_fail("build-forgets-layout-expert", "T11", B, [("    record->layout_expert = layout_expert;\n", "")])
     expect_fail("patch-switch-per-call", "T11", B,
                 [("    static const bool enabled = [] {\n        const char * env = std::getenv(\"" + PATCH_ENV,
                   "    const bool enabled = [] {\n        const char * env = std::getenv(\"" + PATCH_ENV)])

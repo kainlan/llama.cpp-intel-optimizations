@@ -266,7 +266,8 @@ moe_hybrid_record_shape moe_hybrid_record_shape_of(const std::vector<const void 
 }
 
 // Why slots of shape `s` cannot stand as an all-host (`all_host`) or a split record, or nullptr when they can. These
-// are the build's own refusals over its slots, so a patch never publishes a record the build would refuse.
+// are the build's own refusals over its slots; a patch asks them after the plan rule and the frame check below, so it
+// never publishes a record the build would refuse.
 inline const char * moe_hybrid_record_shape_refusal(bool all_host, const moe_hybrid_record_shape & s) {
     if (s.n_empty > 0) {
         return "an expert's slot names no weight it holds";
@@ -281,6 +282,36 @@ inline const char * moe_hybrid_record_shape_refusal(bool all_host, const moe_hyb
         return "no device expert pointer stands in for the host slots";
     }
     return nullptr;
+}
+
+// The plan's refusal of a record of a tensor, or nullptr: the one rule the build and the patch decide the plan's part
+// of a record by. A record needs a host expert (`has_host`), and every device expert planned on the record's own device
+// (`on_device` planned on a device, `on_target` of them on this one); a plan that puts no expert on a device is the
+// all-host shape, not a refusal.
+inline const char * moe_hybrid_record_plan_refusal(bool has_host, int64_t on_device, int64_t on_target) {
+    if (!has_host) {
+        return "the plan puts no expert of it on the host";
+    }
+    if (on_device > on_target) {
+        return "the plan puts an expert on another device";
+    }
+    return nullptr;
+}
+
+// Whether the frame the build would decide now is the held record's, so a patch whose lowest moved expert is
+// `first_changed` may stand: the plan, asked again, gives the held all-host mode (`all_host`: its counts name no device
+// expert), and for a split record every moved expert comes after `held_layout_expert`, the expert whose materialized
+// layouts gave the record its layout. The build's layout scan stops at the first expert with a layout the batched
+// kernel reads; when every expert up to that one is unchanged since the build, the scan stops at the same expert and
+// takes the same layout. A move at or before it could stop the scan elsewhere, so the build decides.
+inline bool moe_hybrid_record_patch_frame_holds(bool    held_all_host,
+                                                int64_t held_layout_expert,
+                                                bool    all_host,
+                                                int32_t first_changed) {
+    if (all_host != held_all_host) {
+        return false;
+    }
+    return held_all_host || first_changed > held_layout_expert;
 }
 
 // One token's lookups and what they cost.

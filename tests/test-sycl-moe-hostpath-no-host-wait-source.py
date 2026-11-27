@@ -1450,8 +1450,8 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "    } else {\n        return refuse(\"an expert runs on neither this device nor the CPU\");\n    }\n")
     sub("N9", "slot rule renamed away", "ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_slot(\n",
         "ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_slot_v2(\n")
-    sub("N7", "record patch no longer reached", "ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, *held,",
-        "ggml_sycl_moe_hybrid_decode_record_patch_retired(ctx, src0, *held,")
+    sub("N7", "record patch no longer reached", "ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, held,",
+        "ggml_sycl_moe_hybrid_decode_record_patch_retired(ctx, src0, held,")
     sub("N9", "builder refusal hides its condition from the scan",
         "    if (!all_host && materialized < 0) {\n"
         "        return refuse(\"no device expert is materialized in a layout the batched kernel reads\");\n"
