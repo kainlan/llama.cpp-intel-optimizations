@@ -7551,6 +7551,158 @@ only; every device item is still the lead's.**
   - Not run here, as the lead's: `test-moe-bf16-grouped-device` (10 cases), every other device test, and the two fixed
     sweeps.
 
+**Review round 2 fixes (implementer, 2026-11-27): the review of `a09e879982..4951bde2f1` passed spec, and passed
+quality with minors; every item is fixed below.** The fixes were written and committed while the lead held builds for
+another session's quiet host. Each C++ change is checked with `clang-format-19 --dry-run` and pinned by the Python
+contracts. The builds and the host tests ran after the lead's "builds GO", and their results end this record.
+- S1. The registration of `test-moe-bf16-grouped-device` names both private failpoints and every case, eleven of them.
+- Q1. An eleventh device case, `gate_up-hot-expert`, has 512 tokens, and slot 0 of every token picks expert 5. The
+  other slots stride the other 127 experts, 18 apart.
+  - Expert 5 routes 512 rows, a GEMM width of 512. Every other expert routes 28 or 29, a width of 64. So one node
+    takes two widths, with all 128 experts active and 8640 packed rows, within the 16256 the ring is planned for.
+  - It draws its inputs from its own generator, so every other case keeps the inputs it had.
+  - Every arm case's route line must now name `widths=<n>` as well as its experts. The test counts the widths from
+    the ids (each active expert's rows rounded up to 64), not from the arm's plan, and the hot case requires two.
+  - The test ends `PASS: BF16 grouped prompt arm, 11 cases`.
+- Q2. The hold is an RAII guard, `moe_bf16_grouped_hold`, made in the submit helper immediately before its one `try`.
+  - It is made before the `try`, not at its top, so the `std::exception` handler can still hold first, explicitly.
+    The handler's call and the destructor's are the same idempotent hold.
+  - Its constructor marks the claim used.
+  - `hold_until(event)` publishes the record leases until the event and records the slot on it.
+    `hold_until_marker()` does the same behind a marker submitted after everything. Either runs once.
+  - The destructor holds to a marker on any exit that has not held, including the rethrown
+    `ggml_sycl_fallback_error`. The rethrow clause keeps its `throw;`.
+  - Contract (j) pins the guard, its three members and the declaration's place.
+- Q3. No throwing publication can release a lease.
+  - The guard publishes through `retain_handles_until_event_or_keep`, which leaves the leases as they were when it
+    throws.
+  - The success tail publishes through the same guard, inside the `try` at the stage `handle retention`. A throw
+    there reaches the handler, which holds the leases until a marker.
+  - When the marker or the publication throws in the destructor, the leases go to `keep_handles_after_failed_wait`.
+    They are kept, never released. No drain and no wait was added.
+- Q4. The ring-slot claim is a static helper, `ggml_sycl_moe_bf16_grouped_claim_slot`.
+  - A one-line comment before it cites `llama.cpp-ff54`: one shared helper for the three ring-slot claim sequences,
+    done with or after `llama.cpp-uop2`.
+  - The batched executor's two claim sites are unchanged.
+  - The `llama.cpp-uop2` comment still directly precedes the claim, inside the helper.
+- Q5. The arm's body is in three helpers above it: the claim; `ggml_sycl_moe_bf16_grouped_query_widths`, one
+  `query_only` GEMM per distinct width; and `ggml_sycl_moe_bf16_grouped_submit`. The submit helper holds the row map's
+  copy, the gather, the GEMMs, the scatter, the `try` with its two handlers, and the guard.
+  - The arm maps each helper's `false` to its counted decline (`SCRATCH_SLOT`, `PRIMITIVE`, `SUBMIT`). It has no `try`
+    of its own.
+  - The expert GEMM lambda stays in the arm. `test-sycl-mul-mat-f32-batched-route-source.py` pins the arm's one
+    `DnnlGemmWrapper::gemm(` with `GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT`.
+  - The row map joins the record leases once, in the arm, before the submissions.
+- Q6 to Q9, the docs, are in `0335202533`.
+  - Q6: the memory design names the arm a third claimant of the ring that plans nothing: it writes no weight plane,
+    and it declines quietly where no ring is planned. Inkling's BF16 experts ride the ring its NVFP4 layers plan.
+  - Q7: the canonical architecture names `pp_moe_onednn_admit_weightless_scratch` and its quiet `MISSING_PLAN`.
+  - Q8: the env-vars row and this task's header say a decode node is declined first, as `tokens`, and runs on the
+    direct route, and the opt-out is read with `atoi`. The sibling rows are unchanged.
+  - Q9: the header says the step-0 bench timed the GEMMs and their host submits alone, not the gather, the scatter or
+    the two host waits.
+- Q10. The two mutants that swap the GEMM's math mode and its create-failure mode use real enumerators:
+  `GGML_SYCL_DNNL_FPMATH_BUILD` and `GGML_SYCL_DNNL_CREATE_FAILURE_THROW`.
+- Q11. The plan test's width bound counts the two shapes' primitive keys, (m, width) pairs over m 4608 and 2304. It
+  requires at most 8 per shape and at most 16 together (`0335202533`).
+- Q12. The plan test has a hand case of duplicate picks, ids {2,2, 0,2}. A 64-token node whose picks repeat gives two
+  widths, more than ceil(64/64). The bound "at most ceil(n/align)" is stated for distinct picks only (`0335202533`).
+- Q13. `test-sycl-bf16-expert-gemm-bench` is `EXCLUDE_FROM_ALL`: the lead builds it by name.
+- Q14. Names and cleanups.
+  - `moe_bf16_grouped_build_plan` is `moe_bf16_grouped_plan_build`, and `ggml_sycl_moe_bf16_grouped_decline` is
+    `ggml_sycl_moe_bf16_grouped_note_decline` (`0335202533`).
+  - The WARN and the fallback error say "failed at submission". The round 1 record above quotes the old text.
+  - `src1` is declared only under the oneDNN branch, and `g_moe_bf16_grouped_runs` is `[[maybe_unused]]` for the
+    build without oneDNN.
+  - A comment by the expert GEMM says why padding rows are harmless. They may hold stale or NaN activations, but each
+    output column depends only on its own activation column, and the scatter never reads a padding row's output.
+- Contracts updated:
+  - `test-sycl-moe-bf16-direct-source.py`: (i) and (j) are rewritten for the helpers and the guard.
+    - (i): each helper is defined once above the arm and called once from it. The claim and query helpers are pinned
+      whole. Forbidden spellings are checked in the arm, the helpers and the guard, and the order in each body.
+      The `llama.cpp-ff54` comment must directly precede the claim helper.
+    - (j): the guard's members, the hold made first and before the `try`, and the arm with no `try`. The `try` ends
+      in the hold on the scatter's event, and nothing after the handler.
+    - 89 arm mutants (48 for (i), 41 for (j)), 158 cases in all.
+  - `scripts/check-sycl-dnnl-decline-consumers.py`: the query pin follows the query into its helper, and the arm pins
+    the call. Two new mutants: the arm going on after its width query declined, and reading a passed query as a
+    decline. 223 mutants killed.
+  - `test-sycl-pp-moe-scratch-admission-contract.py`:
+    - It reads the claim and submit helpers, and takes the claim helper as a callee of the arm's ring depth.
+    - The generation and rollback check moves to the helper. The helper's `depth` must be its parameter and its three
+      uses (the claim, the rollback and the binding), so a depth written in the helper fails it.
+    - Two new escapes: the arm claiming at a grown depth, and the helper growing its depth.
+    - Its docstring's count of checks that fail against the pre-ijla tree is 24, not 18. It was 19 at the base, and
+      Task 24's five arm checks fail there too.
+  - `docs/backend/sycl-static-storage-inventory.csv` is regenerated. The handler's `thread_local` now sits in the
+    submit helper, and the decline logger's row names `ggml_sycl_moe_bf16_grouped_note_decline`. `0335202533` had
+    left the old name in the inventory.
+  - `scripts/sycl-alloc-zone-contract/allowlist.json` (`1b34e95659`), found by the full run below. Clause (g) took the
+    guard's destructor handler for a new `catch (...)` with no `ggml_sycl_fallback_error` rethrow before it, and the
+    ten alloc-zone tests went red at `7bf59a61b4`.
+    - The handler cannot swallow a planned refusal. Its `try` holds one marker submit, the store's publication and the
+      claim's record, and none of them throws `ggml_sycl_fallback_error`. A rethrow out of a destructor would
+      terminate.
+    - It is the permanent exemption `E-MOE-BF16-GROUPED-HOLD`, with `count` 1, on the pattern of
+      `E-MOE-RESIDENT-DECODE-RETENTION-DRAIN`. `E-MEM-HANDLE-KEEP-AFTER-FAILED-WAIT` names the hold as its second
+      caller.
+- Host evidence taken under the hold, with nothing compiled:
+  - `clang-format-19 --dry-run -Werror` is clean on every C++ hunk of the round: `ggml-sycl.cpp` checked by `--lines`
+    over the round's hunks; the device test, `moe-bf16-grouped-plan.hpp` and the plan test checked whole.
+  - Contract results:
+    - `test-sycl-moe-bf16-direct-source.py`: 158 passed.
+    - `check-sycl-dnnl-decline-consumers.py`: PASS, 223 mutants killed.
+    - The scratch-admission contract: PASS on 37 checks, and its self-test kills its 14 mutants.
+    - The inventory: `--output`, `--check` and `--check-classification` all return 0.
+    - `test-sycl-static-storage-audit`: PASS (8 tests).
+  - The registered Python contracts ran directly at `7bf59a61b4`, four at a time, each by its registration (command,
+    directory, environment, skip code, `WILL_FAIL`). There were 330 selected: 317 passed and 13 failed.
+    - The ten alloc-zone tests failed, which led to `1b34e95659`. With it, all ten pass: the base check (823 debt
+      entries, no new violation), the witnesses (51 checks), and the eight mutation shards (86 cases each, 0 wrong).
+    - `sycl-private-cpu-traits-source` failed on the round 1 inventory, unchanged.
+    - `test-llama-lazy-declaration-source` and `test-llama-lazy-range-record-source` failed. They read only `src/`,
+      `common/arg.cpp` and their own files, and none of those changed in `9710996f92..HEAD`, so they fail the same way
+      at the range's base. One flags a `deepseek41` tensor with no declaration entry. The other finds no class
+      `llm_graph_input_ple` in `qwen4exp.cpp`.
+    - After `1b34e95659`, the CMake comment's edit and this record, the 96 selected contracts whose code names
+      CMakeLists, the plan or a glob ran again, the ten alloc-zone tests among them. 94 passed. The two that failed
+      are `sycl-private-cpu-traits-source` and `test-llama-lazy-declaration-source`, as above.
+  - 30 were left out because they run what the hold forbids: a `build/bin` binary, a compiler, bash or `readelf`.
+    - The four artifact tests named below.
+    - `sycl-cache-backing-token-forgery-compile`, `test-llama-context-cpu-only-compile`,
+      `test-sycl-kv-layer-sizing-source` and `test-sycl-lifecycle-public-wrappers` compile.
+    - The rest are the GPU and lifecycle tests registered on `build/bin` (`mem-handle-eviction-b70-repeat-clean-exit`,
+      `sycl-lifecycle-gpu-sequential`, `sycl-lifecycle-mutation-M1` to `-M3`), `test-skip-policy`,
+      `test-moe-cache-sim`, and fifteen script tests driven by bash or `readelf` (the profile, harness, parser, VTune
+      and zebin scripts).
+- After the lead's "builds GO", in this worktree, one ninja, `TMPDIR` in the task's own directory, miniconda's Python
+  first on `PATH`:
+  - `sycl-build.sh` built `ggml-sycl`, `test-moe-bf16-grouped-plan`, `test-moe-scratch-admission`,
+    `test-sycl-moe-bf16-grouped-kernel`, `test-sycl-moe-bf16-direct-kernel`, `test-moe-bf16-grouped-device`,
+    `test-moe-pp-staging-refusal` and `test-sycl-staging-replacement-failpoints`. It returned 0.
+    - Both backend objects recompiled: `ggml-sycl.cpp.o` and the Q1 route-test objects' copy.
+    - The build added no warning in the arm's lines or in the device test.
+    - `test-sycl-bf16-expert-gemm-bench` was not built: it now builds only by name.
+    - The cache records `/home/kainlan/miniconda3/bin/python3`. A first launch with the system Python first on
+      `PATH` was stopped after a minute and relaunched.
+  - Host tests, through ctest. Each printed its own PASS line, so none of them skipped:
+    - `sycl-moe-bf16-grouped-plan`: PASS.
+    - `sycl-moe-scratch-admission`: PASS, 13 cases.
+    - On `opencl:cpu`: `sycl-moe-bf16-grouped-kernel` and `sycl-moe-bf16-direct-kernel` both PASS.
+  - The artifact tests:
+    - `sycl-unified-private-seams`, `sycl-retained-publication-no-export` and `sycl-staging-failpoint-no-export`
+      pass. The last now has its fixture, `test-sycl-staging-replacement-failpoints`.
+    - `sycl-private-carrier-linkage` stops at `test-layout-cache`, the one carrier of its 49 this worktree never
+      built. Run on the 48 that exist, it passes all 48.
+  - The four compile contracts left out above:
+    - `sycl-cache-backing-token-forgery-compile`, `test-sycl-kv-layer-sizing-source` and
+      `test-sycl-lifecycle-public-wrappers` pass.
+    - `test-llama-context-cpu-only-compile` fails: `src/llama-context.cpp` uses `llama_context_sycl_device_index`
+      with neither `GGML_USE_SYCL` nor `GGML_BACKEND_DL` defined. `src/` is unchanged in the range, so the failure
+      is older than this task.
+  - Not run here: the remaining 22 contracts left out above, and every device test. Those are the lead's, among them
+    `test-moe-bf16-grouped-device` (11 cases) and `test-moe-pp-staging-refusal`.
+
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
 *Left by Task 21, step 1d (2026-11-24):*
