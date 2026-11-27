@@ -497,10 +497,16 @@ rule refusing the record (`ggml_sycl_moe_hybrid_decode_record_frame_refusal`:
 more than one routable card, a tensor the MMID direct route runs), or a later
 model's route-count table in the device's place builds the record again over
 every expert. A level-2 `GGML_SYCL_MOE_HYBRID_RECORD_TRACE` line names the rule
-that declined a patch. A patch or build that the expert storage moved under (a
-loan or evict its own allocations set off) is not served: the patch declines,
-the build ends as a retry, and the record's leases wait for the queue as a
-replaced record's do. An expert loan's or evict's view drop
+that declined a patch. A patch or build that the expert storage moved under is
+not served: the patch declines, the build ends as a retry, and the record's
+leases wait for the queue as a replaced record's do. The check is defensive:
+nothing in the lookup's own resolves or allocations moves the generation (an
+expert move runs in a transaction that refuses while a graph computes, and
+both resolves pass `allow_materialize=false`). It guards against an expert
+move on another thread that overlaps the lookup: the graph-compute flag is one
+process-wide flag, so a transaction that passed its check just before a graph
+set it, or ran while another context's graph had cleared it, can overlap.
+An expert loan's or evict's view drop
 (`ggml_sycl_drop_lent_expert_views`) does not drop the record: it withdraws,
 from a copy it publishes in the record's place, only the slots that lease the
 entry it retired, retains their leases with the other views it drops, and notes

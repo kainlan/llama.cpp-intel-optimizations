@@ -60,9 +60,11 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
       so the next lookup is a generation miss the patch serves. That lookup counts the withdrawn slots in the trace,
       once, between the held record's binding and the patch plan, and the replaced record's retained handles skip a
       withdrawn slot's empty lease;
-  T13 a patch or a build that the expert storage moved under (a loan or evict its own allocations set off) is not
-      served: the patch counts as declined, with that reason, and the build ends as a retry, each checked before its
-      count, and the discarded record's handles wait for a barrier on the queue as a replaced record's do;
+  T13 a patch or a build that the expert storage moved under is not served, a defensive check (nothing in the
+      lookup's own resolves or allocations moves the generation, but an expert move on another thread can overlap
+      the lookup): the patch counts as declined, with that reason, and the build ends as a retry, each checked
+      before its count, and the discarded record's handles wait for a barrier on the queue as a replaced record's
+      do;
   T14 a build that replaces the held record retains the replaced record's handles to a barrier on the queue before
       it replaces or drops it, as a published patch retains what it replaced.
 
@@ -250,9 +252,13 @@ PATCH_LEVEL_BODY = ('{ static const bool enabled = [] { const char * env = std::
 DOC_NEEDLES = ("`GGML_SYCL_MOE_HYBRID_RECORD_TRACE=1\\|2`", "[MOE-HYBRID-RECORD]", "[MOE-HYBRID-RECORD-BUILD]",
                "[MOE-HYBRID-RECORD-PATCH]", "patches=", "withdrawn=", "Read once", "lower block",
                "outcome=patched\\|declined: <why>\\|unlogged", "a plan that no patch answers builds once",
-               "the patch attempts asked for, resolved or not", "two or three per tensor, so about 21 to 32 moves")
-# A move writes two or three notes per tensor, so the row must not count three alone.
-DOC_FORBIDDEN = ("about three",)
+               "the patch attempts asked for, resolved or not", "two or three per tensor, so about 21 to 32 moves",
+               "an expert move on another thread that overlapped the lookup")
+# What the row must not say, and why: it must not count three notes alone, nor blame the lookup itself for a move.
+DOC_FORBIDDEN = {
+    "about three": "an expert move writes two or three notes per tensor",
+    "its own allocations set off": "nothing the lookup's own resolves or allocations do moves the generation",
+}
 PATCH_DOC_NEEDLES = ("`GGML_SYCL_MOE_HYBRID_RECORD_PATCH=0`", "Read once", "every expert", "instead of patching it",
                      "still withdraws", "parses as a non-zero integer (`on` and `true` parse as 0)")
 # `=0` keeps the loan and evict withdrawal, so it is not the tree before the patch, and the row must not say it is.
@@ -333,8 +339,10 @@ WITHDRAW_STEPS = (
 FIXTURE_CLEAR = ("extra.weight().moe_expert_storage_handles.clear(); extra.weight().note_moe_storage_change("
                  + ALL + ");")
 
-# T13: a patch or build the expert storage moved under is not served. A loan or evict that its own allocations set off
-# moves the generation and may publish a withdrawn copy in the held record's place.
+# T13: a patch or build the expert storage moved under is not served. Nothing in the lookup's own resolves or
+# allocations moves the generation: the check guards against an expert move on another thread that overlaps the
+# lookup (the graph-compute flag a transaction refuses under is one process-wide flag), which may also publish a
+# withdrawn copy in the held record's place.
 PATCH_MOVED = ("if (patched_ok && weight.moe_expert_storage_generation != storage_generation) { "
                "ggml_sycl_moe_hybrid_decode_record_append_handles(*patched, replaced); "
                "ggml_sycl::retain_handles_until_event(std::move(replaced), ctx.stream()->ext_oneapi_submit_barrier()); "
@@ -551,10 +559,9 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str, log
     for needle in DOC_NEEDLES:
         if needle not in rows[0]:
             raise ContractError(f"FAIL [pin T7]: the {ENV_NAME} row does not say `{needle}`")
-    for needle in DOC_FORBIDDEN:
+    for needle, why in DOC_FORBIDDEN.items():
         if needle in rows[0]:
-            raise ContractError(f"FAIL [pin T7]: the {ENV_NAME} row says `{needle}`, but an expert move writes two or "
-                                f"three notes per tensor")
+            raise ContractError(f"FAIL [pin T7]: the {ENV_NAME} row says `{needle}`, but {why}")
     patch_rows = [line for line in docs_raw.splitlines() if line.startswith(f"| `{PATCH_ENV}")]
     if len(patch_rows) != 1 or not all(needle in patch_rows[0] for needle in PATCH_DOC_NEEDLES):
         raise ContractError(f"FAIL [pin T7]: docs/backend/sycl-env-vars.md has no one {PATCH_ENV} row that says "
@@ -1106,6 +1113,9 @@ def self_test(raws: dict[str, str]) -> int:
                 [("parses as a non-zero integer (`on` and `true` parse as 0)", "any non-zero value")])
     expect_fail("docs-row-lacks-withdrawn", "T7", D,
                 [("patch_unlogged= withdrawn=` line", "patch_unlogged=` line"), (" `withdrawn=` counts", " counts")])
+    expect_fail("docs-row-blames-own-allocations", "T7", D,
+                [("by an expert move on another thread that overlapped the lookup",
+                  "by a loan or evict its own allocations set off")])
 
     try:
         mutate(B, [("this anchor is in no source", "x")])
