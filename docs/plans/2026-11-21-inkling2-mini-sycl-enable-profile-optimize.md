@@ -7455,7 +7455,8 @@ only; every device item is still the lead's.**
      - the arm's decline line with `reason=submit`, the direct-route line, and no arm line;
      - dst matching the CPU within the same NMSE bound, and no refusal;
      - the failpoint consumed exactly once.
-     The next case, `gate_up-after-declined`, runs on the arm again. Every other case must consume no failpoint.
+     The next case, `gate_up-after-declined`, runs on the arm again. Every case run without a failpoint must consume
+     none.
 2. The planned-size admission now runs before the ids, on the routed rows unpadded. No packing is smaller, so the
    admission declines no node it would admit later. A SCRATCH_UNPLANNED decline therefore pays no ids wait. The same
    admission runs again on the packed rows after the plan. The per-node row-count check stays after the ids.
@@ -7465,8 +7466,9 @@ only; every device item is still the lead's.**
    - An arm case must move runs by 1 and declines by 0.
    - A decline case (`tokens`, `opt_out`) must move runs by 0, declines by 1 and its own reason by 1.
    - The route lines stay as a second witness.
-   - The test now links `ggml-sycl-private-fixtures`. It has 9 cases (8 in round 1, and the declined case added after
-     the lead's ruling) and ends `PASS: BF16 grouped prompt arm, 9 cases`.
+   - The test now links `ggml-sycl-private-fixtures`. It has 10 cases and ends
+     `PASS: BF16 grouped prompt arm, 10 cases`. Round 1 had 8; the lead's ruling added two, the declined case and the
+     arm case after it.
 4. Round to nearest even is proved at kernel level, in `tests/test-sycl-moe-bf16-grouped-kernel.cpp` (ctest
    `sycl-moe-bf16-grouped-kernel`, `opencl:cpu`, labels `sycl;moe;bf16;kernel;hostonly`).
    - A table of 27 f32 inputs gives each one's bf16 bits. It covers ties to even both ways, one ulp either side of a
@@ -7546,7 +7548,7 @@ only; every device item is still the lead's.**
         this worktree. Run on the 33 that exist, it passes all 33.
       - `sycl-staging-failpoint-no-export`: its export check passes (no `failpoint` symbol in the shipped DSO). Its
         positive control needs `test-sycl-staging-replacement-failpoints`, which this worktree never built.
-  - Not run here, as the lead's: `test-moe-bf16-grouped-device` (9 cases), every other device test, and the two fixed
+  - Not run here, as the lead's: `test-moe-bf16-grouped-device` (10 cases), every other device test, and the two fixed
     sweeps.
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
