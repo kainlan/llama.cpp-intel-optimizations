@@ -828,7 +828,9 @@ INTERNAL_WRAPPER_SITES = {
         # 21 -> 25: the evict cases read the publication a call starts from: the one-evict and shared-storage cases
         # show an accepted call replaced it, and the just-admitted and lent cases show a BUSY evict left it in place.
         # 25 -> 26: the evict into a host zone without room reads the publication its BUSY refusal must leave in place.
-        "const auto published = ::ggml_sycl_global_plan_snapshot();": 26,
+        # 26 -> 27: the pointer-table lease case reads the publication its loan replaces, to show the loan left that
+        # plan's entries as they were.
+        "const auto published = ::ggml_sycl_global_plan_snapshot();": 27,
         # llama.cpp-sif1: the unpreparable-triplet case reads the publication a refill into a full WEIGHT zone must
         # leave in place, and shows it does.
         "const auto before_full = ::ggml_sycl_global_plan_snapshot();": 1,
