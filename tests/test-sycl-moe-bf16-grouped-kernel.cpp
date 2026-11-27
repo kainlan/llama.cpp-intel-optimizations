@@ -10,8 +10,10 @@
 //     both ways, one ulp either side of a tie, the largest finite rounding to infinity, infinities, quiet and
 //     signalling NaN made quiet, subnormals, zeros), must hold for ggml_sycl_bf16::f32_to_bf16_rne and for the CPU
 //     backend's ggml_fp32_to_bf16, which agree on every input of every case;
-//   - every routed row of the gathered plane is bit for bit f32_to_bf16_rne of its src1 row, on activations that are
-//     not bf16 values: the table's inputs first, then random 32-bit patterns (NaN payloads and subnormals included);
+//   - every routed row of the gathered plane is bit for bit f32_to_bf16_rne of its src1 row, on activations almost all
+//     of which are not bf16 values: the table's inputs first (all but its few exact values, 1.0, the zeros, the
+//     infinities and a quiet NaN, lie between two bf16 values), then random 32-bit patterns (NaN payloads and
+//     subnormals included);
 //   - the scatter writes every routed row's f32 output row to its (slot, token) row of dst, bit for bit;
 //   - the plane's padding rows, every dst element no routed row names (row padding and gaps between tokens) and every
 //     input come back untouched;

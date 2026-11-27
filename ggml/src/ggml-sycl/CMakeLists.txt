@@ -6643,12 +6643,14 @@ endif() # private SYCL backend fixture
 
 # Task 24 (Inkling 2 Mini): the gather and the scatter of the BF16 grouped prompt arm (moe-bf16-grouped.cpp), on rows
 # laid out by the arm's own plan (moe-bf16-grouped-plan.hpp): the gathered bf16 plane bit for bit what
-# ggml_sycl_bf16::f32_to_bf16_rne and the CPU backend's ggml_fp32_to_bf16 give, on activations that are not bf16 values
-# (ties to even both ways, one ulp either side of a tie, the largest finite, infinities, quiet and signalling NaN,
-# subnormals and zeros), a broadcast row and a row per slot, padded strides, padding rows and every unrouted dst row
-# left untouched; and each refusal enqueuing nothing. The kernel file needs no backend state, so the test compiles it
-# directly (JIT spir64, as test-sycl-moe-bf16-direct-kernel does) and links ggml-base alone. The registration pins
-# opencl:cpu so it never touches a GPU. NAME and labels carry none of the substrings the throttled sweep excludes.
+# ggml_sycl_bf16::f32_to_bf16_rne and the CPU backend's ggml_fp32_to_bf16 give, on a table of inputs almost all between
+# two bf16 values (ties to even both ways, one ulp either side of a tie, the largest finite, signalling NaN, subnormals;
+# beside a few exact ones: 1.0, infinities, a quiet NaN, zeros) and on random bit patterns; a broadcast row and a row
+# per slot, padded strides, two GEMM widths in one plane, padding rows and every unrouted dst row left untouched; and
+# each refusal enqueuing nothing and leaving the caller's event. The kernel file needs no backend state, so the test
+# compiles it directly (JIT spir64, as test-sycl-moe-bf16-direct-kernel does) and links ggml-base alone. The
+# registration pins opencl:cpu so it never touches a GPU. NAME and labels carry none of the substrings the throttled
+# sweep excludes.
 add_executable(test-sycl-moe-bf16-grouped-kernel
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-bf16-grouped-kernel.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe-bf16-grouped.cpp
