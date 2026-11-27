@@ -296,6 +296,7 @@ struct moe_hybrid_record_counts {
     uint64_t patch_experts                                 = 0;   // experts the patch attempts asked for
     uint64_t patch_declined                                = 0;   // patches that could not stand: a build followed
     uint64_t patch_unlogged                                = 0;   // generation misses the log could not name: built
+    uint64_t withdrawn = 0;  // slots loans and evicts withdrew from the records the lookups replaced
 };
 
 // The submitting thread's count. A token starts when a lookup's block number is lower than the last lookup's, the rule
@@ -352,6 +353,9 @@ struct moe_hybrid_record_trace {
         counts.patch_experts += experts;
         ++(patched ? counts.patches : counts.patch_declined);
     }
+
+    // A lookup is about to replace a record a loan or an evict withdrew `slots` slots from.
+    void withdrawn(size_t slots) { counts.withdrawn += slots; }
 };
 
 // The per-token line's fields, after its tag. Returns what snprintf returns. The widest values fit 768 bytes.
@@ -360,7 +364,7 @@ inline int moe_hybrid_record_line(char * buf, size_t n, uint64_t token, const mo
         buf, n,
         "token=%llu lookups=%llu current=%llu no_plan=%llu undecided=%llu retry=%llu epoch=%llu rows=%llu "
         "generation=%llu generation_steps=%llu builds=%llu built_experts=%llu eligible=%llu refused=%llu "
-        "retried=%llu patches=%llu patch_experts=%llu patch_declined=%llu patch_unlogged=%llu",
+        "retried=%llu patches=%llu patch_experts=%llu patch_declined=%llu patch_unlogged=%llu withdrawn=%llu",
         (unsigned long long) token, (unsigned long long) c.lookups,
         (unsigned long long) c.misses[MOE_HYBRID_RECORD_MISS_NONE], (unsigned long long) c.no_plan,
         (unsigned long long) c.misses[MOE_HYBRID_RECORD_MISS_UNDECIDED],
@@ -373,7 +377,7 @@ inline int moe_hybrid_record_line(char * buf, size_t n, uint64_t token, const mo
         (unsigned long long) c.outcomes[MOE_DECODE_DIRECT_OUTCOME_REFUSED],
         (unsigned long long) c.outcomes[MOE_DECODE_DIRECT_OUTCOME_RETRY], (unsigned long long) c.patches,
         (unsigned long long) c.patch_experts, (unsigned long long) c.patch_declined,
-        (unsigned long long) c.patch_unlogged);
+        (unsigned long long) c.patch_unlogged, (unsigned long long) c.withdrawn);
 }
 
 }  // namespace ggml_sycl

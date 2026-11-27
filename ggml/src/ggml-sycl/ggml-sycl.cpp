@@ -91511,6 +91511,11 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
     // the experts that moved. A replan, a change of selected rows, a log that lost a move or named every expert, or a
     // patch that declines, builds the record again over every expert below.
     std::shared_ptr<const moe_hybrid_decode_record> & held = weight.moe_hybrid_decode[device];
+    // Every way on from here replaces the held record, by a patch or a build, so its withdrawn slots count once. On a
+    // device this is the trace's one sign that a loan or evict matched a slot by the entry it retired.
+    if (trace > 0 && held && held->n_withdrawn > 0) {
+        g_moe_hybrid_record_trace.withdrawn(held->n_withdrawn);
+    }
     std::vector<int32_t>                              changed;
     const ggml_sycl::moe_hybrid_record_patch_plan     plan =
         ggml_sycl_moe_hybrid_record_patch_enabled() ?

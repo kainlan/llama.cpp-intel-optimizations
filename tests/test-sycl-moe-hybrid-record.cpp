@@ -138,6 +138,7 @@ static int test_trace_line() {
     c.patch_experts                                           = 9;
     c.patch_declined                                          = 1;
     c.patch_unlogged                                          = 0;
+    c.withdrawn                                               = 2;
 
     char      line[768];
     const int n = ggml_sycl::moe_hybrid_record_line(line, sizeof(line), 41, c);
@@ -145,7 +146,7 @@ static int test_trace_line() {
     const std::string want =
         "token=41 lookups=144 current=138 no_plan=0 undecided=1 retry=0 epoch=0 rows=0 generation=5 "
         "generation_steps=15 builds=6 built_experts=3072 eligible=6 refused=0 retried=0 patches=4 patch_experts=9 "
-        "patch_declined=1 patch_unlogged=0";
+        "patch_declined=1 patch_unlogged=0 withdrawn=2";
     if (want != line) {
         std::printf("FAILED: line\n  got:  %s\n  want: %s\n", line, want.c_str());
         return 1;
@@ -154,7 +155,7 @@ static int test_trace_line() {
     // The widest values each field can hold still fit the buffer the backend prints from.
     moe_hybrid_record_counts wide;
     wide.lookups = wide.no_plan = wide.generation_steps = wide.builds = wide.built_experts = UINT64_MAX;
-    wide.patches = wide.patch_experts = wide.patch_declined = wide.patch_unlogged = UINT64_MAX;
+    wide.patches = wide.patch_experts = wide.patch_declined = wide.patch_unlogged = wide.withdrawn = UINT64_MAX;
     for (uint64_t & m : wide.misses) {
         m = UINT64_MAX;
     }
@@ -441,7 +442,8 @@ static int test_withdraw() {
     return 0;
 }
 
-// The per-token counts of what the patches did.
+// The per-token counts of what the patches did, and of the slots loans and evicts had withdrawn from the records the
+// lookups replaced: the one sign on a device that a drop matched a record slot by the entry it retired.
 static int test_trace_patches() {
     moe_hybrid_record_trace t;
     t.patch(ggml_sycl::MOE_HYBRID_RECORD_PATCH_EXPERTS, /*patched=*/true, 2);
@@ -450,6 +452,9 @@ static int test_trace_patches() {
     CHECK(t.counts.patches == 1 && t.counts.patch_declined == 1 && t.counts.patch_unlogged == 1,
           "one patch stood, one declined, one found the log silent");
     CHECK(t.counts.patch_experts == 5, "the attempts asked for five experts");
+    t.withdrawn(2);
+    t.withdrawn(1);
+    CHECK(t.counts.withdrawn == 3, "two replaced records had three withdrawn slots between them");
     return 0;
 }
 

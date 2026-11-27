@@ -41,7 +41,9 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
   T12 an expert loan or evict (ggml_sycl_drop_lent_expert_views) withdraws only the record's slots that lease the
       entry it retired, from a copy it publishes in the held record's place (never the held one), counting them on the
       copy and moving their leases into the drop's retention; it keeps the stamp, and notes every expert it emptied,
-      so the next lookup is a generation miss the patch serves.
+      so the next lookup is a generation miss the patch serves. That lookup counts the withdrawn slots in the trace,
+      once, between the held record's binding and the patch plan, and the replaced record's retained handles skip a
+      withdrawn slot's empty lease.
 
 Checks run on comment-blanked text (string literals kept). NOT VACUOUS: --self-test runs the gate on in-memory mutants
 of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if another pin
@@ -161,7 +163,7 @@ PATCH_LEVEL_BODY = ('{ static const bool enabled = [] { const char * env = std::
                     "return env == nullptr || std::atoi(env) != 0; }(); return enabled; }")
 
 DOC_NEEDLES = ("`GGML_SYCL_MOE_HYBRID_RECORD_TRACE=1\\|2`", "[MOE-HYBRID-RECORD]", "[MOE-HYBRID-RECORD-BUILD]",
-               "[MOE-HYBRID-RECORD-PATCH]", "patches=", "Read once", "lower block")
+               "[MOE-HYBRID-RECORD-PATCH]", "patches=", "withdrawn=", "Read once", "lower block")
 PATCH_DOC_NEEDLES = ("`GGML_SYCL_MOE_HYBRID_RECORD_PATCH=0`", "Read once", "every expert")
 HEADER_INCLUDE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]', re.M)
 HEADER_ALLOWED = {"moe-decode-hostpath.hpp"}
@@ -210,6 +212,14 @@ DROP_NOTES = NOTE_SITES[6][2]
 DROP_RETIRED = ("moe_hybrid_decode_stamp", "moe_hybrid_decode[device].reset()",
                 "ggml_sycl_moe_hybrid_decode_record_append_handles(")
 WITHDRAW_MATCH = "return h.is_weight() && h.device() == device && h.key() == withdrawn;"
+# The lookup that replaces a withdrawn record counts its withdrawn slots: on a device, the trace's one sign that a drop
+# matched a slot by the retired entry. A drop that matched none still moves the generation for the expert whose storage
+# record it dropped, so the patch and the tokens look the same either way.
+WITHDRAWN_COUNT = ("if (trace > 0 && held && held->n_withdrawn > 0) { "
+                   "g_moe_hybrid_record_trace.withdrawn(held->n_withdrawn); }")
+# The replaced record's handles, retained to a barrier, skip a withdrawn slot's empty lease.
+APPEND_SIG = "static void ggml_sycl_moe_hybrid_decode_record_append_handles("
+APPEND_LEASES = "for (const ggml_sycl::mem_handle & h : record.lease) { if (h.valid()) { out.push_back(h); } }"
 WITHDRAW_STEPS = (
     ("test that a slot leases the entry",
      "if (!held || std::none_of(held->lease.begin(), held->lease.end(), on_entry)) { return false; }"),
@@ -515,6 +525,14 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str) -> 
         last = at
     if "const_cast" in withdraw or WAIT_CALLS.search(withdraw):
         raise ContractError("FAIL [pin T12]: the withdrawal writes the published record or waits on the device")
+    at_withdrawn = once(current, WITHDRAWN_COUNT, "T12", "the lookup's count of the withdrawn slots it refills")
+    if not at_patch_held < at_withdrawn < at_plan:
+        raise ContractError("FAIL [pin T12]: the withdrawn slots are not counted between the held record's binding and "
+                            "the patch plan, the one place every lookup that replaces the record passes exactly once")
+    appends = definition_spans(backend_sq, APPEND_SIG)
+    if len(appends) != 1 or APPEND_LEASES not in backend_sq[appends[0][0] : appends[0][1] + 1]:
+        raise ContractError("FAIL [pin T12]: the replaced record's handle list does not skip a withdrawn slot's empty "
+                            "lease")
 
 
 def self_test(raws: dict[str, str]) -> int:
@@ -705,6 +723,19 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("withdraw-matches-by-resolve", "T12", B,
                 [("    const auto on_entry = [&](const ggml_sycl::mem_handle & h) {\n        return h.is_weight() &&",
                   "    const auto on_entry = [&](const ggml_sycl::mem_handle & h) {\n        return h.resolve(device).ptr &&")])
+    withdrawn_count = ("    if (trace > 0 && held && held->n_withdrawn > 0) {\n"
+                       "        g_moe_hybrid_record_trace.withdrawn(held->n_withdrawn);\n    }\n")
+    expect_fail("lookup-uncounts-withdrawal", "T12", B, [(withdrawn_count, "")])
+    expect_fail("withdrawal-counted-after-plan", "T12", B,
+                [(withdrawn_count, ""),
+                 ("    std::shared_ptr<const moe_hybrid_decode_record> patched;\n",
+                  withdrawn_count + "    std::shared_ptr<const moe_hybrid_decode_record> patched;\n")])
+    expect_fail("append-keeps-empty-leases", "T12", B,
+                [("    for (const ggml_sycl::mem_handle & h : record.lease) {\n        if (h.valid()) {\n"
+                  "            out.push_back(h);\n        }\n    }\n",
+                  "    out.insert(out.end(), record.lease.begin(), record.lease.end());\n")])
+    expect_fail("docs-row-lacks-withdrawn", "T7", D,
+                [("patch_unlogged= withdrawn=` line", "patch_unlogged=` line"), (" `withdrawn=` counts", " counts")])
 
     try:
         mutate(B, [("this anchor is in no source", "x")])
