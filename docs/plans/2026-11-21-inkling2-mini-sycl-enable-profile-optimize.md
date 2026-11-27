@@ -7403,6 +7403,20 @@ reference kernels and must not be used.
   - `test-sycl-pp-moe-scratch-admission-contract.py`: the arm is a third reserve site, under the batched executor's
     planned names. Mutants written for the batched executor are applied inside that executor (`mutate_once`),
     because the arm, earlier in the file, spells the same statements.
+  - `test-sycl-mul-mat-f32-batched-route-source.py`: the arm is the third caller that passes
+    `GGML_SYCL_DNNL_FPMATH_NO_DOWNCONVERT`, beside the f32 batched route and the BF16 weight's oneDNN route. Three
+    new mutants make the arm pass the build's math, omit it, or name strict twice.
+  - `test-sycl-moe-nvfp4-resident-decode-source.py` (d): the AOS table helper has four spellings: its definition, the
+    BF16 direct route's ask, the arm's ask, and the NVFP4 route's.
+  - `test-sycl-window-path-submit-census-source.py`: `moe-bf16-grouped.cpp` is in `EXCLUDED_FILES`, for the reason
+    `moe-bf16-direct.cpp` is: it runs only for a BF16 expert weight, and the Qwen3.8-Flash-Next packs hold none.
+  - The last three were found by a host run of the Python contracts that name the touched identifiers or read the
+    touched files, after the GREEN commit's message was written, so that message does not list them.
+- Host evidence: 162 registered Python-only contracts were run by name, not the two fixed sweeps, which stay the
+  lead's. Every one passes except `sycl-private-cpu-traits-source`, which was red before this task.
+  - That test pins 8 `ggml_sycl_get_type_traits_cpu(` calls in `ggml-sycl.cpp`. With its own comment stripper, the
+    count is 9 both at base `a09e879982` and at the GREEN commit.
+  - `test-skip-policy` was left out because it launches `build/bin/test-autorelease`.
 
 ---
 
