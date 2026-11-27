@@ -4450,7 +4450,7 @@ struct ggml_tensor_extra_gpu_weight_ext {
     std::unordered_map<uint64_t, std::vector<moe_expert_storage_record>> moe_expert_storage_handles;
     uint64_t                                                             moe_expert_storage_generation = 1;
     // Which expert each recent generation move changed, so a decision made at an older generation can re-check only
-    // those experts (the hybrid decode record). Every move goes through note_moe_storage_change(), so the log sees each.
+    // those experts (the hybrid decode record). Every move calls note_moe_storage_change(), so the log sees each.
     ggml_sycl::moe_storage_change_log                                    moe_expert_storage_changes;
     uint64_t                           moe_full_local_probe_generation[GGML_SYCL_MAX_DEVICES]          = {};
     ggml_layout_mode                   moe_full_local_probe_layout[GGML_SYCL_MAX_DEVICES]              = {};

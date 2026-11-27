@@ -669,7 +669,8 @@ def self_test(raws: dict[str, str]) -> int:
                   "        (void) ggml_sycl::moe_route_counts_current(device);")])
     expect_fail("patch-installs-the-current-table", "P10", B,
                 [("    patched->n_withdrawn = 0;\n",
-                  "    patched->n_withdrawn = 0;\n    patched->route_counts = ggml_sycl::moe_route_counts_current(device);\n")])
+                  "    patched->n_withdrawn = 0;\n"
+                  "    patched->route_counts = ggml_sycl::moe_route_counts_current(device);\n")])
     expect_fail("patch-takes-the-table-to-read-it", "P10", B,
                 [(PATCH_TABLE_CHECK,
                   "ggml_sycl::moe_route_counts_current(device)->decode_count(0, 0) != 0")])

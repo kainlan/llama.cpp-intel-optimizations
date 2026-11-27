@@ -120,7 +120,8 @@ WAIT_CALLS = re.compile(r"\.wait\(|wait_and_throw\(|get_info<")
 # T9: the lookup's patch path.
 PATCH_HELD = "std::shared_ptr<const moe_hybrid_decode_record> & held = weight.moe_hybrid_decode[device];"
 PATCH_PLAN = ("const ggml_sycl::moe_hybrid_record_patch_plan plan = ggml_sycl_moe_hybrid_record_patch_enabled() ? "
-              "ggml_sycl::moe_hybrid_record_plan_patch(miss, stamp, held != nullptr, weight.moe_expert_storage_changes, "
+              "ggml_sycl::moe_hybrid_record_plan_patch(miss, stamp, held != nullptr, "
+              "weight.moe_expert_storage_changes, "
               "storage_generation, &changed) : ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_NONE;")
 PATCH_CALL = ("if (plan == ggml_sycl::MOE_HYBRID_RECORD_PATCH_PLAN_EXPERTS) { patched_ok = "
               "ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, held, changed, &patched, &replaced, &declined); }")
@@ -227,7 +228,8 @@ PLAN_SIG = "static const char * ggml_sycl_moe_hybrid_decode_record_plan_refusal(
 PLAN_STEPS = (
     ("query of the host experts", "const bool has_host = plan->has_host_experts(src0->name, n_as, device);"),
     ("query of the planned residency",
-     "*counts = has_host ? plan->count_planned_experts(src0->name, n_as, device) : ggml_sycl::expert_residency_counts{};"),
+     "*counts = has_host ? plan->count_planned_experts(src0->name, n_as, device) : "
+     "ggml_sycl::expert_residency_counts{};"),
     ("decision by the header's rule",
      "return ggml_sycl::moe_hybrid_record_plan_refusal(has_host, counts->on_device, counts->on_target);"),
 )
@@ -310,7 +312,8 @@ NOTE_SITES = (
 # T12: an expert loan's or evict's drop withdraws the record's slots that lease the retired entry, from a copy.
 DROP_SIG = "static void ggml_sycl_drop_lent_expert_views("
 WITHDRAW_SIG = "static bool ggml_sycl_moe_hybrid_decode_record_withdraw("
-WITHDRAW_DECL = ("static bool ggml_sycl_moe_hybrid_decode_record_withdraw(std::shared_ptr<const moe_hybrid_decode_record> "
+WITHDRAW_DECL = ("static bool ggml_sycl_moe_hybrid_decode_record_withdraw("
+                 "std::shared_ptr<const moe_hybrid_decode_record> "
                  "& held,")
 DROP_WITHDRAW = ("if (ggml_sycl_moe_hybrid_decode_record_withdraw(w.moe_hybrid_decode[device], device, withdrawn, "
                  "retained, emptied)) { table_dropped = true; }")
@@ -824,7 +827,8 @@ def self_test(raws: dict[str, str]) -> int:
                   'GGML_LOG_INFO(\n                "[MOE-HYBRID-RECORD-BUILD] ')])
     expect_fail("build-line-at-level-1", "T5", B,
                 [("        if (trace >= 2) {\n            GGML_LOG_WARN(\n                \"[MOE-HYBRID-RECORD-BUILD] ",
-                  "        if (trace >= 1) {\n            GGML_LOG_WARN(\n                \"[MOE-HYBRID-RECORD-BUILD] ")])
+                  "        if (trace >= 1) {\n            GGML_LOG_WARN(\n"
+                  "                \"[MOE-HYBRID-RECORD-BUILD] ")])
     expect_fail("header-includes-sycl", "T6", H, [("#include <cstdio>", "#include <sycl/sycl.hpp>\n#include <cstdio>")])
     expect_fail("header-includes-common", "T6", H, [("#include <cstdio>", '#include "common.hpp"\n#include <cstdio>')])
     expect_fail("log-header-includes-sycl", "T6", "log",
@@ -857,7 +861,8 @@ def self_test(raws: dict[str, str]) -> int:
                 [("        g_moe_hybrid_record_trace.patch(plan, patched_ok, changed.size());\n", "")])
     expect_fail("patch-line-at-level-1", "T9", B,
                 [("        if (trace >= 2) {\n            GGML_LOG_WARN(\n                \"[MOE-HYBRID-RECORD-PATCH] ",
-                  "        if (trace >= 1) {\n            GGML_LOG_WARN(\n                \"[MOE-HYBRID-RECORD-PATCH] ")])
+                  "        if (trace >= 1) {\n            GGML_LOG_WARN(\n"
+                  "                \"[MOE-HYBRID-RECORD-PATCH] ")])
     expect_fail("patch-reason-unprinted", "T9", B,
                 [('declined ? ": " : "", declined ? declined : "");', '"", "");')])
     expect_fail("patch-published-unretained", "T9", B,
@@ -868,20 +873,25 @@ def self_test(raws: dict[str, str]) -> int:
                 [("        (void) ggml_sycl::moe_decode_direct_stamp_settle(stamp,", "        (void) (stamp,")])
     expect_fail("lookup-returns-true-elsewhere", "T9", B,
                 [("    *out = held;\n    return *out != nullptr;",
-                  "    *out = held;\n    if (*out != nullptr) {\n        return true;\n    }\n    return *out != nullptr;")])
+                  "    *out = held;\n    if (*out != nullptr) {\n        return true;\n    }\n"
+                  "    return *out != nullptr;")])
 
     # T10: the patch.
     held_param = "std::shared_ptr<const moe_hybrid_decode_record>   held,"
     expect_fail("patch-takes-held-mutable", "T10", B,
                 [(held_param, "std::shared_ptr<moe_hybrid_decode_record>         held,")])
-    expect_fail("patch-borrows-held", "T10", B, [(held_param, "const moe_hybrid_decode_record &                  held,")])
+    expect_fail("patch-borrows-held", "T10", B,
+                [(held_param, "const moe_hybrid_decode_record &                  held,")])
     expect_fail("patch-skips-plan-rule", "T10", B,
-                [("    if (const char * why =\n            ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, "
+                [("    if (const char * why =\n"
+                  "            ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, "
                   "static_cast<int64_t>(held->n_as), &counts)) {\n        return decline(why);\n    }\n", "")])
     expect_fail("patch-skips-frame-rule", "T10", B,
-                [("    if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, held->all_host, "
+                [("    if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, "
+                  "held->all_host, "
                   "held->layout)) {\n        return decline(why);\n    }\n", "")])
-    route_check = "    if (held->route_block >= 0 && held->route_counts != ggml_sycl::moe_route_counts_current(device)) {\n"
+    route_check = ("    if (held->route_block >= 0 && held->route_counts != "
+                   "ggml_sycl::moe_route_counts_current(device)) {\n")
     expect_fail("patch-keeps-replaced-route-counts", "T10", B, [(route_check, "    if (false) {\n")])
     expect_fail("patch-checks-route-counts-on-every-tensor", "T10", B,
                 [(route_check, "    if (held->route_counts != ggml_sycl::moe_route_counts_current(device)) {\n")])
@@ -890,24 +900,29 @@ def self_test(raws: dict[str, str]) -> int:
                   "            return false;")])
     expect_fail("patch-takes-no-reason", "T10", B,
                 [("replaced,\n" + " " * 53 + "const char **" + " " * 37 + "reason) {",
-                  "replaced) {\n    const char *  local_reason = nullptr;\n    const char ** reason       = &local_reason;")])
+                  "replaced) {\n    const char *  local_reason = nullptr;\n"
+                  "    const char ** reason       = &local_reason;")])
     expect_fail("patch-skips-batch-size", "T10", B,
                 [("    if (!resolved || resolved.batch.operands.size() != changed.size()) {", "    if (!resolved) {")])
     expect_fail("patch-skips-order-check", "T10", B,
                 [("        if (operand.expert_id != changed[i]) {\n"
-                  "            return decline(\"the resolved batch is not in the moved experts' order\");\n        }\n", "")])
+                  "            return decline(\"the resolved batch is not in the moved experts' order\");\n"
+                  "        }\n", "")])
     expect_fail("patch-ignores-install-failure", "T10", B,
                 [("    if (!ggml_sycl::moe_hybrid_record_install(patched->device_weight,",
                   "    if (false && !ggml_sycl::moe_hybrid_record_install(patched->device_weight,")])
     expect_fail("patch-writes-held-table", "T10", B,
                 [("    patched->n_withdrawn = 0;\n\n    sycl::queue & queue = *ctx.stream();\n",
-                  "    patched->n_withdrawn = 0;\n\n    sycl::queue & queue = *ctx.stream();\n    if (held->table.valid()) {\n"
+                  "    patched->n_withdrawn = 0;\n\n    sycl::queue & queue = *ctx.stream();\n"
+                  "    if (held->table.valid()) {\n"
                   "        static_cast<const void **>(held->table.resolve().ptr)[0] = nullptr;\n    }\n")])
     expect_fail("patch-fills-held-table", "T10", B,
                 [("    if (!ready.empty()) {\n        // The unchanged slots' weights",
-                  "    (void) ggml_sycl_moe_hybrid_decode_table_fill(queue, device, extra->model_id, patched->device_weight,\n"
+                  "    (void) ggml_sycl_moe_hybrid_decode_table_fill(queue, device, extra->model_id, "
+                  "patched->device_weight,\n"
                   "                                                  shape.substitute,\n"
-                  "                                                  const_cast<ggml_sycl::mem_handle *>(&held->table));\n"
+                  "                                                  "
+                  "const_cast<ggml_sycl::mem_handle *>(&held->table));\n"
                   "    if (!ready.empty()) {\n        // The unchanged slots' weights")])
     # The copy shares the held table's handle until its reset, so a write through it before then writes the held table.
     expect_fail("patch-writes-held-table-through-copy", "T10", B,
@@ -965,9 +980,11 @@ def self_test(raws: dict[str, str]) -> int:
                   "    if (const char * why =\n"
                   "            ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, static_cast<int64_t>")])
     expect_fail("patch-checks-mmid-itself", "T11", B,
-                [("    if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, held->all_host, "
+                [("    if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, "
+                  "held->all_host, "
                   "held->layout)) {\n        return decline(why);\n    }\n",
-                  "    if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, held->all_host, "
+                  "    if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, "
+                  "held->all_host, "
                   "held->layout)) {\n        return decline(why);\n    }\n"
                   "    if (!held->all_host && moe_mmid_direct_route_runs_type(src0->type)) {\n"
                   "        return decline(\"mmid\");\n    }\n")])
@@ -979,7 +996,8 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    if (const char * why = ggml_sycl_moe_hybrid_decode_record_frame_refusal(ctx, src0, all_host, "
                   "layout)) {\n        return refuse(why);\n    }\n", "")])
     expect_fail("frame-rule-allows-two-cards", "T11", B,
-                [("    if (ggml_sycl_routable_device_count() != 1) {", "    if (ggml_sycl_routable_device_count() > 2) {")])
+                [("    if (ggml_sycl_routable_device_count() != 1) {",
+                  "    if (ggml_sycl_routable_device_count() > 2) {")])
     expect_fail("frame-rule-drops-mmid", "T11", B,
                 [("    if (!all_host && layout == GGML_LAYOUT_AOS && ggml_sycl_moe_mmid_route_reachable(ctx) &&\n"
                   "        moe_mmid_direct_route_runs_type(src0->type)) {\n"
@@ -988,8 +1006,10 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    if (!all_host && layout == GGML_LAYOUT_AOS && ggml_sycl_moe_mmid_route_reachable(ctx) &&",
                   "    if (layout == GGML_LAYOUT_AOS && ggml_sycl_moe_mmid_route_reachable(ctx) &&")])
     expect_fail("build-asks-plan-itself", "T11", B,
-                [("    if (const char * why = ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, n_as, &counts)) {",
-                  "    if (const char * why = ggml_sycl_cache_plan_owner(ggml_sycl::get_unified_cache_for_device(device))"
+                [("    if (const char * why = ggml_sycl_moe_hybrid_decode_record_plan_refusal(src0, device, n_as, "
+                  "&counts)) {",
+                  "    if (const char * why = ggml_sycl_cache_plan_owner("
+                  "ggml_sycl::get_unified_cache_for_device(device))"
                   "->has_host_experts(src0->name, n_as, device) ? nullptr : \"no host expert\") {")])
     expect_fail("plan-rule-skips-residency", "T11", B,
                 [("    *counts = has_host ? plan->count_planned_experts(src0->name, n_as, device) : "
@@ -1011,20 +1031,25 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("note-does-not-log", "T8", C,
                 [("        moe_expert_storage_changes.note(moe_expert_storage_generation, expert_id);\n", "")])
     expect_fail("raw-bump-in-common", "T8", C,
-                [("        if (erased) {\n            note_moe_storage_change(expert_id);\n        }\n        return erased;",
-                  "        if (erased) {\n            ++moe_expert_storage_generation;\n        }\n        return erased;")])
+                [("        if (erased) {\n            note_moe_storage_change(expert_id);\n        }\n"
+                  "        return erased;",
+                  "        if (erased) {\n            ++moe_expert_storage_generation;\n        }\n"
+                  "        return erased;")])
     expect_fail("raw-bump-in-backend", "T8", B,
                 [("        w.note_moe_storage_change(e);", "        ++w.moe_expert_storage_generation;")])
     expect_fail("mutation-names-one-expert", "T8", B,
                 [("extra->weight().note_moe_storage_change(" + ALL + ");",
                   "extra->weight().note_moe_storage_change(0);")])
     expect_fail("fixture-clear-names-one-expert", "T8", B,
-                [("extra.weight().note_moe_storage_change(" + ALL + ");", "extra.weight().note_moe_storage_change(0);")])
+                [("extra.weight().note_moe_storage_change(" + ALL + ");",
+                  "extra.weight().note_moe_storage_change(0);")])
     expect_fail("unread-note-site", "T8", B,
-                [("    if (stored || table_dropped) {", "    w.note_moe_storage_change(0);\n    if (stored || table_dropped) {")])
+                [("    if (stored || table_dropped) {",
+                  "    w.note_moe_storage_change(0);\n    if (stored || table_dropped) {")])
     expect_fail("mutation-notes-only-when-nothing-withdrawn", "T8", B,
                 [("    extra->weight().note_moe_storage_change(" + ALL + ");\n",
-                  "    if (expert_count == 0) {\n        extra->weight().note_moe_storage_change(" + ALL + ");\n    }\n")])
+                  "    if (expert_count == 0) {\n"
+                  "        extra->weight().note_moe_storage_change(" + ALL + ");\n    }\n")])
 
     # T1, T10, T12: the drop's withdrawal, and the two places that refuse or clear a withdrawn record.
     expect_fail("lookup-classifies-without-withdrawn", "T1", B,
@@ -1034,7 +1059,8 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    if (stored && std::find(emptied.begin(),",
                   "    w.moe_hybrid_decode_stamp[device] = {};\n    if (stored && std::find(emptied.begin(),")])
     expect_fail("drop-withdraws-unnoted", "T12", B,
-                [("    std::vector<int32_t> emptied;\n", "    std::vector<int32_t> emptied;\n    std::vector<int32_t> unnoted;\n"),
+                [("    std::vector<int32_t> emptied;\n",
+                  "    std::vector<int32_t> emptied;\n    std::vector<int32_t> unnoted;\n"),
                  ("                                                    emptied)) {",
                   "                                                    unnoted)) {")])
     expect_fail("withdraw-writes-held", "T12", B,
@@ -1044,7 +1070,8 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("withdraw-unpublished", "T12", B, [("    held = std::move(copy);\n", "")])
     expect_fail("withdraw-matches-by-resolve", "T12", B,
                 [("    const auto on_entry = [&](const ggml_sycl::mem_handle & h) {\n        return h.is_weight() &&",
-                  "    const auto on_entry = [&](const ggml_sycl::mem_handle & h) {\n        return h.resolve(device).ptr &&")])
+                  "    const auto on_entry = [&](const ggml_sycl::mem_handle & h) {\n"
+                  "        return h.resolve(device).ptr &&")])
     withdrawn_count = ("    if (trace > 0 && held && held->n_withdrawn > 0) {\n"
                        "        g_moe_hybrid_record_trace.withdrawn(held->n_withdrawn);\n    }\n")
     expect_fail("lookup-uncounts-withdrawal", "T12", B, [(withdrawn_count, "")])

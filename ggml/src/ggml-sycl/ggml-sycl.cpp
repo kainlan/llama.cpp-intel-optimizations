@@ -91451,8 +91451,8 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
 // the record another way now (the plan refuses it, or names another all-host mode, a moved expert could move the
 // layout the build takes, the frame rule refuses the held mode and layout, or the device's route-count table is no
 // longer the held one) or a moved expert no longer fits the held record's shape (another layout, a device expert in
-// an all-host record, no host expert left), and the caller builds the record again over every expert. `held` is the patch's own reference, so a resolve that replaces the
-// tensor's record cannot release the one it copies.
+// an all-host record, no host expert left), and the caller builds the record again over every expert. `held` is the
+// patch's own reference, so a resolve that replaces the tensor's record cannot release the one it copies.
 static bool ggml_sycl_moe_hybrid_decode_record_patch(ggml_backend_sycl_context &                       ctx,
                                                      const ggml_tensor *                               src0,
                                                      std::shared_ptr<const moe_hybrid_decode_record>   held,

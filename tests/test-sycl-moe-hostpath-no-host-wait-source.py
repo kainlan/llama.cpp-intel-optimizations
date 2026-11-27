@@ -1409,7 +1409,8 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "    if (all_host) {\n        return ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED;\n    }\n")
     sub("N9", "builder refuses a tensor with no device layout", "    if (!all_host && materialized < 0) {",
         "    if (materialized < 0) {")
-    sub("N9", "builder retries a tensor with no table", "    if (!all_host && !ggml_sycl_moe_hybrid_decode_table_fill(queue,",
+    sub("N9", "builder retries a tensor with no table",
+        "    if (!all_host && !ggml_sycl_moe_hybrid_decode_table_fill(queue,",
         "    if (!ggml_sycl_moe_hybrid_decode_table_fill(queue,")
     sub("N9", "builder refuses a tensor with no substitute",
         "    if (const char * why = ggml_sycl::moe_hybrid_record_shape_refusal(all_host, shape)) {",
@@ -1448,7 +1449,8 @@ def mutants(src: str) -> list[tuple[str, str, str]]:
         "    } else {\n        return refuse(\"an expert runs on neither this device nor the CPU\");\n    }\n",
         "    } else if (!all_host) {\n        (void) choice;\n"
         "    } else {\n        return refuse(\"an expert runs on neither this device nor the CPU\");\n    }\n")
-    sub("N9", "slot rule renamed away", "ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_slot(\n",
+    sub("N9", "slot rule renamed away",
+        "ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_slot(\n",
         "ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_slot_v2(\n")
     sub("N7", "record patch no longer reached", "ggml_sycl_moe_hybrid_decode_record_patch(ctx, src0, held,",
         "ggml_sycl_moe_hybrid_decode_record_patch_retired(ctx, src0, held,")
