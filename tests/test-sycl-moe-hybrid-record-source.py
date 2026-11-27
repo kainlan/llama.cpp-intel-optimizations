@@ -48,8 +48,9 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
       (never the held one), declines when the install into it refuses, checks the copy's shape with the build's rule,
       gives it a table of its own filled from every slot (the one table it fills; the held table it only hands back,
       it resolves no handle, and it names the copy's table, the held one's handle until the reset, only to reset and
-      fill it), a ready barrier over the held one's and the new events, records the block's residency only after every
-      way out, hands the replaced leases and the held table back for retention, and waits for nothing;
+      fill it, however either record is spelled: `x->`, `(*x).` or `x.get()->`), a ready barrier over the held
+      one's and the new events, records the block's residency only after every way out, hands the replaced leases
+      and the held table back for retention, and waits for nothing;
   T11 the build takes its plan, its frame, its slots, its shape check and its table from those same helpers and
       records the expert its layout came from; the plan is asked in the plan rule alone, the routable cards and the
       MMID direct route in the frame rule alone, the executor in the slot rule alone; and
@@ -69,8 +70,9 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
       it replaces or drops it, as a published patch retains what it replaced.
 
 Checks run on comment-blanked text (string literals kept). NOT VACUOUS: --self-test runs the gate on in-memory mutants
-of the real sources. Each mutant names the pin that must catch it, and is reported if it survives, if another pin
-catches it, or if its anchor no longer matches exactly once (NOT APPLIED). ctest registers it with --self-test.
+of the real sources. Each mutant names the pin that must catch it, and a mutant aimed at one of a pin's several rules
+names that rule's message too. A mutant is reported if it survives, if another pin or rule catches it, or if its
+anchor no longer matches exactly once (NOT APPLIED). ctest registers it with --self-test.
 
 WHAT THIS DOES NOT PROVE. It reads text. That the counts add up is the host test's job; what they read on Qwen3.8 is
 the lead's device run.
@@ -150,6 +152,14 @@ TABLE_FILL = "ggml_sycl_moe_hybrid_decode_table_fill("
 # The copy starts as the held record, so its table is the held table's handle until the reset: the patch names the
 # copy's table only to reset it and to fill it.
 PATCH_COPY_TABLE_USES = ("patched->table = {};", "&patched->table)")
+# What each table rule says when it fails, so a self-test mutant names the rule that must catch it.
+RESOLVE_SAYS = "the patch resolves a handle"
+HELD_TABLE_SAYS = "the patch names the held table other than"
+COPY_TABLE_SAYS = "the patch names the copy's table other than"
+# A dereference of the copy or the held record, spelled `(*x).` or `x.get()->`, is rewritten to `x->` before the
+# table rules count `patched->table` and `held->table`, so another spelling of the same member is counted too.
+DEREF_SPELLINGS = (re.compile(r"\(\s*\*\s*(patched|held)\s*\)\s*\.\s*"),
+                   re.compile(r"\b(patched|held)\s*\.\s*get\s*\(\s*\)\s*->\s*"))
 PATCH_STEPS = (
     ("decline helper", PATCH_DECLINE),
     ("the build's plan rule, asked again",
@@ -460,6 +470,13 @@ def included_headers(code: str) -> set[str]:
     return {Path(m.group(2)).name for m in HEADER_INCLUDE.finditer(code) if m.group(1) == '"'}
 
 
+def arrow_spelling(text: str) -> str:
+    """`(*x).m` and `x.get()->m` written as `x->m`, for x the patch's copy or the held record."""
+    for spelling in DEREF_SPELLINGS:
+        text = spelling.sub(r"\1->", text)
+    return text
+
+
 def once(text: str, needle: str, pin: str, what: str) -> int:
     n = text.count(needle)
     if n != 1:
@@ -626,14 +643,15 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str, log
     # shares its handle until the reset, so the patch resolves no handle at all, and names the copy's table only to
     # reset and fill it: the fill writes the one table the patch writes.
     if ".resolve(" in patch:
-        raise ContractError("FAIL [pin T10]: the patch resolves a handle, so it could write the held table, through "
+        raise ContractError(f"FAIL [pin T10]: {RESOLVE_SAYS}, so it could write the held table, through "
                             "the held record or through the copy that shares its table until the reset")
-    if patch.count("held->table") != PATCH_HELD_TABLE.count("held->table"):
-        raise ContractError("FAIL [pin T10]: the patch names the held table other than to hand it back for retention, "
+    tables = arrow_spelling(patch)
+    if tables.count("held->table") != PATCH_HELD_TABLE.count("held->table"):
+        raise ContractError(f"FAIL [pin T10]: {HELD_TABLE_SAYS} to hand it back for retention, "
                             "so it could write a table a queued copy still reads")
-    copy_table_uses = [patch.count(use) for use in PATCH_COPY_TABLE_USES]
-    if copy_table_uses != [1] * len(PATCH_COPY_TABLE_USES) or patch.count("patched->table") != sum(copy_table_uses):
-        raise ContractError("FAIL [pin T10]: the patch names the copy's table other than to reset it and fill it, so "
+    copy_table_uses = [tables.count(use) for use in PATCH_COPY_TABLE_USES]
+    if copy_table_uses != [1] * len(PATCH_COPY_TABLE_USES) or tables.count("patched->table") != sum(copy_table_uses):
+        raise ContractError(f"FAIL [pin T10]: {COPY_TABLE_SAYS} to reset it and fill it, so "
                             "it could use the held table's handle, which the copy holds until the reset")
     if patch.count(TABLE_FILL) != 1:
         raise ContractError("FAIL [pin T10]: the patch fills a table besides the copy's own")
@@ -772,7 +790,7 @@ def self_test(raws: dict[str, str]) -> int:
         out[file] = text
         return out
 
-    def expect_fail(name: str, pin: str, file: str, edits: list) -> None:
+    def expect_fail(name: str, pin: str, file: str, edits: list, says: str | None = None) -> None:
         nonlocal n_mutants
         n_mutants += 1
         try:
@@ -787,6 +805,11 @@ def self_test(raws: dict[str, str]) -> int:
             if f"[pin {pin}]" not in str(e):
                 failures.append(f"{name}: caught, but not by pin {pin}: {str(e)[:140]}")
                 print(f"  mutant {name}: caught by the WRONG pin ({str(e)[:120]}...)")
+                return
+            if says is not None and says not in str(e):
+                failures.append(f"{name}: caught by pin {pin}, but not by the rule that says `{says}`: "
+                                f"{str(e)[:140]}")
+                print(f"  mutant {name}: caught by the WRONG rule of pin {pin} ({str(e)[:120]}...)")
                 return
             print(f"  mutant {name}: caught (pin {pin})")
             return
@@ -915,7 +938,8 @@ def self_test(raws: dict[str, str]) -> int:
                 [("    patched->n_withdrawn = 0;\n\n    sycl::queue & queue = *ctx.stream();\n",
                   "    patched->n_withdrawn = 0;\n\n    sycl::queue & queue = *ctx.stream();\n"
                   "    if (held->table.valid()) {\n"
-                  "        static_cast<const void **>(held->table.resolve().ptr)[0] = nullptr;\n    }\n")])
+                  "        static_cast<const void **>(held->table.resolve().ptr)[0] = nullptr;\n    }\n")],
+                RESOLVE_SAYS)
     expect_fail("patch-fills-held-table", "T10", B,
                 [("    if (!ready.empty()) {\n        // The unchanged slots' weights",
                   "    (void) ggml_sycl_moe_hybrid_decode_table_fill(queue, device, extra->model_id, "
@@ -928,10 +952,28 @@ def self_test(raws: dict[str, str]) -> int:
     expect_fail("patch-writes-held-table-through-copy", "T10", B,
                 [("        patched->table = {};\n",
                   "        static_cast<const void **>(patched->table.resolve().ptr)[changed.front()] = nullptr;\n"
-                  "        patched->table = {};\n")])
+                  "        patched->table = {};\n")],
+                RESOLVE_SAYS)
     expect_fail("patch-releases-held-table-through-copy", "T10", B,
                 [("        patched->table = {};\n",
-                  "        (void) patched->table.reset_owned_allocation();\n        patched->table = {};\n")])
+                  "        (void) patched->table.reset_owned_allocation();\n        patched->table = {};\n")],
+                COPY_TABLE_SAYS)
+    # Each spelling of the copy's and the held record's table: a resolve is the resolve rule's to catch, and a use
+    # that resolves nothing is the count rules'.
+    reset = "        patched->table = {};\n"
+    for name, use, says in (
+            ("patch-resolves-copy-table-by-deref", "(void) (*patched).table.resolve();", RESOLVE_SAYS),
+            ("patch-resolves-held-table-by-deref", "(void) (*held).table.resolve();", RESOLVE_SAYS),
+            ("patch-releases-copy-table-by-deref", "(void) (*patched).table.reset_owned_allocation();",
+             COPY_TABLE_SAYS),
+            ("patch-releases-copy-table-by-get", "(void) patched.get()->table.reset_owned_allocation();",
+             COPY_TABLE_SAYS),
+            ("patch-releases-held-table-by-deref",
+             "(void) const_cast<ggml_sycl::mem_handle &>((*held).table).reset_owned_allocation();", HELD_TABLE_SAYS),
+            ("patch-releases-held-table-by-get",
+             "(void) const_cast<ggml_sycl::mem_handle &>(held.get()->table).reset_owned_allocation();",
+             HELD_TABLE_SAYS)):
+        expect_fail(name, "T10", B, [(reset, "        " + use + "\n" + reset)], says)
     expect_fail("patch-ignores-layout-expert", "T10", B,
                 [("held->layout_expert, counts.on_device == 0,", "-1, counts.on_device == 0,")])
     expect_fail("patch-resolves-every-expert", "T10", B,
