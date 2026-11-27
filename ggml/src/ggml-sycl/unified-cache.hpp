@@ -1934,9 +1934,12 @@ struct placement_plan {
     }
 
     // Takes now the entry-chunk clone that update_expert_placement and set_expert_host_backing would take for this
-    // expert, so those writes allocate nothing. A copy shares its source's chunks, and the expert move transaction
-    // must flip every triplet the cache has moved, whatever followed: it calls this for each member before the first
-    // move. False when the plan has no such entry.
+    // expert, so their entry writes allocate nothing. A copy shares its source's chunks, and the expert move
+    // transaction must flip every triplet the cache has moved, whatever followed: it calls this for each member before
+    // the first move. update_expert_placement can still allocate in one place, its residency count's first pair for a
+    // device a group had no device-resident expert on (expert_residency_group::count_residency): at most one small
+    // append per group and device, which the transaction accepts (see its unshare loop). False when the plan has no
+    // such entry.
     bool unshare_expert_entry(int layer_id, int expert_id, expert_tensor_role role) {
         auto it = plan_index().expert_placement.find(expert_placement_key{ layer_id, expert_id, role });
         if (it == plan_index().expert_placement.end()) {

@@ -4801,7 +4801,8 @@ def test_mutant_dpas_restores_aos_by_the_reorder_fill_fails():
 # store, so the copy costs one shared pointer per chunk and a flip clones only the chunk it writes. What this pins:
 #   - the entries are that store, so HOIST_PLAN is a sharing copy, not an O(entries) one;
 #   - the transaction takes the clones every prepared member's flip needs once the copy exists and before the first
-#     move, so a flip allocates nothing and a moved triplet is flipped whatever followed (the claim above);
+#     move, so a flip's entry write allocates nothing (its residency count can still append one small pair per group
+#     and device, which the transaction's comment accepts) and a moved triplet is flipped whatever followed;
 #   - the transaction reaches the copy only through the calls that write one indexed entry (the flips, the unshare)
 #     or read it, and counts the chunks it cloned: a mutable iterator over the entries would clone every chunk, so
 #     neither the transaction nor the two flips names one;

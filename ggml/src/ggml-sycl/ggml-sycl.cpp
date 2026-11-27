@@ -23436,7 +23436,12 @@ static ggml_sycl_txn_result ggml_sycl_expert_txn_run(
         ledger.triplet_bytes.reserve(ledger.triplet_bytes.size() + prepared.size());
     }
     // The flips below write the plan copy's shared chunks, which clones them. Taken here, before the first move, so a
-    // flip allocates nothing and a moved triplet is always flipped.
+    // flip's entry write allocates nothing. One allocation is left in a flip: its residency count
+    // (expert_residency_group::count_residency) appends a (target device, count) pair the first time the expert's
+    // (layer, role) group, or its by-name fallback group, gains a device-resident expert on that device. A group holds
+    // at most one pair per device, so that is a few small appends over a plan's life, and a bad_alloc there means the
+    // host has nothing left; the throw then takes the transaction's throw path (the swap driver settles the batch
+    // from the published plan at its next boundary), as a throw anywhere else in the call does.
     for (const ggml_sycl_expert_prepared_triplet & triplet : prepared) {
         for (int r = 0; r < 3; ++r) {
             const ggml_sycl::expert_placement_key & k = triplet.members[r].placement;
