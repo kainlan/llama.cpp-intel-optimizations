@@ -7721,13 +7721,15 @@ findings and one doc check.**
     leases whole, and the arm's vector releases them on unwind.
   - Both texts now state that residual, in the words of `E-MEM-HANDLE-KEEP-AFTER-FAILED-WAIT`'s reason: the handler
     reports it at ERROR.
+  - The round 2 record's Q3 above ("They are kept, never released") overstates it the same way, and this residual
+    applies there too.
 - M2. The plan test's primitive bound could not fail on its own.
   - It filed every width under both shapes' m, so its "at most 16 primitives" check only repeated the per-shape one.
   - It now drops the m and asserts that the union of the GEMM widths over every node is at most ceil(512 / 64) = 8.
     A comment says the primitive bound 16 is 2 x 8: one primitive per width and expert shape.
   - RED: a mutant build that halves that bound fails the check
-    ("FAIL: over every node up to 512 tokens: at most ceil(512 / align) = 8 GEMM widths in all"). The source was
-    restored, rebuilt, and passes.
+    ("FAIL: over every node up to 512 tokens: at most ceil(512 / align) = 8 GEMM widths in all",
+    `r3/plan-mutant-run.log`). The source was restored, rebuilt, and passes.
 - M3. In the round 2 record above, every count without a saved log is marked "not logged", and the counts with a
   saved log cite it.
 - D1. Checked, and not changed: the memory design's figures for Inkling's ring are right.
@@ -7750,9 +7752,14 @@ findings and one doc check.**
     - this task's acceptance text above ("2304 x 4608 gate_up and 2304 x 2304 down");
     - the device test (`k_gate_up = 4608`, and "down (k 2304, m 2304)");
     - the kernel test's rows "Inkling gate_up shape" (k 2304, m 4608) and "Inkling down shape" (k 2304, m 2304);
-    - the round 2 record's Q11 above, which counted primitive keys over m 4608 and 2304.
-  - Inkling's gate_up has m 2304, not 4608, and its down has k 1152, not 2304. Those cases pass on shapes that are not
-    Inkling's.
+    - the round 2 record's Q11 above, which counted primitive keys over m 4608 and 2304;
+    - the step-0 bench, `tests/test-sycl-bf16-expert-gemm-bench.cpp` (its header and its shape table: gate_up K 2304
+      M 4608, down K 2304 M 2304), and so its data, `docs/backend/data/inkling2/t24-bench-b70-3b132a14ed.txt`.
+      That data gave the step-0 verdict and the arm's 64-token minimum.
+  - Inkling's gate_up has m 2304, not 4608, and its down has k 1152, not 2304. Each wrong shape does twice the work of
+    Inkling's. The device and kernel cases pass on shapes that are not Inkling's.
+  - The older profile `docs/backend/data/inkling2/m21-reprofile-b70-06e1c3858.md` gives the right shapes: gate_up
+    2304->2304 and down 1152->2304.
 - Evidence. The logs are in `/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/tmpdir-t24/`.
   - `clang-format-19 --dry-run -Werror` is clean on the guard's comment (`--lines`) and on the plan test, whole.
   - The alloc-zone contract, with the new reason (`az-r3/`):
