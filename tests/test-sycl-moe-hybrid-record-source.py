@@ -245,9 +245,12 @@ PATCH_LEVEL_BODY = ('{ static const bool enabled = [] { const char * env = std::
 
 DOC_NEEDLES = ("`GGML_SYCL_MOE_HYBRID_RECORD_TRACE=1\\|2`", "[MOE-HYBRID-RECORD]", "[MOE-HYBRID-RECORD-BUILD]",
                "[MOE-HYBRID-RECORD-PATCH]", "patches=", "withdrawn=", "Read once", "lower block",
-               "outcome=patched\\|declined: <why>\\|unlogged")
+               "outcome=patched\\|declined: <why>\\|unlogged", "a plan that no patch answers builds once",
+               "the patch attempts asked for, resolved or not", "two or three per tensor, so about 21 to 32 moves")
+# A move writes two or three notes per tensor, so the row must not count three alone.
+DOC_FORBIDDEN = ("about three",)
 PATCH_DOC_NEEDLES = ("`GGML_SYCL_MOE_HYBRID_RECORD_PATCH=0`", "Read once", "every expert", "instead of patching it",
-                     "still withdraws")
+                     "still withdraws", "parses as a non-zero integer (`on` and `true` parse as 0)")
 # `=0` keeps the loan and evict withdrawal, so it is not the tree before the patch, and the row must not say it is.
 PATCH_DOC_FORBIDDEN = ("as before the patch",)
 HEADER_INCLUDE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]', re.M)
@@ -544,6 +547,10 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str, log
     for needle in DOC_NEEDLES:
         if needle not in rows[0]:
             raise ContractError(f"FAIL [pin T7]: the {ENV_NAME} row does not say `{needle}`")
+    for needle in DOC_FORBIDDEN:
+        if needle in rows[0]:
+            raise ContractError(f"FAIL [pin T7]: the {ENV_NAME} row says `{needle}`, but an expert move writes two or "
+                                f"three notes per tensor")
     patch_rows = [line for line in docs_raw.splitlines() if line.startswith(f"| `{PATCH_ENV}")]
     if len(patch_rows) != 1 or not all(needle in patch_rows[0] for needle in PATCH_DOC_NEEDLES):
         raise ContractError(f"FAIL [pin T7]: docs/backend/sycl-env-vars.md has no one {PATCH_ENV} row that says "
@@ -1071,6 +1078,12 @@ def self_test(raws: dict[str, str]) -> int:
                     "        std::vector<ggml_sycl::mem_handle> handles;\n" + build_retain + "    }\n")
     expect_fail("build-retains-after-replace", "T14", B,
                 [(retain_block, ""), (build_replace, build_replace + retain_block)])
+    expect_fail("docs-row-counts-three-notes", "T7", D,
+                [("two or three per tensor, so about 21 to 32 moves", "about three per tensor, so about 21 moves")])
+    expect_fail("docs-row-builds-every-miss", "T7", D,
+                [("a plan that no patch answers builds once", "a plan builds once")])
+    expect_fail("docs-patch-row-any-value", "T7", D,
+                [("parses as a non-zero integer (`on` and `true` parse as 0)", "any non-zero value")])
     expect_fail("docs-row-lacks-withdrawn", "T7", D,
                 [("patch_unlogged= withdrawn=` line", "patch_unlogged=` line"), (" `withdrawn=` counts", " counts")])
 

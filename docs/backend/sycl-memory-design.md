@@ -474,8 +474,9 @@ The event-chained hybrid decode route's per-tensor record
 too, but a generation that only expert moves advanced does not rebuild it over
 every expert. Every generation move goes through the extra's
 `note_moe_storage_change()`, which also logs the expert it changed in a bounded
-per-weight change log (`moe_storage_change_log`, 64 entries, about 21 expert
-moves; a cleared store or a rewrite of the weight logs every expert). On such a
+per-weight change log (`moe_storage_change_log`, 64 entries; an expert move
+writes two or three notes per tensor, so about 21 to 32 moves; a cleared store
+or a rewrite of the weight logs every expert). On such a
 miss the lookup patches a copy of the held record over the experts the log names
 since the held decision (`ggml_sycl_moe_hybrid_decode_record_patch`): it
 resolves those alone, each takes its slot from the build's own slot rule, so a
