@@ -7339,6 +7339,20 @@ reference kernels and must not be used.
 - RED first: the host planner test and the weightless admission test, each red by a failed assertion, not only by
   a compile failure.
 
+**Step 0 result (lead run, B70, `3b132a14ed`, 2026-11-26): PROCEED.** The output is
+`docs/backend/data/inkling2/t24-bench-b70-3b132a14ed.txt` (`rc=0`).
+- Every primitive is `jit:gemm:any` with a 0 B scratchpad, and every sampled output matched.
+- Per expert at n = 64, 128 distinct experts: gate_up 47.0 us on the device and 20.7 us of host submit; down 25.4 us
+  and 18.6 us. That is under both stop thresholds (60 us device, 100 us host) and under the 40 us marginal line.
+- A whole node at 512 tokens: gate_up 8.6 ms on the arm (GEMMs plus host submit) against 144.8 ms for the direct
+  kernel; down 5.6 ms against 73.8 ms. The arm wins on gate_up from 32 tokens and on down from 64.
+
+**Lead rulings after step 0 (2026-11-26).**
+- The minimum token count is a named constant of 64: the bench's suggestion, and the width from which both shapes
+  win.
+- The 64-row rounding stays. At n = 32 the device time per call is 41.7 us against 47.0 us at n = 64, about 11%
+  less, which is not worth four times the primitives.
+
 ---
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
