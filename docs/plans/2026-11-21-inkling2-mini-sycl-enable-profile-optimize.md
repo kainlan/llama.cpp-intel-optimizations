@@ -7205,8 +7205,9 @@ reference kernels and must not be used.
 - Text byte-equal run to run. Decode not slower. Peak host backing not higher.
 - Inkling perplexity on the B70 within 0.25 of the original 7.5792, not of 7.5959.
 - A device test of the arm against the CPU reference at the same NMSE bound as `test-moe-pp-batched-dequant`, on
-  Inkling's shapes (2304 x 4608 gate_up and 2304 x 2304 down, 128 experts, top-8, 512 tokens) and on a node with
-  experts no token selects.
+  Inkling's shapes (gate_up K 2304 by M 2304, down K 1152 by M 2304, 128 experts, top-8, 512 tokens) and on a node
+  with experts no token selects. Corrected 2026-11-27: the original text named doubled shapes ("2304 x 4608 gate_up
+  and 2304 x 2304 down"), found in review round 3.
 - The Inkling gates on the B70, the B50 and both cards. The Mistral B70 and GPT-OSS B50 gates.
 - `test-backend-ops -o MUL_MAT_ID` with no case changing on either card.
 - The two fixed sweeps with no new red. The interleaved ABBA against `2a69aea88b`.
@@ -7346,6 +7347,8 @@ reference kernels and must not be used.
   and 18.6 us. That is under both stop thresholds (60 us device, 100 us host) and under the 40 us marginal line.
 - A whole node at 512 tokens: gate_up 8.6 ms on the arm (GEMMs plus host submit) against 144.8 ms for the direct
   kernel; down 5.6 ms against 73.8 ms. The arm wins on gate_up from 32 tokens and on down from 64.
+- Note (2026-11-27, review round 3): that file was measured at doubled shapes, gate_up M 4608 and down K 2304
+  (Inkling's are gate_up K 2304 by M 2304 and down K 1152 by M 2304); the lead's rerun at the real shapes follows.
 
 **Lead rulings after step 0 (2026-11-26).**
 - The minimum token count is a named constant of 64: the bench's suggestion, and the width from which both shapes
@@ -7605,6 +7608,8 @@ contracts. The builds and the host tests ran after the lead's "builds GO", and t
   `GGML_SYCL_DNNL_FPMATH_BUILD` and `GGML_SYCL_DNNL_CREATE_FAILURE_THROW`.
 - Q11. The plan test's width bound counts the two shapes' primitive keys, (m, width) pairs over m 4608 and 2304. It
   requires at most 8 per shape and at most 16 together (`0335202533`).
+  - Corrected 2026-11-27 (review round 3): m 4608 was a doubled shape. Inkling's two expert shapes both have m 2304
+    and differ in k (2304 and 1152). Round 3's M2 below replaced this bound with one on the union of the widths.
 - Q12. The plan test has a hand case of duplicate picks, ids {2,2, 0,2}. A 64-token node whose picks repeat gives two
   widths, more than ceil(64/64). The bound "at most ceil(n/align)" is stated for distinct picks only (`0335202533`).
 - Q13. `test-sycl-bf16-expert-gemm-bench` is `EXCLUDE_FROM_ALL`: the lead builds it by name.
@@ -7760,6 +7765,8 @@ findings and one doc check.**
     Inkling's. The device and kernel cases pass on shapes that are not Inkling's.
   - The older profile `docs/backend/data/inkling2/m21-reprofile-b70-06e1c3858.md` gives the right shapes: gate_up
     2304->2304 and down 1152->2304.
+  - Lead ruling (2026-11-27): every Inkling-labelled shape moves to the real ones, and the memory design's paragraph
+    stays as it is. The shape fix after this record does that.
 - Evidence. The logs are in `/home/kainlan/.claude/tmp/claude-1000/-Apps-llama-cpp/inkling/tmpdir-t24/`.
   - `clang-format-19 --dry-run -Werror` is clean on the guard's comment (`--lines`) and on the plan test, whole.
   - The alloc-zone contract, with the new reason (`az-r3/`):
@@ -7783,6 +7790,46 @@ findings and one doc check.**
   - `sycl-moe-bf16-grouped-plan`: PASS (`r3/host-plan.log`).
   - The nine contracts that read the plan, run through ctest after this record (`r3/plan-readers.log`): all nine
     pass.
+
+**Shape fix (implementer, 2026-11-27, after the D1 ruling): the tests, the step-0 bench and this plan use Inkling's
+real expert shapes, gate_up K 2304 by M 2304 and down K 1152 by M 2304.**
+- The device test, `test-moe-bf16-grouped-device.cpp`:
+  - `k_gate_up_k`, `k_gate_up_m`, `k_down_k` and `k_down_m` hold the four numbers from the GGUF. `bf16_shape` now
+    takes k as well as m, so the down model's experts are 1152 wide.
+  - Every case carries its model's k (`case_data::k`), which sizes its activations. `run_backend` requires the
+    activations to match the tensor's size, and the CASE line prints the model's own k.
+  - It still has eleven cases, with the same names.
+- Re-derived from the cases' ids, with the test's routing:
+  - The hot-expert case: its routing depends on neither k nor m. At 512 tokens expert 5 routes 512 rows and each other
+    expert 28 or 29, so the case has two widths, {64, 512}, and 8,640 packed rows.
+  - Ring admission:
+    - The fixture plans the ring from its own model's shape (activation rows of k x 2 B, output rows of m x 4 B), for
+      16,256 packed rows.
+    - The arm asks for its packed rows times the same two row sizes, so a case is admitted when it packs at most
+      16,256 rows, at either shape.
+    - The cases pack 8,640 (the hot expert), 8,192 (all experts, the 64-token minimum, down) and 5,120 (the subset).
+- The kernel test's two Inkling rows are k 2304 m 2304 and k 1152 m 2304.
+- The bench's shape table and header use the real shapes, and its device peak is about 1.6 GB. Its data file stays as
+  it was, and the step-0 record above says which shapes it measured.
+- The registration comments in `ggml/src/ggml-sycl/CMakeLists.txt` take memory figures that follow from the shapes.
+  They are estimates, not measurements:
+  - the device test's gate_up model: about 2.3 GB on the card, 4.5 GB of host memory, and 6 GB while its experts are
+    quantized;
+  - its down model: about half that;
+  - the bench: about 1.6 GB.
+- In this plan:
+  - the acceptance text, the step-0 record and the round 2 record's Q11 carry dated corrections;
+  - round 3's D1 records the ruling.
+- Evidence (`tmpdir-t24/r4/`):
+  - `sycl-build.sh ggml-sycl test-moe-bf16-grouped-device test-sycl-moe-bf16-grouped-kernel
+    test-sycl-bf16-expert-gemm-bench` returned 0 (`build-r4.log`). `ggml-sycl.cpp` did not change, so the
+    static-storage inventory was not regenerated.
+  - `sycl-moe-bf16-grouped-kernel` on opencl:cpu: PASS on 6 cases, the two Inkling rows at the real shapes
+    (`host-kernel.log`).
+  - `sycl-moe-bf16-grouped-plan`: PASS (`host-plan.log`).
+  - `check-ctest-safety-net.sh` reports "safety net intact" (`safety-net.log`).
+  - The nine contracts that read the plan, run through ctest after this record (`plan-readers.log`): all nine pass.
+  - Not run here: the device test and the bench. Both are the lead's.
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
