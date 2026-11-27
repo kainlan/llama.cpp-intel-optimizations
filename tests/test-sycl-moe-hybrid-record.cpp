@@ -356,6 +356,22 @@ static int test_install() {
     CHECK(!ggml_sycl::moe_hybrid_record_install(device_weight, host_weight, lease, { 0, 3 }, one, &none) &&
               none.empty() && device_weight[0] == &w[0],
           "slots that do not pair with the ids refuse the install");
+
+    // An in-range id ahead of one past the record: the install refuses before it writes any slot, so the in-range
+    // expert keeps its slot and its lease, and no lease reaches the retained list.
+    std::vector<fake_slot> two(2);
+    two[0].host_weight = &w[7];
+    two[0].lease       = lease_of(7);
+    two[1].host_weight = &w[4];
+    two[1].lease       = lease_of(4);
+
+    const fake_lease slot_1_lease = lease[1];
+    CHECK(
+        !ggml_sycl::moe_hybrid_record_install(device_weight, host_weight, lease, { 1, 9 }, two, &none) && none.empty(),
+        "an id past the record refuses the install, whatever ids come before it");
+    CHECK(device_weight[1] == &w[5] && host_weight[1] == nullptr && lease[1].storage == slot_1_lease.storage,
+          "the refused install leaves the in-range expert's slot and lease as they were");
+    CHECK(two[0].lease.valid() && *two[0].lease.storage == 7, "the refused install takes no fresh lease");
     return 0;
 }
 
@@ -405,6 +421,21 @@ static int test_shape() {
     s = ggml_sycl::moe_hybrid_record_shape_of(no_device, no_device, lease);
     CHECK(s.n_empty == 4 && ggml_sycl::moe_hybrid_record_shape_refusal(true, s) != nullptr,
           "slots naming no weight are empty");
+
+    // Arrays of different lengths are no record's slots: the shape is empty, and neither mode stands on it.
+    const std::vector<fake_lease> three_leases(lease.begin(), lease.begin() + 3);
+    s = ggml_sycl::moe_hybrid_record_shape_of(device_weight, host_weight, three_leases);
+    CHECK(s.n_empty > 0 && ggml_sycl::moe_hybrid_record_shape_refusal(false, s) != nullptr &&
+              ggml_sycl::moe_hybrid_record_shape_refusal(true, s) != nullptr,
+          "fewer leases than weights is an empty shape");
+    const std::vector<const void *> three_device(device_weight.begin(), device_weight.begin() + 3);
+    s = ggml_sycl::moe_hybrid_record_shape_of(three_device, host_weight, lease);
+    CHECK(s.n_empty > 0 && ggml_sycl::moe_hybrid_record_shape_refusal(false, s) != nullptr,
+          "fewer device weights than leases is an empty shape");
+    const std::vector<const void *> three_host(host_weight.begin(), host_weight.begin() + 3);
+    s = ggml_sycl::moe_hybrid_record_shape_of(device_weight, three_host, lease);
+    CHECK(s.n_empty > 0 && ggml_sycl::moe_hybrid_record_shape_refusal(true, s) != nullptr,
+          "fewer host weights than leases is an empty shape");
     return 0;
 }
 
