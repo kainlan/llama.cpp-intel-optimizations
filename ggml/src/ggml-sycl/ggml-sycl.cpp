@@ -132,6 +132,7 @@
 #include "ggml-sycl/moe-bf16-direct.hpp"
 #include "ggml-sycl/moe-exec-cost.hpp"
 #include "ggml-sycl/moe-host-island.hpp"
+#include "ggml-sycl/moe-hybrid-record.hpp"
 #include "ggml-sycl/moe-layer-ids-cache.hpp"
 #include "ggml-sycl/moe-mmvq-tables.hpp"
 #include "ggml-sycl/moe-pp-pack.hpp"
@@ -91074,6 +91075,36 @@ static bool ggml_sycl_moe_hybrid_decode_table_allocate(sycl::queue &           q
     return true;
 }
 
+// GGML_SYCL_MOE_HYBRID_RECORD_TRACE: 1 prints, per token, one WARN line of what keeping the hybrid decode records
+// current cost the submitting thread (the fields are moe_hybrid_record_counts'); 2 adds one WARN line per record
+// build. Read once, so a lookup with the trace off tests one cached value and reads no name.
+static int ggml_sycl_moe_hybrid_record_trace_level() {
+    static const int level = [] {
+        const char * env = std::getenv("GGML_SYCL_MOE_HYBRID_RECORD_TRACE");
+        return env ? std::atoi(env) : 0;
+    }();
+    return level;
+}
+
+// The lookups run on the submitting thread, so the count is that thread's.
+static thread_local ggml_sycl::moe_hybrid_record_trace g_moe_hybrid_record_trace;
+
+// Counts one lookup of src0's record and why its stamp missed. A lookup at a lower block than the last one starts a
+// token, and the token that ended prints its line.
+static void ggml_sycl_moe_hybrid_record_trace_lookup(const ggml_tensor *               src0,
+                                                     ggml_sycl::moe_hybrid_record_miss miss,
+                                                     uint64_t                          generation_steps) {
+    ggml_sycl::moe_hybrid_record_trace & trace      = g_moe_hybrid_record_trace;
+    uint64_t                             done_token = 0;
+    ggml_sycl::moe_hybrid_record_counts  done;
+    if (trace.lookup(parse_layer_id_from_name(src0->name), &done_token, &done)) {
+        char line[512];
+        ggml_sycl::moe_hybrid_record_line(line, sizeof(line), done_token, done);
+        GGML_LOG_WARN("[MOE-HYBRID-RECORD] %s\n", line);
+    }
+    trace.miss(miss, generation_steps);
+}
+
 // Builds the record of src0 on ctx.device (llama.cpp-7pvo). Each expert's executor is the retained decode route's
 // choice for it (choose_moe_batch_executor over the same resolved batch), so the record and that route place every
 // expert alike. Two shapes:
@@ -91154,6 +91185,9 @@ static ggml_sycl::moe_decode_direct_outcome ggml_sycl_moe_hybrid_decode_record_b
     std::vector<int32_t> all_experts(static_cast<size_t>(n_as));
     for (int64_t e = 0; e < n_as; ++e) {
         all_experts[static_cast<size_t>(e)] = static_cast<int32_t>(e);
+    }
+    if (ggml_sycl_moe_hybrid_record_trace_level() > 0) {
+        g_moe_hybrid_record_trace.resolved(all_experts.size());
     }
     const ggml_sycl::moe_resolved_batch_result resolved = ggml_sycl::ggml_sycl_build_moe_resolved_batch(
         src0, device, all_experts.data(), all_experts.size(), all_experts.size(), layout,
@@ -91268,19 +91302,49 @@ static bool ggml_sycl_moe_hybrid_decode_record_current(ggml_backend_sycl_context
     ggml_sycl::moe_decode_direct_stamp & stamp        = weight.moe_hybrid_decode_stamp[device];
     const uint64_t                       replan_epoch = ggml_sycl::moe_route_table_current_replan_epoch();
     const uint64_t                       storage_generation = weight.moe_expert_storage_generation;
-    if (ggml_sycl::moe_decode_direct_stamp_current(stamp, replan_epoch, storage_generation, selected_rows)) {
+    const ggml_sycl::moe_hybrid_record_miss miss =
+        ggml_sycl::moe_hybrid_record_miss_classify(stamp, replan_epoch, storage_generation, selected_rows);
+    const int trace = ggml_sycl_moe_hybrid_record_trace_level();
+    if (trace > 0) {
+        ggml_sycl_moe_hybrid_record_trace_lookup(src0, miss,
+                                                 miss == ggml_sycl::MOE_HYBRID_RECORD_MISS_GENERATION ?
+                                                     storage_generation - stamp.expert_storage_generation :
+                                                     0);
+    }
+    if (miss == ggml_sycl::MOE_HYBRID_RECORD_MISS_NONE) {
         *out = weight.moe_hybrid_decode[device];
         return stamp.eligible && *out;
     }
     ggml_sycl::unified_cache * cache = ggml_sycl::get_unified_cache_for_device(device);
     if (!cache || ggml_sycl_cache_plan_owner(cache)->entries.empty()) {
+        if (trace > 0) {
+            g_moe_hybrid_record_trace.no_plan();
+        }
         return false;
     }
+
+    // What the per-build line reports: the generation the held decision was made at, and the experts resolved
+    // before this build.
+    const uint64_t decided_generation = stamp.expert_storage_generation;
+    const uint64_t resolved_before    = g_moe_hybrid_record_trace.counts.built_experts;
 
     std::shared_ptr<const moe_hybrid_decode_record> built;
     const char *                                    refusal = "unnamed";
     const ggml_sycl::moe_decode_direct_outcome      outcome =
         ggml_sycl_moe_hybrid_decode_record_build(ctx, src0, &built, &refusal);
+    if (trace > 0) {
+        g_moe_hybrid_record_trace.build_outcome(outcome);
+        if (trace >= 2) {
+            GGML_LOG_WARN(
+                "[MOE-HYBRID-RECORD-BUILD] token=%llu tensor=%s device=%d miss=%s generation=%llu->%llu experts=%llu "
+                "outcome=%s\n",
+                (unsigned long long) g_moe_hybrid_record_trace.token, src0->name, device,
+                ggml_sycl::moe_hybrid_record_miss_name(miss), (unsigned long long) decided_generation,
+                (unsigned long long) storage_generation,
+                (unsigned long long) (g_moe_hybrid_record_trace.counts.built_experts - resolved_before),
+                ggml_sycl::moe_hybrid_record_outcome_name(outcome));
+        }
+    }
     if (outcome == ggml_sycl::MOE_DECODE_DIRECT_OUTCOME_REFUSED) {
         // A refusal is cached under the stamp, so this prints once per stamp and never on a steady decode op.
         GGML_LOG_INFO(

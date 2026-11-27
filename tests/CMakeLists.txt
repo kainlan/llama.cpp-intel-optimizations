@@ -541,6 +541,18 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     target_include_directories(test-sycl-moe-decode-hostpath PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
 endif()
 
+# The event-chained hybrid decode route's record bookkeeping: why a held record's stamp misses, and the per-token
+# count GGML_SYCL_MOE_HYBRID_RECORD_TRACE prints. ggml-sycl/moe-hybrid-record.hpp includes the standard library and
+# moe-decode-hostpath.hpp (which needs ggml.h for its types only), so the test links nothing: no SYCL runtime is
+# loaded and no device is opened.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-moe-hybrid-record test-sycl-moe-hybrid-record.cpp)
+    target_include_directories(test-sycl-moe-hybrid-record PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src
+                                                                   ${CMAKE_SOURCE_DIR}/ggml/include)
+    add_test(NAME test-sycl-moe-hybrid-record COMMAND test-sycl-moe-hybrid-record)
+    set_tests_properties(test-sycl-moe-hybrid-record PROPERTIES LABELS "sycl;moe;hostonly" TIMEOUT 30)
+endif()
+
 # The CPU expert pool trace's per-job stamp sums and per-job line (llama.cpp-j6jf).
 # ggml-sycl/cpu-expert-pool-stamps.hpp includes only the standard library, so the
 # test links nothing: no SYCL runtime is loaded and no device is opened.
@@ -1205,6 +1217,13 @@ if (Python3_Interpreter_FOUND)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-route-counts-source.py --self-test)
     set_tests_properties(test-sycl-moe-route-counts-source PROPERTIES
         LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 180)
+    # How the event-chained hybrid decode route keeps its per-tensor record current: the lookup's one stamp
+    # classification, and the GGML_SYCL_MOE_HYBRID_RECORD_TRACE count at every exit, WARN, read once. Run WITH
+    # --self-test so each mutant is caught by the pin it names. Text only: no device, no model.
+    add_test(NAME test-sycl-moe-hybrid-record-source
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-moe-hybrid-record-source.py --self-test)
+    set_tests_properties(test-sycl-moe-hybrid-record-source PROPERTIES
+        LABELS "sycl;moe;source;source-contract;hostonly;python" TIMEOUT 120)
     # The fused gate_up expert role (its enum slot, classifier order, switches, claim, paired-path exclusions, ring
     # consumer and loader name test) and the seam where the direct MMID route steps aside for the batched prompt
     # executor and takes a node back only while the executor has submitted nothing. Run WITH --self-test so each
