@@ -7932,11 +7932,10 @@ class unified_cache {
     // and a restore and erase_entry_locked() take it out, so the set and retired_pending_count_ name the same entries.
     // A retired entry still leased stays in the set until the pass that finds its last lease gone erases it.
     // Retirement must not fail once withdrawal has begun, so an insert that cannot allocate only sets
-    // retired_index_incomplete_, and the next finalize walks every entry once to put the missing keys back.
-    using retired_key_set = std::unordered_set<unified_cache_key,
-                                               unified_cache_key_hash,
-                                               std::equal_to<unified_cache_key>,
-                                               detail::cache_guard_allocator<unified_cache_key>>;
+    // retired_index_incomplete_, and the next finalize walks every entry once to put the missing keys back. The set
+    // takes the standard allocator, not cache_guard_allocator: the private fixtures' allocation-failure countdown counts
+    // the cache's map allocations, and an index insert must not take the failure a fixture aimed at one of them.
+    using retired_key_set = std::unordered_set<unified_cache_key, unified_cache_key_hash>;
     retired_key_set retired_keys_;
     bool            retired_index_incomplete_ = false;
 

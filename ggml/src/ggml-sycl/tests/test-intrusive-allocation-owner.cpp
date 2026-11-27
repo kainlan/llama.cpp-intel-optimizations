@@ -656,6 +656,10 @@ void busy_pending_row_stays_pending_through_a_retry() {
     check(allocation_registry_test_cleanup_pending(exact.ptr), "the in-flight row was not marked pending");
     check(allocation_registry_test_has_promotion_cleanup_pending(exact.device),
           "the in-flight pending row was not reported");
+    // The control: the row is held RELEASING, so a release of it now answers BUSY, not a lease refusal.
+    check(allocation_registry_test_release_exact(exact, registered_release_mode::LEGACY) ==
+              registered_release_status::BUSY,
+          "a release during the paused claim did not answer BUSY");
     check(allocation_registry_test_process_promotion_retries(exact.device) == 0,
           "a retry released a row another claimant holds");
     check(allocation_registry_test_cleanup_pending(exact.ptr), "a BUSY retry dropped the row's pending cleanup");
