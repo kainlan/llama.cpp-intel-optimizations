@@ -23,7 +23,9 @@ many records a token rebuilds, why, and how many experts each rebuild resolves. 
   T5  the per-token line and the per-build line are WARN, each printed from one site, the per-build one only at
       level 2 and above; the per-token line's buffer is the 768 bytes the host test proves the widest line fits;
   T6  the header is plain host code: standard includes and moe-decode-hostpath.hpp only, no SYCL;
-  T7  the env-var row names the variable, both line tags, the read-once rule and the token rule;
+  T7  the env-var row names the variable, both line tags, the read-once rule and the token rule; the patch switch's
+      row says that `=0` builds the whole record instead of patching it and that the withdrawal still runs, and
+      never that `=0` is the tree before the patch;
   T8  every move of a weight's expert storage generation goes through note_moe_storage_change(), which logs the
       expert the move changed: no other site writes the generation, each site that moves one expert's storage names
       that expert, and each site that clears a whole store names every expert (moe_storage_change_log::ALL). A site
@@ -189,7 +191,10 @@ PATCH_LEVEL_BODY = ('{ static const bool enabled = [] { const char * env = std::
 
 DOC_NEEDLES = ("`GGML_SYCL_MOE_HYBRID_RECORD_TRACE=1\\|2`", "[MOE-HYBRID-RECORD]", "[MOE-HYBRID-RECORD-BUILD]",
                "[MOE-HYBRID-RECORD-PATCH]", "patches=", "withdrawn=", "Read once", "lower block")
-PATCH_DOC_NEEDLES = ("`GGML_SYCL_MOE_HYBRID_RECORD_PATCH=0`", "Read once", "every expert")
+PATCH_DOC_NEEDLES = ("`GGML_SYCL_MOE_HYBRID_RECORD_PATCH=0`", "Read once", "every expert", "instead of patching it",
+                     "still withdraws")
+# `=0` keeps the loan and evict withdrawal, so it is not the tree before the patch, and the row must not say it is.
+PATCH_DOC_FORBIDDEN = ("as before the patch",)
 HEADER_INCLUDE = re.compile(r'^\s*#\s*include\s*([<"])([^>"]+)[>"]', re.M)
 HEADER_ALLOWED = {"moe-decode-hostpath.hpp"}
 
@@ -440,6 +445,10 @@ def check(backend_raw: str, header_raw: str, docs_raw: str, common_raw: str) -> 
     if len(patch_rows) != 1 or not all(needle in patch_rows[0] for needle in PATCH_DOC_NEEDLES):
         raise ContractError(f"FAIL [pin T7]: docs/backend/sycl-env-vars.md has no one {PATCH_ENV} row that says "
                             f"{PATCH_DOC_NEEDLES}")
+    for needle in PATCH_DOC_FORBIDDEN:
+        if needle in patch_rows[0]:
+            raise ContractError(f"FAIL [pin T7]: the {PATCH_ENV} row says `{needle}`, but `=0` still withdraws "
+                                f"loaned and evicted slots")
 
     # T9: the lookup's patch path, ahead of the build, published only by retaining what it replaced.
     at_patch_held = once(current, PATCH_HELD, "T9", "the held record's one binding in the lookup")
@@ -649,6 +658,12 @@ def self_test(raws: dict[str, str]) -> int:
                 [("`[MOE-HYBRID-RECORD-PATCH] token=T", "`[MOE-HYBRID-PATCH] token=T")])
     expect_fail("docs-patch-row-dropped", "T7", D,
                 [("| `GGML_SYCL_MOE_HYBRID_RECORD_PATCH=0`", "| `GGML_SYCL_MOE_HYBRID_RECORD_NOPATCH=0`")])
+    expect_fail("docs-patch-row-hides-withdrawal", "T7", D,
+                [("an expert loan or evict still withdraws the held record's",
+                  "an expert loan or evict withdraws the held record's")])
+    expect_fail("docs-patch-row-claims-the-old-tree", "T7", D,
+                [("instead of patching it, as every other stamp miss does either way.",
+                  "instead of patching it, as before the patch.")])
 
     # T9: the lookup's patch path.
     expect_fail("patch-ignores-switch", "T9", B,

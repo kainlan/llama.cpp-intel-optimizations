@@ -91077,6 +91077,7 @@ static bool ggml_sycl_moe_hybrid_decode_record_withdraw(std::shared_ptr<const mo
     const auto on_entry = [&](const ggml_sycl::mem_handle & h) {
         return h.is_weight() && h.device() == device && h.key() == withdrawn;
     };
+    // A key compare per slot, run once per loan or evict, as the drop's other lease scans beside it are.
     if (!held || std::none_of(held->lease.begin(), held->lease.end(), on_entry)) {
         return false;
     }
