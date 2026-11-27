@@ -17,9 +17,16 @@
 //     route's line;
 //   * down (k 2304, m 2304), one activation row per slot: 512 tokens over all 128 experts, on the arm;
 //   * GGML_SYCL_MOE_BF16_GROUPED=0, which the backend reads once, so in a child process (this binary as --opt-out): the
-//     gate_up 512-token case on the direct route, with the arm's decline line reason=opt_out.
-// No case may show a refusal: the direct route's "[MoE] BF16 direct route refused", or the arm's "does not fit the
-// planned PP MoE oneDNN ring".
+//     gate_up 512-token case on the direct route, with the arm's decline line reason=opt_out;
+//   * the gate_up 512-token case with the private failpoint armed that throws at the arm's GEMM stage, after its gather
+//     was submitted: the compute must end GGML_STATUS_FAILED with the arm's WARN line and graph_compute's recoverable
+//     fallback line naming "BF16 grouped arm: expert GEMM failed after submission", the failpoint consumed once, and
+//     neither the arm's run line nor the direct route's; the same case then runs on the arm again in this process.
+// Besides its lines, each case reads the arm's own counters (ggml_sycl_moe_bf16_grouped_test_counters_read): a node
+// the arm takes adds exactly one run and no decline, a declined node exactly one decline, under its reason, and no
+// run, and the thrown node neither. No case may show a refusal: the direct route's "[MoE] BF16 direct route refused",
+// or the arm's "does not fit the planned PP MoE oneDNN ring". The counters and the failpoint exist only in the private
+// backend objects, so this links ggml-sycl-private-fixtures, not the ordinary ggml-sycl.
 //
 // The activations are BF16-representable: the CPU rounds src1 to BF16 before its dot products and the arm's gather
 // rounds it to BF16 to nearest even, so the two sides differ in summation order only. dst starts as NaN on both
@@ -34,7 +41,8 @@
 #include "ggml-cpu.h"
 #include "ggml-sycl.h"
 #include "ggml.h"
-#include "moe-planned-model-fixture.hpp"  // the planned model's shape, experts, inventory and lifecycle
+#include "moe-planned-model-fixture.hpp"            // the planned model's shape, experts, inventory and lifecycle
+#include "q1-nvfp4-production-route-test-seam.hpp"  // the arm's counters, the failpoint and its consumed count
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -284,9 +292,38 @@ double max_row_nmse(const std::vector<float> & ref, const std::vector<float> & g
     return worst;
 }
 
+// The arm's counters, with `reason` the decline reason whose count is read (any reason when only the runs and the total
+// matter).
+ggml_sycl_moe_bf16_grouped_test_counters arm_counters(const char * reason) {
+    ggml_sycl_moe_bf16_grouped_test_counters counters{};
+    require(ggml_sycl_moe_bf16_grouped_test_counters_read(reason, &counters),
+            std::string("the BF16 grouped arm has no decline reason named ") + reason);
+    return counters;
+}
+
+// How the arm's counters moved over one case.
+struct counter_moves {
+    uint64_t runs;
+    uint64_t declines;
+    uint64_t reason_declines;
+};
+
+counter_moves counters_since(const ggml_sycl_moe_bf16_grouped_test_counters & before, const char * reason) {
+    const ggml_sycl_moe_bf16_grouped_test_counters after = arm_counters(reason);
+    return { after.runs - before.runs, after.declines - before.declines,
+             after.reason_declines - before.reason_declines };
+}
+
+uint64_t failures_consumed() {
+    ggml_sycl_q1_nvfp4_test_counters counters{};
+    ggml_sycl_q1_nvfp4_test_counters_read(&counters);
+    return counters.failure_consumed;
+}
+
 // Runs one case and prints its CASE line. Returns true when it passed. Every count is of the lines that appeared
-// while this case ran. With `decline` null the arm must run the node; otherwise the arm must decline it for that
-// reason and the direct route must run it.
+// while this case ran, and of the arm's counters across it. With `decline` null the arm must run the node: one run,
+// no decline. Otherwise the arm must decline it for that reason, one decline and no run, and the direct route must run
+// it.
 bool run_case(const moe_planned_fixture::planned_model & model,
               ggml_backend_t                             cpu,
               const cpu_weights &                        reference,
@@ -295,23 +332,26 @@ bool run_case(const moe_planned_fixture::planned_model & model,
     const char * name     = model.gate->name;
     const size_t m        = size_t(model.gate->ne[1]);
     const bool   admitted = supports(model.backend, model.gate, c);
+    const char * reason   = decline ? decline : "tokens";
 
     std::vector<float> ref;
     require(run_backend(cpu, reference.tensor, c, ref) == GGML_STATUS_SUCCESS,
             std::string("CPU reference compute failed for ") + c.label);
 
-    const size_t       from = g_log.mark();
-    std::vector<float> got;
-    ggml_status        status = GGML_STATUS_FAILED;
-    double             err    = NAN;
+    const ggml_sycl_moe_bf16_grouped_test_counters before = arm_counters(reason);
+    const size_t                                   from   = g_log.mark();
+    std::vector<float>                             got;
+    ggml_status                                    status = GGML_STATUS_FAILED;
+    double                                         err    = NAN;
     if (admitted) {
         status = run_backend(model.backend, model.gate, c, got);
         err    = status == GGML_STATUS_SUCCESS ? max_row_nmse(ref, got, m) : NAN;
     }
-    const std::string experts_field = "experts=" + std::to_string(c.active) + " ";
-    const std::string reason_field  = std::string("reason=") + (decline ? decline : "") + " ";
-    const size_t      arm_lines     = g_log.count_since(from, { "[MOE-ROUTE] bf16 grouped tensor=", name });
-    const size_t      arm_experts =
+    const counter_moves moved         = counters_since(before, reason);
+    const std::string   experts_field = "experts=" + std::to_string(c.active) + " ";
+    const std::string   reason_field  = std::string("reason=") + (decline ? decline : "") + " ";
+    const size_t        arm_lines     = g_log.count_since(from, { "[MOE-ROUTE] bf16 grouped tensor=", name });
+    const size_t        arm_experts =
         g_log.count_since(from, { "[MOE-ROUTE] bf16 grouped tensor=", name, experts_field.c_str() });
     const size_t direct_lines = g_log.count_since(from, { "[MOE-ROUTE] bf16 direct tensor=", name });
     const size_t decline_lines =
@@ -336,6 +376,9 @@ bool run_case(const moe_planned_fixture::planned_model & model,
         if (direct_lines != 0) {
             why += " direct-route-ran";
         }
+        if (moved.runs != 1 || moved.declines != 0) {
+            why += " arm-counters";
+        }
     } else if (admitted) {
         if (arm_lines != 0) {
             why += " arm-ran";
@@ -346,6 +389,9 @@ bool run_case(const moe_planned_fixture::planned_model & model,
         if (direct_lines == 0) {
             why += " direct-route-did-not-run";
         }
+        if (moved.runs != 0 || moved.declines != 1 || moved.reason_declines != 1) {
+            why += " decline-counters";
+        }
     }
     if (refusals != 0) {
         why += " refusal";
@@ -353,10 +399,77 @@ bool run_case(const moe_planned_fixture::planned_model & model,
     std::fprintf(stderr,
                  "CASE %s tensor=%s k=%d m=%zu experts=%d used=%d ne11=%d tokens=%d active=%d want=%s supports_op=%d "
                  "status=%d max_row_nmse=%.3e arm_lines=%zu arm_experts_lines=%zu direct_lines=%zu decline_lines=%zu "
-                 "refusals=%zu -> %s%s\n",
+                 "refusals=%zu runs+=%llu declines+=%llu %s+=%llu -> %s%s\n",
                  c.label, name, k_in, m, k_experts, k_used, c.ne11, c.n_tokens, c.active, decline ? decline : "arm",
                  admitted ? 1 : 0, static_cast<int>(status), err, arm_lines, arm_experts, direct_lines, decline_lines,
-                 refusals, why.empty() ? "PASS" : "FAIL:", why.c_str());
+                 refusals, (unsigned long long) moved.runs, (unsigned long long) moved.declines, reason,
+                 (unsigned long long) moved.reason_declines, why.empty() ? "PASS" : "FAIL:", why.c_str());
+    return why.empty();
+}
+
+// The failpoint case: the arm throws at its GEMM stage once, after its gather was submitted. The compute must fail
+// with the arm's WARN line and graph_compute's recoverable fallback line, both naming the stage, with the failpoint
+// consumed once, no run or decline counted, and neither the arm's run line nor the direct route's line: a thrown
+// submission does not fall through to the direct kernel.
+bool run_thrown_case(const moe_planned_fixture::planned_model & model, const case_data & c) {
+    const char * name     = model.gate->name;
+    const bool   admitted = supports(model.backend, model.gate, c);
+
+    const ggml_sycl_moe_bf16_grouped_test_counters before          = arm_counters("submit");
+    const uint64_t                                 consumed_before = failures_consumed();
+    const size_t                                   from            = g_log.mark();
+    ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_AFTER_GATHER);
+    std::vector<float> got;
+    const ggml_status  status   = admitted ? run_backend(model.backend, model.gate, c, got) : GGML_STATUS_FAILED;
+    const uint64_t     consumed = failures_consumed() - consumed_before;
+    if (consumed == 0) {
+        // The node never reached the failpoint; disarm it so the next case measures only itself.
+        ggml_sycl_q1_nvfp4_test_failure_once(GGML_SYCL_Q1_NVFP4_TEST_FAILURE_NONE);
+    }
+    const counter_moves moved = counters_since(before, "submit");
+
+    const std::string named_warn  = std::string("tensor=") + name + " device=0 stage=expert GEMM error=";
+    const size_t      warns       = g_log.count_since(from, { "[MoE] BF16 grouped arm failed after submission: " });
+    const size_t      named_warns = g_log.count_since(
+        from, { "[MoE] BF16 grouped arm failed after submission: ", named_warn.c_str(), "private-testing failpoint" });
+    const size_t fallbacks    = g_log.count_since(from, { "recoverable runtime fallback failed" });
+    const size_t named_errors = g_log.count_since(
+        from, { "recoverable runtime fallback failed: BF16 grouped arm: expert GEMM failed after submission: "
+                "private-testing failpoint after the gather" });
+    const size_t arm_lines    = g_log.count_since(from, { "[MOE-ROUTE] bf16 grouped tensor=", name });
+    const size_t direct_lines = g_log.count_since(from, { "[MOE-ROUTE] bf16 direct tensor=", name });
+
+    std::string why;
+    if (!admitted) {
+        why += " supports-op";
+    } else if (status != GGML_STATUS_FAILED) {
+        why += " compute-status";
+    }
+    if (consumed != 1) {
+        why += " failpoint-consumed";
+    }
+    if (warns != 1 || named_warns != 1) {
+        why += " arm-warn";
+    }
+    if (fallbacks != 1 || named_errors != 1) {
+        why += " named-error";
+    }
+    if (arm_lines != 0) {
+        why += " arm-ran";
+    }
+    if (direct_lines != 0) {
+        why += " direct-route-ran";
+    }
+    if (moved.runs != 0 || moved.declines != 0) {
+        why += " counters";
+    }
+    std::fprintf(stderr,
+                 "CASE %s tensor=%s tokens=%d want=thrown supports_op=%d status=%d failpoint_consumed=%llu warns=%zu "
+                 "named_warns=%zu fallback_lines=%zu named_errors=%zu arm_lines=%zu direct_lines=%zu runs+=%llu "
+                 "declines+=%llu -> %s%s\n",
+                 c.label, name, c.n_tokens, admitted ? 1 : 0, static_cast<int>(status), (unsigned long long) consumed,
+                 warns, named_warns, fallbacks, named_errors, arm_lines, direct_lines, (unsigned long long) moved.runs,
+                 (unsigned long long) moved.declines, why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
 }
 
@@ -455,6 +568,9 @@ int main(int argc, char ** argv) {
             run("gate_up-subset", 512, k_subset, nullptr);
             run("gate_up-min-tokens", k_min_tokens, k_experts, nullptr);
             run("gate_up-below-min", k_min_tokens - 1, k_experts, "tokens");
+            // A thrown submission fails the graph by name; the process and the arm go on.
+            tally(run_thrown_case(model, make_case("gate_up-thrown-after-gather", 512, 1, k_experts, rng)));
+            run("gate_up-after-thrown", 512, k_experts, nullptr);
         }
         {
             moe_planned_fixture::planned_model model(k_down_shape, "test-moe-bf16-grouped-device-down.gguf", rng);

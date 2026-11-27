@@ -496,14 +496,26 @@ def evaluate(sycl, cache, module, header, doc="", others=""):
                     "pp_moe_onednn_claim_scratch_slot(ctx.device, ring_depth, scratch_slot)",
                     "claim_pp_moe_onednn_scratch_slot(scratch_slot, reserved)",
                     "DnnlGemmWrapper::gemm(", "moe_bf16_grouped_gather_submit(", "moe_bf16_grouped_scatter_submit("),
+        # One admission lambda, answering what the weightless admission answers, asked twice: for the routed rows
+        # unpadded before the ids (a node the ring cannot hold pays no ids wait), then for the packed rows. Each `no` is
+        # a SCRATCH_UNPLANNED decline, and both come before the arm's one reservation.
         "the BF16 grouped arm declines, never grows the ring, on a refusal":
-            ordered(arm, "if (!admission.allowed) {", "return decline(moe_bf16_grouped_decline::SCRATCH_UNPLANNED);",
-                    "reserve_pp_moe_onednn_scratch("),
+            ordered(arm, "const auto admit_planes = [&](size_t act_bytes, size_t out_bytes) {",
+                    "return admission.allowed;",
+                    "if (!admit_planes(io.n_rows * ", "return decline(moe_bf16_grouped_decline::SCRATCH_UNPLANNED);",
+                    "ggml_sycl_refresh_moe_ids_cache(ctx, ids, ids_entry)",
+                    "if (!admit_planes(act_bytes, out_bytes)) {",
+                    "return decline(moe_bf16_grouped_decline::SCRATCH_UNPLANNED);",
+                    "reserve_pp_moe_onednn_scratch(")
+            and arm.count("admit_planes(") == 2
+            and arm.count("return decline(moe_bf16_grouped_decline::SCRATCH_UNPLANNED);") == 2
+            and arm.count("reserve_pp_moe_onednn_scratch(") == 1,
         # Quiet on a card with no ring planned (a model whose only experts are BF16: the direct route is its plan), at
         # WARN once on a ring the plan sized too small for the node.
         "the BF16 grouped arm warns unconditionally, once, on a ring that does not fit it":
             latched_warn(arm, "bf16_grouped_refusal_latch")
-            and ordered(arm, "if (admission.reason != ggml_sycl::pp_moe_onednn_scratch_admission_reason::MISSING_PLAN &&",
+            and ordered(arm, "if (!admission.allowed && "
+                        "admission.reason != ggml_sycl::pp_moe_onednn_scratch_admission_reason::MISSING_PLAN &&",
                         "ggml_sycl::pp_moe_onednn_should_report_refusal(admission, bf16_grouped_refusal_latch)) {",
                         "GGML_LOG_WARN(", "(reported once per", "required=[%zu,%zu] planned=[%zu,%zu]",
                         "pp_moe_onednn_scratch_admission_reason_name(admission.reason)"),

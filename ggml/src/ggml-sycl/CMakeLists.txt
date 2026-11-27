@@ -6612,10 +6612,13 @@ endif() # static SYCL backend fixture
 # the PP MoE oneDNN ring, runs on the BF16 grouped arm: one batched gather, a oneDNN bf16 GEMM per active expert on the
 # expert as loaded, one batched scatter. Cases: all experts, 40 of them, the 64-token minimum, and the down shape on the
 # arm; 63 tokens and GGML_SYCL_MOE_BF16_GROUPED=0 (a child process of the test) on the BF16 direct route, with the
-# arm's decline line naming the reason. Every output row within NMSE 5e-4 of the CPU backend, no refusal. Each model
-# holds ~4.5 GB on the card with its ring and ~9 GB of host memory (~12 GB while its experts are quantized), so the
-# label is `model`, which keeps it out of the full sweep (CLAUDE.md, .claude/rules/ctest-registration.md): run it
-# alone. Pinned to the B70; a run with no SYCL GPU exits 77.
+# arm's decline line naming the reason; and a private failpoint that throws at the arm's GEMM stage after its gather,
+# which must fail the compute with the arm's named error, followed by the same case on the arm again. Every output row
+# within NMSE 5e-4 of the CPU backend, no refusal, and every case moves the arm's run and decline counters by exactly
+# what it should. The counters and the failpoint exist only in the private backend objects, so it links
+# ggml-sycl-private-fixtures (not the ordinary DSO). Each model holds ~4.5 GB on the card with its ring and ~9 GB of
+# host memory (~12 GB while its experts are quantized), so the label is `model`, which keeps it out of the full sweep
+# (CLAUDE.md, .claude/rules/ctest-registration.md): run it alone. Pinned to the B70; a run with no SYCL GPU exits 77.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-bf16-grouped-device
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-bf16-grouped-device.cpp
@@ -6624,14 +6627,9 @@ target_include_directories(test-moe-bf16-grouped-device PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-    ${SYCL_INCLUDE_DIR}
 )
-target_compile_options(test-moe-bf16-grouped-device PRIVATE "-fsycl" "-Wno-narrowing")
-target_link_options(test-moe-bf16-grouped-device PRIVATE "-fsycl")
-target_link_libraries(test-moe-bf16-grouped-device PRIVATE ggml-base ggml ggml-cpu ggml-sycl)
-if (IntelSYCL_FOUND)
-    target_link_libraries(test-moe-bf16-grouped-device PRIVATE IntelSYCL::SYCL_CXX)
-endif()
+target_compile_options(test-moe-bf16-grouped-device PRIVATE "-Wno-narrowing")
+target_link_libraries(test-moe-bf16-grouped-device PRIVATE ggml-sycl-private-fixtures)
 set_target_properties(test-moe-bf16-grouped-device PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 add_test(NAME test-moe-bf16-grouped-device COMMAND test-moe-bf16-grouped-device)
 set_tests_properties(test-moe-bf16-grouped-device PROPERTIES
@@ -6641,7 +6639,37 @@ set_tests_properties(test-moe-bf16-grouped-device PROPERTIES
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 600
 )
-endif() # static SYCL backend fixture
+endif() # private SYCL backend fixture
+
+# Task 24 (Inkling 2 Mini): the gather and the scatter of the BF16 grouped prompt arm (moe-bf16-grouped.cpp), on rows
+# laid out by the arm's own plan (moe-bf16-grouped-plan.hpp): the gathered bf16 plane bit for bit what
+# ggml_sycl_bf16::f32_to_bf16_rne and the CPU backend's ggml_fp32_to_bf16 give, on activations that are not bf16 values
+# (ties to even both ways, one ulp either side of a tie, the largest finite, infinities, quiet and signalling NaN,
+# subnormals and zeros), a broadcast row and a row per slot, padded strides, padding rows and every unrouted dst row
+# left untouched; and each refusal enqueuing nothing. The kernel file needs no backend state, so the test compiles it
+# directly (JIT spir64, as test-sycl-moe-bf16-direct-kernel does) and links ggml-base alone. The registration pins
+# opencl:cpu so it never touches a GPU. NAME and labels carry none of the substrings the throttled sweep excludes.
+add_executable(test-sycl-moe-bf16-grouped-kernel
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../tests/test-sycl-moe-bf16-grouped-kernel.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe-bf16-grouped.cpp
+)
+target_include_directories(test-sycl-moe-bf16-grouped-kernel PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+)
+target_compile_options(test-sycl-moe-bf16-grouped-kernel PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_options(test-sycl-moe-bf16-grouped-kernel PRIVATE ${SYCL_LINK_ONLY_TEST_OPTIONS})
+target_link_libraries(test-sycl-moe-bf16-grouped-kernel PRIVATE ggml-base)
+set_target_properties(test-sycl-moe-bf16-grouped-kernel PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME sycl-moe-bf16-grouped-kernel COMMAND test-sycl-moe-bf16-grouped-kernel)
+set_tests_properties(sycl-moe-bf16-grouped-kernel PROPERTIES
+    ENVIRONMENT "LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH};ONEAPI_DEVICE_SELECTOR=opencl:cpu"
+    LABELS "sycl;moe;bf16;kernel;hostonly"
+    SKIP_RETURN_CODE 77
+    TIMEOUT 300
+)
 
 # Task 8g (Inkling 2 Mini): the BF16 MUL_MAT_ID expert kernel (moe-bf16-direct.cpp) against a double-precision
 # reference: Inkling's k with a broadcast row and a row per slot, the scalar form (k 99, a broken row stride, an expert

@@ -54,6 +54,17 @@ enum ggml_sycl_q1_nvfp4_test_failure {
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_ROW_MAP_STAGING,
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_DST_STAGING,
     GGML_SYCL_Q1_NVFP4_TEST_FAILURE_PP_SRC1_F32_STAGING,
+    // The BF16 grouped prompt arm of MUL_MAT_ID (Inkling 2 Mini plan, Task 24) throws once at its GEMM stage, after its
+    // gather was submitted, as a oneDNN execute that throws would (test-moe-bf16-grouped-device).
+    GGML_SYCL_Q1_NVFP4_TEST_FAILURE_BF16_GROUPED_AFTER_GATHER,
+};
+
+// The BF16 grouped prompt arm's counters: the nodes it ran, the nodes it declined under every reason, and those it
+// declined under the one reason asked for.
+struct ggml_sycl_moe_bf16_grouped_test_counters {
+    uint64_t runs;
+    uint64_t declines;
+    uint64_t reason_declines;
 };
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -102,3 +113,8 @@ GGML_SYCL_Q1_TEST_LOCAL bool ggml_sycl_q1_nvfp4_test_write_expert_slot(ggml_back
 // Consumes an armed failure if it is this one (counted in failure_consumed). For the backend's own translation
 // units outside ggml-sycl.cpp, which arm nothing themselves.
 GGML_SYCL_Q1_TEST_LOCAL bool ggml_sycl_q1_nvfp4_test_failure_take(enum ggml_sycl_q1_nvfp4_test_failure failure);
+// Reads the BF16 grouped arm's counters, with `reason` the name its route log prints for a decline (opt_out, tokens,
+// ...). False, with nothing written, when `reason` names no reason.
+GGML_SYCL_Q1_TEST_LOCAL bool ggml_sycl_moe_bf16_grouped_test_counters_read(
+    const char *                               reason,
+    ggml_sycl_moe_bf16_grouped_test_counters * counters);
