@@ -25368,6 +25368,25 @@ struct test_loan_fixture {
         return n;
     }
 
+    // Gives (layer, slot)'s extra the route table a decode build stores (ggml_sycl_moe_route_table_store): a lease on
+    // each expert whose device handle the slot cache holds, at the expert's own id. A prompt preload's build stores
+    // none while the staged entries still carry their ready events, so a case that needs the route-table view seeds
+    // it. The stamp stays unset, so no lookup serves a route from it.
+    void seed_route_table(int layer, int slot) {
+        ggml_tensor_extra_gpu_weight_ext & w      = *extras[layer * 3 + slot]->weight_ext;
+        moe_route_table &                  routes = w.moe_route_tables[device];
+        routes.invalidate();
+        routes.experts.assign(static_cast<size_t>(n_experts), moe_route_entry{});
+        for (size_t e = 0; e < routes.experts.size() && e < w.moe_expert_handles[device].size(); ++e) {
+            if (!w.moe_expert_handles[device][e].valid()) {
+                continue;
+            }
+            routes.experts[e].lease = w.moe_expert_handles[device][e];
+            routes.experts[e].ptr =
+                e < w.moe_expert_ptr_payload[device].size() ? w.moe_expert_ptr_payload[device][e] : nullptr;
+        }
+    }
+
     // Whether (layer, slot)'s extra keeps a hybrid decode record on the device.
     bool has_hybrid_record(int layer, int slot) const {
         const auto & w = extras[layer * 3 + slot]->weight_ext;
@@ -25482,11 +25501,12 @@ struct test_loan_fixture {
     // A loan of bytes_wanted run at the graph boundary, which must lend n_expected triplets; then each lent device
     // entry is reclaimed and its storage handed back, so a refill meets no withdrawn entry under the ids it re-admits.
     // `freed`, when given, receives the loan's bytes_freed; `check` says how the reclaim is checked.
-    std::string lend(size_t        bytes_wanted,
-                     uint32_t      n_expected,
-                     int           host_expert,
-                     size_t *      freed = nullptr,
-                     reclaim_check check = reclaim_check::POLL) {
+    std::string lend(size_t                           bytes_wanted,
+                     uint32_t                         n_expected,
+                     int                              host_expert,
+                     size_t *                         freed  = nullptr,
+                     reclaim_check                    check  = reclaim_check::POLL,
+                     ::ggml_sycl_expert_loan_result * loaned = nullptr) {
         const device_bytes                     before   = sample();
         const ::ggml_sycl_expert_loan_resolver resolver = this->resolver();
         ::ggml_sycl_expert_loan_result         result;
@@ -25518,6 +25538,9 @@ struct test_loan_fixture {
         }
         if (freed) {
             *freed = result.bytes_freed;
+        }
+        if (loaned) {
+            *loaned = result;
         }
         // As synchronize runs it: after the loan, before the deferred-free pass.
         const bool drained = ::ggml_sycl_expert_loan_boundary_drain(device, result.accepted && result.n_triplets != 0);
@@ -25943,7 +25966,11 @@ std::vector<test_plan_placement> test_plan_placements(const lifecycle_plan_snaps
 // (`published`, whose `placements` the caller read before the call):
 //   - the replaced plan's entries read as they did: the copy the transaction published shares that plan's entry
 //     chunks, so a flip that wrote a shared chunk would move the expert in the plan its readers still hold;
-//   - no lent-view drop walked a whole table: each moved expert's own slot held the view it retired;
+//   - no lent-view drop walked a whole table. A walk happens only for a route table or hybrid decode record whose slot
+//     for the moved expert does not hold the retired entry, so the count can be nonzero only where the extra holds one:
+//     the pointer-table lease case seeds a route table and checks it there. The two-triplet loan and the resident
+//     evict hold none, so there the check is vacuous, and the source gate's claim_lent_views_found_without_a_walk pins
+//     the slot-first lookup;
 //   - the copy cloned at least one chunk, since its first flip writes a chunk the replaced plan still shares, and at
 //     most one per member it flipped, 3 * triplets, since a chunk once cloned is the copy's own and a second member in
 //     it clones nothing; nor more chunks than the plan has. These fixtures' plans fit one 32-entry chunk, so here the
@@ -27520,12 +27547,38 @@ static std::string test_expert_loan_pointer_table_leases_case(test_loan_fixture:
         fx.table_leases_on_device_entry(0, 0, 2) == 0 || !fx.device_table_valid(0, 0)) {
         return "slot 0 is not lease-only before the loan: " + fx.device_entry_holders(0, 0, 2);
     }
+    // Slot 2 also gets the route table a decode build stores, each expert at its own id, so the loan's drop meets a
+    // route-table view of the entry it retires; slot 1 keeps none, so its stale mark still witnesses the slot path
+    // alone. The control: slot 2's table holds one route lease on expert 2's entry, so the walk count checked after the
+    // loan comes from a drop that had a route table to ask.
+    fx.seed_route_table(0, /*slot=*/2);
+    if (fx.route_leases_on_device_entry(0, 2, 2) != 1 || fx.route_leases_on_device_entry(0, 1, 2) != 0) {
+        return test_loan_fail(
+            "before the loan expert 2's entry has %d route leases in slot 2 and %d in slot 1, not 1, 0",
+            fx.route_leases_on_device_entry(0, 2, 2), fx.route_leases_on_device_entry(0, 1, 2));
+    }
+    const auto published = ::ggml_sycl_global_plan_snapshot();
+    if (!published || !published->plan) {
+        return "the fixture's plan was not published";
+    }
+    const std::vector<test_plan_placement> placements = test_plan_placements(*published);
 
-    if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3, /*freed=*/nullptr, check); !why.empty()) {
+    ::ggml_sycl_expert_loan_result loan;
+    if (std::string why = fx.lend(3 * charge, 1, /*host_expert=*/3, /*freed=*/nullptr, check, &loan); !why.empty()) {
         for (int s = 0; s < 3; ++s) {
             why += "; " + fx.device_entry_holders(0, s, 2);
         }
         return why;
+    }
+    // Each drop found expert 2's route lease at expert 2's own slot, so none walked a table: a drop that asked another
+    // slot would walk the table to find the lease, and count it.
+    if (std::string why = test_txn_plan_cost(*published, placements, loan.plan_chunks_cloned, loan.view_scan_fallbacks,
+                                             loan.n_triplets);
+        !why.empty()) {
+        return "the loan: " + why;
+    }
+    if (fx.route_leases_on_device_entry(0, 2, 2) != 0) {
+        return "slot 2's route table still leases expert 2's entry after the loan";
     }
     // No table still trusted with a raw pointer into the room the zone got back: each is stale, so the next
     // MUL_MAT_ID or preload rebuilds it. Lease-only slot 0 is checked by its stale mark alone, since only its device
