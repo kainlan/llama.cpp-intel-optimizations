@@ -10372,6 +10372,15 @@ static ggml_sycl::lifecycle::ModelToken ggml_sycl_cpp_token(ggml_sycl_model_toke
     };
 }
 
+// ggml_sycl_execution_c_result is the C API mapping of ggml_sycl::execution::error and
+// ggml_sycl_execution_error_name its diagnostic name. Both switches list every enumerator and have no `default:`
+// label, so a new error value must be mapped on purpose: an unmapped value would fall to the trailing return, and an
+// allocation failure misreported there as BUSY, which a caller retries, is what this layout fixed. The pragma turns
+// a missing case into a build error under clang/icpx, the only compilers of this translation unit; GCC ignores
+// clang pragmas. Do not "tidy" a default in.
+#pragma clang diagnostic push
+#pragma clang diagnostic error "-Wswitch"
+
 static ggml_sycl_execution_result ggml_sycl_execution_c_result(ggml_sycl::execution::error e) {
     using E = ggml_sycl::execution::error;
     switch (e) {
@@ -10393,11 +10402,18 @@ static ggml_sycl_execution_result ggml_sycl_execution_c_result(ggml_sycl::execut
             return GGML_SYCL_EXECUTION_FOREIGN_BACKEND;
         case E::NOT_FOUND:
             return GGML_SYCL_EXECUTION_NOT_FOUND;
+        case E::ALLOCATION_FAILED:
+            return GGML_SYCL_EXECUTION_ALLOCATION_FAILURE;
+        // A persistent allocation about to run under the registry mutex is a code defect, not memory pressure, so it
+        // is not ALLOCATION_FAILURE and must not read as retryable.
+        case E::LOCK_HELD_ALLOCATION:
+            return GGML_SYCL_EXECUTION_INTERNAL_ERROR;
     }
-    return GGML_SYCL_EXECUTION_BUSY;
+    // A value outside the enum is a defect too: never BUSY, which a caller retries.
+    return GGML_SYCL_EXECUTION_INTERNAL_ERROR;
 }
 
-// Diagnostic-only mapping (llama.cpp-cnre): the internal registry error name,
+// Diagnostic-only mapping: the internal registry error name,
 // for logs/exception text. Distinct from ggml_sycl_execution_c_result() above,
 // which maps to the public ggml_sycl_execution_result C enum for the
 // lifecycle-context ABI; this one stays local to ggml-sycl.cpp.
@@ -10422,9 +10438,15 @@ static const char * ggml_sycl_execution_error_name(ggml_sycl::execution::error e
             return "FOREIGN_BACKEND";
         case E::NOT_FOUND:
             return "NOT_FOUND";
+        case E::ALLOCATION_FAILED:
+            return "ALLOCATION_FAILED";
+        case E::LOCK_HELD_ALLOCATION:
+            return "LOCK_HELD_ALLOCATION";
     }
     return "UNKNOWN";
 }
+
+#pragma clang diagnostic pop
 
 static ggml_sycl_execution_result ggml_sycl_execution_caught_bad_alloc() {
     return GGML_SYCL_EXECUTION_ALLOCATION_FAILURE;

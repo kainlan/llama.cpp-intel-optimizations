@@ -1127,6 +1127,13 @@ if (Python3_Interpreter_FOUND)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-async-failure-source.py --self-test)
     set_tests_properties(test-sycl-async-failure-source PROPERTIES
         LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 120)
+    # Every ggml_sycl::execution::error maps to a C result and a name, and -Wswitch is an error across both switches.
+    # Run WITH --self-test so each pin is proven to catch its mutant.
+    add_test(NAME test-sycl-execution-result-map-source
+        COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test-sycl-execution-result-map-source.py --self-test)
+    set_tests_properties(test-sycl-execution-result-map-source PROPERTIES
+        LABELS "sycl;source;source-contract;hostonly;python" TIMEOUT 30)
     # Every queue and context the backend constructs carries the async-failure handler, and the last drain before an
     # early-destroyed queue delivers (llama.cpp-kjoc). Run WITH --self-test so each pin is proven to catch its mutant.
     add_test(NAME test-sycl-async-handler-source
