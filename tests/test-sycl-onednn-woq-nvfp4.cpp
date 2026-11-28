@@ -1336,9 +1336,11 @@ void report_xcheck(int                   arm,
 
 // Cross-checks the two 3-D WOQ forms Task 26b chooses between against f16-gemm at one point. All three read the 8
 // checked experts repeated and the same src, so every column must agree with f16-gemm's. The dequant and the repack
-// run first, into poisoned buffers (NaN halves, 0xff planes, whose scales read as NaN), so a point that was not timed
-// has its planes too and a region either kernel skips shows as non-finite output. Then each arm runs once into a
-// NaN-filled dst that is read back before the next arm runs, so no arm's output stands in for another's.
+// run first, into buffers filled with 0xff, so a point that was not timed has its planes too. A region the dequant
+// skips in w16, or the repack skips in s16, reads as NaN and shows as non-finite output. A region the repack skips in
+// nib reads as nibble code 0xf (-6), a finite value that only worst_rel catches. woq-3d-ba-diag reads the host-built
+// nib_nk, not nib, and neither arm reads s8. Then each arm runs once into a NaN-filled dst that is read back before
+// the next arm runs, so no arm's output stands in for another's.
 void bench_xcheck_point(sycl::queue &            q,
                         const dnnl::engine &     eng,
                         dnnl::stream &           stream,
