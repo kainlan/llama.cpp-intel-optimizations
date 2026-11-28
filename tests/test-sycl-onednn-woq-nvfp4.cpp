@@ -335,9 +335,15 @@ struct dev_buffer {
 
     dev_buffer(sycl::queue & queue, size_t bytes) : q(queue) { ptr = sycl::malloc_device(bytes, q); }
 
+    // Waits for the queue first, so a buffer left behind by an exception is not freed under a kernel still using it. A
+    // destructor must not throw, so nothing the wait or the free raises escapes.
     ~dev_buffer() {
         if (ptr != nullptr) {
-            sycl::free(ptr, q);
+            try {
+                q.wait();
+                sycl::free(ptr, q);
+            } catch (...) {
+            }
         }
     }
 
@@ -665,14 +671,16 @@ sycl::event submit_marker(sycl::queue & q) {
 }
 
 struct bench_timing {
-    bool   ok      = false;
-    double dev_us  = NAN;  // per expert
-    double wall_us = NAN;  // per expert
+    bool   ok       = false;
+    bool   bad_span = false;  // ran, but marker2 command_start did not follow marker1 command_end; dev_us is 0
+    double dev_us   = NAN;    // per expert
+    double wall_us  = NAN;    // per expert
 };
 
 // Device time per expert of rep(), one rep being B experts' work: 3 warm-up reps, then a marker, R reps and a second
 // marker on the in-order profiling queue, (marker2 command_start - marker1 command_end) / R / B. R grows until the timed
-// span is at least 50 ms. Host wall-clock is taken over the same R, from the first marker's submission to the wait.
+// span is at least 50 ms. Host wall-clock is taken over the same R, from the first marker's submission to the wait. A
+// span of zero or less means the timestamps cannot time this arm: it stops there, marked bad_span, and R does not grow.
 template <typename F> bench_timing time_arm(sycl::queue & q, int B, F && rep) {
     for (int i = 0; i < k_bench_warmup; ++i) {
         rep();
@@ -691,11 +699,12 @@ template <typename F> bench_timing time_arm(sycl::queue & q, int B, F && rep) {
         const uint64_t end1   = m1.get_profiling_info<sycl::info::event_profiling::command_end>();
         const uint64_t start2 = m2.get_profiling_info<sycl::info::event_profiling::command_start>();
         const double   span   = start2 > end1 ? (double) (start2 - end1) : 0.0;
-        if (span >= k_bench_min_span_ns || reps >= k_bench_max_reps) {
+        if (span <= 0.0 || span >= k_bench_min_span_ns || reps >= k_bench_max_reps) {
             bench_timing t;
-            t.ok      = span > 0.0;
-            t.dev_us  = span / 1e3 / reps / B;
-            t.wall_us = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps / B;
+            t.ok       = span > 0.0;
+            t.bad_span = span <= 0.0;
+            t.dev_us   = span / 1e3 / reps / B;
+            t.wall_us  = std::chrono::duration<double, std::micro>(t1 - t0).count() / reps / B;
             return t;
         }
         const double per_rep = std::max(span / reps, 1e3);
@@ -1065,12 +1074,13 @@ void report_bench(int                  arm,
                   const bench_timing & t,
                   int                  verdict,
                   const std::string &  impl) {
+    // A bad span ran the arm, so its numerics stand; its device time is printed as 0 and flagged.
     const double gbps = t.ok ? bench_arm_bytes(arm, pt) / t.dev_us / 1e3 : NAN;
     std::printf(
         "BENCH %s shape=%s B=%d M=%d K=%d N=%d dev_us_per_expert=%.2f wall_us_per_expert=%.2f GBps=%.1f numerics=%s "
-        "impl=%s\n",
+        "impl=%s%s\n",
         k_bench_arm_names[arm], sh.name, pt.B, pt.M, pt.K, pt.N, t.dev_us, t.wall_us, gbps,
-        t.ok ? bench_verdict_str(verdict) : "FAIL", impl.c_str());
+        t.ok || t.bad_span ? bench_verdict_str(verdict) : "FAIL", impl.c_str(), t.bad_span ? " timing=BADSPAN" : "");
     if (t.ok && t.dev_us > t.wall_us) {
         std::printf("WARN %s shape=%s B=%d M=%d: device time exceeds wall time, the timestamps are not trustworthy\n",
                     k_bench_arm_names[arm], sh.name, pt.B, pt.M);
@@ -1244,8 +1254,21 @@ int run_bench() {
                 }
             }
             const double woq = best >= 0 && rp.ok ? rp.dev_us + r.t[best].dev_us : NAN;
-            std::printf("PIPELINE shape=%s B=%d M=%d f16=%.2f woq_best=%.2f form=%s ratio=%.3f\n", shapes[r.shape].name,
-                        r.B, r.M, f16, woq, best >= 0 ? k_bench_arm_names[best] : "none", woq / f16);
+            // The ratio is a number only when both pipelines' inputs passed and both sums are finite times.
+            const int *  v           = verdicts[r.shape];
+            const bool   inputs_pass = v[BENCH_ARM_F16_DEQUANT] == BENCH_VERDICT_PASS &&
+                                     v[BENCH_ARM_F16_GEMM] == BENCH_VERDICT_PASS &&
+                                     v[BENCH_ARM_WOQ_REPACK] == BENCH_VERDICT_PASS;
+            char ratio[32];
+            if (!inputs_pass) {
+                std::snprintf(ratio, sizeof(ratio), "BADNUM");
+            } else if (!std::isfinite(woq) || !std::isfinite(f16) || f16 <= 0.0) {
+                std::snprintf(ratio, sizeof(ratio), "nan");
+            } else {
+                std::snprintf(ratio, sizeof(ratio), "%.3f", woq / f16);
+            }
+            std::printf("PIPELINE shape=%s B=%d M=%d f16=%.2f woq_best=%.2f form=%s ratio=%s\n", shapes[r.shape].name,
+                        r.B, r.M, f16, woq, best >= 0 ? k_bench_arm_names[best] : "none", ratio);
         }
         std::fflush(stdout);
     } catch (const std::exception & e) {
