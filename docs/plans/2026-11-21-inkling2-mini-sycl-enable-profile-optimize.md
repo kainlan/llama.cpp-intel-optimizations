@@ -8421,6 +8421,16 @@ extra point, on both cards, before Task 26b-4 starts. Tasks 26b-1 to 26b-3 may s
   repack, the bench's `nvfp4_bench_repack`, and weights `{B,K,N}` with strides `{K*N,N,1}`. 26b-3 and 26b-4 keep
   their shape.
 
+**Precondition result (lead, 2026-11-27, `c5cfb60ffa`).** Met on both cards: `XCHECK_SUMMARY pass=48 fail=0` on each
+(`inkling/t26a-xchk-b70-c5cfb60ffa/out.txt` and `inkling/t26a-xchk-b50-c5cfb60ffa/out.txt`).
+- Across every grid point and the extra points B 1 / M 64, B 32 / M 192 and B 32 / M 256, the largest `worst_rel` of
+  `woq-3d-ba-diag` against the f16 GEMM is 1.09e-06 on the B70 and 1.28e-06 on the B50.
+- At M 256 both WOQ forms are bit-identical to the f16 GEMM (`worst_rel=0.00e+00`). oneDNN appears to unpack the
+  weights to f16 and run the f16 kernel there. That fits the M 128 slowdown in the Task 26a result.
+- The stored-order primitive needs no scratchpad in user mode: `user_bytes=0` at all 24 points on both cards.
+- The B 32, M 64 timings repeat Task 26a's within 1-3%: ba-diag 8.70 µs gate_up and 4.97 µs down on the B70, and
+  21.40 and 12.63 µs on the B50.
+
 **Arithmetic, fixed here.** K is `ne00` and N is `ne01`, and G = K / 16 is the number of scale groups.
 - Per expert:
   - nibble plane `nib = N * K / 2` bytes;
