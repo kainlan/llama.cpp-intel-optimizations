@@ -21,7 +21,7 @@
 // WOQ arm, about a quarter of every expert in f16. The f16 arm runs in that slot, never a wider one: it groups the
 // active experts to fit it, alternating between the slot's two halves, each group's dequant chained on the GEMMs
 // that last read its half. At this shape the slot holds 8 f16 experts, and every case activates all 32, so a case
-// runs 8 groups of 4 and must name at least three groups.
+// runs 8 groups of 4 and must name at least three groups; NVFP4's larger slot runs fewer groups (see k_min_groups).
 // GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX caps the experts per group. The backend reads it once per process, so the
 // capped cases run in child processes: the test runs itself again as --group-cap N for each N in k_group_caps (1 and
 // 3), each child runs one Q4_0 case at 300 tokens with the cap at N, and that case must name exactly ceil(32 / N)
@@ -151,9 +151,9 @@ static_assert(k_cases <= k_route_log_cap, "a case past the route log's cap has n
 
 // The fewest f16 groups a case's success line may name at the slot's own grouping. At this shape the MXFP4-sized slot
 // that every type but NVFP4 plans holds 8 f16 experts, so such a case runs 8 groups of 4. NVFP4 plans a larger slot for
-// its f16 scale plane (983,040 bytes per expert, 10 f16 experts), so its cases run fewer groups, still at least 4 of
-// the 32 experts. A slot that held every expert would run one group, and the case fails rather than pass without the
-// chain.
+// its f16 scale plane (983,040 bytes per expert, 10 f16 experts), split into two halves of 5, so its cases run 7
+// groups (6 of 5 and one of 2; moe_pp_batched_f16_plan_groups), still at least k_min_groups. A slot that held every
+// expert would run one group, and the case fails rather than pass without the chain.
 constexpr size_t k_min_groups = 3;
 
 // The group caps of the capped cases, one Q4_0 case each, each in its own child process (run_child_case).
