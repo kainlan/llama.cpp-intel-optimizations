@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <sycl/sycl.hpp>
 #include <vector>
@@ -109,13 +110,34 @@ int run_and_check(sycl::queue &                q,
     const size_t sc_halves    = want.scales.size();
 
     // 64-byte alignment covers the entry's 8-byte asserts on both destination planes.
-    uint8_t *    src_dev = (uint8_t *) sycl::aligned_alloc_device(64, stored.size(), q);
-    uint8_t *    nib_dev = (uint8_t *) sycl::aligned_alloc_device(64, nib_bytes + k_guard_bytes, q);
-    sycl::half * sc_dev =
-        (sycl::half *) sycl::aligned_alloc_device(64, (sc_halves + k_guard_halves) * sizeof(sycl::half), q);
+    const size_t src_alloc = stored.size();
+    const size_t nib_alloc = nib_bytes + k_guard_bytes;
+    const size_t sc_alloc  = (sc_halves + k_guard_halves) * sizeof(sycl::half);
+    uint8_t *    src_dev   = (uint8_t *) sycl::aligned_alloc_device(64, src_alloc, q);
+    uint8_t *    nib_dev   = (uint8_t *) sycl::aligned_alloc_device(64, nib_alloc, q);
+    sycl::half * sc_dev    = (sycl::half *) sycl::aligned_alloc_device(64, sc_alloc, q);
+    if (!src_dev || !nib_dev || !sc_dev) {
+        if (!src_dev) {
+            std::printf("FAIL[%s]: aligned_alloc_device of the source buffer (%zu bytes) returned null\n", label,
+                        src_alloc);
+        }
+        if (!nib_dev) {
+            std::printf("FAIL[%s]: aligned_alloc_device of the nibble plane (%zu bytes) returned null\n", label,
+                        nib_alloc);
+        }
+        if (!sc_dev) {
+            std::printf("FAIL[%s]: aligned_alloc_device of the scale plane (%zu bytes) returned null\n", label,
+                        sc_alloc);
+        }
+        // sycl::free on a null pointer does nothing, so freeing all three releases exactly what was allocated.
+        sycl::free(src_dev, q);
+        sycl::free(nib_dev, q);
+        sycl::free(sc_dev, q);
+        return 1;
+    }
     q.memcpy(src_dev, stored.data(), stored.size()).wait();
-    q.memset(nib_dev, k_sentinel_byte, nib_bytes + k_guard_bytes).wait();
-    q.memset(sc_dev, k_sentinel_byte, (sc_halves + k_guard_halves) * sizeof(sycl::half)).wait();
+    q.memset(nib_dev, k_sentinel_byte, nib_alloc).wait();
+    q.memset(sc_dev, k_sentinel_byte, sc_alloc).wait();
 
     std::vector<const void *> srcs(n_slots);
     for (int s = 0; s < n_slots; ++s) {
@@ -281,9 +303,17 @@ int check_crosses_max_slots(sycl::queue & q) {
 }  // namespace
 
 int main() {
+    // Only a missing device is a skip. Once the queue exists, any SYCL exception (an allocation, a copy or the kernel
+    // launch) is a failure.
+    std::unique_ptr<sycl::queue> queue;
     try {
-        sycl::queue q{ sycl::gpu_selector_v };
-
+        queue = std::make_unique<sycl::queue>(sycl::gpu_selector_v);
+    } catch (const sycl::exception & ex) {
+        std::printf("SKIP: no SYCL GPU (%s)\n", ex.what());
+        return LLAMA_TEST_EXIT_SKIP;
+    }
+    sycl::queue & q = *queue;
+    try {
         int rc = check_hand_fixture(q);
         if (rc != 0) {
             return rc;
@@ -298,7 +328,7 @@ int main() {
         }
         return 0;
     } catch (const sycl::exception & ex) {
-        std::printf("SKIP: no SYCL GPU (%s)\n", ex.what());
-        return LLAMA_TEST_EXIT_SKIP;
+        std::printf("FAIL: SYCL exception after the device was found (%s)\n", ex.what());
+        return 1;
     }
 }
