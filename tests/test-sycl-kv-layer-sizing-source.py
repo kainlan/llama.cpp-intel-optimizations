@@ -1913,10 +1913,13 @@ def optional_layout_release_violations(sycl_cpp: str, cache_cpp: str) -> list[st
     reap = body.find("reaped           = release_retained_referencing(request);")
     # The drain drops each matching row from deferred_frees_ in its compaction visit (moved into `released`, then
     # dropped there with no lock held); a visit that keeps the row leaves the copy's storage deferred.
+    # The drop is searched for only inside that visit lambda (the call to its closing "});"), so a drop elsewhere
+    # cannot stand in for it.
     drain_walk = body.find("ggml_sycl::vector_compact_visit(deferred_frees_,")
-    drain_drop = re.compile(r"released\.push_back\(std::move\(entry\)\);\s*return true;").search(
-        body, max(drain_walk, 0))
-    drain = drain_drop.start() if drain_walk >= 0 and drain_drop is not None else -1
+    drain_end = body.find("});", drain_walk) if drain_walk >= 0 else -1
+    drain_drop = (re.compile(r"released\.push_back\(std::move\(entry\)\);\s*return true;").search(
+        body, drain_walk, drain_end) if drain_end >= 0 else None)
+    drain = drain_drop.start() if drain_drop is not None else -1
     finalize = body.find("finalize_retired_entries_locked();")
     if min(wait, drain, finalize) < 0 or not wait < finalize < drain:
         found.append("a yield returns before the retired copies' storage is back in its zone")

@@ -1,5 +1,6 @@
 // The in-place compaction the unified cache's deferred-free walks drop their ready entries with: one pass, each kept
-// element moves at most once, survivors keep their order, and a dropped element is destroyed during its own visit.
+// element moves at most once, survivors keep their order, and a dropped element is destroyed as soon as its visit
+// returns true, before the next element is visited.
 // ggml-sycl/vector-compact.hpp is SYCL-free, so this links nothing and opens no device.
 #include "ggml-sycl/vector-compact.hpp"
 
@@ -101,6 +102,7 @@ static int test_empty_vector() {
 }
 
 static int test_mixed_keep_drop() {
+    g_stats              = {};
     std::vector<probe> v = make_probes(10);
     std::vector<int>   visited;
     const size_t       dropped = ggml_sycl::vector_compact_visit(v, [&](probe & p) {
@@ -114,6 +116,7 @@ static int test_mixed_keep_drop() {
     for (size_t i = 0; i < want.size(); ++i) {
         CHECK(v[i].id == want[i] && v[i].live, "the survivors keep their relative order");
     }
+    CHECK(g_stats.destroyed_live == std::vector<int>({ 0, 3, 6, 9 }), "the drops alone are destroyed, in order");
     return 0;
 }
 
@@ -185,7 +188,9 @@ static int test_linear_moves() {
             return p.id % 2 == 0;
         });
         CHECK(visits == (size_t) n && dropped == (size_t) n / 2, "alternating drop visits all and drops half");
-        CHECK(moves() <= 2 * (size_t) n, "alternating drop moves O(n) times, not O(n^2)");
+        // Each drop is move-constructed out once; each survivor but the first is move-assigned down once.
+        CHECK(g_stats.move_constructs == (size_t) n / 2 && g_stats.move_assigns == (size_t) n / 2,
+              "alternating drop moves each element once: n/2 constructs and n/2 assigns, not O(n^2)");
         CHECK(g_stats.assigns_onto_live == 0, "a kept element never lands on a live element");
         CHECK(g_stats.destroyed_live.size() == (size_t) n / 2, "each drop is destroyed once");
         CHECK(v.size() == (size_t) n / 2, "half survive");
@@ -198,7 +203,8 @@ static int test_linear_moves() {
         g_stats              = {};
         const size_t dropped = ggml_sycl::vector_compact_visit(v, [](probe &) { return true; });
         CHECK(dropped == (size_t) n && v.empty(), "all-drop empties the vector");
-        CHECK(moves() <= 2 * (size_t) n, "all-drop moves O(n) times");
+        CHECK(g_stats.move_constructs == (size_t) n && g_stats.move_assigns == 0,
+              "all-drop moves each element out once and assigns nothing");
         CHECK(g_stats.destroyed_live.size() == (size_t) n, "all-drop destroys every element once");
     }
     {
@@ -240,6 +246,42 @@ static int test_visit_throws() {
     return 0;
 }
 
+// The documented limit of the throw guarantee: a visit that moves the element out and then throws leaves the
+// moved-from shell in its slot, so a visitor that moves out must do so as its last step.
+static int test_visit_moves_out_then_throws() {
+    const int          n = 10;
+    const int          k = 6;
+    std::vector<probe> v = make_probes(n);
+    std::vector<probe> sink;
+    sink.reserve(1);
+    g_stats    = {};
+    bool threw = false;
+    try {
+        ggml_sycl::vector_compact_visit(v, [&](probe & p) {
+            if (p.id == k) {
+                sink.push_back(std::move(p));
+                throw std::runtime_error("visit failed after moving its element out");
+            }
+            return p.id % 2 == 0;  // drop 0, 2, 4 before k
+        });
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    CHECK(threw, "the exception from visit propagates");
+    CHECK(sink.size() == 1 && sink[0].id == k && sink[0].live, "visit took element k out before it threw");
+    const std::vector<int> want = { 1, 3, 5, k, 7, 8, 9 };
+    CHECK(v.size() == want.size(), "the survivors before k, the shell at k, then the tail");
+    for (size_t i = 0; i < want.size(); ++i) {
+        CHECK(v[i].id == want[i], "survivors before k compacted, then the shell, then the tail in order");
+        CHECK(v[i].live == (want[i] != k), "only the slot visit moved out of holds a moved-from shell");
+    }
+    for (size_t i = 4; i < want.size(); ++i) {
+        CHECK(v[i].payload == want[i], "the tail after k is untouched");
+    }
+    CHECK(g_stats.destroyed_live == std::vector<int>({ 0, 2, 4 }), "each drop before k was destroyed once");
+    return 0;
+}
+
 int main() {
     int (*const tests[])() = { test_empty_vector,
                                test_mixed_keep_drop,
@@ -247,7 +289,8 @@ int main() {
                                test_drop_destroyed_before_next_visit,
                                test_drop_may_move_element_out,
                                test_linear_moves,
-                               test_visit_throws };
+                               test_visit_throws,
+                               test_visit_moves_out_then_throws };
     for (int (*t)() : tests) {
         if (t() != 0) {
             return 1;

@@ -17261,7 +17261,8 @@ void unified_cache::process_deferred_frees_locked() {
     // Both walks compact in place rather than erase each ready entry from the
     // middle: one evict boundary can make thousands ready at once, and an erase
     // per entry moves every later entry, O(n^2) moves on this thread. Each
-    // dropped entry is still destroyed during its own visit, under these locks.
+    // dropped entry is still destroyed as soon as its visit returns true,
+    // before the next entry is visited, under these locks.
     ggml_sycl::vector_compact_visit(deferred_frees_, [this](deferred_free_entry & entry) {
         const bool ready = !entry.has_event || event_complete(entry.event);
         if (!ready) {
