@@ -1667,6 +1667,123 @@ class DnnlGemmWrapper {
         }
         return q->ext_oneapi_submit_barrier(per_batch_events);
     }
+
+    // One 3-D primitive over batch_size experts: src {B,M,K} f16 strides {stride_a,K,1}; weights f4_e2m1 {B,K,N} strides
+    // {K*N,1,K} (stored order, dense, Task 26a woq-3d-ba-diag); scales f16 {B,K/16,N} strides {(K/16)*N,N,1}, mask 7,
+    // groups {16,1}; dst {B,M,N} strides {stride_c,N,1}. Returns nullopt when the scratchpad is declined.
+    // The weight and scale planes are the ones repack_nvfp4_to_woq_nk_batched (convert.hpp) writes. The scale groups
+    // are two entries, as the C API's "0 or 2" asks: the MXFP4 opt-in 3-D arm above passes three. A caller checks
+    // woq_nvfp4_library_ok() before it commits a weight to this layout.
+    [[nodiscard]] static std::optional<sycl::event> woq_gemm_batch_nvfp4(ggml_backend_sycl_context &      ctx,
+                                                                         int                              m,
+                                                                         int                              n,
+                                                                         int                              k,
+                                                                         const void *                     a,
+                                                                         dt                               at,
+                                                                         int64_t                          stride_a,
+                                                                         const void *                     b_nibbles,
+                                                                         const sycl::half *               b_scales,
+                                                                         void *                           c,
+                                                                         dt                               ct,
+                                                                         int64_t                          stride_c,
+                                                                         int                              batch_size,
+                                                                         const queue_ptr &                q,
+                                                                         const std::vector<sycl::event> & deps = {}) {
+        constexpr int64_t group_size = 16;  // NVFP4's E4M3 scale covers 16 values
+        if (m <= 0 || n <= 0 || k <= 0 || batch_size <= 0 || (k % 64) != 0) {
+            throw std::runtime_error("woq_gemm_batch_nvfp4: invalid dims (k must be a multiple of 64)");
+        }
+        if (dt_size_bytes(at) == 0 || dt_size_bytes(ct) == 0) {
+            throw std::runtime_error("woq_gemm_batch_nvfp4: unsupported activation/output dtype");
+        }
+        const int64_t K      = k;
+        const int64_t N      = n;
+        const int64_t groups = K / group_size;
+        const int     mask   = (1 << 0) | (1 << 1) | (1 << 2);
+
+        std::lock_guard<std::mutex> lock(exec_mutex(q));
+        auto                        stream = ctx.stream_dnnl(q);
+        auto                        eng    = ctx.engine_dnnl(q);
+        auto &                      cache  = get_dnnl_primitive_cache();
+
+        const dnnl::memory::desc a_md({ batch_size, m, K }, at, { stride_a, K, 1 });
+        const dnnl::memory::desc b_md({ batch_size, K, N }, dt::f4_e2m1, { K * N, 1, K });
+        const dnnl::memory::desc s_md({ batch_size, groups, N }, dt::f16, { groups * N, N, 1 });
+        const dnnl::memory::desc c_md({ batch_size, m, N }, ct, { stride_c, N, 1 });
+
+        dnnl::primitive_attr attr;
+        ggml_sycl_dnnl_attr_set_reproducible(attr);
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        attr.set_scales(DNNL_ARG_WEIGHTS, mask, { group_size, 1 }, dt::f16);
+#    ifdef GGML_SYCL_F16
+        attr.set_fpmath_mode(dnnl::fpmath_mode::f16, /* apply_to_int = */ true);
+#    endif
+
+        DnnlPrimitiveKey key{};
+        key.m               = m;
+        key.n               = n;
+        key.k               = k;
+        key.batches_a       = batch_size;
+        key.batches_b       = batch_size;
+        key.at              = at;
+        key.bt              = dt::f4_e2m1;
+        key.ct              = ct;
+        key.stra0           = stride_a;
+        key.stra1           = K;
+        key.stra2           = 1;
+        key.strb0           = K * N;
+        key.strb1           = 1;
+        key.strb2           = K;
+        key.strc0           = stride_c;
+        key.strc1           = N;
+        key.ldc             = n;
+        key.batch_size      = batch_size;
+        key.variant         = 6;  // woq_gemm_batch_nvfp4: stored-order weights, f16 grouped scales
+        key.woq_group_size  = group_size;
+        key.woq_scales_mask = mask;
+        key.woq_zp_mask     = 0;
+
+        const DnnlCachedPrimitive * cached = cache.get_or_create(key, eng, a_md, b_md, c_md, attr);
+        if (!cached) {
+            throw std::runtime_error("woq_gemm_batch_nvfp4: primitive creation failed");
+        }
+
+        auto scratchpad_mem = ctx.get_scratchpad_mem(cached->scratchpad_md, eng, q);
+        if (ggml_sycl_scratchpad_declined(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_NVFP4_BATCH, scratchpad_mem,
+                                          cached->scratchpad_md)) {
+            return std::nullopt;
+        }
+        ggml_sycl_dnnl_note_engaged(GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_NVFP4_BATCH);
+
+        std::unordered_map<int, dnnl::memory> args;
+        args.insert({ DNNL_ARG_SRC, dnnl::memory(a_md, eng, const_cast<void *>(a)) });
+        args.insert({ DNNL_ARG_WEIGHTS, dnnl::memory(b_md, eng, const_cast<void *>(b_nibbles)) });
+        args.insert({ DNNL_ARG_DST, dnnl::memory(c_md, eng, c) });
+        args.insert(
+            { DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, dnnl::memory(s_md, eng, const_cast<sycl::half *>(b_scales)) });
+        if (cached->scratchpad_md.get_size() > 0) {
+            args.insert({ DNNL_ARG_SCRATCHPAD, scratchpad_mem });
+        }
+        ggml_sycl_profile_label gemm_label{};
+        gemm_label.name       = "nvfp4.pp.gemm.execute";
+        gemm_label.category   = "nvfp4.pp.gemm";
+        gemm_label.queue_kind = "compute";
+        gemm_label.metadata   = "arm=3d-nk";
+        gemm_label.device     = ctx.device;
+        return ggml_sycl_profile_submit(*q, gemm_label, [&](sycl::queue &) {
+            return dnnl::sycl_interop::execute(cached->primitive, stream, args, deps);
+        });
+    }
+
+    // Whether the loaded oneDNN computes this form right: dnnl_version() at least 3.13 (Task 26a measured 3.13.2; Task
+    // 4nlr found 3.11.4 computing transposed sub-byte weights wrong). Read once.
+    static bool woq_nvfp4_library_ok() {
+        static const bool ok = [] {
+            const dnnl_version_t * v = dnnl_version();
+            return v->major > 3 || (v->major == 3 && v->minor >= 13);
+        }();
+        return ok;
+    }
 };
 
 #endif

@@ -3194,8 +3194,8 @@ ggml_sycl_ready_query_census & ggml_sycl_ready_query_census_this_thread() {
 // --- Scratchpad decline seam (llama.cpp-23mk S3-3) ---
 namespace {
 const char * const g_scratchpad_site_names[GGML_SYCL_SCRATCHPAD_SITE_COUNT] = {
-    "dnnl_softmax",  "dnnl_eltwise",  "dnnl_binary_row", "dnnl_gemm",
-    "dnnl_woq_q8_0", "dnnl_woq_q4_0", "dnnl_gemm_batch", "dnnl_woq_mxfp4_batch",
+    "dnnl_softmax",    "dnnl_eltwise",         "dnnl_binary_row",      "dnnl_gemm", "dnnl_woq_q8_0", "dnnl_woq_q4_0",
+    "dnnl_gemm_batch", "dnnl_woq_mxfp4_batch", "dnnl_woq_nvfp4_batch",
 };
 
 #if defined(GGML_SYCL_PRIVATE_TESTING)
