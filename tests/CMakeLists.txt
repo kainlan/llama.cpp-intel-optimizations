@@ -786,6 +786,29 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     )
 endif()
 
+# Stored NVFP4 -> stored-order WOQ repack kernel device test (Inkling Task
+# 26b-1, llama.cpp-7mub): the production repack_nvfp4_to_woq_nk_batched
+# (ggml-sycl/convert.cpp/.hpp) must write the nibble and f16 scale planes
+# oneDNN reads as {B,K,N} strides {K*N,1,K}, byte for byte. Links the real
+# ggml-sycl library, as test-sycl-mxfp4-woq-repack above does.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-nvfp4-woq-repack.cpp)
+    set_tests_properties(test-sycl-nvfp4-woq-repack PROPERTIES LABELS "sycl;moe;nvfp4;woq;tdd")
+    target_include_directories(test-sycl-nvfp4-woq-repack PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-nvfp4-woq-repack PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-nvfp4-woq-repack PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-nvfp4-woq-repack PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-nvfp4-woq-repack PRIVATE "-fsycl")
+        target_link_options(test-sycl-nvfp4-woq-repack PRIVATE "-fsycl")
+    endif()
+    # Pin off the measurement card -- see test-sycl-mxfp4-woq-repack above.
+    set_tests_properties(test-sycl-nvfp4-woq-repack PROPERTIES
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+    )
+endif()
+
 # XMX_TILED MXFP4 -> WOQ repack kernel device test (perf-recovery epic, track
 # C2b Option T, llama.cpp-ntfx): the production repack_mxfp4_xmx_tiled_to_woq
 # (ggml-sycl/convert.cpp/.hpp) must invert the tiled materializer's byte

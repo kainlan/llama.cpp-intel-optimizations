@@ -2708,6 +2708,110 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
     });
 }
 
+// Stored NVFP4 -> stored-order WOQ planes (Inkling Task 26b-1, llama.cpp-7mub). One work-item per 64-element
+// block_nvfp4 of a launch slot: it reads the block's 36 bytes and writes 32 nibble bytes and 4 f16 scales. Work-item i
+// of a slot is block i of the expert's row-major block array, so n = i / blocks_per_row and ib = i % blocks_per_row,
+// and row n's 64 elements of block ib land at byte (n*K + ib*64)/2 = i*32 of the slot's nibble plane: the reorder is a
+// shuffle inside each 16-element sub-block and no transpose. Stored sub-block sb holds qs[sb*8 + j], element j (j < 8)
+// in the low nibble and element j+8 in the high nibble; output byte t holds elements 2t (low) and 2t+1 (high). The 4
+// scales go to (4*ib + sb)*N + n, strided by N: 8 of the 40 bytes a work-item writes. srcs, dst_nibbles and dst_scales
+// are already offset to the launch's first slot; slot is the slot's index within the launch.
+static void repack_nvfp4_to_woq_nk_batched_kernel(mxfp4_woq_repack_src_table srcs,
+                                                  uint8_t * __restrict__ dst_nibbles,
+                                                  sycl::half * __restrict__ dst_scales,
+                                                  size_t                   nibble_slot_bytes,
+                                                  size_t                   scale_slot_halves,
+                                                  int64_t                  blocks_per_row,
+                                                  int64_t                  n_rows,
+                                                  int64_t                  blocks_per_slot,
+                                                  const sycl::nd_item<3> & item) {
+    const int64_t i = static_cast<int64_t>(item.get_global_id(2));
+    if (i >= blocks_per_slot) {
+        return;
+    }
+    const size_t        slot = item.get_group(1);
+    const int64_t       n    = i / blocks_per_row;
+    const int64_t       ib   = i % blocks_per_row;
+    const block_nvfp4 * blk  = static_cast<const block_nvfp4 *>(srcs.ptr[slot]) + i;
+
+    uint64_t * const dst64 =
+        reinterpret_cast<uint64_t *>(dst_nibbles + slot * nibble_slot_bytes + static_cast<size_t>(i) * (QK_NVFP4 / 2));
+#pragma unroll
+    for (int sb = 0; sb < QK_NVFP4 / QK_NVFP4_SUB; ++sb) {
+        const uint8_t * q    = blk->qs + sb * (QK_NVFP4_SUB / 2);
+        uint64_t        word = 0;
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const uint8_t lo = static_cast<uint8_t>((q[2 * t] & 0xf) | ((q[2 * t + 1] & 0xf) << 4));
+            const uint8_t hi = static_cast<uint8_t>((q[2 * t] >> 4) | (q[2 * t + 1] & 0xf0));
+            word |= static_cast<uint64_t>(lo) << (t * 8);
+            word |= static_cast<uint64_t>(hi) << ((t + 4) * 8);
+        }
+        dst64[sb] = word;
+    }
+
+    sycl::half * const scales = dst_scales + slot * scale_slot_halves;
+#pragma unroll
+    for (int sb = 0; sb < QK_NVFP4 / QK_NVFP4_SUB; ++sb) {
+        scales[(ib * (QK_NVFP4 / QK_NVFP4_SUB) + sb) * n_rows + n] =
+            sycl::half(2.0f * ggml_sycl_ue4m3_to_fp32(blk->d[sb]));
+    }
+}
+
+void repack_nvfp4_to_woq_nk_batched(const void * const * srcs,
+                                    int                  n_slots,
+                                    uint8_t *            dst_nibbles,
+                                    sycl::half *         dst_scales,
+                                    int                  k,
+                                    int                  n,
+                                    dpct::queue_ptr      stream,
+                                    int                  device) {
+    GGML_ASSERT(k % QK_NVFP4 == 0);
+    GGML_ASSERT(n > 0);
+    GGML_ASSERT(n_slots > 0);
+    // The nibble stores are uint64_t; every slot's plane starts a multiple of 32 bytes past dst_nibbles because
+    // N*K/2 is, so the base's alignment is the only one to check.
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst_nibbles) % 8 == 0);
+    GGML_ASSERT(reinterpret_cast<uintptr_t>(dst_scales) % 8 == 0);
+
+    const int64_t blocks_per_row    = k / QK_NVFP4;
+    const int64_t blocks_per_slot   = static_cast<int64_t>(n) * blocks_per_row;
+    const size_t  nibble_slot_bytes = static_cast<size_t>(n) * static_cast<size_t>(k) / 2;
+    const size_t  scale_slot_halves = static_cast<size_t>(k / QK_NVFP4_SUB) * static_cast<size_t>(n);
+    constexpr int WG_SIZE           = 64;
+    const int64_t n_groups          = (blocks_per_slot + WG_SIZE - 1) / WG_SIZE;
+
+    // Each launch carries at most GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS source pointers as kernel argument bytes (see
+    // mxfp4_woq_repack_src_table), so a larger slot count runs as several launches, each offset to its first slot.
+    for (int first = 0; first < n_slots; first += GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS) {
+        const int left  = n_slots - first;
+        const int count = left < GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS ? left : GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS;
+        mxfp4_woq_repack_src_table src_table{};
+        for (int i = 0; i < count; ++i) {
+            src_table.ptr[i] = srcs[first + i];
+        }
+        uint8_t * const    nib = dst_nibbles + static_cast<size_t>(first) * nibble_slot_bytes;
+        sycl::half * const sc  = dst_scales + static_cast<size_t>(first) * scale_slot_halves;
+
+        ggml_sycl_profile_label label{};
+        label.name       = "nvfp4.pp.repack.nk";
+        label.category   = "nvfp4.pp.repack";
+        label.queue_kind = "compute";
+        label.metadata   = "form=batched";
+        label.device     = device;
+        (void) ggml_sycl_profile_submit(*stream, label, [&](sycl::queue & profiled_queue) {
+            return profiled_queue.submit([&](sycl::handler & cgh) {
+                cgh.parallel_for(
+                    sycl::nd_range<3>(sycl::range<3>(1, count, n_groups * WG_SIZE), sycl::range<3>(1, 1, WG_SIZE)),
+                    [=](sycl::nd_item<3> item) {
+                        repack_nvfp4_to_woq_nk_batched_kernel(src_table, nib, sc, nibble_slot_bytes, scale_slot_halves,
+                                                              blocks_per_row, n, blocks_per_slot, item);
+                    });
+            });
+        });
+    }
+}
+
 // Host function to launch Q4_0 Coalesced to SoA conversion
 void reorder_q4_0_coalesced_to_soa_sycl(const void *    src,
                                         void *          dst,  // SoA format: [all qs bytes][all d values]
