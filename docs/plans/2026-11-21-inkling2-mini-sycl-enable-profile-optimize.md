@@ -8507,11 +8507,13 @@ This is a register shuffle with no transpose.
      same in both rows.
    Expected nibble bytes come from the two formulas above, computed by hand in a comment. Expected halves are 1.0,
    2.0, 1.0 and 0.0.
-2. A randomized fixture: 3 experts with K 1152 and N 72 (not a multiple of 64), random bytes, two launches forced by
-   calling the entry with `n_slots = 3`. Check it against a CPU mirror that decodes every (k, n) the way
+2. A randomized fixture: 3 experts with K 1152 and N 72 (not a multiple of 64), random bytes, one call with
+   `n_slots = 3` and the sources permuted, so a kernel that ignores the source table fails. Check it against a CPU mirror that decodes every (k, n) the way
    `make_nvfp4_problem` does and places it by the interface formula. The mirror reads the stored order, not the
    kernel's t-formula.
-3. A third case passes 130 slots of K 64 and N 8, to cross `GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS` (128).
+3. A third case passes 130 slots of K 64 and N 8, to cross `GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS` (128). That makes
+   two launches, the only multi-launch case. Slots 128 and 129 must land at their own plane offsets, so that a chunk
+   that restarts its slot index at 0 fails.
 
 Register it as `test-sycl-nvfp4-woq-repack` with labels `sycl;moe;nvfp4;woq;tdd` and
 `ONEAPI_DEVICE_SELECTOR=level_zero:1`, as `:758-776` does. Build it and confirm that it fails to link (no symbol).
