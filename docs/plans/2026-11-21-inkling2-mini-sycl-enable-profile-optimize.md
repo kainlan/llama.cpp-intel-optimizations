@@ -8430,11 +8430,17 @@ extra point, on both cards, before Task 26b-4 starts. Tasks 26b-1 to 26b-3 may s
 - The stored-order primitive needs no scratchpad in user mode: `user_bytes=0` at all 24 points on both cards.
 - The B 32, M 64 timings repeat Task 26a's within 1-3%: ba-diag 8.70 µs gate_up and 4.97 µs down on the B70, and
   21.40 and 12.63 µs on the B50.
-- **Provisional.** The quality re-review found that this XCHECK left the dequant and repack outputs unpoisoned. A
-  coverage gap in both kernels would therefore read as zeros on both sides and pass, so the exact zeros at M 256 are
-  not yet evidence.
-  - The fix poisons the planes and counts zero columns against the expected 3/8.
-  - The rerun on both cards must pass before 26b-4 merges. 26b-4 may be written meanwhile.
+- **Confirmed with poisoned planes (lead, 2026-11-27, `c637e7d47`).** The quality re-review found that the first
+  XCHECK left the dequant and repack outputs unpoisoned. A coverage gap in both kernels would then have read as zeros
+  on both sides and passed.
+  - The fix fills w16, nib, s8 and s16 with 0xff before the kernels run, and counts the all-zero columns against the
+    3/8 of N that the scale-class table expects.
+  - The rerun gives `XCHECK_SUMMARY pass=48 fail=0` on both cards (`inkling/t26a-xchk2-b70-c637e7d47/out.txt` and
+    `inkling/t26a-xchk2-b50-c637e7d47/out.txt`), with no XCHECK-ERROR line.
+  - At every point `zero_cols` is exactly 864 × B of 2304 × B, and `nonfinite=0` and `ref_nonfinite=0`.
+  - The largest `worst_rel` is unchanged, 1.09e-06 on the B70 and 1.28e-06 on the B50. M 256 is still bit-identical,
+    `user_bytes=0` at all 24 points, and the kernel log is clean.
+  - The precondition is met: 26b-4 may merge once its own reviews pass.
 
 **Arithmetic, fixed here.** K is `ne00` and N is `ne01`, and G = K / 16 is the number of scale groups.
 - Per expert:
