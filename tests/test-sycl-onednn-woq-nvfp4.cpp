@@ -41,19 +41,25 @@
 //   NUMERICS <arm> ... PASS|FAIL      the check at B 8, M 32; its verdict is BENCH's numerics= for the whole shape:
 //                                     PASS, BADNUM (ran, check failed) or FAIL (could not be built or run).
 //   BENCH ... timing=BADSPAN          appended when marker2 did not start after marker1 ended: dev_us_per_expert=0.00.
-//   BENCH ... timing=FAIL             appended when the arm threw while timed; its numerics= is still the check's.
+//   BENCH ... timing=FAIL             appended when the arm produced no time (refused, unallocated, or threw while
+//                                     timed); its numerics= is still the check's.
 //   WARN ... device time exceeds wall time   the timestamps of that BENCH line are not trustworthy.
 //   PIPELINE ... ratio=BADNUM         f16-dequant, f16-gemm or woq-repack did not pass at that shape.
 //   PIPELINE ... form=none ratio=nan  no WOQ form passed, or a sum is not a finite time.
-//   XCHECK <arm> shape= B= M= worst_rel= nonfinite= PASS|FAIL   woq-3d-ba-diag and woq-3d-f16s against f16-gemm's dst
-//                                     at every grid point and at (B 1, M 64), (B 32, M 192), (B 32, M 256): the same
-//                                     weights and src, worst column error over the column's largest value, PASS at
-//                                     <= 1e-3 with no non-finite output. XCHECK-ERROR names an arm that could not run.
+//   XCHECK <arm> shape= B= M= worst_rel= nonfinite= ref_nonfinite= zero_cols=<n> of <B*N> PASS|FAIL impl=
+//                                     woq-3d-ba-diag and woq-3d-f16s against f16-gemm's dst at every grid point and at
+//                                     (B 1, M 64), (B 32, M 192), (B 32, M 256): the same weights and src, worst column
+//                                     error over the column's largest value. nonfinite= counts the arm's non-finite
+//                                     output, ref_nonfinite= f16-gemm's; zero_cols= counts the columns both read as all
+//                                     zero, 3 of every 8 when healthy (the 0x00, 0x7f and 0xff scale classes). PASS at
+//                                     <= 1e-3, both counts 0 and no more zero columns than the class table holds.
+//   XCHECK-ERROR <arm> shape= B= M= <why>   before an XCHECK line: the arm, or f16-gemm, could not run
+//                                     (f16-gemm:nonfinite when the reference itself held non-finite output).
 //   SCRATCHPAD woq-3d-ba-diag shape= B= M= user_bytes= impl=   that primitive built in user scratchpad mode
 //                                     (production's; the bench times library mode), not executed.
 //   XCHECK_SUMMARY pass= fail=        the XCHECK totals. XCHECK failures do not change the exit status.
-// woq-repack writes both scale planes, so a form's woq_best pays about 11% of the repack's bytes for the plane that
-// form does not read.
+// woq-repack writes both scale planes, so woq_best pays for the plane its form does not read: about 10% of the repack's
+// bytes when woq_best is an e4m3 form, about 5% when it is an f16-scale form.
 #include "test-skip.h"
 // The attribute production builds with, so the answer is about the primitive the backend would run.
 #include "ggml-sycl/dnnl-deterministic.hpp"
@@ -786,7 +792,8 @@ constexpr const char * k_bench_arm_names[BENCH_ARM_COUNT] = {
 constexpr int k_bench_woq_forms[] = { BENCH_ARM_WOQ_3D_E4M3, BENCH_ARM_WOQ_3D_F16S, BENCH_ARM_WOQ_2D_E4M3,
                                       BENCH_ARM_WOQ_2D_F16S };
 
-// The arms XCHECK holds to f16-gemm: the stored-order diagnostic form and the transposed 3-D f16-scale form.
+// The arms XCHECK holds to f16-gemm: the diagnostic form (n-major, K-contiguous nibbles; its scale plane stays
+// k-major) and the transposed 3-D f16-scale form.
 constexpr int k_xcheck_arms[] = { BENCH_ARM_WOQ_3D_BA_DIAG, BENCH_ARM_WOQ_3D_F16S };
 
 bool bench_arm_f16_scales(int arm) {
@@ -831,7 +838,7 @@ struct bench_point {
     dev_buffer stored;  // B experts of block_nvfp4 rows
     dev_buffer w16;     // f16-dequant's output, f16-gemm's weights
     dev_buffer nib;     // woq-repack's nibble plane
-    dev_buffer nib_nk;  // woq-3d-ba-diag's nibbles, K-contiguous per n, built on the host
+    dev_buffer nib_nk;  // woq-3d-ba-diag's nibbles, n-major and K-contiguous, built on the host
     dev_buffer s8;      // woq-repack's f8_e4m3 scale plane
     dev_buffer s16;     // woq-repack's f16 scale plane
     dev_buffer src;
@@ -916,8 +923,8 @@ woq_form bench_woq_form(int arm) {
 }
 
 // A WOQ arm's descriptors, as make_descs declares them: the 2-D form for one expert, the 3-D form for B experts (B 1
-// included). The diagnostic arm alone declares its weights K-contiguous per n: nibble (b, k, n) at
-// b * K * N + n * K + k.
+// included). The diagnostic arm alone declares its nibbles n-major and K-contiguous, nibble (b, k, n) at
+// b * K * N + n * K + k, while its scale plane stays k-major like every other form's.
 memory_descs bench_woq_descs(int arm, const bench_point & pt, const woq_form & f) {
     const bool  two_d = bench_arm_2d(arm);
     woq_problem dims;
@@ -1229,37 +1236,49 @@ void upload_tiled(sycl::queue & q, void * dst, const std::vector<uint8_t> & expe
 }
 
 // Per column (and expert), the largest |out - ref| over its rows divided by the column's largest |ref|; a column whose
-// ref is exactly 0 must read exactly 0. Entries where either side is not finite are counted and left out.
+// ref is exactly 0 must read exactly 0. Entries where either side is not finite are left out, and the output's are
+// counted (the caller counts the reference's). A column whose ref and out are both exactly 0 on every row, with no
+// entry left out, is a zero column.
 struct xcheck_result {
-    double worst_rel = NAN;
-    int    nonfinite = -1;  // -1: not compared
+    double    worst_rel     = NAN;
+    int       nonfinite     = -1;  // the WOQ arm's output; -1: not compared
+    int       ref_nonfinite = -1;  // f16-gemm's output; -1: not read
+    long long zero_cols     = -1;
 };
 
 xcheck_result xcheck_columns(const std::vector<float> & ref, const std::vector<float> & out, const bench_point & pt) {
     xcheck_result       r;
     std::vector<double> max_ref(pt.N);
+    std::vector<double> max_out(pt.N);
     std::vector<double> max_err(pt.N);
+    std::vector<char>   skipped(pt.N);
     r.worst_rel = 0.0;
     r.nonfinite = 0;
+    r.zero_cols = 0;
     for (int b = 0; b < pt.B; ++b) {
         std::fill(max_ref.begin(), max_ref.end(), 0.0);
+        std::fill(max_out.begin(), max_out.end(), 0.0);
         std::fill(max_err.begin(), max_err.end(), 0.0);
+        std::fill(skipped.begin(), skipped.end(), 0);
         for (int m = 0; m < pt.M; ++m) {
             const size_t row = ((size_t) b * pt.M + m) * pt.N;
             for (int n = 0; n < pt.N; ++n) {
                 const double o = out[row + n];
                 const double f = ref[row + n];
+                r.nonfinite += !std::isfinite(o);
                 if (!std::isfinite(o) || !std::isfinite(f)) {
-                    r.nonfinite++;
+                    skipped[n] = 1;
                     continue;
                 }
                 max_ref[n] = std::max(max_ref[n], std::fabs(f));
+                max_out[n] = std::max(max_out[n], std::fabs(o));
                 max_err[n] = std::max(max_err[n], std::fabs(o - f));
             }
         }
         for (int n = 0; n < pt.N; ++n) {
             const double rel = max_ref[n] == 0.0 ? (max_err[n] == 0.0 ? 0.0 : INFINITY) : max_err[n] / max_ref[n];
             r.worst_rel      = std::max(r.worst_rel, rel);
+            r.zero_cols += !skipped[n] && max_ref[n] == 0.0 && max_out[n] == 0.0;
         }
     }
     return r;
@@ -1270,21 +1289,74 @@ struct xcheck_tally {
     int fail = 0;
 };
 
+// The scale classes whose every byte decodes to 0 (0x00, and 0x7f and 0xff, read as 0), so a column drawn from one
+// has all-zero weights and an all-zero output.
+bool scale_class_reads_zero(int cls) {
+    return cls == SCALE_CLASS_ZERO || cls == SCALE_CLASS_NAN_PATTERN || cls == SCALE_CLASS_SIGNED_NAN_PATTERN;
+}
+
+// The zero columns a point's B experts hold: every expert repeats one of the 8 checked experts, whose columns all take
+// their scale class from col_class.
+long long xcheck_expected_zero_cols(const std::vector<int> & col_class, const bench_point & pt) {
+    long long per_expert = 0;
+    for (int n = 0; n < pt.N; ++n) {
+        per_expert += scale_class_reads_zero(col_class[n]);
+    }
+    return per_expert * pt.B;
+}
+
+// One XCHECK line (after an XCHECK-ERROR line naming what could not run, if anything). More zero columns than the
+// class table holds means some output was never written, so the line fails.
+void report_xcheck(int                   arm,
+                   const bench_shape &   sh,
+                   const bench_point &   pt,
+                   const xcheck_result & r,
+                   long long             expected_zero_cols,
+                   const std::string &   error,
+                   const std::string &   impl,
+                   xcheck_tally &        tally) {
+    if (!error.empty()) {
+        std::printf("XCHECK-ERROR %s shape=%s B=%d M=%d %s\n", k_bench_arm_names[arm], sh.name, pt.B, pt.M,
+                    error.c_str());
+    }
+    if (r.ref_nonfinite > 0) {
+        std::printf("XCHECK-ERROR %s shape=%s B=%d M=%d f16-gemm:nonfinite\n", k_bench_arm_names[arm], sh.name, pt.B,
+                    pt.M);
+    }
+    const bool pass = error.empty() && r.nonfinite == 0 && r.ref_nonfinite == 0 && r.worst_rel <= k_xcheck_tol &&
+                      r.zero_cols >= 0 && r.zero_cols <= expected_zero_cols;
+    std::printf(
+        "XCHECK %s shape=%s B=%d M=%d worst_rel=%.2e nonfinite=%d ref_nonfinite=%d zero_cols=%lld of %lld %s "
+        "impl=%s\n",
+        k_bench_arm_names[arm], sh.name, pt.B, pt.M, r.worst_rel, r.nonfinite, r.ref_nonfinite, r.zero_cols,
+        (long long) pt.B * pt.N, pass ? "PASS" : "FAIL", impl.c_str());
+    std::fflush(stdout);
+    (pass ? tally.pass : tally.fail)++;
+}
+
 // Cross-checks the two 3-D WOQ forms Task 26b chooses between against f16-gemm at one point. All three read the 8
 // checked experts repeated and the same src, so every column must agree with f16-gemm's. The dequant and the repack
-// run first, so a point that was not timed has its planes too; then each arm runs once into a NaN-filled dst that is
-// read back before the next arm runs, so no arm's output stands in for another's.
-void bench_xcheck_point(sycl::queue &        q,
-                        const dnnl::engine & eng,
-                        dnnl::stream &       stream,
-                        const bench_shape &  sh,
-                        bench_point &        pt,
-                        xcheck_tally &       tally) {
+// run first, into poisoned buffers (NaN halves, 0xff planes, whose scales read as NaN), so a point that was not timed
+// has its planes too and a region either kernel skips shows as non-finite output. Then each arm runs once into a
+// NaN-filled dst that is read back before the next arm runs, so no arm's output stands in for another's.
+void bench_xcheck_point(sycl::queue &            q,
+                        const dnnl::engine &     eng,
+                        dnnl::stream &           stream,
+                        const bench_shape &      sh,
+                        bench_point &            pt,
+                        const std::vector<int> & col_class,
+                        xcheck_tally &           tally) {
+    const long long    expected_zero_cols = xcheck_expected_zero_cols(col_class, pt);
     std::vector<float> ref;
+    int                ref_nonfinite = -1;
     std::string        ref_error;
     {
         onednn_arm g;
         try {
+            q.memset(pt.w16.ptr, 0xff, pt.w16_bytes);
+            q.memset(pt.nib.ptr, 0xff, pt.nib_bytes);
+            q.memset(pt.s8.ptr, 0xff, pt.s8_bytes);
+            q.memset(pt.s16.ptr, 0xff, pt.s8_bytes * 2);
             launch_dequant(q, static_cast<const uint8_t *>(pt.stored.ptr), static_cast<uint32_t *>(pt.w16.ptr), pt.B,
                            pt.K, pt.N);
             launch_repack(q, static_cast<const uint8_t *>(pt.stored.ptr), static_cast<uint8_t *>(pt.nib.ptr),
@@ -1292,7 +1364,8 @@ void bench_xcheck_point(sycl::queue &        q,
             q.wait_and_throw();
             g = build_onednn_arm(BENCH_ARM_F16_GEMM, eng, pt);
             if (g.ok) {
-                ref = onednn_arm_read(g, stream, q, pt);
+                ref           = onednn_arm_read(g, stream, q, pt);
+                ref_nonfinite = (int) std::count_if(ref.begin(), ref.end(), [](float v) { return !std::isfinite(v); });
             } else {
                 ref_error = "f16-gemm:" + g.impl;
             }
@@ -1307,10 +1380,12 @@ void bench_xcheck_point(sycl::queue &        q,
     for (const int arm : k_xcheck_arms) {
         xcheck_result r;
         std::string   error = ref_error;
+        std::string   impl  = "-";
         if (error.empty()) {
             onednn_arm a;
             try {
-                a = build_onednn_arm(arm, eng, pt);
+                a    = build_onednn_arm(arm, eng, pt);
+                impl = a.impl;
                 if (a.ok) {
                     r = xcheck_columns(ref, onednn_arm_read(a, stream, q, pt), pt);
                 } else {
@@ -1324,28 +1399,16 @@ void bench_xcheck_point(sycl::queue &        q,
                 error = one_token(std::string("sycl:") + e.what());
             }
         }
-        if (!error.empty()) {
-            std::printf("XCHECK-ERROR %s shape=%s B=%d M=%d %s\n", k_bench_arm_names[arm], sh.name, pt.B, pt.M,
-                        error.c_str());
-        }
-        const bool pass = error.empty() && r.nonfinite == 0 && r.worst_rel <= k_xcheck_tol;
-        std::printf("XCHECK %s shape=%s B=%d M=%d worst_rel=%.2e nonfinite=%d %s\n", k_bench_arm_names[arm], sh.name,
-                    pt.B, pt.M, r.worst_rel, r.nonfinite, pass ? "PASS" : "FAIL");
-        std::fflush(stdout);
-        (pass ? tally.pass : tally.fail)++;
+        r.ref_nonfinite = ref_nonfinite;
+        report_xcheck(arm, sh, pt, r, expected_zero_cols, error, impl, tally);
     }
 }
 
 // A point whose buffers could not be allocated still prints its two XCHECK lines, as failures.
 void bench_xcheck_unallocated(const bench_shape & sh, const bench_point & pt, xcheck_tally & tally) {
     for (const int arm : k_xcheck_arms) {
-        std::printf("XCHECK-ERROR %s shape=%s B=%d M=%d device-allocation-failed\n", k_bench_arm_names[arm], sh.name,
-                    pt.B, pt.M);
-        std::printf("XCHECK %s shape=%s B=%d M=%d worst_rel=nan nonfinite=-1 FAIL\n", k_bench_arm_names[arm], sh.name,
-                    pt.B, pt.M);
-        tally.fail++;
+        report_xcheck(arm, sh, pt, xcheck_result(), 0, "device-allocation-failed", "-", tally);
     }
-    std::fflush(stdout);
 }
 
 // The diagnostic arm's primitive_desc in user scratchpad mode, production's: its scratchpad size and implementation.
@@ -1488,6 +1551,7 @@ int run_bench() {
                             report_bench(arm, sh, pt, bench_timing(), BENCH_VERDICT_FAIL, "device-allocation-failed");
                         }
                         bench_xcheck_unallocated(sh, pt, tally);
+                        bench_report_scratchpad(eng, sh, pt);
                         results.push_back(res);
                         continue;
                     }
@@ -1497,7 +1561,7 @@ int run_bench() {
                         bench_check(*q, eng, stream, sh, pt, chk, chk_f16, verdict);
                     }
                     bench_time_point(*q, eng, stream, sh, pt, verdict, res);
-                    bench_xcheck_point(*q, eng, stream, sh, pt, tally);
+                    bench_xcheck_point(*q, eng, stream, sh, pt, chk.col_class, tally);
                     bench_report_scratchpad(eng, sh, pt);
                     results.push_back(res);
                 }
@@ -1508,17 +1572,18 @@ int run_bench() {
                 bench_point pt(*q, x.B, x.M, sh.K, sh.N);
                 if (!pt.allocated()) {
                     bench_xcheck_unallocated(sh, pt, tally);
+                    bench_report_scratchpad(eng, sh, pt);
                     continue;
                 }
                 bench_upload_point(*q, pt, chk.stored, nk8, src_all.data());
-                bench_xcheck_point(*q, eng, stream, sh, pt, tally);
+                bench_xcheck_point(*q, eng, stream, sh, pt, chk.col_class, tally);
                 bench_report_scratchpad(eng, sh, pt);
             }
         }
 
         // f16 = dequant + gemm; woq_best = repack + the fastest WOQ form whose check passed at this shape. woq-repack
-        // writes both scale planes, so woq_best pays about 11% of the repack's bytes for a plane its form does not
-        // read.
+        // writes both scale planes, so woq_best pays for a plane its form does not read: about 10% of the repack's
+        // bytes when woq_best is an e4m3 form, about 5% when it is an f16-scale form.
         for (const bench_result & r : results) {
             const bench_timing & dq   = r.t[BENCH_ARM_F16_DEQUANT];
             const bench_timing & gemm = r.t[BENCH_ARM_F16_GEMM];
