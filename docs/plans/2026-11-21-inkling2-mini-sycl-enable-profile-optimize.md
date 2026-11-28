@@ -8430,6 +8430,11 @@ extra point, on both cards, before Task 26b-4 starts. Tasks 26b-1 to 26b-3 may s
 - The stored-order primitive needs no scratchpad in user mode: `user_bytes=0` at all 24 points on both cards.
 - The B 32, M 64 timings repeat Task 26a's within 1-3%: ba-diag 8.70 µs gate_up and 4.97 µs down on the B70, and
   21.40 and 12.63 µs on the B50.
+- **Provisional.** The quality re-review found that this XCHECK left the dequant and repack outputs unpoisoned. A
+  coverage gap in both kernels would therefore read as zeros on both sides and pass, so the exact zeros at M 256 are
+  not yet evidence.
+  - The fix poisons the planes and counts zero columns against the expected 3/8.
+  - The rerun on both cards must pass before 26b-4 merges. 26b-4 may be written meanwhile.
 
 **Arithmetic, fixed here.** K is `ne00` and N is `ne01`, and G = K / 16 is the number of scale groups.
 - Per expert:
