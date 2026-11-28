@@ -557,6 +557,11 @@ int main() {
         { GGML_TYPE_Q8_0,   GGML_LAYOUT_COALESCED, true,  true,  false, "Q8_0 COALESCED has no arm"          },
         { GGML_TYPE_IQ4_XS, GGML_LAYOUT_AOS,       false, true,  true,  "IQ4_XS AOS f16 arm"                 },
         { GGML_TYPE_IQ4_XS, GGML_LAYOUT_SOA,       false, true,  false, "IQ4_XS has no SOA dequant"          },
+        // NVFP4's WOQ row picks the arm, never the claim: the claim follows its f16 row under the AOS knob.
+        { GGML_TYPE_NVFP4,  GGML_LAYOUT_AOS,       true,  true,  true,  "NVFP4 AOS, WOQ on"                  },
+        { GGML_TYPE_NVFP4,  GGML_LAYOUT_AOS,       false, true,  true,  "NVFP4 AOS, WOQ off"                 },
+        { GGML_TYPE_NVFP4,  GGML_LAYOUT_AOS,       true,  false, false, "NVFP4 AOS, WOQ on, AOS knob off"    },
+        { GGML_TYPE_NVFP4,  GGML_LAYOUT_SOA,       true,  true,  false, "NVFP4 has no SOA row"               },
     };
 
     for (const auto & c : pp_batched_cases) {
@@ -565,17 +570,177 @@ int main() {
             ++failures;
         }
     }
+    // Which nodes the executor takes does not change for NVFP4 with either WOQ switch: at every (woq, aos) pair it is
+    // its f16 row (AOS) under the AOS knob.
+    for (const ggml_layout_mode layout : all_layouts()) {
+        for (const bool woq : { false, true }) {
+            for (const bool aos : { false, true }) {
+                const bool want = aos && layout == GGML_LAYOUT_AOS;
+                if (moe_pp_batched_supports_layout(GGML_TYPE_NVFP4, layout, woq, aos) != want) {
+                    std::printf(
+                        "FAIL: the executor's NVFP4 claim moved with the WOQ switch: layout=%d woq=%d aos=%d "
+                        "(want %d)\n",
+                        static_cast<int>(layout), woq ? 1 : 0, aos ? 1 : 0, want ? 1 : 0);
+                    ++failures;
+                }
+            }
+        }
+    }
     for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
         const ggml_type type = static_cast<ggml_type>(t);
-        if (moe_pp_batched_woq_supports_layout(type, GGML_LAYOUT_SOA) && type != GGML_TYPE_MXFP4) {
-            std::printf("FAIL: the WOQ arm admits type=%d; it is MXFP4 only\n", t);
-            ++failures;
+        // The WOQ table is exactly MXFP4 on SOA and XMX_TILED, and NVFP4 on AOS.
+        for (const ggml_layout_mode layout : all_layouts()) {
+            const bool want =
+                (type == GGML_TYPE_MXFP4 && (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_XMX_TILED)) ||
+                (type == GGML_TYPE_NVFP4 && layout == GGML_LAYOUT_AOS);
+            const bool got = moe_pp_batched_woq_supports_layout(type, layout);
+            if (got != want) {
+                std::printf(
+                    "FAIL: the WOQ table answers type=%d layout=%d with %d; it is MXFP4 SOA and XMX_TILED, "
+                    "and NVFP4 AOS\n",
+                    t, static_cast<int>(layout), got ? 1 : 0);
+                ++failures;
+            }
         }
         for (const ggml_layout_mode layout : all_layouts()) {
             // GGML_SYCL_MOE_PP_F16_BATCHED_AOS=0 must leave exactly the MXFP4 executor.
             if (moe_pp_batched_supports_layout(type, layout, true, false) && type != GGML_TYPE_MXFP4) {
                 std::printf("FAIL: the AOS knob off still admits type=%d layout=%d\n", t, static_cast<int>(layout));
                 ++failures;
+            }
+        }
+    }
+
+    //    The arm a dispatch the executor took runs (moe_pp_batched_woq_arm_runs): the type's WOQ row under
+    //    GGML_SYCL_MOE_PP_WOQ, and for NVFP4 its own switch as well (GGML_SYCL_MOE_PP_WOQ_NVFP4 and the oneDNN
+    //    version). Every other pair runs the f16 arm.
+    const struct {
+        ggml_type        type;
+        ggml_layout_mode layout;
+        bool             woq_enabled;
+        bool             nvfp4_woq_enabled;
+        bool             want;
+        const char *     name;
+    } pp_woq_arm_cases[] = {
+        { GGML_TYPE_NVFP4, GGML_LAYOUT_AOS,       true,  true,  true,  "NVFP4 AOS, both switches on"        },
+        { GGML_TYPE_NVFP4, GGML_LAYOUT_AOS,       false, true,  false, "NVFP4 AOS, WOQ off"                 },
+        { GGML_TYPE_NVFP4, GGML_LAYOUT_AOS,       true,  false, false, "NVFP4 AOS, NVFP4 switch off"        },
+        { GGML_TYPE_NVFP4, GGML_LAYOUT_SOA,       true,  true,  false, "NVFP4 has no SOA WOQ row"           },
+        { GGML_TYPE_MXFP4, GGML_LAYOUT_SOA,       true,  false, true,  "MXFP4 SOA ignores the NVFP4 switch" },
+        { GGML_TYPE_MXFP4, GGML_LAYOUT_XMX_TILED, true,  true,  true,  "MXFP4 XMX_TILED WOQ arm"            },
+        { GGML_TYPE_MXFP4, GGML_LAYOUT_SOA,       false, true,  false, "MXFP4 SOA with WOQ off"             },
+        { GGML_TYPE_MXFP4, GGML_LAYOUT_AOS,       true,  true,  false, "MXFP4 AOS has no WOQ row"           },
+        { GGML_TYPE_Q4_0,  GGML_LAYOUT_AOS,       true,  true,  false, "Q4_0 AOS runs the f16 arm"          },
+    };
+
+    for (const auto & c : pp_woq_arm_cases) {
+        if (moe_pp_batched_woq_arm_runs(c.type, c.layout, c.woq_enabled, c.nvfp4_woq_enabled) != c.want) {
+            std::printf("FAIL: the WOQ arm choice is wrong for: %s (want %d)\n", c.name, c.want ? 1 : 0);
+            ++failures;
+        }
+    }
+    //    Over every pair and switch setting: the arm runs only on a pair the executor takes with the AOS knob on, only
+    //    for MXFP4 and NVFP4, and the NVFP4 switch turns off NVFP4's arm alone.
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        const ggml_type type = static_cast<ggml_type>(t);
+        for (const ggml_layout_mode layout : all_layouts()) {
+            for (const bool woq : { false, true }) {
+                const bool on  = moe_pp_batched_woq_arm_runs(type, layout, woq, true);
+                const bool off = moe_pp_batched_woq_arm_runs(type, layout, woq, false);
+                if ((on || off) && !moe_pp_batched_supports_layout(type, layout, woq, true)) {
+                    std::printf(
+                        "FAIL: the WOQ arm runs on type=%d layout=%d woq=%d, which the executor does not "
+                        "take\n",
+                        t, static_cast<int>(layout), woq ? 1 : 0);
+                    ++failures;
+                }
+                if ((on || off) && type != GGML_TYPE_MXFP4 && type != GGML_TYPE_NVFP4) {
+                    std::printf("FAIL: the WOQ arm runs for type=%d; it is MXFP4's and NVFP4's\n", t);
+                    ++failures;
+                }
+                if (off != (on && type != GGML_TYPE_NVFP4)) {
+                    std::printf("FAIL: the NVFP4 switch is wrong for type=%d layout=%d woq=%d (on=%d off=%d)\n", t,
+                                static_cast<int>(layout), woq ? 1 : 0, on ? 1 : 0, off ? 1 : 0);
+                    ++failures;
+                }
+            }
+        }
+    }
+
+    //    NVFP4's WOQ planes in the slot (moe_pp_woq_nvfp4_dense_planes): dense, so one oneDNN batch strides by the
+    //    raw plane sizes, with the scale planes from the next 256-byte boundary after the last nibble plane, ending
+    //    inside the per-expert slots the admission asked for (align256 of each plane, per active expert). K 64 and N 3
+    //    make planes of 96 bytes and 12 halves, neither a 256-byte multiple, so a layout that strides by the aligned
+    //    slot sizes fails here; at the device test's and Inkling's shapes the two coincide.
+    {
+        const auto align256 = [](size_t v) {
+            return (v + 255) & ~size_t(255);
+        };
+        moe_pp_woq_nvfp4_planes p;
+        if (!moe_pp_woq_nvfp4_dense_planes(64, 3, 3, &p) || p.nibble_bytes != 96 || p.scale_halves != 12 ||
+            p.scale_offset_bytes != 512 || p.used_bytes != 584) {
+            std::printf(
+                "FAIL: NVFP4 WOQ planes at K 64, N 3, 3 experts: nibble=%zu scale_halves=%zu "
+                "scale_offset=%zu used=%zu (want 96, 12, 512, 584)\n",
+                p.nibble_bytes, p.scale_halves, p.scale_offset_bytes, p.used_bytes);
+            ++failures;
+        }
+        // Inkling's fused gate_up over 128 experts: both planes are 256-byte multiples, so the planes fill the
+        // admission's 3,317,760-byte slots exactly.
+        p = {};
+        if (!moe_pp_woq_nvfp4_dense_planes(2304, 2304, 128, &p) || p.nibble_bytes != 2654208 ||
+            p.scale_halves != 331776 || p.scale_offset_bytes != size_t(2654208) * 128 ||
+            p.used_bytes != size_t(3317760) * 128) {
+            std::printf(
+                "FAIL: NVFP4 WOQ planes at Inkling's gate_up: nibble=%zu scale_halves=%zu scale_offset=%zu "
+                "used=%zu\n",
+                p.nibble_bytes, p.scale_halves, p.scale_offset_bytes, p.used_bytes);
+            ++failures;
+        }
+
+        const struct {
+            size_t       k, n, active;
+            const char * why;
+        } refused[] = {
+            { 32,            8,                  1,        "K not a multiple of one 64-value NVFP4 block" },
+            { 100,           8,                  1,        "K not a multiple of one 64-value NVFP4 block" },
+            { 0,             8,                  1,        "no K"                                         },
+            { 64,            0,                  1,        "no N"                                         },
+            { 64,            8,                  0,        "no active expert"                             },
+            { 64,            SIZE_MAX,           1,        "a nibble plane that overflows"                },
+            { 2048,          768,                SIZE_MAX, "the planes of every expert overflow"          },
+            // 2^64 - 64 nibble bytes: they fit, but not with the 256-byte round-up after them.
+            { SIZE_MAX - 63, 2,                  1,        "no room to round the nibbles up"              },
+            // 16,640,000,000,000,000,000 nibble bytes fit, 4,160,000,000,000,000,000 scale bytes after them do not.
+            { 64,            520000000000000000, 1,        "the scales overflow after the nibbles"        },
+        };
+
+        for (const auto & c : refused) {
+            moe_pp_woq_nvfp4_planes untouched;
+            untouched.used_bytes = 7;
+            if (moe_pp_woq_nvfp4_dense_planes(c.k, c.n, c.active, &untouched) || untouched.used_bytes != 7) {
+                std::printf("FAIL: NVFP4 WOQ planes accepted K %zu, N %zu, %zu experts (%s)\n", c.k, c.n, c.active,
+                            c.why);
+                ++failures;
+            }
+        }
+        for (const size_t k : { size_t(64), size_t(128), size_t(1152), size_t(2048), size_t(2304) }) {
+            for (const size_t n : { size_t(1), size_t(2), size_t(3), size_t(5), size_t(72), size_t(768) }) {
+                for (const size_t active : { size_t(1), size_t(2), size_t(3), size_t(31), size_t(32), size_t(130) }) {
+                    moe_pp_woq_nvfp4_planes q;
+                    const size_t            nibble = n * k / 2;
+                    const size_t            halves = (k / 16) * n;
+                    const size_t            slots  = active * (align256(nibble) + align256(halves * 2));
+                    if (!moe_pp_woq_nvfp4_dense_planes(k, n, active, &q) || q.nibble_bytes != nibble ||
+                        q.scale_halves != halves || q.scale_offset_bytes != align256(active * nibble) ||
+                        q.used_bytes != q.scale_offset_bytes + active * halves * 2 || q.used_bytes > slots) {
+                        std::printf(
+                            "FAIL: NVFP4 WOQ planes at K %zu, N %zu, %zu experts: nibble=%zu scale_halves=%zu "
+                            "scale_offset=%zu used=%zu slots=%zu\n",
+                            k, n, active, q.nibble_bytes, q.scale_halves, q.scale_offset_bytes, q.used_bytes, slots);
+                        ++failures;
+                    }
+                }
             }
         }
     }

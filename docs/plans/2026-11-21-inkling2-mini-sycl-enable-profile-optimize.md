@@ -8113,7 +8113,7 @@ its kernel.
      `table.size() * ne10 * sizeof(sycl::half)`. Use `grid_dims(1, 1, table.size())` and the same
      `pp_copy_work_group_size(ne10)` block. Depend on `{ row_mappings_ready, packed_rows_ready }`. The `act` base is
      `batched_acts`, the packed row 0.
-   - (d) The WOQ fallback repack (the `!woq_repack_batched` branch inside the gather loop) moves into its own
+   - (d) The WOQ fallback repack (the `!mxfp4_repack_batched` branch inside the gather loop) moves into its own
      per-slot loop, unchanged and in the same position: before the gather submit.
    - (e) Replace the scatter loop the same way, with label `moe.pp.stage.scatter` / `mxfp4.pp.stage.scatter`,
      `phase=output_scatter_out`, `bytes = table.size() * ne0 * sizeof(float)` and the `out` base `batched_out`.
