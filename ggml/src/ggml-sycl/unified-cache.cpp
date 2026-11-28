@@ -17323,7 +17323,7 @@ void unified_cache::process_deferred_frees_locked() {
         return true;
     });
 
-    ggml_sycl::vector_compact_visit(deferred_host_frees_, [this](deferred_host_free_entry & entry) {
+    ggml_sycl::vector_compact_visit(deferred_host_frees_, [](deferred_host_free_entry & entry) {
         const bool ready = !entry.has_event || event_complete(entry.event);
         if (!ready) {
             return false;
