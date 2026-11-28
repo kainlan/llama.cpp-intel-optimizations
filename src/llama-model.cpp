@@ -515,8 +515,9 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
         llama_load_measure_shape_resolve(n_ctx_hint, n_ubatch_hint, hparams.n_ctx_train).n_ubatch;
     if (hparams.n_expert > 0 && hparams.n_expert_used_max() > 0) {
         // llama.cpp-sr83 (C3): the batched executor repacks straight to a
-        // {nibbles,e8m0-scales} WOQ shape by default and deletes the f16
-        // dequant (GGML_SYCL_MOE_PP_WOQ default ON, mirrors the same env
+        // {nibbles,e8m0-scales} WOQ shape ({nibbles,f16-scales} for NVFP4)
+        // by default and deletes the f16 dequant (GGML_SYCL_MOE_PP_WOQ
+        // default ON, mirrors the same env
         // read in ggml-sycl.cpp's try_pp_onednn_f16_batched) --
         // size the plan for whichever arm will actually run, or admission
         // refuses every real dispatch (f2bdfbffe's fail-closed contract,

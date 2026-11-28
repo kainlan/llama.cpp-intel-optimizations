@@ -101207,7 +101207,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 if (src0->type == GGML_TYPE_NVFP4) {
                     // Unreachable until Task 26b-4 admits NVFP4 to the WOQ arm.
                     size_t scale_elems_per_expert = 0;
-                    if (!checked_mul(static_cast<size_t>(ne00 / 16), static_cast<size_t>(ne01),
+                    if (!checked_mul(static_cast<size_t>(ne00 / QK_NVFP4_SUB), static_cast<size_t>(ne01),
                                      scale_elems_per_expert) ||
                         !checked_mul(scale_elems_per_expert, sizeof(sycl::half), scale_bytes_per_expert)) {
                         return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);

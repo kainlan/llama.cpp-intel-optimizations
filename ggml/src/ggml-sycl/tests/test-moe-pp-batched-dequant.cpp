@@ -18,10 +18,11 @@
 //     re-entered" (an executor decline that sent a node back to the direct MMID route).
 //
 // The ring is planned the way libllama plans it by default (src/llama-model.cpp): weight slots sized for the MXFP4
-// WOQ arm, about a quarter of every expert in f16. The f16 arm runs in that slot, never a wider one: it groups the
-// active experts to fit it, alternating between the slot's two halves, each group's dequant chained on the GEMMs
-// that last read its half. At this shape the slot holds 8 f16 experts, and every case activates all 32, so a case
-// runs 8 groups of 4 and must name at least three groups; NVFP4's larger slot runs fewer groups (see k_min_groups).
+// WOQ arm (NVFP4 plans f16 scales, so its slot is larger), about a quarter of every expert in f16. The f16 arm runs
+// in that slot, never a wider one: it groups the active experts to fit it, alternating between the slot's two halves,
+// each group's dequant chained on the GEMMs that last read its half. At this shape the slot holds 8 f16 experts, and
+// every case activates all 32, so a case runs 8 groups of 4 and must name at least three groups; NVFP4's larger slot
+// runs fewer groups (see k_min_groups).
 // GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX caps the experts per group. The backend reads it once per process, so the
 // capped cases run in child processes: the test runs itself again as --group-cap N for each N in k_group_caps (1 and
 // 3), each child runs one Q4_0 case at 300 tokens with the cap at N, and that case must name exactly ceil(32 / N)

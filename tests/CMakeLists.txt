@@ -1507,8 +1507,10 @@ if (Python3_Interpreter_FOUND)
     # test-sycl-zone-reset-audit-source's own llama_test_cmd registration
     # further below in this file -- test-sycl-pp-moe-scratch-source.py is
     # NOT a llama_test_cmd precedent, it is registered via a bare add_test
-    # in ggml/src/ggml-sycl/CMakeLists.txt instead). Host-only -- reads two
-    # source files as text, builds nothing, touches no device.
+    # in ggml/src/ggml-sycl/CMakeLists.txt instead). Host-only -- reads four
+    # source files as text (the plan, the backend sizing, the planned-model
+    # fixture and ggml-common.h, for MXFP4's e8m0 and NVFP4's f16 scale
+    # planes), builds nothing, touches no device.
     llama_test_cmd(
         ${Python3_EXECUTABLE}
         NAME test-sycl-woq-slot-formula-source
