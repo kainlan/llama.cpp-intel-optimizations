@@ -149,9 +149,11 @@ constexpr int k_cases =
 constexpr int k_route_log_cap = 96;
 static_assert(k_cases <= k_route_log_cap, "a case past the route log's cap has no success line to count");
 
-// The fewest f16 groups a case's success line may name at the slot's own grouping. The slot holds 8 f16 experts at
-// this shape, so a case runs 8 groups of 4; a slot that held every expert would run one group, and the case fails
-// rather than pass without the chain.
+// The fewest f16 groups a case's success line may name at the slot's own grouping. At this shape the MXFP4-sized slot
+// that every type but NVFP4 plans holds 8 f16 experts, so such a case runs 8 groups of 4. NVFP4 plans a larger slot for
+// its f16 scale plane (983,040 bytes per expert, 10 f16 experts), so its cases run fewer groups, still at least 4 of
+// the 32 experts. A slot that held every expert would run one group, and the case fails rather than pass without the
+// chain.
 constexpr size_t k_min_groups = 3;
 
 // The group caps of the capped cases, one Q4_0 case each, each in its own child process (run_child_case).
