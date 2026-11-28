@@ -12,6 +12,10 @@ Shape both sites must express: nibble plane = align256(N * (K/2)); scale
 plane = align256((K/32) * N); K/32 is QK_MXFP4 in ggml-sycl.cpp and the
 locally-named kMxfp4BlockSize in llama-model.cpp (which does not include
 ggml-common.h). llama.cpp-sr83, quality review coverage gap (a).
+NVFP4 (Task 26b-3) keeps the nibble plane and takes an f16 scale plane:
+align256((K/16) * N * 2), kNvfp4ScaleGroup in llama-model.cpp and
+ne00 / 16 times sizeof(sycl::half) in ggml-sycl.cpp. Every other type keeps
+the K/32 one-byte formula above.
 
 Backend checks are anchored to the sizing region only (between the
 experts_are_tiled declaration, the sizing block's first line, and the
@@ -75,6 +79,19 @@ checks = {
     "ggml-sycl.cpp (sizing region): weight slot is nibble plane + scale plane, nothing else":
         re.search(r"weight_slot_bytes\s*=\s*woq_nibble_slot_bytes\s*\+\s*woq_scale_slot_bytes;", backend)
         is not None,
+    # Task 26b-3: NVFP4 keeps the nibble plane and swaps the scale plane for f16 scales, one per 16-element group
+    # ((K/16) * N * 2 bytes, 256-aligned). Every other type keeps the K/32 one-byte formula checked above.
+    "llama-model.cpp: NVFP4 scale group is 16":
+        re.search(r"kNvfp4ScaleGroup\s*=\s*16\s*;", model) is not None,
+    "llama-model.cpp: NVFP4 scale plane is (K/16) * N f16 halves, 256-aligned":
+        re.search(
+            r"align_up\(\s*\(\s*k\s*/\s*kNvfp4ScaleGroup\s*\)\s*\*\s*n\s*\*\s*sizeof\(\s*ggml_fp16_t\s*\)\s*,"
+            r"\s*256\s*\)", model) is not None,
+    "ggml-sycl.cpp (sizing region): NVFP4 scale plane is (ne00/16) * N, then times sizeof(sycl::half)":
+        re.search(
+            r"checked_mul\(\s*static_cast<size_t>\(\s*ne00\s*/\s*16\s*\)\s*,\s*static_cast<size_t>\(ne01\)\s*,\s*"
+            r"(\w+)\s*\)[\s\S]{0,200}?checked_mul\(\s*\1\s*,\s*sizeof\(sycl::half\)\s*,\s*scale_bytes_per_expert\s*\)",
+            backend) is not None,
 }
 
 failed = sorted(name for name, ok in checks.items() if not ok)

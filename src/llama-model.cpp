@@ -531,6 +531,9 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
         // headers) -- not re-included here to avoid pulling ggml-common.h
         // into this TU; grouped scales are one e8m0 byte per 32-element block.
         constexpr size_t kMxfp4BlockSize = 32;
+        // NVFP4's WOQ scale group: one f16 scale per 16 elements (the
+        // stored-order WOQ planes Task 26b's reorder writes).
+        constexpr size_t kNvfp4ScaleGroup = 16;
         size_t           max_weight_slot = 0;
         size_t           max_k           = 0;
         size_t           max_n           = 0;
@@ -547,11 +550,16 @@ static void llama_model_sycl_populate_inventory(ggml_sycl_tensor_inventory &    
             max_n          = std::max(max_n, n);
             if (pp_woq_enabled_at_plan) {
                 // Must match try_pp_onednn_f16_batched's WOQ-arm
-                // slot layout byte-for-byte: nibbles (k*n/2 bytes) then e8m0
-                // scales ((k/kMxfp4BlockSize)*n bytes), each 256-aligned.
+                // slot layout byte-for-byte: nibbles (k*n/2 bytes) then the
+                // scales, each 256-aligned. NVFP4's scales are f16, one per
+                // kNvfp4ScaleGroup elements; every other type keeps MXFP4's
+                // e8m0 scales ((k/kMxfp4BlockSize)*n bytes).
                 const size_t nibble_bytes = llama_model_sycl_align_up(n * (k / 2), 256);
-                const size_t scale_bytes  = llama_model_sycl_align_up((k / kMxfp4BlockSize) * n, 256);
-                max_weight_slot           = std::max(max_weight_slot, nibble_bytes + scale_bytes);
+                const size_t scale_bytes =
+                    tensor.type == GGML_TYPE_NVFP4 ?
+                        llama_model_sycl_align_up((k / kNvfp4ScaleGroup) * n * sizeof(ggml_fp16_t), 256) :
+                        llama_model_sycl_align_up((k / kMxfp4BlockSize) * n, 256);
+                max_weight_slot = std::max(max_weight_slot, nibble_bytes + scale_bytes);
             } else {
                 max_weight_slot =
                     std::max(max_weight_slot, llama_model_sycl_align_up(k * n * sizeof(ggml_fp16_t), 256));

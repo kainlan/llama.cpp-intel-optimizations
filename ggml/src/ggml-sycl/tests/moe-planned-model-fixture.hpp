@@ -92,8 +92,8 @@ inline std::vector<uint8_t> planned_expert_bytes(const planned_shape & shape, st
 }
 
 // The inventory libllama stages for a planned model: its expert tensors, with the PP MoE ring fields libllama computes
-// for their shape with GGML_SYCL_MOE_PP_WOQ at its default (on): weight slots sized for the MXFP4 WOQ arm, about a
-// quarter of every expert in f16.
+// for their shape with GGML_SYCL_MOE_PP_WOQ at its default (on): weight slots sized for the WOQ arm of the shape's
+// type, about a quarter of every expert in f16.
 struct planned_inventory {
     ggml_sycl_tensor_info        tensors[4]{};
     ggml_sycl_tensor_inventory   inventory{};
@@ -121,8 +121,12 @@ struct planned_inventory {
         inventory.n_ctx         = shape.n_ctx;
         inventory.n_ubatch      = shape.n_ubatch;
 
-        const size_t woq_slot =
-            align_256(size_t(shape.n_out) * (shape.n_in / 2)) + align_256(size_t(shape.n_in / 32) * shape.n_out);
+        // libllama's WOQ slot: the nibble plane, then f16 scales per 16 elements for NVFP4 or one e8m0 byte per 32
+        // for every other type.
+        const size_t woq_scale_bytes = shape.type == GGML_TYPE_NVFP4 ?
+                                           size_t(shape.n_in / 16) * shape.n_out * sizeof(ggml_fp16_t) :
+                                           size_t(shape.n_in / 32) * shape.n_out;
+        const size_t woq_slot        = align_256(size_t(shape.n_out) * (shape.n_in / 2)) + align_256(woq_scale_bytes);
         inventory.pp_moe_onednn_weight_slot_bytes        = woq_slot * shape.n_experts;
         // One scratch row: n_in half floats in, n_out floats out. The backend sizes the activation and output slots
         // from these and the expert counts, so the loader leaves both slots 0 and plans only the weight slot.
