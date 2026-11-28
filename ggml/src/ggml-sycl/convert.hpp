@@ -360,6 +360,21 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(
     dpct::queue_ptr stream,
     int device = -1);
 
+// Stored NVFP4 (block_nvfp4 rows, AOS) of n_slots experts -> the stored-order WOQ planes oneDNN reads as f4_e2m1
+// weights {B,K,N} with strides {K*N,1,K} and f16 scales {B,K/16,N} with strides {(K/16)*N,N,1}:
+//   nibble (k, n) of slot s at byte dst_nibbles + s*(N*K/2) + (n*K + k)/2, even k in the low nibble;
+//   scale  (g, n) of slot s at half  dst_scales  + s*(K/16)*N + g*N + n, value = 2 * ggml_sycl_ue4m3_to_fp32(d)
+//   (ggml_sycl_ue4m3_to_fp32 returns half the E4M3 value; E2M1 codes pass through unchanged).
+// srcs may hold more than GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS entries: the entry launches ceil(n/MAX) times.
+void repack_nvfp4_to_woq_nk_batched(const void * const * srcs,
+                                    int                  n_slots,
+                                    uint8_t *            dst_nibbles,
+                                    sycl::half *         dst_scales,
+                                    int                  k,
+                                    int                  n,
+                                    dpct::queue_ptr      stream,
+                                    int                  device = -1);
+
 // Convert Q4_0 from Coalesced layout to SoA layout (for testing/debugging)
 void reorder_q4_0_coalesced_to_soa_sycl(
     const void * src,
