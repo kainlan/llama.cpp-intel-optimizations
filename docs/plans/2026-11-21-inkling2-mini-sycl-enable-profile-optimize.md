@@ -8769,6 +8769,15 @@ Run in this order, once each, on the merged `feat/inkling2` build:
    - the kernel profile shows `nvfp4.pp.repack.nk` and `nvfp4.pp.gemm.execute` rows and no `moe.pp.dequant.nvfp4`
      row.
 
+   Compare the `nvfp4.pp.repack.nk` row with its byte bound: about 6.3 MB per active expert at K = N = 2304 (36 B
+   read and 40 B written per 64 values), at about 224 GB/s on the B50 and about 608 GB/s on the B70. If the row is
+   more than 2x that bound, file the reorder tiling as a follow-up. The tiling has two parts:
+   - make each work-group a tile of 16 n by 4 ib, stage the tile's scales in local memory, and write them as 32-byte
+     runs along n, as the coalesced MXFP4 scales kernel at convert.cpp:1958 does;
+   - use int32 index math and word loads of `block_nvfp4`.
+   The 26b-1 quality review estimated that the scale plane's 2-byte scatter costs about 1.3-1.5x the bound, and the
+   tiling is not worth doing below 2x.
+
    The output is compared with the Task 25 long-prompt baselines. A difference is expected, because the
    accumulation order changes. Report where it first diverges and whether the text stays coherent.
 5. Perplexity on `inkling/lead/ppl-text.txt`, base and new on the same text. The base is a fresh build at
