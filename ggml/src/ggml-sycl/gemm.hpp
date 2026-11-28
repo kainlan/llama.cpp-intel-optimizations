@@ -1696,10 +1696,10 @@ class DnnlGemmWrapper {
         if (dt_size_bytes(at) == 0 || dt_size_bytes(ct) == 0) {
             throw std::runtime_error("woq_gemm_batch_nvfp4: unsupported activation/output dtype");
         }
-        const int64_t K      = k;
-        const int64_t N      = n;
-        const int64_t groups = K / group_size;
-        const int     mask   = (1 << 0) | (1 << 1) | (1 << 2);
+        const int64_t K          = k;
+        const int64_t N          = n;
+        const int64_t groups     = K / group_size;
+        const int     scale_mask = (1 << 0) | (1 << 1) | (1 << 2);
 
         std::lock_guard<std::mutex> lock(exec_mutex(q));
         auto                        stream = ctx.stream_dnnl(q);
@@ -1714,7 +1714,7 @@ class DnnlGemmWrapper {
         dnnl::primitive_attr attr;
         ggml_sycl_dnnl_attr_set_reproducible(attr);
         attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
-        attr.set_scales(DNNL_ARG_WEIGHTS, mask, { group_size, 1 }, dt::f16);
+        attr.set_scales(DNNL_ARG_WEIGHTS, scale_mask, { group_size, 1 }, dt::f16);
 #    ifdef GGML_SYCL_F16
         attr.set_fpmath_mode(dnnl::fpmath_mode::f16, /* apply_to_int = */ true);
 #    endif
@@ -1740,7 +1740,7 @@ class DnnlGemmWrapper {
         key.batch_size      = batch_size;
         key.variant         = 6;  // woq_gemm_batch_nvfp4: stored-order weights, f16 grouped scales
         key.woq_group_size  = group_size;
-        key.woq_scales_mask = mask;
+        key.woq_scales_mask = scale_mask;
         key.woq_zp_mask     = 0;
 
         const DnnlCachedPrimitive * cached = cache.get_or_create(key, eng, a_md, b_md, c_md, attr);
