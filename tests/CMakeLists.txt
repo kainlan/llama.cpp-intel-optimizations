@@ -727,6 +727,17 @@ endif()
 # fail, and no shipped path relies on an arm yet (the NVFP4 prompt executor runs its F16 arm; the weight-only arm is
 # later work). The lead runs it by hand on the B50 and reads the PROBE lines:
 #   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-onednn-woq-nvfp4
+# With --bench it runs no probe arm and instead times dequant + f16 GEMM against repack + WOQ GEMM at Inkling's expert
+# shapes in device time, printing "NUMERICS <arm> ..." per arm and shape, "BENCH <arm> ..." per arm and grid point and
+# "PIPELINE ..." per shape, B and M (plan Task 26a). A BENCH line ends in "timing=BADSPAN" or "timing=FAIL" when its
+# timing produced no figure, and a "WARN ... device time exceeds wall time" line flags timestamps not to trust; PIPELINE
+# prints "ratio=BADNUM" when an input arm failed its check and "form=none ratio=nan" when no WOQ form passed. At every
+# grid point and at three XCHECK-only points it prints "XCHECK <arm> ... ref_nonfinite= zero_cols=<n> of <B*N>
+# PASS|FAIL impl=" for woq-3d-ba-diag and woq-3d-f16s against f16-gemm's output, after an "XCHECK-ERROR <arm> ..." line
+# when that arm or f16-gemm could not run, and "SCRATCHPAD woq-3d-ba-diag ... user_bytes=" for that primitive in user
+# scratchpad mode, then one "XCHECK_SUMMARY pass= fail=" line; XCHECK failures do not change the exit status. woq-repack
+# writes both scale planes, so woq_best pays for the plane its form does not read: about 10% of the repack's bytes when
+# woq_best is an e4m3 form, about 5% when it is an f16-scale form.
 # Same build shape as test-onednn-woq-mxfp4 above (oneDNN and SYCL only, no backend).
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build(test-sycl-onednn-woq-nvfp4.cpp)
