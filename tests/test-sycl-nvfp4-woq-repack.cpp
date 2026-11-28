@@ -92,8 +92,8 @@ planes mirror(const std::vector<uint8_t> & stored, const std::vector<int> & slot
 }
 
 // Uploads the experts, points slot s at expert slot_expert[s], runs the production entry once, and compares both
-// planes (and their sentinel guard tails) against `want`. Returns 0 on match, 1 on the first mismatch. `got` receives
-// the downloaded planes, guard tails stripped, for callers that check more.
+// planes (and their sentinel guard tails) against `want`. Returns 0 on match, 1 on the first mismatch. The slots in
+// `own_offset_slots` are compared first, each at its own plane offset, so a slot written elsewhere fails by name.
 int run_and_check(sycl::queue &                q,
                   const char *                 label,
                   const std::vector<uint8_t> & stored,
@@ -101,16 +101,18 @@ int run_and_check(sycl::queue &                q,
                   int                          K,
                   int                          N,
                   const planes &               want,
-                  planes *                     got_out = nullptr) {
+                  const std::vector<int> &     own_offset_slots = {}) {
     const int    nb           = K / QK_NVFP4;
     const size_t expert_bytes = (size_t) N * nb * sizeof(block_nvfp4);
     const int    n_slots      = (int) slot_expert.size();
     const size_t nib_bytes    = want.nibbles.size();
     const size_t sc_halves    = want.scales.size();
 
-    uint8_t *    src_dev = (uint8_t *) sycl::malloc_device(stored.size(), q);
-    uint8_t *    nib_dev = (uint8_t *) sycl::malloc_device(nib_bytes + k_guard_bytes, q);
-    sycl::half * sc_dev  = sycl::malloc_device<sycl::half>(sc_halves + k_guard_halves, q);
+    // 64-byte alignment covers the entry's 8-byte asserts on both destination planes.
+    uint8_t *    src_dev = (uint8_t *) sycl::aligned_alloc_device(64, stored.size(), q);
+    uint8_t *    nib_dev = (uint8_t *) sycl::aligned_alloc_device(64, nib_bytes + k_guard_bytes, q);
+    sycl::half * sc_dev =
+        (sycl::half *) sycl::aligned_alloc_device(64, (sc_halves + k_guard_halves) * sizeof(sycl::half), q);
     q.memcpy(src_dev, stored.data(), stored.size()).wait();
     q.memset(nib_dev, k_sentinel_byte, nib_bytes + k_guard_bytes).wait();
     q.memset(sc_dev, k_sentinel_byte, (sc_halves + k_guard_halves) * sizeof(sycl::half)).wait();
@@ -132,6 +134,14 @@ int run_and_check(sycl::queue &                q,
 
     const size_t nib_slot = nib_bytes / n_slots;
     const size_t sc_slot  = sc_halves / n_slots;
+    for (const int s : own_offset_slots) {
+        if (std::memcmp(got_nib.data() + nib_slot * s, want.nibbles.data() + nib_slot * s, nib_slot) != 0 ||
+            std::memcmp(got_sc.data() + sc_slot * s, want.scales.data() + sc_slot * s, sc_slot * sizeof(uint16_t)) !=
+                0) {
+            std::printf("FAIL[%s]: slot %d is not at its own plane offset\n", label, s);
+            return 1;
+        }
+    }
     for (size_t i = 0; i < got_nib.size(); ++i) {
         const uint8_t w = i < nib_bytes ? want.nibbles[i] : k_sentinel_byte;
         if (got_nib[i] != w) {
@@ -147,10 +157,6 @@ int run_and_check(sycl::queue &                q,
                         i / sc_slot, i < sc_halves ? "" : ", guard tail", got_sc[i], w);
             return 1;
         }
-    }
-    if (got_out) {
-        got_out->nibbles.assign(got_nib.begin(), got_nib.begin() + nib_bytes);
-        got_out->scales.assign(got_sc.begin(), got_sc.begin() + sc_halves);
     }
     std::printf("OK[%s]: repack_nvfp4_to_woq_nk_batched matches (%d slots, %zu nibble bytes, %zu scale halves)\n",
                 label, n_slots, nib_bytes, sc_halves);
@@ -234,9 +240,9 @@ int check_randomized(sycl::queue & q) {
 }
 
 // Check 3: 130 slots of K 64 and N 8, crossing GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS (128), so the entry launches
-// twice. Slot s reads expert 129 - s, and each expert's first qs byte is its index, so every slot's planes differ. Beyond
-// the whole-plane comparison, slots 128 and 129 are checked at their own offsets by name: a second launch that restarts
-// its slot index at 0 writes them over slots 0 and 1 and leaves their own offsets as sentinel.
+// twice. Slot s reads expert 129 - s, and each expert's first qs byte is its index, so every slot's planes differ.
+// Before the whole-plane comparison, slots 128 and 129 are checked at their own offsets by name: a second launch that
+// restarts its slot index at 0 writes them over slots 0 and 1 and leaves their own offsets as sentinel.
 int check_crosses_max_slots(sycl::queue & q) {
     constexpr int K       = 64;
     constexpr int N       = 8;
@@ -252,26 +258,20 @@ int check_crosses_max_slots(sycl::queue & q) {
         slot_expert[s] = n_slots - 1 - s;
     }
     const planes want = mirror(stored, slot_expert, K, N);
-    planes       got;
-    if (run_and_check(q, "crosses-max-slots", stored, slot_expert, K, N, want, &got) != 0) {
-        return 1;
-    }
 
-    const size_t nib_slot = (size_t) N * K / 2;
-    const size_t sc_slot  = (size_t) (K / QK_NVFP4_SUB) * N;
+    const size_t     nib_slot = (size_t) N * K / 2;
+    std::vector<int> high_slots;
     for (int s = GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS; s < n_slots; ++s) {
         const int low = s - GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS;
-        if (std::memcmp(got.nibbles.data() + nib_slot * s, want.nibbles.data() + nib_slot * s, nib_slot) != 0 ||
-            std::memcmp(got.scales.data() + sc_slot * s, want.scales.data() + sc_slot * s,
-                        sc_slot * sizeof(uint16_t)) != 0) {
-            std::printf("FAIL[crosses-max-slots]: slot %d is not at its own plane offset\n", s);
-            return 1;
-        }
         if (std::memcmp(want.nibbles.data() + nib_slot * s, want.nibbles.data() + nib_slot * low, nib_slot) == 0) {
             std::printf("FAIL[crosses-max-slots]: fixture slots %d and %d are identical, the offset check is blind\n",
                         s, low);
             return 1;
         }
+        high_slots.push_back(s);
+    }
+    if (run_and_check(q, "crosses-max-slots", stored, slot_expert, K, N, want, high_slots) != 0) {
+        return 1;
     }
     std::printf("OK[crosses-max-slots]: slots %d and %d landed at their own offsets\n",
                 GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS, n_slots - 1);
