@@ -342,9 +342,9 @@ struct ggml_sycl_tensor_inventory {
     size_t                         pp_pipeline_scratch_bytes;
     // Ring-backed PP MoE oneDNN staging planned from the model inventory.
     // The weight slot is sized for every expert in the GEMM's weight form: the WOQ repack (4-bit values and e8m0
-    // scales) by default, or the f16 dequant when GGML_SYCL_MOE_PP_WOQ=0 at load. A type on the executor's f16 arm
-    // stages as many experts in f16 as the slot holds. The activation slot holds f16 input rows and the output slot
-    // f32 output rows.
+    // scales, or f16 scales for NVFP4) by default, or the f16 dequant when GGML_SYCL_MOE_PP_WOQ=0 at load. A type on
+    // the executor's f16 arm stages as many experts in f16 as the slot holds. The activation slot holds f16 input rows
+    // and the output slot f32 output rows.
     // The current PP path serializes slot use, so the default plan reserves one reusable slot.
     size_t                         pp_moe_onednn_weight_slot_bytes;
     // Unused: the loader writes 0 to both, and they stay because the layout static_asserts after this struct pin its

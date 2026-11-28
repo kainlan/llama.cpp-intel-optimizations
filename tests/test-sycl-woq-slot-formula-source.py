@@ -12,6 +12,15 @@ Shape both sites must express: nibble plane = align256(N * (K/2)); scale
 plane = align256((K/32) * N); K/32 is QK_MXFP4 in ggml-sycl.cpp and the
 locally-named kMxfp4BlockSize in llama-model.cpp (which does not include
 ggml-common.h). llama.cpp-sr83, quality review coverage gap (a).
+NVFP4 (Task 26b-3) keeps the nibble plane and takes an f16 scale plane:
+align256((K/16) * N * 2), kNvfp4ScaleGroup in llama-model.cpp and
+ne00 / QK_NVFP4_SUB times sizeof(sycl::half) in ggml-sycl.cpp (QK_NVFP4_SUB
+is 16 in ggml-common.h, read through --common). Every other type keeps the
+K/32 one-byte formula above, as the else of the NVFP4 branch. The type
+selector is pinned with each NVFP4 formula, so a branch keyed on another
+type, or on nothing, fails.
+The planned-model test fixture (moe-planned-model-fixture.hpp) mirrors the
+plan and must carry the same NVFP4 branch.
 
 Backend checks are anchored to the sizing region only (between the
 experts_are_tiled declaration, the sizing block's first line, and the
@@ -35,10 +44,14 @@ root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", default=str(root / "src/llama-model.cpp"))
 parser.add_argument("--backend", default=str(root / "ggml/src/ggml-sycl/ggml-sycl.cpp"))
+parser.add_argument("--fixture", default=str(root / "ggml/src/ggml-sycl/tests/moe-planned-model-fixture.hpp"))
+parser.add_argument("--common", default=str(root / "ggml/src/ggml-common.h"))
 args = parser.parse_args()
 
 model = Path(args.model).read_text()
 backend_full = Path(args.backend).read_text()
+fixture = Path(args.fixture).read_text()
+common = Path(args.common).read_text()
 
 REGION_START = "experts_are_tiled = route_layout == GGML_LAYOUT_XMX_TILED;"
 REGION_END = "weight_slot_bytes     = woq_nibble_slot_bytes + woq_scale_slot_bytes;"
@@ -75,6 +88,40 @@ checks = {
     "ggml-sycl.cpp (sizing region): weight slot is nibble plane + scale plane, nothing else":
         re.search(r"weight_slot_bytes\s*=\s*woq_nibble_slot_bytes\s*\+\s*woq_scale_slot_bytes;", backend)
         is not None,
+    # Task 26b-3: NVFP4 keeps the nibble plane and swaps the scale plane for f16 scales, one per 16-element group
+    # ((K/16) * N * 2 bytes, 256-aligned). Every other type keeps the K/32 one-byte formula checked above.
+    "llama-model.cpp: NVFP4 scale group is 16":
+        re.search(r"kNvfp4ScaleGroup\s*=\s*16\s*;", model) is not None,
+    "llama-model.cpp: NVFP4 scale plane is (K/16) * N f16 halves, 256-aligned":
+        re.search(
+            r"align_up\(\s*\(\s*k\s*/\s*kNvfp4ScaleGroup\s*\)\s*\*\s*n\s*\*\s*sizeof\(\s*ggml_fp16_t\s*\)\s*,"
+            r"\s*256\s*\)", model) is not None,
+    "ggml-sycl.cpp (sizing region): NVFP4 scale plane is (ne00/QK_NVFP4_SUB) * N, then times sizeof(sycl::half)":
+        re.search(
+            r"checked_mul\(\s*static_cast<size_t>\(\s*ne00\s*/\s*QK_NVFP4_SUB\s*\)\s*,\s*"
+            r"static_cast<size_t>\(ne01\)\s*,\s*(\w+)\s*\)[\s\S]{0,200}?"
+            r"checked_mul\(\s*\1\s*,\s*sizeof\(sycl::half\)\s*,\s*scale_bytes_per_expert\s*\)",
+            backend) is not None,
+    # The selector is pinned to the branch that computes the f16 plane, so keying it on another type fails.
+    "llama-model.cpp: the f16 scale plane is selected by tensor.type == GGML_TYPE_NVFP4":
+        re.search(
+            r"tensor\.type\s*==\s*GGML_TYPE_NVFP4\s*\?\s*"
+            r"llama_model_sycl_align_up\(\s*\(\s*k\s*/\s*kNvfp4ScaleGroup\s*\)",
+            model) is not None,
+    "ggml-sycl.cpp (sizing region): the f16 scale plane is selected by src0->type == GGML_TYPE_NVFP4":
+        re.search(
+            r"if\s*\(\s*src0->type\s*==\s*GGML_TYPE_NVFP4\s*\)\s*\{[\s\S]{0,200}?"
+            r"checked_mul\(\s*static_cast<size_t>\(\s*ne00\s*/\s*QK_NVFP4_SUB\s*\)", backend) is not None,
+    # The MXFP4 K/32 product is the else of the NVFP4 branch, so it never overwrites NVFP4's f16 plane.
+    "ggml-sycl.cpp (sizing region): the K/32 scale plane is the else of the NVFP4 branch":
+        re.search(r"\}\s*else\s+if\s*\(\s*!checked_mul\(\s*static_cast<size_t>\(blocks_per_row\)", backend)
+        is not None,
+    "ggml-common.h: QK_NVFP4_SUB is 16 (matches kNvfp4ScaleGroup)":
+        re.search(r"#define\s+QK_NVFP4_SUB\s+16\b", common) is not None,
+    "moe-planned-model-fixture.hpp: NVFP4 scale plane is (n_in/16) * n_out f16 halves":
+        re.search(
+            r"type\s*==\s*GGML_TYPE_NVFP4\s*\?\s*size_t\(\s*n_in\s*/\s*16\s*\)\s*\*\s*n_out\s*\*\s*"
+            r"sizeof\(\s*ggml_fp16_t\s*\)", fixture) is not None,
 }
 
 failed = sorted(name for name, ok in checks.items() if not ok)

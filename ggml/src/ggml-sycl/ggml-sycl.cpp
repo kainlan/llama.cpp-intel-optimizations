@@ -101191,17 +101191,29 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             if (pp_woq_arm) {
                 // The weight slot holds the two WOQ planes back to back --
-                // nibbles (K*N/2 bytes) then e8m0 scales ((K/QK_MXFP4)*N
-                // bytes), each 256-byte aligned. ~4x smaller than the
-                // f16-arm's dequant slot.
+                // nibbles (K*N/2 bytes) then the scales, each 256-byte
+                // aligned: e8m0 scales ((K/QK_MXFP4)*N bytes) for MXFP4, f16
+                // scales ((K/16)*N halves) for NVFP4. ~4x smaller than the
+                // f16-arm's dequant slot. llama-model.cpp's plan computes the
+                // same slot (tests/test-sycl-woq-slot-formula-source.py).
                 const auto align_up_256 = [](size_t v) -> size_t {
                     return (v + 255) & ~static_cast<size_t>(255);
                 };
                 size_t nibble_bytes_per_expert = 0;
                 size_t scale_bytes_per_expert  = 0;
-                if (!checked_mul(static_cast<size_t>(ne01), static_cast<size_t>(ne00) / 2, nibble_bytes_per_expert) ||
-                    !checked_mul(static_cast<size_t>(blocks_per_row), static_cast<size_t>(ne01),
-                                 scale_bytes_per_expert)) {
+                if (!checked_mul(static_cast<size_t>(ne01), static_cast<size_t>(ne00) / 2, nibble_bytes_per_expert)) {
+                    return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
+                }
+                if (src0->type == GGML_TYPE_NVFP4) {
+                    // Unreachable until Task 26b-4 admits NVFP4 to the WOQ arm.
+                    size_t scale_elems_per_expert = 0;
+                    if (!checked_mul(static_cast<size_t>(ne00 / QK_NVFP4_SUB), static_cast<size_t>(ne01),
+                                     scale_elems_per_expert) ||
+                        !checked_mul(scale_elems_per_expert, sizeof(sycl::half), scale_bytes_per_expert)) {
+                        return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
+                    }
+                } else if (!checked_mul(static_cast<size_t>(blocks_per_row), static_cast<size_t>(ne01),
+                                        scale_bytes_per_expert)) {
                     return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
                 }
                 woq_nibble_slot_bytes = align_up_256(nibble_bytes_per_expert);
