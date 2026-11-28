@@ -188,7 +188,7 @@ static int test_linear_moves() {
             return p.id % 2 == 0;
         });
         CHECK(visits == (size_t) n && dropped == (size_t) n / 2, "alternating drop visits all and drops half");
-        // Each drop is move-constructed out once; each survivor but the first is move-assigned down once.
+        // Each drop is move-constructed out once; slot 0 is dropped, so every survivor is move-assigned down once.
         CHECK(g_stats.move_constructs == (size_t) n / 2 && g_stats.move_assigns == (size_t) n / 2,
               "alternating drop moves each element once: n/2 constructs and n/2 assigns, not O(n^2)");
         CHECK(g_stats.assigns_onto_live == 0, "a kept element never lands on a live element");
