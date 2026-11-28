@@ -8287,9 +8287,9 @@ today. The bench runs these arms, each at every point in the grid below:
    does (`woq_gemm_batch_mxfp4`'s default 2-D loop).
 6. `woq-3d-ba-diag`: diagnostic only. The 3-D f16-scale form with the weights declared `{B,K,N}` with strides
    `{K*N, 1, K}` in nibbles, that is K-contiguous per n, the stored order once blocks are unpacked. Task 4nlr found
-   that on oneDNN 3.11.4 transposed sub-byte weights are accepted and silently compute garbage. So this arm always runs
-   the numerics check, and prints `BADNUM` when the check fails. Nothing may rely on it unless it prints `PASS` at
-   speed.
+   that on oneDNN 3.11.4 transposed sub-byte weights are accepted and silently compute garbage. So this arm never
+   skips the numerics check (run once per shape at B 8, M 32, as below), and prints `BADNUM` when the check fails.
+   Nothing may rely on it unless it prints `PASS` at speed.
 
 **Grid.** Shapes `gate_up` (K 2304, N 2304) and `down` (K 1152, N 2304). M in {32, 64, 128}; the executor pads a
 group's rows to a multiple of 64, so 64 is its common case. B in {8, 32, 128}. Allocate with `sycl::malloc_device`
@@ -8335,7 +8335,7 @@ BENCH <arm> shape=<gate_up|down> B=<b> M=<m> K=<k> N=<n> dev_us_per_expert=<x.xx
 **Acceptance criteria.**
 - `./scripts/sycl-build.sh test-sycl-onednn-woq-nvfp4` builds with no new warning.
 - Without `--bench`, the binary prints the same seven `PROBE` arms as before. The lead checks this on the device.
-- `--bench` prints one `BENCH` line per arm and grid point (7 arms x 2 shapes x 3 M x 3 B = 126) and 18 `PIPELINE`
+- `--bench` prints one `BENCH` line per arm and grid point (8 arms x 2 shapes x 3 M x 3 B = 144) and 18 `PIPELINE`
   lines. It exits 0, or 77 with no GPU.
 - `clang-format-19 --dry-run -Werror tests/test-sycl-onednn-woq-nvfp4.cpp` is clean on the lines you touched.
 - The implementer runs no GPU binary. The lead runs `--bench` once per card.
@@ -8352,6 +8352,52 @@ BENCH <arm> shape=<gate_up|down> B=<b> M=<m> K=<k> N=<n> dev_us_per_expert=<x.xx
 
 **Commit:** `tests: the NVFP4 oneDNN probe gains a --bench mode that times dequant+f16 GEMM against repack+WOQ GEMM at
 Inkling's shapes`, staging `tests/test-sycl-onednn-woq-nvfp4.cpp` and `tests/CMakeLists.txt` only.
+
+**Result (lead, 2026-11-27, `bd31e99f48`, driver 26.44, oneDNN 3.13.2).** Evidence is in
+`inkling/t26a-bench-b70-bd31e99f48/out.txt` and `inkling/t26a-bench-b50-bd31e99f48/out.txt`. Each card printed 144
+`BENCH` and 18 `PIPELINE` lines, and all 144 `BENCH` lines are `numerics=PASS`, `woq-3d-ba-diag` included.
+
+Device µs per expert at B 32, M 64:
+
+| arm | B70 gate_up | B70 down | B50 gate_up | B50 down |
+|-----|------------:|---------:|------------:|---------:|
+| `f16-dequant` (stand-in) | 60.34 | 30.84 | 150.04 | 76.79 |
+| `f16-gemm` | 19.13 | 10.16 | 52.87 | 27.51 |
+| `woq-repack` (transpose) | 18.92 | 10.03 | 50.77 | 26.55 |
+| `woq-3d-e4m3` | 18.19 | 9.61 | 48.88 | 25.20 |
+| `woq-3d-f16s` | 18.29 | 9.58 | 48.22 | 24.91 |
+| `woq-2d-e4m3` | 54.30 | 28.28 | 77.31 | 41.58 |
+| `woq-2d-f16s` | 48.59 | 25.50 | 67.32 | 35.56 |
+| `woq-3d-ba-diag` | **8.69** | **5.01** | **21.38** | **12.58** |
+| `PIPELINE` ratio | 0.467 | 0.479 | 0.488 | 0.493 |
+
+The decision rule is applied as follows:
+- The ratios are 0.467 and 0.479 on the B70 (limit 0.80) and 0.488 and 0.493 on the B50 (limit 1.00). So Task 26b is
+  a WOQ arm, not a fused kernel.
+- `woq-3d-ba-diag` passes numerics and is not just "within 10%" of the best 3-D form. At B 32 and M 64 it is about
+  2x faster on both cards and both shapes. So Task 26b declares the weights in stored order, K-contiguous per n
+  (`{B,K,N}` with strides `{K*N,1,K}`), with f16 scales `[G][N]`. Its repack is a per-block nibble reorder plus a
+  scale widen. It does no transpose.
+
+Three facts that Task 26b must carry:
+- **The 128-row crossover.** At M 128, gate_up, the stored-order form is slower than the transposed 3-D form at every
+  B: 23.12 against 19.12 µs on the B70 (B 128) and 69.66 against 52.03 on the B50. At M 32 and M 64 it is 2.2-4.5x
+  faster. On down it never loses by more than 6%.
+  - The executor pads groups to multiples of 64, and a 512-token ubatch averages 32 rows per expert. So M 64 is the
+    common case, and 26b uses the stored-order form for every group.
+  - The weight has one layout, so 26b cannot switch forms per group without a second repack.
+  - The crossover is a follow-up, recorded under "Tracker tasks owed".
+- **The dequant stand-in is slow.** `f16-dequant` runs at 202-232 GB/s on the B70 and 75-93 GB/s on the B50. In the
+  Task 25 profile, 768.8 GB of production dequant output fits inside the pass, so the production converter must run
+  faster than the stand-in. The `PIPELINE` ratios therefore overstate the gain of the transposed form. Against a
+  dequant at twice the stand-in's speed, the transposed form would land near 0.7-0.8 on the B70.
+  - The stored-order form wins either way. If the reorder costs what the transpose repack costs, it is still
+    27.6 µs against about 49 µs for gate_up on the B70.
+  - So 26b must time the real kernels in the executor profile, with a profiler row for the reorder and one for the
+    WOQ GEMM. It must not reuse the `moe.pp.dequant.<type>` row, which times the wrong event.
+- **The silent-garbage risk is real.** Task 4nlr found that oneDNN 3.11.4 accepts transposed sub-byte weights and
+  computes garbage. 3.13.2 passes here. 26b therefore runs a per-device numerics probe of the exact stored-order
+  descriptor before its first use, and on a failure falls back to today's f16 arm, logged once at WARN.
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
@@ -8718,6 +8764,17 @@ interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkli
   must not be read alone.
 - `llama-bench`'s random tokens gave Inkling 112 t/s where real text gives 92: the bench stays a regression
   instrument, the long arm is the speed that is reported.
+
+*Left by Task 26a (2026-11-27):*
+- **At 128 rows, oneDNN's stored-order NVFP4 form is slower than its transposed form.** On gate_up at M 128 it takes
+  19.9-23.1 µs against 19.1-30.5 µs for the transposed form on the B70, and 47.7-69.7 against 51.5-54.0 on the B50.
+  The B 128 row is the loss on both cards (23.12 against 19.12, 69.66 against 52.03). At M 32 and M 64 the
+  stored-order form is 2.2-4.5x faster. Task 26b uses the stored-order form for every group. Whether a group of 128
+  rows or more is common on a real prompt is unmeasured: read it from 26b's executor profile, which shows the group
+  sizes. If such groups are common, the fix is a oneDNN issue or a kernel of our own, not a second layout.
+- **The NVFP4 experts' WOQ planes are rebuilt for every call.** Task 26b repacks into scratch for each node, as the
+  MXFP4 arm does. If the loaded layout were the WOQ layout, no repack would run. But every consumer, the decode
+  kernels included, would then have to read that layout (one layout per weight). This is `llama.cpp-v8d8`.
 
 ---
 
