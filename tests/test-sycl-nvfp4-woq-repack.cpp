@@ -157,11 +157,25 @@ int run_and_check(sycl::queue &                q,
     const size_t nib_slot = nib_bytes / n_slots;
     const size_t sc_slot  = sc_halves / n_slots;
     for (const int s : own_offset_slots) {
-        if (std::memcmp(got_nib.data() + nib_slot * s, want.nibbles.data() + nib_slot * s, nib_slot) != 0 ||
-            std::memcmp(got_sc.data() + sc_slot * s, want.scales.data() + sc_slot * s, sc_slot * sizeof(uint16_t)) !=
-                0) {
-            std::printf("FAIL[%s]: slot %d is not at its own plane offset\n", label, s);
-            return 1;
+        for (size_t j = 0; j < nib_slot; ++j) {
+            const size_t i = nib_slot * s + j;
+            if (got_nib[i] != want.nibbles[i]) {
+                std::printf(
+                    "FAIL[%s]: slot %d is not at its own plane offset: nibble plane differs at slot byte %zu "
+                    "(plane byte %zu): got=0x%02x want=0x%02x\n",
+                    label, s, j, i, got_nib[i], want.nibbles[i]);
+                return 1;
+            }
+        }
+        for (size_t j = 0; j < sc_slot; ++j) {
+            const size_t i = sc_slot * s + j;
+            if (got_sc[i] != want.scales[i]) {
+                std::printf(
+                    "FAIL[%s]: slot %d is not at its own plane offset: scale plane differs at slot half %zu "
+                    "(plane half %zu): got=0x%04x want=0x%04x\n",
+                    label, s, j, i, got_sc[i], want.scales[i]);
+                return 1;
+            }
         }
     }
     for (size_t i = 0; i < got_nib.size(); ++i) {

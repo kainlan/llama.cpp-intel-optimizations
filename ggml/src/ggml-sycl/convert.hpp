@@ -365,7 +365,7 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(
 //   nibble (k, n) of slot s at byte dst_nibbles + s*(N*K/2) + (n*K + k)/2, even k in the low nibble;
 //   scale  (g, n) of slot s at half  dst_scales  + s*(K/16)*N + g*N + n, value = 2 * ggml_sycl_ue4m3_to_fp32(d)
 //   (ggml_sycl_ue4m3_to_fp32 returns half the E4M3 value; E2M1 codes pass through unchanged).
-// srcs may hold more than GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS entries: the entry launches ceil(n/MAX) times.
+// srcs may hold more than GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS entries: the entry launches ceil(n_slots/MAX) times.
 void repack_nvfp4_to_woq_nk_batched(const void * const * srcs,
                                     int                  n_slots,
                                     uint8_t *            dst_nibbles,

@@ -2714,8 +2714,8 @@ void repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(const void * const * srcs,
 // and row n's 64 elements of block ib land at byte (n*K + ib*64)/2 = i*32 of the slot's nibble plane: the reorder is a
 // shuffle inside each 16-element sub-block and no transpose. Stored sub-block sb holds qs[sb*8 + j], element j (j < 8)
 // in the low nibble and element j+8 in the high nibble; output byte t holds elements 2t (low) and 2t+1 (high). The 4
-// scales go to (4*ib + sb)*N + n, strided by N (1/9 of the bytes written). srcs, dst_nibbles and dst_scales are
-// already offset to the launch's first slot; slot is the slot's index within the launch.
+// scales go to (4*ib + sb)*N + n, strided by N: 8 of the 40 bytes a work-item writes. srcs, dst_nibbles and dst_scales
+// are already offset to the launch's first slot; slot is the slot's index within the launch.
 static void repack_nvfp4_to_woq_nk_batched_kernel(mxfp4_woq_repack_src_table srcs,
                                                   uint8_t * __restrict__ dst_nibbles,
                                                   sycl::half * __restrict__ dst_scales,
