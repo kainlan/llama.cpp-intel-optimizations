@@ -17,9 +17,10 @@
 //   the moved-from shell is then what is destroyed, so T's moved-from state must be safe to destroy and to assign over.
 // - If visit throws at element i, v is valid when the exception propagates: the survivors of [0, i) in order, then
 //   elements [i, n) as they were (element i as visit left it), with no moved-from element left behind.
-// Requires T's move constructor and move assignment not to throw: the closing erase runs in a destructor, during the
-// unwinding when visit throws.
+// Requires T's move constructor and move assignment not to throw (checked at compile time): the closing erase runs in a
+// destructor, during the unwinding when visit throws.
 #include <cstddef>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -27,6 +28,10 @@ namespace ggml_sycl {
 
 template <typename T, typename Alloc, typename Visit>
 size_t vector_compact_visit(std::vector<T, Alloc> & v, Visit && visit) {
+    static_assert(std::is_nothrow_move_constructible<T>::value && std::is_nothrow_move_assignable<T>::value,
+                  "vector_compact_visit needs noexcept moves: the gap-closing erase runs in a destructor, so a move "
+                  "that throws while an exception from visit unwinds would call std::terminate");
+
     // Elements [0, w) are the survivors so far; [w, i) are moved-from shells. The guard erases the shells on every
     // exit, normal or by an exception from visit, so the vector never holds one. A catch-and-rethrow would do the same
     // on the throwing path, but a destructor covers both paths with one statement.
