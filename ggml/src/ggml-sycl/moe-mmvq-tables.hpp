@@ -393,18 +393,25 @@ struct moe_pp_woq_nvfp4_planes {
     size_t used_bytes;          // the end of the last scale plane, bytes from the slot's start
 };
 
+// NVFP4's values per block (QK_NVFP4) and per f16 scale (QK_NVFP4_SUB). This header does not include ggml-common.h,
+// so it names them itself; the executor static_asserts that the two spellings agree.
+constexpr size_t moe_pp_woq_nvfp4_block       = 64;
+constexpr size_t moe_pp_woq_nvfp4_scale_group = 16;
+static_assert(moe_pp_woq_nvfp4_block % moe_pp_woq_nvfp4_scale_group == 0 && moe_pp_woq_nvfp4_scale_group >= 4,
+              "a row's f16 scales take at most its nibble bytes, so the nibble planes' overflow checks bound them");
+
 inline bool moe_pp_woq_nvfp4_dense_planes(size_t k, size_t n, size_t active, moe_pp_woq_nvfp4_planes * out) {
-    constexpr size_t block       = 64;  // QK_NVFP4: values per NVFP4 block
-    constexpr size_t scale_group = 16;  // QK_NVFP4_SUB: values per f16 scale
-    if (out == nullptr || k == 0 || k % block != 0 || n == 0 || active == 0) {
+    if (out == nullptr || k == 0 || k % moe_pp_woq_nvfp4_block != 0 || n == 0 || active == 0) {
         return false;
     }
-    if (n > SIZE_MAX / (k / 2) || n > SIZE_MAX / (k / scale_group)) {
+    // A row's scales are (k / 16) * 2 bytes against its k / 2 nibble bytes, so a product that bounds the nibble
+    // planes bounds the scale planes too.
+    if (n > SIZE_MAX / (k / 2)) {
         return false;
     }
     const size_t nibble_bytes = n * (k / 2);
-    const size_t scale_halves = (k / scale_group) * n;
-    if (scale_halves > SIZE_MAX / 2 || active > SIZE_MAX / nibble_bytes || active > SIZE_MAX / (scale_halves * 2)) {
+    const size_t scale_halves = (k / moe_pp_woq_nvfp4_scale_group) * n;
+    if (active > SIZE_MAX / nibble_bytes) {
         return false;
     }
     const size_t nibbles = active * nibble_bytes;
@@ -421,8 +428,9 @@ inline bool moe_pp_woq_nvfp4_dense_planes(size_t k, size_t n, size_t active, moe
 
 // The one question both gates ask. woq_enabled is GGML_SYCL_MOE_PP_WOQ; aos_enabled is
 // GGML_SYCL_MOE_PP_F16_BATCHED_AOS, which set to 0 drops every non-MXFP4 entry (the SOA ones too, despite
-// the name) and so restricts the executor to MXFP4 as it was before llama.cpp-348c. The WOQ row admits MXFP4 only:
-// NVFP4 is claimed through its f16 row under aos_enabled, whichever arm then runs it, so its switch moves no claim.
+// the name) and so restricts the executor to MXFP4 as it was before llama.cpp-348c. This function's WOQ branch counts
+// for MXFP4 alone, although NVFP4 has a WOQ row too: NVFP4 is claimed through its f16 row under aos_enabled,
+// whichever arm then runs it, so its switch moves no claim.
 inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
                                            enum ggml_layout_mode layout,
                                            bool                  woq_enabled,

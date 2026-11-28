@@ -101268,12 +101268,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     // oneDNN's 3-D GEMM steps from one expert to the next by one nibble and one scale stride, so
                     // NVFP4's planes are dense, every nibble plane and then every scale plane, and they end inside
                     // the per-expert slots asked for above.
-                    static_assert(QK_NVFP4 == 64 && QK_NVFP4_SUB == 16,
-                                  "moe_pp_woq_nvfp4_dense_planes counts 64-value blocks and 16-value scale groups");
+                    // moe-mmvq-tables.hpp does not include ggml-common.h, so it names NVFP4's block and scale group
+                    // itself; this is where its names meet ggml-common.h's.
+                    static_assert(QK_NVFP4 == moe_pp_woq_nvfp4_block && QK_NVFP4_SUB == moe_pp_woq_nvfp4_scale_group,
+                                  "moe_pp_woq_nvfp4_dense_planes counts NVFP4's blocks and scale groups as ggml does");
                     if (!moe_pp_woq_nvfp4_dense_planes(static_cast<size_t>(ne00), static_cast<size_t>(ne01),
                                                        active_count, &nvfp4_planes)) {
                         return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
                     }
+                    // The dense planes are this admission's own per-expert planes, laid end to end.
+                    GGML_ASSERT(nvfp4_planes.nibble_bytes == nibble_bytes_per_expert &&
+                                nvfp4_planes.scale_halves * sizeof(sycl::half) == scale_bytes_per_expert);
                     GGML_ASSERT(nvfp4_planes.used_bytes <= weight_bytes);
                 }
             } else {
@@ -101511,10 +101516,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             //
             // NVFP4's WOQ repack takes every active expert in one call, whatever their number: its entry launches once
             // per GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS experts itself, so it has no per-slot fallback.
-            const bool woq_repack_batched =
+            const bool mxfp4_repack_batched =
                 pp_woq_arm && !pp_woq_nvfp4 &&
                 active_experts.size() <= static_cast<size_t>(GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
-            if (pp_woq_nvfp4 || woq_repack_batched) {
+            if (pp_woq_nvfp4 || mxfp4_repack_batched) {
                 std::vector<const void *> repack_srcs;
                 repack_srcs.reserve(active_experts.size());
                 for (const pp_onednn_batched_expert & expert : active_experts) {
@@ -101531,22 +101536,19 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     pp_profile_repack_begin.push_back(
                         ggml_sycl_submit_marker<mxfp4_pp_profile_repack_begin_marker>(*stream));
                 }
-                // Coalesced (SLM-tiled, vectorized-write) forms as of the
-                // perf-recovery epic's track D (llama.cpp-0vqt): byte-for-
-                // byte identical output to the *_batched functions above --
-                // each coalesced entry point falls back to the corresponding
-                // pre-0vqt kernel internally on its own shape gate (SOA:
-                // nrows%16==0; XMX_TILED: tile_n_total==16 exactly), so no
-                // new condition is needed at this call site. Iteration 3
-                // measured 4.8-5.7x over the pre-0vqt batched kernels'
-                // effective bandwidth on both cards (task comments c-swol,
-                // and the iter3 acceptance run).
                 if (pp_woq_nvfp4) {
                     // Each expert's AOS blocks into its dense planes: nibbles in stored order, UE4M3 scales as f16.
                     repack_nvfp4_to_woq_nk_batched(repack_srcs.data(), n_slots, batched_weight_bytes, woq_nvfp4_scales,
                                                    static_cast<int>(ne00), static_cast<int>(ne01), ctx.stream(),
                                                    ctx.device);
                 } else if (experts_are_tiled) {
+                    // MXFP4's two repacks, this one and the SOA one below, are the coalesced (SLM-tiled,
+                    // vectorized-write) forms as of the perf-recovery epic's track D (llama.cpp-0vqt): byte-for-byte
+                    // identical output to the *_batched functions above -- each coalesced entry point falls back to
+                    // the corresponding pre-0vqt kernel internally on its own shape gate (SOA: nrows%16==0;
+                    // XMX_TILED: tile_n_total==16 exactly), so no new condition is needed at this call site.
+                    // Iteration 3 measured 4.8-5.7x over the pre-0vqt batched kernels' effective bandwidth on both
+                    // cards (task comments c-swol, and the iter3 acceptance run).
                     repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(
                         repack_srcs.data(), n_slots, batched_weight_bytes, weight_slot_bytes, woq_nibble_slot_bytes,
                         blocks_per_row, static_cast<int>(ne01), static_cast<int>(tile_n_total), ctx.stream(),
@@ -101565,7 +101567,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // Fallback: this dispatch exceeded the batched repack's slot capacity (see
             // GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS above) -- repack each slot individually, exactly as before
             // llama.cpp-1lon.
-            if (pp_woq_arm && !pp_woq_nvfp4 && !woq_repack_batched) {
+            if (pp_woq_arm && !pp_woq_nvfp4 && !mxfp4_repack_batched) {
                 for (size_t slot = 0; slot < active_experts.size(); ++slot) {
                     const pp_onednn_batched_expert & expert     = active_experts[slot];
                     uint8_t *                        nibble_dst = batched_weight_bytes + slot * weight_slot_bytes;
@@ -102381,12 +102383,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // executor read from ring slots, so a census can tell a staged layer that took this executor from a
             // resident one, and (llama.cpp-8epx) how many of them its windows did not have staged ahead (misses=,
             // window_begin's count, 0 for an exposed window). The tensor name carries the layer and the role.
+            // gemm_groups= is the GEMM row groups the dispatch ran (moe_pp_pack_gemm_groups), not the f16 arm's phases
+            // (the success line's groups=), so a test can tell a dispatch whose later groups start past expert 0.
             if (ggml_sycl_moe_exec_config().trace >= 1) {
                 char exec_line[256];
                 std::snprintf(exec_line, sizeof(exec_line),
-                              "[MOE-EXEC-TRACE] executor device %d tensor=%s experts=%zu staged=%zu arm=%s misses=%u",
+                              "[MOE-EXEC-TRACE] executor device %d tensor=%s experts=%zu staged=%zu arm=%s misses=%u "
+                              "gemm_groups=%zu",
                               ctx.device, src0->name, active_count, pp_staged_experts, pp_woq_arm ? "woq" : "f16",
-                              pp_window_misses);
+                              pp_window_misses, gemm_groups.size());
                 ggml_sycl_moe_exec_trace_sink(nullptr, exec_line);
             }
             return true;

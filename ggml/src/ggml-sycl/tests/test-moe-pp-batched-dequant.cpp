@@ -16,10 +16,13 @@
 //   * no refusal: no "[PP-MOE] refused" (traced under GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE=1, set below), no
 //     "[MOE-PROMPT-REFUSAL]", no "refusing unplanned PP MoE oneDNN batched scratch", and no "direct MMID route
 //     re-entered" (an executor decline that sent a node back to the direct MMID route);
-//   * the arm the case's type runs (expect_woq_arm): NVFP4's experts run the WOQ arm, a GEMM that reads their nibbles
-//     and scales in stored order, unless GGML_SYCL_MOE_PP_WOQ or GGML_SYCL_MOE_PP_WOQ_NVFP4 is 0, and every other
-//     type here runs the f16 arm. The [PP-MOE] line names the arm, and so does the one "[MOE-EXEC-TRACE] executor"
-//     line each dispatch prints (GGML_SYCL_MOE_EXEC_TRACE=1, set below): a case must show exactly one, of its arm.
+//   * the arm the case's type runs (expect_woq_arm): NVFP4's experts run the arm --arm names (woq when it is not
+//     given), the WOQ arm being a GEMM that reads their nibbles and scales in stored order, and every other type here
+//     runs the f16 arm. The [PP-MOE] line names the arm, and so does the one "[MOE-EXEC-TRACE] executor" line each
+//     dispatch prints (GGML_SYCL_MOE_EXEC_TRACE=1, set below): a case must show exactly one, of its arm. The
+//     environment decides the arm (GGML_SYCL_MOE_PP_WOQ and GGML_SYCL_MOE_PP_WOQ_NVFP4, either 0 turning NVFP4's WOQ
+//     arm off), so the test fails before any case when --arm and the environment disagree, rather than checking
+//     whichever arm the environment happened to give.
 //
 // The ring is planned the way libllama plans it by default (src/llama-model.cpp): weight slots sized for the MXFP4
 // WOQ arm (NVFP4 plans f16 scales, so its slot is larger), about a quarter of every expert in f16. The f16 arm runs
@@ -41,8 +44,9 @@
 //
 // NVFP4 runs four cases more on its plain fixture, with the activation broadcast, for the GEMM shapes its WOQ arm
 // batches: one expert takes every token while the other 31 share the rest, at 64, 128 and 192 tokens, so one GEMM
-// group is that one expert at that many rows beside a group of 31 at one aligned block each; and 64 tokens that each
-// use one expert, all the same one, so a single expert is active.
+// group is that one expert at that many rows beside a group of 31 at one aligned block each, and the executor trace
+// must name at least those two GEMM groups (gemm_groups=), so the GEMM of a group that starts past expert 0 runs; and
+// 64 tokens that each use one expert, all the same one, so a single expert is active.
 // NVFP4 runs three cases more, each on a fixture of its own, at 64 tokens with the activation broadcast:
 //   * every UE4M3 scale byte of the weight rewritten from a cycle of small ones (zero, subnormals, the NaN code, and
 //     their sign-set forms), and again from a cycle of large ones (the largest finite value, its sign-set form, and
@@ -66,9 +70,10 @@
 // process exits 1 if any case failed, 77 when there is no SYCL GPU or the weights are not evictable. Pin one card (the
 // registration selects level_zero:1, the B50).
 //
-// --types NAME[,NAME...] (ggml_type_name spellings) runs only those types' cases, and the Q4_0 child cases only when
-// Q4_0 is named. The second registration runs --types nvfp4 under GGML_SYCL_MOE_PP_WOQ_NVFP4=0, so NVFP4's cases run
-// its f16 arm as well.
+// --types NAME[,NAME...] (ggml_type_name spellings, each one of k_types) runs only those types' cases, and the Q4_0
+// child cases only when Q4_0 is named. --arm woq|f16, last on the command line, names NVFP4's arm. The first
+// registration runs --arm woq; the second runs --types nvfp4 --arm f16 under GGML_SYCL_MOE_PP_WOQ_NVFP4=0, so NVFP4's
+// cases run its f16 arm as well.
 #include "../../../../tests/test-skip.h"  // LLAMA_TEST_EXIT_SKIP: the one definition of "77 means skip"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -347,7 +352,8 @@ struct case_data {
     int                  ne11;  // 1: the activation broadcasts to every used expert (gate/up); k_used: one row each
     std::vector<float>   input;
     std::vector<int32_t> ids;
-    int                  n_used = k_used;  // experts each token uses: the ids' rows
+    int                  n_used          = k_used;  // experts each token uses: the ids' rows
+    size_t               min_gemm_groups = 0;       // the fewest GEMM row groups the executor trace may name, 0: any
 };
 
 // The experts a case's routing activates.
@@ -399,10 +405,12 @@ case_data make_skew_case(int n_tokens, std::mt19937 & rng) {
 
 // NVFP4 at `n_tokens` tokens with the activation broadcast, expert 0 taking every token: its GEMM group is that one
 // expert at n_tokens rows. The other picks cycle experts 1 to 10, 11 to 20 and 21 to 31, so all 32 are active (from 11
-// tokens on), a token's four picks are distinct, and the other 31 fit one aligned block each up to 640 tokens.
+// tokens on), a token's four picks are distinct, and the other 31 fit one aligned block each up to 640 tokens. Each of
+// them has under half expert 0's rows, so they start a GEMM group of their own (moe_pp_pack_gemm_groups): at least two.
 case_data make_hot_case(int n_tokens, std::mt19937 & rng) {
     case_data                             c{ GGML_TYPE_NVFP4, n_tokens, 1, {}, {} };
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    c.min_gemm_groups = 2;
     c.input.resize(size_t(k_in) * n_tokens);
     for (float & v : c.input) {
         v = dist(rng);
@@ -507,16 +515,25 @@ double nmse(const std::vector<float> & ref, const std::vector<float> & got) {
     return err / (norm > 0.0 ? norm : 1.0);
 }
 
-// Whether a case of `type` must run the WOQ arm: NVFP4's, unless GGML_SYCL_MOE_PP_WOQ or GGML_SYCL_MOE_PP_WOQ_NVFP4
-// is 0 (read as the backend reads them, atoi). Every other type here runs the f16 arm. The backend also turns NVFP4's
-// arm off for a oneDNN older than 3.13, with a WARN; this host's oneDNN is newer, so a case that sees that WARN fails
-// and names it.
+// Whether NVFP4's cases must run the WOQ arm: --arm woq, or no --arm (main). main checks it against the environment
+// before any case runs.
+bool g_nvfp4_woq = true;
+
+// Whether a case of `type` must run the WOQ arm: NVFP4's when --arm is woq. Every other type here runs the f16 arm.
+// The backend also turns NVFP4's arm off for a oneDNN older than 3.13, with a WARN; this host's oneDNN is newer, so a
+// case that sees that WARN fails and names it.
 bool expect_woq_arm(ggml_type type) {
+    return type == GGML_TYPE_NVFP4 && g_nvfp4_woq;
+}
+
+// Whether the environment leaves NVFP4's WOQ arm on: GGML_SYCL_MOE_PP_WOQ and GGML_SYCL_MOE_PP_WOQ_NVFP4 read as the
+// backend reads them, unset or a nonzero atoi being on.
+bool env_runs_nvfp4_woq() {
     const auto on = [](const char * name) {
         const char * value = std::getenv(name);
         return value == nullptr || std::atoi(value) != 0;
     };
-    return type == GGML_TYPE_NVFP4 && on("GGML_SYCL_MOE_PP_WOQ") && on("GGML_SYCL_MOE_PP_WOQ_NVFP4");
+    return on("GGML_SYCL_MOE_PP_WOQ") && on("GGML_SYCL_MOE_PP_WOQ_NVFP4");
 }
 
 // Runs one case and prints its CASE line. Returns true when it passed. Every count is of the lines that appeared
@@ -553,6 +570,9 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c,
     const size_t exec_f16   = g_log.count_since(from, { "[MOE-EXEC-TRACE] executor device", "arm=f16 " });
     const size_t old_onednn = g_log.count_since(0, { "[PP-MOE] oneDNN ", "older than 3.13" });
     const size_t active     = active_expert_count(c);
+
+    // The GEMM row groups the dispatch ran, which its executor trace line names (not the f16 arm's phases, groups=).
+    const size_t gemm_groups = g_log.min_field_since(from, "[MOE-EXEC-TRACE] executor device", "gemm_groups=");
 
     // The rest of the group plan the success line names, and what a cap must give: every case activates all k_experts
     // experts, so a cap gives ceil(k_experts / cap) groups of that many experts, alternating between both halves.
@@ -595,17 +615,21 @@ bool run_case(lifecycle_fixture & life, ggml_backend_t cpu, const case_data & c,
                (groups != want_groups || group_experts != size_t(group_cap) || buffers != 2)) {
         why += " group-cap";
     }
+    // A trace line with no gemm_groups= field reads as SIZE_MAX, so it fails a case with a minimum too.
+    if (c.min_gemm_groups > 0 && (gemm_groups == SIZE_MAX || gemm_groups < c.min_gemm_groups)) {
+        why += " gemm-groups";
+    }
     auto shown = [](size_t field) {
         return field == SIZE_MAX ? size_t(0) : field;
     };
     std::fprintf(stderr,
                  "CASE type=%s tokens=%d ne11=%d used=%d active=%zu cap=%d want_arm=%s status=%d nmse=%.3e "
                  "pp_moe_lines=%zu pp_moe_total=%zu woq_lines=%zu f16_lines=%zu batched_lines=%zu groups=%zu "
-                 "group_experts=%zu buffers=%zu pp_moe_refused=%zu prompt_refusal=%zu unplanned_scratch=%zu "
-                 "direct_reentry=%zu -> %s%s\n",
+                 "group_experts=%zu buffers=%zu gemm_groups=%zu pp_moe_refused=%zu prompt_refusal=%zu "
+                 "unplanned_scratch=%zu direct_reentry=%zu -> %s%s\n",
                  type_name.c_str(), c.n_tokens, c.ne11, c.n_used, active, group_cap, want_woq ? "woq" : "f16",
                  static_cast<int>(status), err, pp_moe, pp_total, exec_woq, exec_f16, batched, shown(groups),
-                 shown(group_experts), shown(buffers), refused, prompt_rf, unplanned, reentered,
+                 shown(group_experts), shown(buffers), shown(gemm_groups), refused, prompt_rf, unplanned, reentered,
                  why.empty() ? "PASS" : "FAIL:", why.c_str());
     return why.empty();
 }
@@ -628,16 +652,19 @@ bool run_skew_case(lifecycle_fixture & life, ggml_backend_t cpu, int n_tokens, s
     return passed && packed;
 }
 
-// Runs one case in a child process: this binary again, as `<flag> <value>`, so a setting the backend reads once per
-// process (the group cap) or a fixture of another micro-batch (the skewed cases) starts from a fresh backend. The
-// child's CASE line shares this process's stderr; its exit status is the verdict.
+// Runs one case in a child process: this binary again, as `<flag> <value> --arm <this process's arm>`, so a setting the
+// backend reads once per process (the group cap) or a fixture of another micro-batch (the skewed cases) starts from a
+// fresh backend. The child inherits this process's environment, so it is given this process's arm too, or its own
+// check of --arm against that environment would fail. The child's CASE line shares this process's stderr; its exit
+// status is the verdict.
 bool run_child_case(const char * flag, int value) {
     const std::string arg = std::to_string(value);
     std::fflush(stdout);
     std::fflush(stderr);
     const pid_t pid = fork();
     if (pid == 0) {
-        execl("/proc/self/exe", "test-moe-pp-batched-dequant", flag, arg.c_str(), static_cast<char *>(nullptr));
+        execl("/proc/self/exe", "test-moe-pp-batched-dequant", flag, arg.c_str(), "--arm", g_nvfp4_woq ? "woq" : "f16",
+              static_cast<char *>(nullptr));
         _exit(127);
     }
     if (pid < 0) {
@@ -661,54 +688,89 @@ bool run_child_case(const char * flag, int value) {
     return false;
 }
 
-// Whether `filter` (the --types list, ggml_type_name spellings separated by commas; empty for every type) takes `type`.
+// The names in a --types list, ggml_type_name spellings separated by commas, empty ones included.
+std::vector<std::string> type_list_names(const std::string & list) {
+    std::vector<std::string> names;
+    size_t                   begin = 0;
+    while (begin <= list.size()) {
+        const size_t end = std::min(list.find(',', begin), list.size());
+        names.push_back(list.substr(begin, end - begin));
+        begin = end + 1;
+    }
+    return names;
+}
+
+// Whether `filter` (the --types list; empty for every type) takes `type`.
 bool filter_takes_type(const std::string & filter, ggml_type type) {
     if (filter.empty()) {
         return true;
     }
-    const std::string name  = ggml_type_name(type);
-    size_t            begin = 0;
-    while (begin <= filter.size()) {
-        const size_t end = std::min(filter.find(',', begin), filter.size());
-        if (filter.compare(begin, end - begin, name) == 0) {
-            return true;
+    const std::vector<std::string> names = type_list_names(filter);
+    return std::find(names.begin(), names.end(), ggml_type_name(type)) != names.end();
+}
+
+// Whether every name in a --types list is one of k_types. An empty name (an empty list, or a stray comma) is none.
+bool type_list_known(const std::string & list) {
+    for (const std::string & name : type_list_names(list)) {
+        const bool known = std::any_of(std::begin(k_types), std::end(k_types),
+                                       [&](ggml_type type) { return name == ggml_type_name(type); });
+        if (!known) {
+            return false;
         }
-        begin = end + 1;
     }
-    return false;
+    return true;
 }
 
 }  // namespace
 
 int main(int argc, char ** argv) {
     // A child process (run_child_case) runs one Q4_0 case: with the group cap at argv[2], or skewed at argv[2] rows.
-    // --types limits the run to the types it names.
-    int         group_cap = 0;
-    int         skew_rows = 0;
-    std::string types;
-    if (argc == 3 && std::strcmp(argv[1], "--group-cap") == 0) {
+    // --types limits the run to the types it names. --arm, last when it is given, names NVFP4's arm.
+    int          group_cap = 0;
+    int          skew_rows = 0;
+    std::string  types;
+    const char * arm   = "woq";
+    int          nargs = argc;
+    if (argc >= 3 && std::strcmp(argv[argc - 2], "--arm") == 0) {
+        arm   = argv[argc - 1];
+        nargs = argc - 2;
+    }
+    if (std::strcmp(arm, "woq") != 0 && std::strcmp(arm, "f16") != 0) {
+        std::fprintf(stderr, "FAIL: --arm takes woq or f16, not %s\n", arm);
+        return 1;
+    }
+    g_nvfp4_woq = std::strcmp(arm, "woq") == 0;
+    if (nargs == 3 && std::strcmp(argv[1], "--group-cap") == 0) {
         group_cap = std::atoi(argv[2]);
         if (group_cap < 1) {
             std::fprintf(stderr, "FAIL: --group-cap takes a count of at least 1, not %s\n", argv[2]);
             return 1;
         }
         setenv("GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX", argv[2], 1);
-    } else if (argc == 3 && std::strcmp(argv[1], "--skew") == 0) {
+    } else if (nargs == 3 && std::strcmp(argv[1], "--skew") == 0) {
         skew_rows = std::atoi(argv[2]);
         if (skew_rows < 64) {
             std::fprintf(stderr, "FAIL: --skew takes a row count of at least 64, not %s\n", argv[2]);
             return 1;
         }
-    } else if (argc == 3 && std::strcmp(argv[1], "--types") == 0) {
-        types          = argv[2];
-        const bool any = std::any_of(std::begin(k_types), std::end(k_types),
-                                     [&](ggml_type type) { return filter_takes_type(types, type); });
-        if (types.empty() || !any) {
-            std::fprintf(stderr, "FAIL: --types names none of this test's types: %s\n", argv[2]);
+    } else if (nargs == 3 && std::strcmp(argv[1], "--types") == 0) {
+        types = argv[2];
+        if (!type_list_known(types)) {
+            std::fprintf(stderr, "FAIL: --types takes this test's type names, separated by commas, not %s\n", argv[2]);
             return 1;
         }
-    } else if (argc != 1) {
-        std::fprintf(stderr, "usage: %s [--group-cap N | --skew ROWS | --types NAME[,NAME...]]\n", argv[0]);
+    } else if (nargs != 1) {
+        std::fprintf(stderr, "usage: %s [--group-cap N | --skew ROWS | --types NAME[,NAME...]] [--arm woq|f16]\n",
+                     argv[0]);
+        return 1;
+    }
+    // The flag states the arm and the environment decides it, so they must agree: a run that followed the environment
+    // would pass on whichever arm it happened to give.
+    if (env_runs_nvfp4_woq() != g_nvfp4_woq) {
+        std::fprintf(stderr,
+                     "FAIL: --arm %s, but GGML_SYCL_MOE_PP_WOQ and GGML_SYCL_MOE_PP_WOQ_NVFP4 turn NVFP4's WOQ "
+                     "arm %s\n",
+                     arm, g_nvfp4_woq ? "off" : "on");
         return 1;
     }
     // Read once by the backend, so they are set before anything touches it. The executor trace names each dispatch's
@@ -818,8 +880,8 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(stderr,
                      "PASS: batched MoE prompt executor, %d cases (%d at the slot's own grouping, %d in child "
-                     "processes)%s%s\n",
-                     total, ran_slot, ran_children, types.empty() ? "" : ", types ", types.c_str());
+                     "processes)%s%s, NVFP4 on the %s arm\n",
+                     total, ran_slot, ran_children, types.empty() ? "" : ", types ", types.c_str(), arm);
         return 0;
     } catch (const sycl::exception & e) {
         std::fprintf(stderr, "SKIP: no usable SYCL GPU: %s\n", e.what());

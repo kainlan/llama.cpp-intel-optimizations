@@ -702,13 +702,17 @@ int main() {
             size_t       k, n, active;
             const char * why;
         } refused[] = {
-            { 32,   8,        1,        "K not a multiple of one 64-value NVFP4 block" },
-            { 100,  8,        1,        "K not a multiple of one 64-value NVFP4 block" },
-            { 0,    8,        1,        "no K"                                         },
-            { 64,   0,        1,        "no N"                                         },
-            { 64,   8,        0,        "no active expert"                             },
-            { 64,   SIZE_MAX, 1,        "a nibble plane that overflows"                },
-            { 2048, 768,      SIZE_MAX, "the planes of every expert overflow"          },
+            { 32,            8,                  1,        "K not a multiple of one 64-value NVFP4 block" },
+            { 100,           8,                  1,        "K not a multiple of one 64-value NVFP4 block" },
+            { 0,             8,                  1,        "no K"                                         },
+            { 64,            0,                  1,        "no N"                                         },
+            { 64,            8,                  0,        "no active expert"                             },
+            { 64,            SIZE_MAX,           1,        "a nibble plane that overflows"                },
+            { 2048,          768,                SIZE_MAX, "the planes of every expert overflow"          },
+            // 2^64 - 64 nibble bytes: they fit, but not with the 256-byte round-up after them.
+            { SIZE_MAX - 63, 2,                  1,        "no room to round the nibbles up"              },
+            // 16,640,000,000,000,000,000 nibble bytes fit, 4,160,000,000,000,000,000 scale bytes after them do not.
+            { 64,            520000000000000000, 1,        "the scales overflow after the nibbles"        },
         };
 
         for (const auto & c : refused) {

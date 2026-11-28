@@ -6547,7 +6547,9 @@ endif() # static SYCL backend fixture
 # one expert at 64, 128 and 192 rows and a single active expert. Pinned to the B50; a run with no SYCL GPU exits 77.
 # The timeout covers 48 cases, two of them skewed at 1024 and 2048 rows, and the single-threaded IQ quantizers.
 # test-moe-pp-batched-dequant-nvfp4-f16 runs NVFP4's 9 cases again with GGML_SYCL_MOE_PP_WOQ_NVFP4=0, on the f16 arm
-# that switch keeps for it.
+# that switch keeps for it. --arm names the arm each registration expects NVFP4 to run, and the test fails before any
+# case when its environment gives the other. Both load a planned model onto the card, so both carry the model label,
+# which keeps them out of the unattended ctest sweep.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-pp-batched-dequant
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-pp-batched-dequant.cpp
@@ -6565,17 +6567,17 @@ if (IntelSYCL_FOUND)
     target_link_libraries(test-moe-pp-batched-dequant PRIVATE IntelSYCL::SYCL_CXX)
 endif()
 set_target_properties(test-moe-pp-batched-dequant PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-add_test(NAME test-moe-pp-batched-dequant COMMAND test-moe-pp-batched-dequant)
+add_test(NAME test-moe-pp-batched-dequant COMMAND test-moe-pp-batched-dequant --arm woq)
 set_tests_properties(test-moe-pp-batched-dequant PROPERTIES
-    LABELS "sycl;moe;device;B50"
+    LABELS "sycl;moe;device;B50;model"
     SKIP_RETURN_CODE 77
     RUN_SERIAL TRUE
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 600
 )
-add_test(NAME test-moe-pp-batched-dequant-nvfp4-f16 COMMAND test-moe-pp-batched-dequant --types nvfp4)
+add_test(NAME test-moe-pp-batched-dequant-nvfp4-f16 COMMAND test-moe-pp-batched-dequant --types nvfp4 --arm f16)
 set_tests_properties(test-moe-pp-batched-dequant-nvfp4-f16 PROPERTIES
-    LABELS "sycl;moe;device;B50"
+    LABELS "sycl;moe;device;B50;model"
     SKIP_RETURN_CODE 77
     RUN_SERIAL TRUE
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_MOE_PP_WOQ_NVFP4=0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"

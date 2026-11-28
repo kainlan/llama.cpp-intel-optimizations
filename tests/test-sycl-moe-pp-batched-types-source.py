@@ -113,19 +113,36 @@ dequant. These claims pin that shape:
       (DnnlGemmWrapper::woq_nvfp4_library_ok) and WARNs when the version alone turns the arm off; it is defined under
       #if GGML_SYCL_DNNL, as the wrapper is, and catalogued. Its repack and its GEMM each run under pp_woq_nvfp4 and
       take the dense planes from moe_pp_woq_nvfp4_dense_planes, asked once; the MXFP4 WOQ GEMM stays under pp_woq_arm.
+      The NVFP4 GEMM's operands are pinned whole and in order (each group's planes lo nibble planes and lo scale planes
+      in), its first scale plane sits at the dense layout's scale_offset_bytes, and the repack writes from the same two
+      bases. After the helper fills the planes the admission asserts that they are its own per-expert sizes and end
+      inside the slots it asked for; the header names NVFP4's block and scale group itself (it cannot see
+      ggml-common.h), counts with those names, and the admission static_asserts them equal to QK_NVFP4 and QK_NVFP4_SUB.
+  (v) the device test checks the arm it is told, not the arm the environment gives. --arm woq|f16 names the arm
+      NVFP4's cases must run (expect_woq_arm reads only that), main compares it with GGML_SYCL_MOE_PP_WOQ and
+      GGML_SYCL_MOE_PP_WOQ_NVFP4, read as the backend reads them, before the backend is touched and fails the run when
+      they disagree, and a child case runs with its parent's --arm. CMakeLists.txt registers the binary twice: --arm
+      woq, and --types nvfp4 --arm f16 with GGML_SYCL_MOE_PP_WOQ_NVFP4=0; both carry the model label, which keeps a
+      test that loads a planned model onto a card out of the unattended sweep. The hot-expert cases require the
+      executor trace to name at least two GEMM groups (gemm_groups=), so the WOQ GEMM's offsets past expert 0 run.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
 """
 import functools
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sycl_gate import cmake_strip  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 SYCL_DIR = ROOT / "ggml" / "src" / "ggml-sycl"
 FILES = {
+    "cmake": SYCL_DIR / "CMakeLists.txt",
     "sycl": SYCL_DIR / "ggml-sycl.cpp",
     "tables": SYCL_DIR / "moe-mmvq-tables.hpp",
     "cost": SYCL_DIR / "moe-exec-cost.hpp",
@@ -261,6 +278,58 @@ NVFP4_REPACK = "repack_nvfp4_to_woq_nk_batched("
 NVFP4_GEMM = "DnnlGemmWrapper::woq_gemm_batch_nvfp4("
 MXFP4_WOQ_GEMM = "DnnlGemmWrapper::woq_gemm_batch_mxfp4("
 NVFP4_PLANES = "moe_pp_woq_nvfp4_dense_planes("
+# NVFP4's WOQ planes as the executor addresses them: the GEMM's every operand in order (m, n, k, the activations and
+# their stride, the group's first nibble plane, its first scale plane, the output and its stride, the batch), the first
+# scale plane at the dense layout's offset, and the repack writing both planes from the same two bases.
+NVFP4_GEMM_CALL = ("group_event = DnnlGemmWrapper::woq_gemm_batch_nvfp4( ctx, static_cast<int>(group.n_rows), "
+                   "static_cast<int>(ne01), static_cast<int>(ne00), act_base(lo), "
+                   "DnnlGemmWrapper::to_dt<sycl::half>(), act_stride, "
+                   "batched_weight_bytes + lo * nvfp4_planes.nibble_bytes, "
+                   "woq_nvfp4_scales + lo * nvfp4_planes.scale_halves, out_base(lo), DnnlGemmWrapper::to_dt<float>(), "
+                   "out_stride, static_cast<int>(hi - lo), ctx.stream(), { deps_in });")
+NVFP4_SCALES_INIT = ("sycl::half * woq_nvfp4_scales = pp_woq_nvfp4 ? "
+                     "reinterpret_cast<sycl::half *>(batched_weight_bytes + nvfp4_planes.scale_offset_bytes) : "
+                     "nullptr;")
+NVFP4_REPACK_CALL = ("repack_nvfp4_to_woq_nk_batched(repack_srcs.data(), n_slots, batched_weight_bytes, "
+                     "woq_nvfp4_scales, static_cast<int>(ne00), static_cast<int>(ne01), ctx.stream(), ctx.device);")
+# The admission's checks on the dense planes: the header's block and scale group are ggml-common.h's, its plane sizes
+# are the admission's own per-expert sizes, and the planes end inside the slots the admission asked for.
+NVFP4_BLOCK_ASSERT = ("static_assert(QK_NVFP4 == moe_pp_woq_nvfp4_block && "
+                      "QK_NVFP4_SUB == moe_pp_woq_nvfp4_scale_group,")
+NVFP4_SIZES_ASSERT = ("GGML_ASSERT(nvfp4_planes.nibble_bytes == nibble_bytes_per_expert && "
+                      "nvfp4_planes.scale_halves * sizeof(sycl::half) == scale_bytes_per_expert);")
+NVFP4_USED_ASSERT = "GGML_ASSERT(nvfp4_planes.used_bytes <= weight_bytes);"
+NVFP4_HEADER_CONSTS = ("constexpr size_t moe_pp_woq_nvfp4_block = 64;",
+                       "constexpr size_t moe_pp_woq_nvfp4_scale_group = 16;")
+NVFP4_HELPER_TERMS = ("k % moe_pp_woq_nvfp4_block != 0", "(k / moe_pp_woq_nvfp4_scale_group) * n",
+                      "out->scale_offset_bytes = (nibbles + 255) / 256 * 256;")
+# The device test's two registrations. Each names the arm NVFP4's cases must run (--arm); the f16 one turns NVFP4's
+# switch off in its environment, and the test fails at startup when the flag and the environment disagree. Both load
+# a planned model onto a card, so both carry the model label that keeps them out of the unattended ctest sweep.
+DEVICE_REG_WOQ = ('add_test(NAME test-moe-pp-batched-dequant COMMAND test-moe-pp-batched-dequant --arm woq) '
+                  'set_tests_properties(test-moe-pp-batched-dequant PROPERTIES LABELS "sycl;moe;device;B50;model" '
+                  'SKIP_RETURN_CODE 77 RUN_SERIAL TRUE ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;'
+                  'LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}" TIMEOUT 600 )')
+DEVICE_REG_F16 = ('add_test(NAME test-moe-pp-batched-dequant-nvfp4-f16 COMMAND test-moe-pp-batched-dequant '
+                  '--types nvfp4 --arm f16) set_tests_properties(test-moe-pp-batched-dequant-nvfp4-f16 PROPERTIES '
+                  'LABELS "sycl;moe;device;B50;model" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE '
+                  'ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_MOE_PP_WOQ_NVFP4=0;'
+                  'LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}" TIMEOUT 600 )')
+DEVICE_REG_COMMAND = "COMMAND test-moe-pp-batched-dequant "
+ARM_EXPECT_BODY = "{ return type == GGML_TYPE_NVFP4 && g_nvfp4_woq; }"
+ARM_ENV_FN = "env_runs_nvfp4_woq"
+ARM_ENV_TERMS = ("std::getenv(name)", "value == nullptr || std::atoi(value) != 0",
+                 'on("GGML_SYCL_MOE_PP_WOQ") && on("GGML_SYCL_MOE_PP_WOQ_NVFP4")')
+ARM_SET = 'g_nvfp4_woq = std::strcmp(arm, "woq") == 0;'
+ARM_CHECK = "if (env_runs_nvfp4_woq() != g_nvfp4_woq) {"
+ARM_BACKEND_FIRST = 'setenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE", "1", 1);'
+ARM_CHILD = ('execl("/proc/self/exe", "test-moe-pp-batched-dequant", flag, arg.c_str(), "--arm", '
+             'g_nvfp4_woq ? "woq" : "f16",')
+# The hot-expert cases' GEMM groups, read from the executor trace: expert 0's group and the other 31's, so the WOQ
+# GEMM's group offsets past expert 0 run.
+HOT_GEMM_GROUPS = "c.min_gemm_groups = 2;"
+GEMM_GROUPS_READ = 'g_log.min_field_since(from, "[MOE-EXEC-TRACE] executor device", "gemm_groups=")'
+GEMM_GROUPS_CHECK = "if (c.min_gemm_groups > 0 && (gemm_groups == SIZE_MAX || gemm_groups < c.min_gemm_groups)) {"
 # A preprocessor directive in squeezed text: its keyword and the first token of its condition.
 DIRECTIVE_RE = re.compile(r"#\s?(ifdef|ifndef|if|elif|else|endif)\b ?([^\s#]*)")
 SEED_MXFP4 = "if (t == GGML_TYPE_MXFP4) { return 3990.0; }"
@@ -313,11 +382,17 @@ def squeeze(src):
 
 
 def load():
-    """Squeezed text per file; C++ sources lose their comments first, the Markdown catalog is kept whole."""
+    """Squeezed text per file; C++ sources lose their comments first, CMake its # comments, and the Markdown catalog is
+    kept whole."""
     out = {}
     for key, path in FILES.items():
         text = path.read_text()
-        out[key] = squeeze(text if path.suffix == ".md" else strip_comments(text))
+        if path.suffix == ".md":
+            out[key] = squeeze(text)
+        elif path.suffix == ".txt":
+            out[key] = squeeze(cmake_strip(text))
+        else:
+            out[key] = squeeze(strip_comments(text))
     return out
 
 
@@ -1376,11 +1451,25 @@ def claim_u_woq_arm(s):
     planes = lam.find(NVFP4_PLANES)
     if lam.count(NVFP4_PLANES) != 1 or (enclosing_if_condition(lam, planes) or "").strip() != "pp_woq_nvfp4":
         fails.append(f"the executor does not ask {NVFP4_PLANES[:-1]} once, under `if (pp_woq_nvfp4)`")
-    gemm = lam.find(NVFP4_GEMM)
-    gemm_call = statement(lam, None, start=gemm) if gemm >= 0 else ""
-    for term in ("nvfp4_planes.nibble_bytes", "nvfp4_planes.scale_halves", "woq_nvfp4_scales"):
-        if term not in (gemm_call or ""):
-            fails.append(f"NVFP4's WOQ GEMM does not address its expert's planes with {term}")
+    for pin, what in ((NVFP4_GEMM_CALL, "NVFP4's WOQ GEMM with its operands in order"),
+                      (NVFP4_SCALES_INIT, "NVFP4's first scale plane at the dense layout's scale offset"),
+                      (NVFP4_REPACK_CALL, "NVFP4's repack writing the nibble and scale planes from their own bases"),
+                      (NVFP4_BLOCK_ASSERT, "the static_assert tying the header's NVFP4 constants to ggml-common.h"),
+                      (NVFP4_SIZES_ASSERT, "the assert that the dense planes are the admission's per-expert sizes"),
+                      (NVFP4_USED_ASSERT, "the assert that the dense planes end inside the admitted slots")):
+        if lam.count(pin) != 1:
+            fails.append(f"the executor does not hold {what} once: `{pin}`")
+    at_planes, at_sizes, at_used = (lam.find(NVFP4_PLANES), lam.find(NVFP4_SIZES_ASSERT), lam.find(NVFP4_USED_ASSERT))
+    if not 0 <= at_planes < at_sizes < at_used:
+        fails.append("the dense planes' asserts do not follow the one call that fills them")
+    for const in NVFP4_HEADER_CONSTS:
+        if tables.count(const) != 1:
+            fails.append(f"moe-mmvq-tables.hpp does not name `{const}` once")
+    helper = one_definition(tables, NVFP4_PLANES[:-1]) or ""
+    for term in NVFP4_HELPER_TERMS:
+        if term not in helper:
+            fails.append(f"{NVFP4_PLANES[:-1]} does not lay the planes out with `{term}` (the header's named "
+                         "constants, the 256-byte scale boundary)")
     switch = one_definition(sycl, NVFP4_SWITCH)
     if switch is None:
         fails.append(f"{NVFP4_SWITCH} is not defined exactly once in ggml-sycl.cpp")
@@ -1396,6 +1485,44 @@ def claim_u_woq_arm(s):
         fails.append(f'"{NVFP4_KNOB}" is spelled {spelled} times in ggml-sycl.cpp, want 1 (the switch\'s one read)')
     if NVFP4_KNOB_ROW not in s["catalog"]:
         fails.append(f"docs/backend/sycl-env-vars.md has no `{NVFP4_KNOB_ROW}` row")
+    return fails
+
+
+def claim_v_device_arm(s):
+    fails = []
+    cmake, test = s["cmake"], s["device_test"]
+    for reg, what in ((DEVICE_REG_WOQ, "the WOQ arm's"), (DEVICE_REG_F16, "the f16 arm's NVFP4")):
+        if cmake.count(reg) != 1:
+            fails.append(f"CMakeLists.txt does not hold {what} registration once as `{reg}`")
+    commands = cmake.count(DEVICE_REG_COMMAND)
+    if commands != 2:
+        fails.append(f"CMakeLists.txt registers test-moe-pp-batched-dequant {commands} times, want the two above")
+    expect = one_definition(test, "expect_woq_arm")
+    if expect != ARM_EXPECT_BODY:
+        fails.append(f"expect_woq_arm is not `{ARM_EXPECT_BODY}`, the flag's arm (got {expect!r})")
+    env = one_definition(test, ARM_ENV_FN) or ""
+    for term in ARM_ENV_TERMS:
+        if term not in env:
+            fails.append(f"{ARM_ENV_FN} does not read the backend's switches as the backend does (`{term}`)")
+    main = one_definition(test, "main") or ""
+    at_set, at_check, at_backend = main.find(ARM_SET), main.find(ARM_CHECK), main.find(ARM_BACKEND_FIRST)
+    if main.count(ARM_SET) != 1 or main.count(ARM_CHECK) != 1 or not 0 <= at_set < at_check < at_backend:
+        fails.append("main does not compare --arm with the environment once, after it reads the flag and before the "
+                     "backend is touched")
+    else:
+        open_at = at_check + len(ARM_CHECK) - 1
+        block = main[open_at : match_close(main, open_at)]
+        if not block.startswith("{ std::fprintf(stderr,") or not block.endswith(" return 1; }"):
+            fails.append("a flag the environment disagrees with does not fail the run: the check's block is "
+                         f"`{block}`")
+    if test.count(ARM_CHILD) != 1:
+        fails.append("a child case is not run with the parent's --arm, so its own check would read another arm")
+    hot = one_definition(test, "make_hot_case") or ""
+    if test.count(HOT_GEMM_GROUPS) != 1 or HOT_GEMM_GROUPS not in hot:
+        fails.append(f"the hot-expert cases do not ask for two GEMM groups (`{HOT_GEMM_GROUPS}` in make_hot_case)")
+    run = one_definition(test, "run_case") or ""
+    if GEMM_GROUPS_READ not in run or GEMM_GROUPS_CHECK not in run:
+        fails.append("run_case does not read gemm_groups= from the executor trace and fail a case under its minimum")
     return fails
 
 
@@ -1421,6 +1548,7 @@ CLAIMS = {
     "s": claim_s_staged_type,
     "t": claim_t_ring_consumer,
     "u": claim_u_woq_arm,
+    "v": claim_v_device_arm,
 }
 
 
@@ -1704,6 +1832,55 @@ MUTANTS = [
     ("u", "sycl", NVFP4_SWITCH_HEAD, "#endif " + NVFP4_SWITCH_HEAD),
     ("u", "sycl", 'std::getenv("GGML_SYCL_MOE_PP_WOQ_NVFP4")', 'std::getenv("GGML_SYCL_MOE_PP_WOQ")'),
     ("u", "catalog", NVFP4_KNOB_ROW, "| `GGML_SYCL_MOE_PP_WOQ_NVFP4=0` | OFF |"),
+    # The GEMM's operands out of order: the activation and output strides swapped, the nibble planes stepped by the
+    # scale stride, or the group's planes taken from the first expert's.
+    ("u", "sycl", NVFP4_GEMM_CALL,
+     NVFP4_GEMM_CALL.replace("act_stride", "@").replace("out_stride", "act_stride").replace("@", "out_stride")),
+    ("u", "sycl", "batched_weight_bytes + lo * nvfp4_planes.nibble_bytes",
+     "batched_weight_bytes + lo * nvfp4_planes.scale_halves"),
+    ("u", "sycl", "woq_nvfp4_scales + lo * nvfp4_planes.scale_halves, out_base(lo)", "woq_nvfp4_scales, out_base(lo)"),
+    # The first scale plane at the slot's start, over the nibbles, or the repack writing its scales there.
+    ("u", "sycl", "reinterpret_cast<sycl::half *>(batched_weight_bytes + nvfp4_planes.scale_offset_bytes)",
+     "reinterpret_cast<sycl::half *>(batched_weight_bytes)"),
+    ("u", "sycl", "n_slots, batched_weight_bytes, woq_nvfp4_scales, static_cast<int>(ne00)",
+     "n_slots, batched_weight_bytes, reinterpret_cast<sycl::half *>(batched_weight_bytes), static_cast<int>(ne00)"),
+    # The admission's checks on the dense planes dropped, or the header's constants tied to literals instead of to
+    # ggml-common.h's, or the helper counting with literals again.
+    ("u", "sycl", NVFP4_USED_ASSERT, ""),
+    ("u", "sycl", NVFP4_SIZES_ASSERT, ""),
+    ("u", "sycl", NVFP4_BLOCK_ASSERT, "static_assert(QK_NVFP4 == 64 && QK_NVFP4_SUB == 16,"),
+    ("u", "tables", "k % moe_pp_woq_nvfp4_block != 0", "k % 64 != 0"),
+    # The first scale plane straight after the last nibble plane, off the 256-byte boundary.
+    ("u", "tables", "out->scale_offset_bytes = (nibbles + 255) / 256 * 256;", "out->scale_offset_bytes = nibbles;"),
+    ("u", "tables", NVFP4_HEADER_CONSTS[1], "constexpr size_t moe_pp_woq_nvfp4_scale_group = 32;"),
+    # A registration without its arm, with the other arm, without NVFP4's switch at 0 in the f16 run's environment,
+    # or without the model label, so the unattended sweep would load the planned model onto a card.
+    ("v", "cmake", "GGML_SYCL_MOE_PP_WOQ_NVFP4=0;", ""),
+    ("v", "cmake", "--types nvfp4 --arm f16)", "--types nvfp4)"),
+    ("v", "cmake", "--types nvfp4 --arm f16)", "--types nvfp4 --arm woq)"),
+    ("v", "cmake", "COMMAND test-moe-pp-batched-dequant --arm woq)", "COMMAND test-moe-pp-batched-dequant --arm f16)"),
+    ("v", "cmake", 'PROPERTIES LABELS "sycl;moe;device;B50;model" SKIP_RETURN_CODE',
+     'PROPERTIES LABELS "sycl;moe;device;B50" SKIP_RETURN_CODE'),
+    ("v", "cmake", 'nvfp4-f16 PROPERTIES LABELS "sycl;moe;device;B50;model"',
+     'nvfp4-f16 PROPERTIES LABELS "sycl;moe;device;B50"'),
+    # A third registration of the binary.
+    ("v", "cmake", "add_test(NAME test-moe-pp-batched-dequant-nvfp4-f16",
+     "add_test(NAME x COMMAND test-moe-pp-batched-dequant --types q8_0) "
+     "add_test(NAME test-moe-pp-batched-dequant-nvfp4-f16"),
+    # The expected arm read from the environment again, so the test follows whichever arm it gives.
+    ("v", "device_test", ARM_EXPECT_BODY, "{ return type == GGML_TYPE_NVFP4 && env_runs_nvfp4_woq(); }"),
+    # The switches read as set-means-on, or one of them not read.
+    ("v", "device_test", "value == nullptr || std::atoi(value) != 0", "value == nullptr"),
+    ("v", "device_test", ' && on("GGML_SYCL_MOE_PP_WOQ_NVFP4")', ""),
+    # The flag ignored, or the mismatch check dropped or made to adapt the flag to the environment.
+    ("v", "device_test", ARM_SET, "g_nvfp4_woq = true;"),
+    ("v", "device_test", ARM_CHECK, "if (false) {"),
+    ("v", "device_test", ARM_CHECK, ARM_CHECK + " g_nvfp4_woq = !g_nvfp4_woq; } if (false) {"),
+    # A child case run without the parent's arm.
+    ("v", "device_test", ARM_CHILD, 'execl("/proc/self/exe", "test-moe-pp-batched-dequant", flag, arg.c_str(),'),
+    # The hot-expert cases without a GEMM-group floor, or the floor read and never checked.
+    ("v", "device_test", HOT_GEMM_GROUPS, "c.min_gemm_groups = 0;"),
+    ("v", "device_test", GEMM_GROUPS_CHECK, "if (false) {"),
 ]
 
 
