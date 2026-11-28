@@ -729,7 +729,12 @@ endif()
 #   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-onednn-woq-nvfp4
 # With --bench it runs no probe arm and instead times dequant + f16 GEMM against repack + WOQ GEMM at Inkling's expert
 # shapes in device time, printing "NUMERICS <arm> ..." per arm and shape, "BENCH <arm> ..." per arm and grid point and
-# "PIPELINE ..." per shape, B and M (plan Task 26a).
+# "PIPELINE ..." per shape, B and M (plan Task 26a). A BENCH line ends in "timing=BADSPAN" or "timing=FAIL" when its
+# timing produced no figure, and a "WARN ... device time exceeds wall time" line flags timestamps not to trust; PIPELINE
+# prints "ratio=BADNUM" when an input arm failed its check and "form=none ratio=nan" when no WOQ form passed. At every
+# grid point and at three XCHECK-only points it prints "XCHECK <arm> ... PASS|FAIL" for woq-3d-ba-diag and woq-3d-f16s
+# against f16-gemm's output and "SCRATCHPAD woq-3d-ba-diag ... user_bytes=" for that primitive in user scratchpad mode,
+# then one "XCHECK_SUMMARY pass= fail=" line; XCHECK failures do not change the exit status.
 # Same build shape as test-onednn-woq-mxfp4 above (oneDNN and SYCL only, no backend).
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build(test-sycl-onednn-woq-nvfp4.cpp)

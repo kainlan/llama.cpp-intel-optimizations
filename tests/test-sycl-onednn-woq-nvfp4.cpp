@@ -36,6 +36,24 @@
 // queue between two marker kernels: one "BENCH <arm> shape= B= M= K= N= dev_us_per_expert= wall_us_per_expert= GBps=
 // numerics= impl=" line per arm and grid point, then one "PIPELINE shape= B= M= f16= woq_best= form= ratio=" line per
 // shape, B and M.
+//
+// The bench's output vocabulary:
+//   NUMERICS <arm> ... PASS|FAIL      the check at B 8, M 32; its verdict is BENCH's numerics= for the whole shape:
+//                                     PASS, BADNUM (ran, check failed) or FAIL (could not be built or run).
+//   BENCH ... timing=BADSPAN          appended when marker2 did not start after marker1 ended: dev_us_per_expert=0.00.
+//   BENCH ... timing=FAIL             appended when the arm threw while timed; its numerics= is still the check's.
+//   WARN ... device time exceeds wall time   the timestamps of that BENCH line are not trustworthy.
+//   PIPELINE ... ratio=BADNUM         f16-dequant, f16-gemm or woq-repack did not pass at that shape.
+//   PIPELINE ... form=none ratio=nan  no WOQ form passed, or a sum is not a finite time.
+//   XCHECK <arm> shape= B= M= worst_rel= nonfinite= PASS|FAIL   woq-3d-ba-diag and woq-3d-f16s against f16-gemm's dst
+//                                     at every grid point and at (B 1, M 64), (B 32, M 192), (B 32, M 256): the same
+//                                     weights and src, worst column error over the column's largest value, PASS at
+//                                     <= 1e-3 with no non-finite output. XCHECK-ERROR names an arm that could not run.
+//   SCRATCHPAD woq-3d-ba-diag shape= B= M= user_bytes= impl=   that primitive built in user scratchpad mode
+//                                     (production's; the bench times library mode), not executed.
+//   XCHECK_SUMMARY pass= fail=        the XCHECK totals. XCHECK failures do not change the exit status.
+// woq-repack writes both scale planes, so a form's woq_best pays about 11% of the repack's bytes for the plane that
+// form does not read.
 #include "test-skip.h"
 // The attribute production builds with, so the answer is about the primitive the backend would run.
 #include "ggml-sycl/dnnl-deterministic.hpp"
@@ -46,10 +64,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <oneapi/dnnl/dnnl.hpp>
 #include <oneapi/dnnl/dnnl_sycl.hpp>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <sycl/sycl.hpp>
 #include <unordered_map>
@@ -358,13 +378,14 @@ struct memory_descs {
     dnnl::memory::desc dst;
 };
 
-memory_descs make_descs(const woq_problem & p, const woq_form & f, dt weight_dt) {
+// The 2-D form for one expert, the 3-D batched form otherwise; force_3d keeps the 3-D form at B 1 (the bench's).
+memory_descs make_descs(const woq_problem & p, const woq_form & f, dt weight_dt, bool force_3d = false) {
     const int64_t M = p.M;
     const int64_t K = p.K;
     const int64_t N = p.N;
     const int64_t G = p.K / f.group_k;
     memory_descs  d;
-    if (p.B == 1) {
+    if (p.B == 1 && !force_3d) {
         d.src     = dnnl::memory::desc({ M, K }, dt::f16, { K, 1 });
         d.weights = dnnl::memory::desc({ K, N }, weight_dt, { N, 1 });
         d.scales  = dnnl::memory::desc({ G, N }, f.scale_dt, { N, 1 });
@@ -380,13 +401,17 @@ memory_descs make_descs(const woq_problem & p, const woq_form & f, dt weight_dt)
 }
 
 // Builds the primitive descriptor with the attribute production uses. Throws dnnl::error when oneDNN refuses the
-// attribute or has no implementation; the caller reports that as UNSUPPORTED.
-dnnl::matmul::primitive_desc make_pd(const dnnl::engine & eng, const memory_descs & d, const woq_form & f) {
+// attribute or has no implementation; the caller reports that as UNSUPPORTED. The bench's SCRATCHPAD line asks for user
+// mode, production's; everything that executes uses library mode.
+dnnl::matmul::primitive_desc make_pd(const dnnl::engine &  eng,
+                                     const memory_descs &  d,
+                                     const woq_form &      f,
+                                     dnnl::scratchpad_mode scratchpad = dnnl::scratchpad_mode::library) {
     dnnl::primitive_attr attr;
     ggml_sycl_dnnl_attr_set_reproducible(attr);
     attr.set_scales(DNNL_ARG_WEIGHTS, f.mask, f.groups, f.scale_dt);
     attr.set_fpmath_mode(dnnl::fpmath_mode::f16, /*apply_to_int=*/true);
-    attr.set_scratchpad_mode(dnnl::scratchpad_mode::library);
+    attr.set_scratchpad_mode(scratchpad);
     return dnnl::matmul::primitive_desc(eng, d.src, d.weights, d.dst, attr);
 }
 
@@ -548,6 +573,23 @@ constexpr int    k_bench_check_b     = 8;
 constexpr int    k_bench_check_m     = 32;
 constexpr int    k_bench_bs[]        = { 8, 32, 128 };
 constexpr int    k_bench_ms[]        = { 32, 64, 128 };
+constexpr double k_xcheck_tol        = 1e-3;
+
+// XCHECK-only points beyond the grid: one expert, and the executor's taller row groups. No BENCH line, no timing.
+struct bench_extent {
+    int B;
+    int M;
+};
+
+constexpr bench_extent k_xcheck_extra[] = {
+    { 1,  64  },
+    { 32, 192 },
+    { 32, 256 },
+};
+
+// The numerics check runs at the first grid point of a shape, and every point's verdicts start as FAIL until it has.
+static_assert(k_bench_bs[0] == k_bench_check_b && k_bench_ms[0] == k_bench_check_m,
+              "the check point must be the grid's first point");
 
 // The scale step of the repack: one work-item per (group, n) of the tile.
 static_assert(k_bench_wg == (k_nvfp4_block / k_nvfp4_sub) * k_bench_tile, "repack scale step needs 4 x 64 work-items");
@@ -563,10 +605,10 @@ float ue4m3_half_device(uint8_t x) {
     return (x & 0x7fu) == 0x7fu ? 0.0f : value;
 }
 
-// f16-dequant: B experts of stored NVFP4 to f16, expert b row n holding its K halves contiguously at (b * N + n) * K + k,
-// the layout the executor's dequant writes and f16-gemm reads. A stand-in for convert.cpp's NVFP4 converter at equal
-// bytes. One work-item per output pair of halves, consecutive work-items consecutive along K; the block indexing is
-// make_nvfp4_problem's.
+// f16-dequant: B experts of stored NVFP4 to f16, expert b row n holding its K halves contiguously at
+// (b * N + n) * K + k, the layout the executor's dequant writes and f16-gemm reads. A stand-in for convert.cpp's NVFP4
+// converter at equal bytes. One work-item per output pair of halves, consecutive work-items consecutive along K; the
+// block indexing is make_nvfp4_problem's. run_bench checks that B * N * K / 2 fills whole work-groups.
 sycl::event launch_dequant(sycl::queue & q, const uint8_t * stored, uint32_t * w16_pairs, int B, int K, int N) {
     const int    nb           = K / k_nvfp4_block;
     const size_t pairs        = (size_t) K / 2;
@@ -597,7 +639,8 @@ sycl::event launch_dequant(sycl::queue & q, const uint8_t * stored, uint32_t * w
 // offset in the low nibble, the ue4m3_sanitize byte of scale group g at g * N + n, and that scale widened to f16 as
 // with_f16_scales does, at the same index. It is a transpose from n-major blocks to k-major nibbles, so it goes
 // through local memory: a work-group owns 64 n by 64 k (block kb of 64 rows), reads those blocks with consecutive
-// work-items on consecutive words, and writes each of its 64 output rows' 32 nibble bytes as 8 consecutive words.
+// work-items on consecutive words, and writes each of its 64 output rows' 32 nibble bytes as 8 consecutive words. It
+// has no tail: run_bench checks that K and N are multiples of 64.
 sycl::event launch_repack(sycl::queue &   q,
                           const uint8_t * stored,
                           uint8_t *       nibbles,
@@ -666,6 +709,14 @@ sycl::event launch_repack(sycl::queue &   q,
     });
 }
 
+// Waits for everything queued, swallowing what the wait raises: for exception paths and destructors.
+void queue_drain_nothrow(sycl::queue & q) {
+    try {
+        q.wait();
+    } catch (...) {
+    }
+}
+
 sycl::event submit_marker(sycl::queue & q) {
     return q.single_task<nvfp4_bench_marker>([]() {});
 }
@@ -678,9 +729,10 @@ struct bench_timing {
 };
 
 // Device time per expert of rep(), one rep being B experts' work: 3 warm-up reps, then a marker, R reps and a second
-// marker on the in-order profiling queue, (marker2 command_start - marker1 command_end) / R / B. R grows until the timed
-// span is at least 50 ms. Host wall-clock is taken over the same R, from the first marker's submission to the wait. A
-// span of zero or less means the timestamps cannot time this arm: it stops there, marked bad_span, and R does not grow.
+// marker on the in-order profiling queue, (marker2 command_start - marker1 command_end) / R / B. R grows until the
+// timed span is at least 50 ms. Host wall-clock is taken over the same R, from the first marker's submission to the
+// wait. A span of zero or less means the timestamps cannot time this arm: it stops there, marked bad_span, and R does
+// not grow.
 template <typename F> bench_timing time_arm(sycl::queue & q, int B, F && rep) {
     for (int i = 0; i < k_bench_warmup; ++i) {
         rep();
@@ -708,8 +760,8 @@ template <typename F> bench_timing time_arm(sycl::queue & q, int B, F && rep) {
             return t;
         }
         const double per_rep = std::max(span / reps, 1e3);
-        reps                 = (int) std::min<double>(k_bench_max_reps,
-                                                      std::max<double>(2.0 * reps, std::ceil(1.2 * k_bench_min_span_ns / per_rep)));
+        const double wanted  = std::ceil(1.2 * k_bench_min_span_ns / per_rep);
+        reps                 = (int) std::min<double>(k_bench_max_reps, std::max<double>(2.0 * reps, wanted));
     }
 }
 
@@ -733,6 +785,9 @@ constexpr const char * k_bench_arm_names[BENCH_ARM_COUNT] = {
 // The forms PIPELINE picks woq_best from; the diagnostic arm is not one of them.
 constexpr int k_bench_woq_forms[] = { BENCH_ARM_WOQ_3D_E4M3, BENCH_ARM_WOQ_3D_F16S, BENCH_ARM_WOQ_2D_E4M3,
                                       BENCH_ARM_WOQ_2D_F16S };
+
+// The arms XCHECK holds to f16-gemm: the stored-order diagnostic form and the transposed 3-D f16-scale form.
+constexpr int k_xcheck_arms[] = { BENCH_ARM_WOQ_3D_BA_DIAG, BENCH_ARM_WOQ_3D_F16S };
 
 bool bench_arm_f16_scales(int arm) {
     return arm == BENCH_ARM_WOQ_3D_F16S || arm == BENCH_ARM_WOQ_2D_F16S || arm == BENCH_ARM_WOQ_3D_BA_DIAG;
@@ -849,6 +904,37 @@ void onednn_arm_rep(onednn_arm & a, dnnl::stream & stream) {
     }
 }
 
+// A WOQ arm's scales: f8_e4m3 or f16, one per 16 elements of K, mask 3 for the 2-D form and 7 for the 3-D form.
+woq_form bench_woq_form(int arm) {
+    const bool two_d = bench_arm_2d(arm);
+    return {
+        bench_arm_f16_scales(arm) ? dt::f16 : dt::f8_e4m3,
+        k_nvfp4_sub,
+        two_d ? (1 << 0) | (1 << 1) : (1 << 0) | (1 << 1) | (1 << 2),
+        { k_nvfp4_sub, 1 }
+    };
+}
+
+// A WOQ arm's descriptors, as make_descs declares them: the 2-D form for one expert, the 3-D form for B experts (B 1
+// included). The diagnostic arm alone declares its weights K-contiguous per n: nibble (b, k, n) at
+// b * K * N + n * K + k.
+memory_descs bench_woq_descs(int arm, const bench_point & pt, const woq_form & f) {
+    const bool  two_d = bench_arm_2d(arm);
+    woq_problem dims;
+    dims.B         = two_d ? 1 : pt.B;
+    dims.M         = pt.M;
+    dims.K         = pt.K;
+    dims.N         = pt.N;
+    memory_descs d = make_descs(dims, f, dt::f4_e2m1, /*force_3d=*/!two_d);
+    if (arm == BENCH_ARM_WOQ_3D_BA_DIAG) {
+        const int64_t B = pt.B;
+        const int64_t K = pt.K;
+        const int64_t N = pt.N;
+        d.weights       = dnnl::memory::desc({ B, K, N }, dt::f4_e2m1, { K * N, 1, K });
+    }
+    return d;
+}
+
 onednn_arm build_onednn_arm(int arm, const dnnl::engine & eng, bench_point & pt) {
     onednn_arm    a;
     const int64_t B = pt.B;
@@ -874,38 +960,24 @@ onednn_arm build_onednn_arm(int arm, const dnnl::engine & eng, bench_point & pt)
                 { DNNL_ARG_DST,     dnnl::memory(dst, eng, pt.dst.ptr) },
             });
         } else {
-            const bool     f16s  = bench_arm_f16_scales(arm);
-            const bool     two_d = bench_arm_2d(arm);
-            const woq_form f     = {
-                f16s ? dt::f16 : dt::f8_e4m3,
-                k_nvfp4_sub,
-                two_d ? (1 << 0) | (1 << 1) : (1 << 0) | (1 << 1) | (1 << 2),
-                { k_nvfp4_sub, 1 }
-            };
-            woq_problem dims;
-            dims.B         = two_d ? 1 : pt.B;
-            dims.M         = pt.M;
-            dims.K         = pt.K;
-            dims.N         = pt.N;
-            memory_descs d = make_descs(dims, f, dt::f4_e2m1);
-            uint8_t *    w = static_cast<uint8_t *>(pt.nib.ptr);
-            if (arm == BENCH_ARM_WOQ_3D_BA_DIAG) {
-                // Diagnostic: nibble (b, k, n) at b * K * N + n * K + k, K-contiguous per n.
-                d.weights = dnnl::memory::desc({ B, K, N }, dt::f4_e2m1, { K * N, 1, K });
-                w         = static_cast<uint8_t *>(pt.nib_nk.ptr);
-            }
-            pd                      = make_pd(eng, d, f);
-            a.prim                  = dnnl::matmul(pd);
-            uint8_t *    src        = static_cast<uint8_t *>(pt.src.ptr);
-            uint8_t *    s          = static_cast<uint8_t *>(f16s ? pt.s16.ptr : pt.s8.ptr);
-            uint8_t *    dst        = static_cast<uint8_t *>(pt.dst.ptr);
+            const bool         f16s  = bench_arm_f16_scales(arm);
+            const bool         two_d = bench_arm_2d(arm);
+            const woq_form     f     = bench_woq_form(arm);
+            const memory_descs d     = bench_woq_descs(arm, pt, f);
+            const bool         diag  = arm == BENCH_ARM_WOQ_3D_BA_DIAG;
+            pd                       = make_pd(eng, d, f);
+            a.prim                   = dnnl::matmul(pd);
+            uint8_t *    w           = static_cast<uint8_t *>(diag ? pt.nib_nk.ptr : pt.nib.ptr);
+            uint8_t *    src         = static_cast<uint8_t *>(pt.src.ptr);
+            uint8_t *    s           = static_cast<uint8_t *>(f16s ? pt.s16.ptr : pt.s8.ptr);
+            uint8_t *    dst         = static_cast<uint8_t *>(pt.dst.ptr);
             // The 2-D forms run once per expert, each on its expert's slice of every buffer.
-            const int    n_exec     = two_d ? pt.B : 1;
-            const size_t src_step   = (size_t) M * K * sizeof(uint16_t);
-            const size_t w_step     = (size_t) K * N / 2;
-            const size_t s_step     = (size_t) pt.G * N * (f16s ? sizeof(uint16_t) : 1);
-            const size_t dst_step   = (size_t) M * N * sizeof(float);
-            const int    scales_arg = DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS;
+            const int    n_exec      = two_d ? pt.B : 1;
+            const size_t src_step    = (size_t) M * K * sizeof(uint16_t);
+            const size_t w_step      = (size_t) K * N / 2;
+            const size_t s_step      = (size_t) pt.G * N * (f16s ? sizeof(uint16_t) : 1);
+            const size_t dst_step    = (size_t) M * N * sizeof(float);
+            const int    scales_arg  = DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS;
             for (int e = 0; e < n_exec; ++e) {
                 a.execs.push_back({
                     { DNNL_ARG_SRC,     dnnl::memory(d.src,     eng, src + e * src_step) },
@@ -915,7 +987,7 @@ onednn_arm build_onednn_arm(int arm, const dnnl::engine & eng, bench_point & pt)
                 });
             }
         }
-        a.impl = pd.impl_info_str() ? pd.impl_info_str() : "?";
+        a.impl = one_token(pd.impl_info_str() ? pd.impl_info_str() : "?");
         a.ok   = true;
     } catch (const dnnl::error & e) {
         a.ok   = false;
@@ -1074,13 +1146,14 @@ void report_bench(int                  arm,
                   const bench_timing & t,
                   int                  verdict,
                   const std::string &  impl) {
-    // A bad span ran the arm, so its numerics stand; its device time is printed as 0 and flagged.
-    const double gbps = t.ok ? bench_arm_bytes(arm, pt) / t.dev_us / 1e3 : NAN;
+    // numerics= is always the check's verdict; a timing that did not produce a figure says why in timing=.
+    const double gbps   = t.ok ? bench_arm_bytes(arm, pt) / t.dev_us / 1e3 : NAN;
+    const char * timing = t.ok ? "" : t.bad_span ? " timing=BADSPAN" : " timing=FAIL";
     std::printf(
         "BENCH %s shape=%s B=%d M=%d K=%d N=%d dev_us_per_expert=%.2f wall_us_per_expert=%.2f GBps=%.1f numerics=%s "
         "impl=%s%s\n",
-        k_bench_arm_names[arm], sh.name, pt.B, pt.M, pt.K, pt.N, t.dev_us, t.wall_us, gbps,
-        t.ok || t.bad_span ? bench_verdict_str(verdict) : "FAIL", impl.c_str(), t.bad_span ? " timing=BADSPAN" : "");
+        k_bench_arm_names[arm], sh.name, pt.B, pt.M, pt.K, pt.N, t.dev_us, t.wall_us, gbps, bench_verdict_str(verdict),
+        impl.c_str(), timing);
     if (t.ok && t.dev_us > t.wall_us) {
         std::printf("WARN %s shape=%s B=%d M=%d: device time exceeds wall time, the timestamps are not trustworthy\n",
                     k_bench_arm_names[arm], sh.name, pt.B, pt.M);
@@ -1107,6 +1180,9 @@ void bench_time_point(sycl::queue &        q,
     for (int arm = 0; arm < BENCH_ARM_COUNT; ++arm) {
         bench_timing & t = res.t[arm];
         std::string    impl;
+        // Declared outside the try, so a throw mid-timing drains the queue (below) before the primitive and its memory
+        // objects are destroyed at the end of this iteration.
+        onednn_arm     a;
         try {
             if (arm == BENCH_ARM_F16_DEQUANT) {
                 impl = "kernel:nvfp4_bench_dequant";
@@ -1120,16 +1196,18 @@ void bench_time_point(sycl::queue &        q,
                                      static_cast<uint16_t *>(pt.s16.ptr), pt.B, pt.K, pt.N);
                 });
             } else {
-                onednn_arm a = build_onednn_arm(arm, eng, pt);
-                impl         = a.impl;
+                a    = build_onednn_arm(arm, eng, pt);
+                impl = a.impl;
                 if (a.ok) {
                     t = time_arm(q, pt.B, [&]() { onednn_arm_rep(a, stream); });
                 }
             }
         } catch (const dnnl::error & e) {
+            queue_drain_nothrow(q);
             t    = bench_timing();
             impl = one_token(impl + " execute:" + e.what());
         } catch (const sycl::exception & e) {
+            queue_drain_nothrow(q);
             t    = bench_timing();
             impl = one_token(impl + " sycl:" + e.what());
         }
@@ -1137,12 +1215,168 @@ void bench_time_point(sycl::queue &        q,
     }
 }
 
-// Copies the 8 check experts' bytes into every group of 8 experts of a point.
+// Copies the 8 check experts' bytes into a point's B experts: whole groups of 8 for B a multiple of 8, or the first B
+// experts for B below 8 (the B 1 XCHECK point). Any other B would leave a partial group, so it is refused.
 void upload_tiled(sycl::queue & q, void * dst, const std::vector<uint8_t> & experts8, int B) {
-    for (int e = 0; e < B; e += k_bench_check_b) {
-        q.memcpy(static_cast<uint8_t *>(dst) + (size_t) e / k_bench_check_b * experts8.size(), experts8.data(),
-                 experts8.size());
+    if (B <= 0 || (B >= k_bench_check_b && B % k_bench_check_b != 0) || experts8.size() % k_bench_check_b != 0) {
+        throw std::runtime_error("upload_tiled: B=" + std::to_string(B) + " is neither below 8 nor a multiple of 8");
     }
+    const size_t expert_bytes = experts8.size() / k_bench_check_b;
+    for (int e = 0; e < B; e += k_bench_check_b) {
+        const int n = std::min(B - e, k_bench_check_b);
+        q.memcpy(static_cast<uint8_t *>(dst) + (size_t) e * expert_bytes, experts8.data(), (size_t) n * expert_bytes);
+    }
+}
+
+// Per column (and expert), the largest |out - ref| over its rows divided by the column's largest |ref|; a column whose
+// ref is exactly 0 must read exactly 0. Entries where either side is not finite are counted and left out.
+struct xcheck_result {
+    double worst_rel = NAN;
+    int    nonfinite = -1;  // -1: not compared
+};
+
+xcheck_result xcheck_columns(const std::vector<float> & ref, const std::vector<float> & out, const bench_point & pt) {
+    xcheck_result       r;
+    std::vector<double> max_ref(pt.N);
+    std::vector<double> max_err(pt.N);
+    r.worst_rel = 0.0;
+    r.nonfinite = 0;
+    for (int b = 0; b < pt.B; ++b) {
+        std::fill(max_ref.begin(), max_ref.end(), 0.0);
+        std::fill(max_err.begin(), max_err.end(), 0.0);
+        for (int m = 0; m < pt.M; ++m) {
+            const size_t row = ((size_t) b * pt.M + m) * pt.N;
+            for (int n = 0; n < pt.N; ++n) {
+                const double o = out[row + n];
+                const double f = ref[row + n];
+                if (!std::isfinite(o) || !std::isfinite(f)) {
+                    r.nonfinite++;
+                    continue;
+                }
+                max_ref[n] = std::max(max_ref[n], std::fabs(f));
+                max_err[n] = std::max(max_err[n], std::fabs(o - f));
+            }
+        }
+        for (int n = 0; n < pt.N; ++n) {
+            const double rel = max_ref[n] == 0.0 ? (max_err[n] == 0.0 ? 0.0 : INFINITY) : max_err[n] / max_ref[n];
+            r.worst_rel      = std::max(r.worst_rel, rel);
+        }
+    }
+    return r;
+}
+
+struct xcheck_tally {
+    int pass = 0;
+    int fail = 0;
+};
+
+// Cross-checks the two 3-D WOQ forms Task 26b chooses between against f16-gemm at one point. All three read the 8
+// checked experts repeated and the same src, so every column must agree with f16-gemm's. The dequant and the repack
+// run first, so a point that was not timed has its planes too; then each arm runs once into a NaN-filled dst that is
+// read back before the next arm runs, so no arm's output stands in for another's.
+void bench_xcheck_point(sycl::queue &        q,
+                        const dnnl::engine & eng,
+                        dnnl::stream &       stream,
+                        const bench_shape &  sh,
+                        bench_point &        pt,
+                        xcheck_tally &       tally) {
+    std::vector<float> ref;
+    std::string        ref_error;
+    {
+        onednn_arm g;
+        try {
+            launch_dequant(q, static_cast<const uint8_t *>(pt.stored.ptr), static_cast<uint32_t *>(pt.w16.ptr), pt.B,
+                           pt.K, pt.N);
+            launch_repack(q, static_cast<const uint8_t *>(pt.stored.ptr), static_cast<uint8_t *>(pt.nib.ptr),
+                          static_cast<uint8_t *>(pt.s8.ptr), static_cast<uint16_t *>(pt.s16.ptr), pt.B, pt.K, pt.N);
+            q.wait_and_throw();
+            g = build_onednn_arm(BENCH_ARM_F16_GEMM, eng, pt);
+            if (g.ok) {
+                ref = onednn_arm_read(g, stream, q, pt);
+            } else {
+                ref_error = "f16-gemm:" + g.impl;
+            }
+        } catch (const dnnl::error & e) {
+            queue_drain_nothrow(q);
+            ref_error = one_token(std::string("f16-gemm:execute:") + e.what());
+        } catch (const sycl::exception & e) {
+            queue_drain_nothrow(q);
+            ref_error = one_token(std::string("f16-gemm:sycl:") + e.what());
+        }
+    }
+    for (const int arm : k_xcheck_arms) {
+        xcheck_result r;
+        std::string   error = ref_error;
+        if (error.empty()) {
+            onednn_arm a;
+            try {
+                a = build_onednn_arm(arm, eng, pt);
+                if (a.ok) {
+                    r = xcheck_columns(ref, onednn_arm_read(a, stream, q, pt), pt);
+                } else {
+                    error = a.impl;
+                }
+            } catch (const dnnl::error & e) {
+                queue_drain_nothrow(q);
+                error = one_token(std::string("execute:") + e.what());
+            } catch (const sycl::exception & e) {
+                queue_drain_nothrow(q);
+                error = one_token(std::string("sycl:") + e.what());
+            }
+        }
+        if (!error.empty()) {
+            std::printf("XCHECK-ERROR %s shape=%s B=%d M=%d %s\n", k_bench_arm_names[arm], sh.name, pt.B, pt.M,
+                        error.c_str());
+        }
+        const bool pass = error.empty() && r.nonfinite == 0 && r.worst_rel <= k_xcheck_tol;
+        std::printf("XCHECK %s shape=%s B=%d M=%d worst_rel=%.2e nonfinite=%d %s\n", k_bench_arm_names[arm], sh.name,
+                    pt.B, pt.M, r.worst_rel, r.nonfinite, pass ? "PASS" : "FAIL");
+        std::fflush(stdout);
+        (pass ? tally.pass : tally.fail)++;
+    }
+}
+
+// A point whose buffers could not be allocated still prints its two XCHECK lines, as failures.
+void bench_xcheck_unallocated(const bench_shape & sh, const bench_point & pt, xcheck_tally & tally) {
+    for (const int arm : k_xcheck_arms) {
+        std::printf("XCHECK-ERROR %s shape=%s B=%d M=%d device-allocation-failed\n", k_bench_arm_names[arm], sh.name,
+                    pt.B, pt.M);
+        std::printf("XCHECK %s shape=%s B=%d M=%d worst_rel=nan nonfinite=-1 FAIL\n", k_bench_arm_names[arm], sh.name,
+                    pt.B, pt.M);
+        tally.fail++;
+    }
+    std::fflush(stdout);
+}
+
+// The diagnostic arm's primitive_desc in user scratchpad mode, production's: its scratchpad size and implementation.
+// Built, not executed.
+void bench_report_scratchpad(const dnnl::engine & eng, const bench_shape & sh, const bench_point & pt) {
+    long long   user_bytes = -1;
+    std::string impl;
+    try {
+        const woq_form                     f = bench_woq_form(BENCH_ARM_WOQ_3D_BA_DIAG);
+        const dnnl::matmul::primitive_desc pd =
+            make_pd(eng, bench_woq_descs(BENCH_ARM_WOQ_3D_BA_DIAG, pt, f), f, dnnl::scratchpad_mode::user);
+        user_bytes = (long long) pd.scratchpad_desc().get_size();
+        impl       = one_token(pd.impl_info_str() ? pd.impl_info_str() : "?");
+    } catch (const dnnl::error & e) {
+        impl = one_token(std::string("refused:") + e.what());
+    }
+    std::printf("SCRATCHPAD %s shape=%s B=%d M=%d user_bytes=%lld impl=%s\n",
+                k_bench_arm_names[BENCH_ARM_WOQ_3D_BA_DIAG], sh.name, pt.B, pt.M, user_bytes, impl.c_str());
+    std::fflush(stdout);
+}
+
+// Uploads a point's inputs: the 8 checked experts' stored bytes and diagnostic plane repeated over B, and src.
+void bench_upload_point(sycl::queue &                q,
+                        bench_point &                pt,
+                        const std::vector<uint8_t> & stored8,
+                        const std::vector<uint8_t> & nk8,
+                        const uint16_t *             src) {
+    upload_tiled(q, pt.stored.ptr, stored8, pt.B);
+    upload_tiled(q, pt.nib_nk.ptr, nk8, pt.B);
+    q.memcpy(pt.src.ptr, src, pt.src_bytes);
+    q.wait_and_throw();
 }
 
 int run_bench() {
@@ -1177,16 +1411,45 @@ int run_bench() {
             }
         }
 
-        dnnl::engine eng    = dnnl::sycl_interop::make_engine(q->get_device(), q->get_context());
-        dnnl::stream stream = dnnl::sycl_interop::make_stream(eng, *q);
-
         const bench_shape shapes[] = {
             { "gate_up", 2304, 2304, 0x475550u },
             { "down",    1152, 2304, 0x444f57u },
         };
-        constexpr int             n_shapes = (int) (sizeof(shapes) / sizeof(shapes[0]));
+        constexpr int n_shapes = (int) (sizeof(shapes) / sizeof(shapes[0]));
+
+        // Every B and M any point uses: the grid and the XCHECK-only points.
+        std::vector<int> all_b(std::begin(k_bench_bs), std::end(k_bench_bs));
+        std::vector<int> all_m(std::begin(k_bench_ms), std::end(k_bench_ms));
+        for (const bench_extent & x : k_xcheck_extra) {
+            all_b.push_back(x.B);
+            all_m.push_back(x.M);
+        }
+        const int max_b = *std::max_element(all_b.begin(), all_b.end());
+        const int max_m = *std::max_element(all_m.begin(), all_m.end());
+
+        // The kernels have no tails: the repack's tiles need K and N in multiples of 64, and the dequant's nd_range
+        // needs B * N * K / 2 in whole work-groups at every B.
+        for (const bench_shape & sh : shapes) {
+            if (sh.K % k_nvfp4_block != 0 || sh.N % k_bench_tile != 0) {
+                std::printf("BENCH harness FAIL shape %s: K=%d and N=%d must be multiples of %d\n", sh.name, sh.K, sh.N,
+                            k_bench_tile);
+                return 1;
+            }
+            for (const int B : all_b) {
+                if ((size_t) B * sh.N * (sh.K / 2) % k_bench_wg != 0) {
+                    std::printf("BENCH harness FAIL shape %s B=%d: B*N*K/2 is not a multiple of %d\n", sh.name, B,
+                                k_bench_wg);
+                    return 1;
+                }
+            }
+        }
+
+        dnnl::engine eng    = dnnl::sycl_interop::make_engine(q->get_device(), q->get_context());
+        dnnl::stream stream = dnnl::sycl_interop::make_stream(eng, *q);
+
         int                       verdicts[n_shapes][BENCH_ARM_COUNT];
         std::vector<bench_result> results;
+        xcheck_tally              tally;
         for (int si = 0; si < n_shapes; ++si) {
             const bench_shape & sh      = shapes[si];
             const woq_problem   chk     = make_nvfp4_problem(k_bench_check_b, k_bench_check_m, sh.K, sh.N, sh.seed);
@@ -1205,14 +1468,15 @@ int run_bench() {
                     }
                 }
             }
-            // Activations for the other grid points; their weights repeat chk's 8 experts.
+            // Activations for every point but the check point; their weights repeat chk's 8 experts.
             std::mt19937                          rng(sh.seed ^ 0x5a5a5a5au);
             std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-            std::vector<uint16_t>                 src_all((size_t) k_bench_bs[2] * k_bench_ms[2] * sh.K);
+            std::vector<uint16_t>                 src_all((size_t) max_b * max_m * sh.K);
             for (uint16_t & h : src_all) {
                 h = f16_bits(dist(rng));
             }
 
+            // Verdicts start as FAIL; the check at the grid's first point (static_assert above) sets them.
             int * verdict = verdicts[si];
             std::fill(verdict, verdict + BENCH_ARM_COUNT, (int) BENCH_VERDICT_FAIL);
             for (const int B : k_bench_bs) {
@@ -1223,24 +1487,38 @@ int run_bench() {
                         for (int arm = 0; arm < BENCH_ARM_COUNT; ++arm) {
                             report_bench(arm, sh, pt, bench_timing(), BENCH_VERDICT_FAIL, "device-allocation-failed");
                         }
+                        bench_xcheck_unallocated(sh, pt, tally);
                         results.push_back(res);
                         continue;
                     }
                     const bool check = B == k_bench_check_b && M == k_bench_check_m;
-                    upload_tiled(*q, pt.stored.ptr, chk.stored, B);
-                    upload_tiled(*q, pt.nib_nk.ptr, nk8, B);
-                    q->memcpy(pt.src.ptr, check ? chk.src.data() : src_all.data(), pt.src_bytes);
-                    q->wait_and_throw();
+                    bench_upload_point(*q, pt, chk.stored, nk8, check ? chk.src.data() : src_all.data());
                     if (check) {
                         bench_check(*q, eng, stream, sh, pt, chk, chk_f16, verdict);
                     }
                     bench_time_point(*q, eng, stream, sh, pt, verdict, res);
+                    bench_xcheck_point(*q, eng, stream, sh, pt, tally);
+                    bench_report_scratchpad(eng, sh, pt);
                     results.push_back(res);
                 }
             }
+
+            // XCHECK-only points: no BENCH line and no timing, so the BENCH and PIPELINE counts stay 144 and 18.
+            for (const bench_extent & x : k_xcheck_extra) {
+                bench_point pt(*q, x.B, x.M, sh.K, sh.N);
+                if (!pt.allocated()) {
+                    bench_xcheck_unallocated(sh, pt, tally);
+                    continue;
+                }
+                bench_upload_point(*q, pt, chk.stored, nk8, src_all.data());
+                bench_xcheck_point(*q, eng, stream, sh, pt, tally);
+                bench_report_scratchpad(eng, sh, pt);
+            }
         }
 
-        // f16 = dequant + gemm; woq_best = repack + the fastest WOQ form whose check passed at this shape.
+        // f16 = dequant + gemm; woq_best = repack + the fastest WOQ form whose check passed at this shape. woq-repack
+        // writes both scale planes, so woq_best pays about 11% of the repack's bytes for a plane its form does not
+        // read.
         for (const bench_result & r : results) {
             const bench_timing & dq   = r.t[BENCH_ARM_F16_DEQUANT];
             const bench_timing & gemm = r.t[BENCH_ARM_F16_GEMM];
@@ -1253,7 +1531,7 @@ int run_bench() {
                     best = arm;
                 }
             }
-            const double woq = best >= 0 && rp.ok ? rp.dev_us + r.t[best].dev_us : NAN;
+            const double woq         = best >= 0 && rp.ok ? rp.dev_us + r.t[best].dev_us : NAN;
             // The ratio is a number only when both pipelines' inputs passed and both sums are finite times.
             const int *  v           = verdicts[r.shape];
             const bool   inputs_pass = v[BENCH_ARM_F16_DEQUANT] == BENCH_VERDICT_PASS &&
@@ -1270,6 +1548,7 @@ int run_bench() {
             std::printf("PIPELINE shape=%s B=%d M=%d f16=%.2f woq_best=%.2f form=%s ratio=%s\n", shapes[r.shape].name,
                         r.B, r.M, f16, woq, best >= 0 ? k_bench_arm_names[best] : "none", ratio);
         }
+        std::printf("XCHECK_SUMMARY pass=%d fail=%d\n", tally.pass, tally.fail);
         std::fflush(stdout);
     } catch (const std::exception & e) {
         std::printf("BENCH harness FAIL %s\n", e.what());
