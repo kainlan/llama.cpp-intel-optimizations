@@ -122,6 +122,7 @@ GEMM_CONSUMERS = (
     ("woq_gemm_q4_0_impl", "DNNL_WOQ_Q4_0", "false", "bool", 1),
     ("gemm_batch_strided", "DNNL_GEMM_BATCH", "std::nullopt", "std::optional<sycl::event>", 2),
     ("woq_gemm_batch_mxfp4", "DNNL_WOQ_MXFP4_BATCH", "std::nullopt", "std::optional<sycl::event>", 2),
+    ("woq_gemm_batch_nvfp4", "DNNL_WOQ_NVFP4_BATCH", "std::nullopt", "std::optional<sycl::event>", 1),
 )
 GEMM_FORWARDERS = (("row_gemm", "std::optional<sycl::event>"), ("woq_gemm_q4_0", "bool"))
 GEMM_DEAD = ("woq_gemm_q4_0_packed", "gemm_batch_array", "row_gemm_batch")

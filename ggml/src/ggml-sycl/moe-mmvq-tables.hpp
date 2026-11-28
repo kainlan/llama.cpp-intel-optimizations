@@ -290,8 +290,9 @@ inline bool moe_type_has_immutable_host_recipe(ggml_type type) {
 //   moe_pp_batched_f16_supports_layout  -- the f16 arm: dequantize the active experts into the planned weight
 //                                          slot, in groups that fit it (moe_pp_batched_f16_plan_groups), and run
 //                                          batched oneDNN GEMMs over each group.
-//   moe_pp_batched_woq_supports_layout  -- the MXFP4 weight-only-quantized arm: repack each expert into the
-//                                          WOQ nibble/scale slots and let oneDNN dequantize inside the GEMM.
+//   moe_pp_batched_woq_supports_layout  -- the weight-only-quantized arm, MXFP4's and NVFP4's: repack each active
+//                                          expert into nibble and scale planes in the slot and let oneDNN
+//                                          dequantize inside the GEMM, with no f16 copy of any expert.
 //
 // The rule for the f16 arm: a (type, layout) pair is admitted when a kernel exists that decodes one expert, in the
 // layout the cache materialized it in, to f16. That kernel is ggml_get_to_fp16_sycl_for_layout's answer for the
@@ -310,11 +311,13 @@ inline bool moe_type_has_immutable_host_recipe(ggml_type type) {
 // records the same limit (llama.cpp-dkw0). This executor's per-expert call passes only the element count. No plan
 // reaches the case either: the planner materializes an expert COALESCED only for MXFP4 without XMX
 // (layout_policy::get_optimal), and MXFP4's f16 arm admits SOA alone.
-// NVFP4 is in on AOS, its only layout: a prompt whose every expert is on the device runs this arm, and the MMID direct
-// route keeps decode and every node the executor does not claim (the route steps aside only when
-// moe_mmid_direct_defers_to_executor says so). Q1_0 has a converter but is left out: it runs on a device through its
-// MMVQ id kernel (the dispatch table above), and listing it here also needs test-moe-pp-batched-dequant to run it
-// against the CPU, as it runs every listed type. The float types need no dequant and keep their own routes.
+// NVFP4 is in on AOS, its only layout: the executor claims a prompt whose every expert is on the device through this
+// row, and the MMID direct route keeps decode and every node the executor does not claim (the route steps aside only
+// when moe_mmid_direct_defers_to_executor says so). Such a prompt then runs NVFP4's WOQ arm when both its switches
+// allow it (moe_pp_batched_woq_arm_runs), and this f16 arm otherwise. Q1_0 has a converter but is left out: it runs on
+// a device through its MMVQ id kernel (the dispatch table above), and listing it here also needs
+// test-moe-pp-batched-dequant to run it against the CPU, as it runs every listed type. The float types need no
+// dequant and keep their own routes.
 // IQ1_S, IQ1_M and IQ4_XS are in although they have no MMVQ id kernel: the f16 arm needs only the dequant,
 // so for IQ4_XS this executor is the only device route for prompts (decode stays refused).
 // test-moe-pp-batched-dequant runs every listed type on a device except IQ1_S, IQ2_XXS and IQ2_XS, which need an
@@ -359,18 +362,80 @@ inline bool moe_pp_batched_f16_supports_layout(enum ggml_type type, enum ggml_la
     }
 }
 
+// The WOQ arm's rows: the layouts its repack reads. MXFP4's repack reads the SOA or XMX_TILED planes the planner
+// materializes for it; NVFP4's (repack_nvfp4_to_woq_nk_batched) reads the AOS blocks as loaded.
 inline bool moe_pp_batched_woq_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
-    return type == GGML_TYPE_MXFP4 && (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_XMX_TILED);
+    return (type == GGML_TYPE_MXFP4 && (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_XMX_TILED)) ||
+           (type == GGML_TYPE_NVFP4 && layout == GGML_LAYOUT_AOS);
+}
+
+// Whether a dispatch runs the WOQ arm: the type's WOQ row, the GGML_SYCL_MOE_PP_WOQ switch, and for NVFP4 its own
+// switch (GGML_SYCL_MOE_PP_WOQ_NVFP4 and the oneDNN version). The executor asks this alone; a dispatch it answers
+// false for runs the f16 arm.
+inline bool moe_pp_batched_woq_arm_runs(enum ggml_type        type,
+                                        enum ggml_layout_mode layout,
+                                        bool                  woq_enabled,
+                                        bool                  nvfp4_woq_enabled) {
+    return woq_enabled && moe_pp_batched_woq_supports_layout(type, layout) &&
+           (type != GGML_TYPE_NVFP4 || nvfp4_woq_enabled);
+}
+
+// Where NVFP4's WOQ arm puts its active experts' planes in the weight slot. oneDNN's 3-D WOQ GEMM strides from one
+// expert to the next by a single nibble stride and a single scale stride, so the planes are dense: expert s's nibbles
+// (K*N/2 bytes) at s * nibble_bytes, then, from the next 256-byte boundary after the last nibble plane, expert s's f16
+// scales ((K/16)*N halves) at scale_offset_bytes + s * scale_halves * 2. They end at used_bytes, which never passes
+// the slot the admission asked for (align256 of each plane, per active expert). False, with *out untouched, for a K
+// that is not a whole number of 64-value NVFP4 blocks, an empty shape, no active expert, or sizes that overflow.
+struct moe_pp_woq_nvfp4_planes {
+    size_t nibble_bytes;        // one expert's nibble plane, bytes
+    size_t scale_halves;        // one expert's scale plane, f16 values
+    size_t scale_offset_bytes;  // the first scale plane, bytes from the slot's start
+    size_t used_bytes;          // the end of the last scale plane, bytes from the slot's start
+};
+
+// NVFP4's values per block (QK_NVFP4) and per f16 scale (QK_NVFP4_SUB). This header does not include ggml-common.h,
+// so it names them itself; the executor static_asserts that the two spellings agree.
+constexpr size_t moe_pp_woq_nvfp4_block       = 64;
+constexpr size_t moe_pp_woq_nvfp4_scale_group = 16;
+static_assert(moe_pp_woq_nvfp4_block % moe_pp_woq_nvfp4_scale_group == 0 && moe_pp_woq_nvfp4_scale_group >= 4,
+              "a row's f16 scales take at most its nibble bytes, so the nibble planes' overflow checks bound them");
+
+inline bool moe_pp_woq_nvfp4_dense_planes(size_t k, size_t n, size_t active, moe_pp_woq_nvfp4_planes * out) {
+    if (out == nullptr || k == 0 || k % moe_pp_woq_nvfp4_block != 0 || n == 0 || active == 0) {
+        return false;
+    }
+    // A row's scales are (k / 16) * 2 bytes against its k / 2 nibble bytes, so a product that bounds the nibble
+    // planes bounds the scale planes too.
+    if (n > SIZE_MAX / (k / 2)) {
+        return false;
+    }
+    const size_t nibble_bytes = n * (k / 2);
+    const size_t scale_halves = (k / moe_pp_woq_nvfp4_scale_group) * n;
+    if (active > SIZE_MAX / nibble_bytes) {
+        return false;
+    }
+    const size_t nibbles = active * nibble_bytes;
+    const size_t scales  = active * scale_halves * 2;
+    if (nibbles > SIZE_MAX - 255 || (nibbles + 255) / 256 * 256 > SIZE_MAX - scales) {
+        return false;
+    }
+    out->nibble_bytes       = nibble_bytes;
+    out->scale_halves       = scale_halves;
+    out->scale_offset_bytes = (nibbles + 255) / 256 * 256;
+    out->used_bytes         = out->scale_offset_bytes + scales;
+    return true;
 }
 
 // The one question both gates ask. woq_enabled is GGML_SYCL_MOE_PP_WOQ; aos_enabled is
 // GGML_SYCL_MOE_PP_F16_BATCHED_AOS, which set to 0 drops every non-MXFP4 entry (the SOA ones too, despite
-// the name) and so restricts the executor to MXFP4 as it was before llama.cpp-348c.
+// the name) and so restricts the executor to MXFP4 as it was before llama.cpp-348c. This function's WOQ branch counts
+// for MXFP4 alone, although NVFP4 has a WOQ row too: NVFP4 is claimed through its f16 row under aos_enabled,
+// whichever arm then runs it, so its switch moves no claim.
 inline bool moe_pp_batched_supports_layout(enum ggml_type        type,
                                            enum ggml_layout_mode layout,
                                            bool                  woq_enabled,
                                            bool                  aos_enabled) {
-    if (woq_enabled && moe_pp_batched_woq_supports_layout(type, layout)) {
+    if (woq_enabled && type == GGML_TYPE_MXFP4 && moe_pp_batched_woq_supports_layout(type, layout)) {
         return true;
     }
     if (type != GGML_TYPE_MXFP4 && !aos_enabled) {

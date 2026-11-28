@@ -342,9 +342,9 @@ struct ggml_sycl_tensor_inventory {
     size_t                         pp_pipeline_scratch_bytes;
     // Ring-backed PP MoE oneDNN staging planned from the model inventory.
     // The weight slot is sized for every expert in the GEMM's weight form: the WOQ repack (4-bit values and e8m0
-    // scales) by default, or the f16 dequant when GGML_SYCL_MOE_PP_WOQ=0 at load. A type on the executor's f16 arm
-    // stages as many experts in f16 as the slot holds. The activation slot holds f16 input rows and the output slot
-    // f32 output rows.
+    // scales, or f16 scales for NVFP4) by default, or the f16 dequant when GGML_SYCL_MOE_PP_WOQ=0 at load. A type on
+    // the executor's f16 arm stages as many experts in f16 as the slot holds. The activation slot holds f16 input rows
+    // and the output slot f32 output rows.
     // The current PP path serializes slot use, so the default plan reserves one reusable slot.
     size_t                         pp_moe_onednn_weight_slot_bytes;
     // Unused: the loader writes 0 to both, and they stay because the layout static_asserts after this struct pin its
@@ -2615,9 +2615,10 @@ GGML_BACKEND_API size_t ggml_backend_sycl_debug_live_kv_view_extra_count(void);
 // llama.cpp-23mk S3-3 (G6): the scratchpad decline seam. Every get_scratchpad_mem family measured so far asks for 0
 // bytes, so a decline cannot be provoked from outside. After inject(site, n) the n-th call that carries the named
 // site tag is declined (n == 0 disarms) and the site's call counter restarts. Sites: "dnnl_softmax", "dnnl_eltwise",
-// "dnnl_binary_row", "dnnl_gemm", "dnnl_woq_q8_0", "dnnl_woq_q4_0", "dnnl_gemm_batch", "dnnl_woq_mxfp4_batch" (S3-4). One
-// "dnnl_gemm" call is the dense gemm's pre-query when the caller hoists one, and that pre-query counts as a call. Returns
-// false, and changes nothing, for an unknown site or a negative n. Process-global, single-threaded test use only.
+// "dnnl_binary_row", "dnnl_gemm", "dnnl_woq_q8_0", "dnnl_woq_q4_0", "dnnl_gemm_batch", "dnnl_woq_mxfp4_batch" (S3-4),
+// "dnnl_woq_nvfp4_batch" (Inkling Task 26b-2). One "dnnl_gemm" call is the dense gemm's pre-query when the caller
+// hoists one, and that pre-query counts as a call. Returns false, and changes nothing, for an unknown site or a
+// negative n. Process-global, single-threaded test use only.
 GGML_BACKEND_API bool ggml_sycl_test_inject_scratchpad_decline(const char * site, int32_t after_n);
 // Zeroes every site's counters and disarms every site.
 GGML_BACKEND_API void ggml_sycl_test_scratchpad_sites_reset(void);

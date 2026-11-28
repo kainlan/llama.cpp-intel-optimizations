@@ -34,14 +34,27 @@ each claim with mutants that must turn it red (its positive controls):
   - a deferred expert the window did not stage (the ring could not take the matrix) is declined, never aborted
     (llama.cpp-9433), and every decline in the phase loop first drains the phases already submitted;
   - the [PP-MOE] first-run line counts the windows the dispatch began, and the executor trace line its misses
-    (Task 6's gate sums misses=);
+    (Task 6's gate sums misses=) and the GEMM row groups it ran (gemm_groups=, the pack's groups);
   - the prose that named the retired staging (moe_stream_phase::stage, reuse_after_readers, stage()) is gone.
 """
+import importlib.util
 import re
+from pathlib import Path
 
 import pytest
 from sycl_gate import body, first_missing, first_present, mutate, norm, ordered, read
 
+
+def _load_batched_types():
+    """The batched-types source contract as a module, for the pins it owns (its file name is not an identifier)."""
+    path = Path(__file__).resolve().parent / "test-sycl-moe-pp-batched-types-source.py"
+    spec = importlib.util.spec_from_file_location("sycl_moe_pp_batched_types_source", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_BATCHED_TYPES = _load_batched_types()
 
 SYCL = read("ggml/src/ggml-sycl/ggml-sycl.cpp")
 TEST_HPP = read("ggml/src/ggml-sycl/ggml-sycl-test.hpp")
@@ -117,7 +130,9 @@ def test_stream_call_at_function_scope_mutants():
 
 ROLE_DECL = ("const ggml_sycl::expert_tensor_role pp_stream_role = ctx.moe_stream ? "
              "ggml_sycl::expert_tensor_role_from_tensor_name(src0->name) : ggml_sycl::expert_tensor_role::UNKNOWN;")
-WOQ_ARM = "const bool pp_woq_arm = pp_woq_enabled && moe_pp_batched_woq_supports_layout(src0->type, route_layout);"
+# The WOQ arm is MXFP4's and NVFP4's: the table's row, GGML_SYCL_MOE_PP_WOQ, and NVFP4's own switch, asked for NVFP4.
+# The line is the batched-types contract's (its claim (u) owns the arm), read from there so the two cannot drift.
+WOQ_ARM = _BATCHED_TYPES.WOQ_ARM_LINE
 WINDOWED = ("const bool pp_stream_windowed = pp_onednn_batched_claims_staged_layer && "
             "ggml_sycl::detail::moe_expert_role_is_triplet(pp_stream_role) && !pp_woq_arm;")
 LAYER_FLAG = "pp_onednn_batched_claims_staged_layer"
@@ -664,14 +679,16 @@ COUNTERS = "size_t pp_windows = 0; uint32_t pp_window_misses = 0;"
 PP_MOE_FMT = ("\"[PP-MOE] device=%d type=%s layout=%s arm=%s experts=%zu groups=%zu planned_weight_slot=%zu "
               "windows=%zu\\n\"")
 PP_MOE_ARGS = "phases.size(), planned_weight, pp_windows);"
-EXEC_TRACE_FMT = "\"[MOE-EXEC-TRACE] executor device %d tensor=%s experts=%zu staged=%zu arm=%s misses=%u\""
-EXEC_TRACE_ARGS = "pp_staged_experts, pp_woq_arm ? \"woq\" : \"f16\", pp_window_misses);"
+EXEC_TRACE_FMT = ("\"[MOE-EXEC-TRACE] executor device %d tensor=%s experts=%zu staged=%zu arm=%s misses=%u "
+                  "gemm_groups=%zu\"")
+EXEC_TRACE_ARGS = "pp_staged_experts, pp_woq_arm ? \"woq\" : \"f16\", pp_window_misses, gemm_groups.size());"
 
 
 def claim_trace_lines(sycl: str) -> bool:
     """The [PP-MOE] first-run line names the windows the dispatch began (0 on a layer the executor does not claim), and
-    the executor trace line the misses of its windows, which Task 6's gate sums (RE_TRACE_MISSES). Both counters start
-    at zero once per dispatch."""
+    the executor trace line the misses of its windows, which Task 6's gate sums (RE_TRACE_MISSES), and the GEMM row
+    groups it ran (the pack's groups, not the f16 arm's phases), which the device test's hot-expert cases bound. Both
+    counters start at zero once per dispatch."""
     n = norm(sycl)
     lam = body(n, EXEC_SIG)
     return (n.count(PP_MOE_FMT) == 1 and n.count(EXEC_TRACE_FMT) == 1 and lam.count(COUNTERS) == 1
@@ -687,8 +704,11 @@ def test_trace_lines():
 
 def test_trace_lines_mutants():
     c = claim_trace_lines
-    assert not c(mutate(SYCL, " misses=%u\"", "\""))
+    assert not c(mutate(SYCL, " misses=%u gemm_groups=%zu\"", " gemm_groups=%zu\""))
     assert not c(mutate(SYCL, EXEC_TRACE_ARGS, EXEC_TRACE_ARGS.replace("pp_window_misses", "0u")))
+    # The GEMM groups dropped from the line, or counted as the f16 arm's phases.
+    assert not c(mutate(SYCL, " gemm_groups=%zu\"", "\""))
+    assert not c(mutate(SYCL, EXEC_TRACE_ARGS, EXEC_TRACE_ARGS.replace("gemm_groups.size()", "phases.size()")))
     assert not c(mutate(SYCL, " windows=%zu\\n\"", "\\n\""))
     assert not c(mutate(SYCL, PP_MOE_ARGS, PP_MOE_ARGS.replace("pp_windows", "phases.size()")))
 

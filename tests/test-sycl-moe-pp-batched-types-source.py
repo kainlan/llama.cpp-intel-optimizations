@@ -15,7 +15,8 @@ dequant. These claims pin that shape:
       without a pin is red), and every type it lists has a case in convert.cpp's
       ggml_get_to_fp16_sycl_for_layout; that case decodes SOA with a reorder kernel for Q4_0, Q4_K and Q6_K, and
       since it answers Q8_0 with the AOS kernel for every layout, the lambda takes Q8_0 SOA to
-      dequantize_row_q8_0_soa_to_fp16_rowmajor and never asks it; the WOQ table is MXFP4 on SOA and XMX_TILED;
+      dequantize_row_q8_0_soa_to_fp16_rowmajor and never asks it; the WOQ table is MXFP4 on SOA and XMX_TILED and
+      NVFP4 on AOS, one row per type;
   (c) the Q4_K device-weight CPU fallback (a D2H copy per dispatch) does not fire for a prompt the executor claims,
       and the mechanism is precedence, not a term on the fallback: a claimed prompt drops the planner's prompt route
       (planner_needs_prompt_route), so an all-local claimed prompt never enters the hybrid world where the fallback
@@ -31,7 +32,8 @@ dequant. These claims pin that shape:
   (f) one [PP-MOE] INFO line per (device, type, layout), naming the type, layout, experts per dispatch and the
       planned slot;
   (g) the MXFP4 profiler label strings are byte-identical and keep their counts, the non-MXFP4 labels are moe.pp.*,
-      and the MXFP4 dispatch-record profile stays MXFP4-only;
+      and the MXFP4 dispatch-record profile stays MXFP4-only; NVFP4's WOQ GEMM and repack keep their one label each
+      (nvfp4.pp.gemm.execute in gemm.hpp, nvfp4.pp.repack.nk in convert.cpp);
   (h) the capability query admits a prompt-phase op the executor takes only after the MMVQ check (so no type that
       has an MMVQ-ID kernel changes kernel), and MUL_MAT_ID admission takes a type with no MMVQ-ID kernel only for
       a prompt the executor claims, which is only a layer whose every expert is planned on this device: the claim's
@@ -103,19 +105,44 @@ dequant. These claims pin that shape:
       names the loader sizes the ring from) of a type that predicate serves. The consumer asks no knob predicate, so the
       ring a load plans never follows a runtime knob. A model whose experts are only Q1_0 (the MMID direct route) or
       BF16 (the BF16 direct route) plans none, so its RUNTIME zone carries no ring nobody would use.
+  (u) the WOQ arm a dispatch runs is one header question: moe_pp_batched_woq_arm_runs (moe-mmvq-tables.hpp) is the
+      type's WOQ row under GGML_SYCL_MOE_PP_WOQ and, for NVFP4, its own switch, and the executor's pp_woq_arm is that
+      call alone. The claim does not move with it: moe_pp_batched_supports_layout takes the WOQ row for MXFP4 only, so
+      NVFP4 is claimed through its f16 row under the AOS knob whichever arm then runs it. NVFP4's switch
+      (ggml_sycl_moe_pp_woq_nvfp4_enabled) reads GGML_SYCL_MOE_PP_WOQ_NVFP4 once, asks the oneDNN version
+      (DnnlGemmWrapper::woq_nvfp4_library_ok) and WARNs when the version alone turns the arm off; it is defined under
+      #if GGML_SYCL_DNNL, as the wrapper is, and catalogued. Its repack and its GEMM each run under pp_woq_nvfp4 and
+      take the dense planes from moe_pp_woq_nvfp4_dense_planes, asked once; the MXFP4 WOQ GEMM stays under pp_woq_arm.
+      The NVFP4 GEMM's operands are pinned whole and in order (each group's planes lo nibble planes and lo scale planes
+      in), its first scale plane sits at the dense layout's scale_offset_bytes, and the repack writes from the same two
+      bases. After the helper fills the planes the admission asserts that they are its own per-expert sizes and end
+      inside the slots it asked for; the header names NVFP4's block and scale group itself (it cannot see
+      ggml-common.h), counts with those names, and the admission static_asserts them equal to QK_NVFP4 and QK_NVFP4_SUB.
+  (v) the device test checks the arm it is told, not the arm the environment gives. --arm woq|f16 names the arm
+      NVFP4's cases must run (expect_woq_arm reads only that), main compares it with GGML_SYCL_MOE_PP_WOQ and
+      GGML_SYCL_MOE_PP_WOQ_NVFP4, read as the backend reads them, before the backend is touched and fails the run when
+      they disagree, and a child case runs with its parent's --arm. CMakeLists.txt registers the binary twice: --arm
+      woq, and --types nvfp4 --arm f16 with GGML_SYCL_MOE_PP_WOQ_NVFP4=0; both carry the model label, which keeps a
+      test that loads a planned model onto a card out of the unattended sweep. The hot-expert cases require the
+      executor trace to name at least two GEMM groups (gemm_groups=), so the WOQ GEMM's offsets past expert 0 run.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
 """
 import functools
 import re
+import sys
 from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sycl_gate import cmake_strip  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 SYCL_DIR = ROOT / "ggml" / "src" / "ggml-sycl"
 FILES = {
+    "cmake": SYCL_DIR / "CMakeLists.txt",
     "sycl": SYCL_DIR / "ggml-sycl.cpp",
     "tables": SYCL_DIR / "moe-mmvq-tables.hpp",
     "cost": SYCL_DIR / "moe-exec-cost.hpp",
@@ -181,10 +208,12 @@ PHASE_OFFSET = ("const size_t phase_offset = "
                 "sycl::half * phase_weights = batched_weights + phase_offset;")
 PHASE_BOUND = ("GGML_ASSERT(pp_woq_arm || (phase_offset + (phase.end - phase.begin) * weight_elems) * "
                "sizeof(sycl::half) <= reserved.weight_size);")
-# The route log's weight figure: the f16 arm's buffers when its phases reuse them, else every active expert's region.
+# The route log's weight figure: NVFP4's dense planes, MXFP4's slots, the f16 arm's buffers when its phases reuse
+# them, else every active expert's region.
 WEIGHT_USED = ("const size_t f16_used_elems = moe_pp_batched_phases_reuse_buffers(f16_groups) ? "
                "phase_buffers * half_elems : active_count * weight_elems; "
-               "const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : f16_used_elems * sizeof(sycl::half);")
+               "const size_t weight_used_bytes = pp_woq_nvfp4 ? nvfp4_planes.used_bytes : pp_woq_arm ? weight_bytes : "
+               "f16_used_elems * sizeof(sycl::half);")
 PHASE_WAIT = ("if (moe_pp_batched_phases_reuse_buffers(f16_groups) && !half_readers[phase.buffer].empty()) { "
               "stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]); half_readers[phase.buffer].clear(); }")
 # The debugging compare arm (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE), the one block in the lambda that may wait on
@@ -227,6 +256,82 @@ CLAIMS_STAGED_TYPE_BODY = ("{ return moe_pp_batched_takes_staged_type(type) && "
                            "ggml_sycl_moe_pp_batched_takes_layout(type, GGML_LAYOUT_AOS); }")
 STAGED_CLAIM_HEAD = "planned = plan != nullptr && ggml_sycl_moe_pp_batched_claims_staged_type(weight->type) && "
 SEED_GATE = "if (!moe_pp_batched_takes_staged_type(t)) { return MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED; }"
+# The WOQ table's rows: MXFP4's repack reads its SOA or XMX_TILED planes, NVFP4's reads its AOS blocks.
+WOQ_ROWS = {"GGML_TYPE_MXFP4": ["GGML_LAYOUT_SOA", "GGML_LAYOUT_XMX_TILED"], "GGML_TYPE_NVFP4": ["GGML_LAYOUT_AOS"]}
+# Which arm a dispatch runs, asked of the header, and the claim's WOQ branch, which stays MXFP4's alone. NVFP4's
+# switch is asked only for an NVFP4 op, so its oneDNN-version WARN never prints for another type's model.
+WOQ_ARM_FN = "moe_pp_batched_woq_arm_runs"
+WOQ_ARM_BODY = ("{ return woq_enabled && moe_pp_batched_woq_supports_layout(type, layout) && "
+                "(type != GGML_TYPE_NVFP4 || nvfp4_woq_enabled); }")
+WOQ_ARM_LINE = ("const bool pp_woq_arm = moe_pp_batched_woq_arm_runs(src0->type, route_layout, pp_woq_enabled, "
+                "src0->type == GGML_TYPE_NVFP4 && ggml_sycl_moe_pp_woq_nvfp4_enabled());")
+WOQ_NVFP4_LINE = "const bool pp_woq_nvfp4 = pp_woq_arm && src0->type == GGML_TYPE_NVFP4;"
+WOQ_CLAIM_BRANCH = ("if (woq_enabled && type == GGML_TYPE_MXFP4 && moe_pp_batched_woq_supports_layout(type, layout)) "
+                    "{ return true; }")
+NVFP4_SWITCH = "ggml_sycl_moe_pp_woq_nvfp4_enabled"
+NVFP4_SWITCH_HEAD = "static bool ggml_sycl_moe_pp_woq_nvfp4_enabled() {"
+NVFP4_KNOB = "GGML_SYCL_MOE_PP_WOQ_NVFP4"
+NVFP4_KNOB_ROW = "| `GGML_SYCL_MOE_PP_WOQ_NVFP4=0` | ON |"
+NVFP4_SWITCH_TERMS = ('static const bool enabled', 'std::getenv("GGML_SYCL_MOE_PP_WOQ_NVFP4")',
+                      "DnnlGemmWrapper::woq_nvfp4_library_ok()", "GGML_LOG_WARN(", "dnnl_version()")
+NVFP4_REPACK = "repack_nvfp4_to_woq_nk_batched("
+NVFP4_GEMM = "DnnlGemmWrapper::woq_gemm_batch_nvfp4("
+MXFP4_WOQ_GEMM = "DnnlGemmWrapper::woq_gemm_batch_mxfp4("
+NVFP4_PLANES = "moe_pp_woq_nvfp4_dense_planes("
+# NVFP4's WOQ planes as the executor addresses them: the GEMM's every operand in order (m, n, k, the activations and
+# their stride, the group's first nibble plane, its first scale plane, the output and its stride, the batch), the first
+# scale plane at the dense layout's offset, and the repack writing both planes from the same two bases.
+NVFP4_GEMM_CALL = ("group_event = DnnlGemmWrapper::woq_gemm_batch_nvfp4( ctx, static_cast<int>(group.n_rows), "
+                   "static_cast<int>(ne01), static_cast<int>(ne00), act_base(lo), "
+                   "DnnlGemmWrapper::to_dt<sycl::half>(), act_stride, "
+                   "batched_weight_bytes + lo * nvfp4_planes.nibble_bytes, "
+                   "woq_nvfp4_scales + lo * nvfp4_planes.scale_halves, out_base(lo), DnnlGemmWrapper::to_dt<float>(), "
+                   "out_stride, static_cast<int>(hi - lo), ctx.stream(), { deps_in });")
+NVFP4_SCALES_INIT = ("sycl::half * woq_nvfp4_scales = pp_woq_nvfp4 ? "
+                     "reinterpret_cast<sycl::half *>(batched_weight_bytes + nvfp4_planes.scale_offset_bytes) : "
+                     "nullptr;")
+NVFP4_REPACK_CALL = ("repack_nvfp4_to_woq_nk_batched(repack_srcs.data(), n_slots, batched_weight_bytes, "
+                     "woq_nvfp4_scales, static_cast<int>(ne00), static_cast<int>(ne01), ctx.stream(), ctx.device);")
+# The admission's checks on the dense planes: the header's block and scale group are ggml-common.h's, its plane sizes
+# are the admission's own per-expert sizes, and the planes end inside the slots the admission asked for.
+NVFP4_BLOCK_ASSERT = ("static_assert(QK_NVFP4 == moe_pp_woq_nvfp4_block && "
+                      "QK_NVFP4_SUB == moe_pp_woq_nvfp4_scale_group,")
+NVFP4_SIZES_ASSERT = ("GGML_ASSERT(nvfp4_planes.nibble_bytes == nibble_bytes_per_expert && "
+                      "nvfp4_planes.scale_halves * sizeof(sycl::half) == scale_bytes_per_expert);")
+NVFP4_USED_ASSERT = "GGML_ASSERT(nvfp4_planes.used_bytes <= weight_bytes);"
+NVFP4_HEADER_CONSTS = ("constexpr size_t moe_pp_woq_nvfp4_block = 64;",
+                       "constexpr size_t moe_pp_woq_nvfp4_scale_group = 16;")
+NVFP4_HELPER_TERMS = ("k % moe_pp_woq_nvfp4_block != 0", "(k / moe_pp_woq_nvfp4_scale_group) * n",
+                      "out->scale_offset_bytes = (nibbles + 255) / 256 * 256;")
+# The device test's two registrations. Each names the arm NVFP4's cases must run (--arm); the f16 one turns NVFP4's
+# switch off in its environment, and the test fails at startup when the flag and the environment disagree. Both load
+# a planned model onto a card, so both carry the model label that keeps them out of the unattended ctest sweep.
+DEVICE_REG_WOQ = ('add_test(NAME test-moe-pp-batched-dequant COMMAND test-moe-pp-batched-dequant --arm woq) '
+                  'set_tests_properties(test-moe-pp-batched-dequant PROPERTIES LABELS "sycl;moe;device;B50;model" '
+                  'SKIP_RETURN_CODE 77 RUN_SERIAL TRUE ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;'
+                  'LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}" TIMEOUT 600 )')
+DEVICE_REG_F16 = ('add_test(NAME test-moe-pp-batched-dequant-nvfp4-f16 COMMAND test-moe-pp-batched-dequant '
+                  '--types nvfp4 --arm f16) set_tests_properties(test-moe-pp-batched-dequant-nvfp4-f16 PROPERTIES '
+                  'LABELS "sycl;moe;device;B50;model" SKIP_RETURN_CODE 77 RUN_SERIAL TRUE '
+                  'ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_MOE_PP_WOQ_NVFP4=0;'
+                  'LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}" TIMEOUT 600 )')
+DEVICE_REG_COMMAND = "COMMAND test-moe-pp-batched-dequant "
+ARM_EXPECT_BODY = "{ return type == GGML_TYPE_NVFP4 && g_nvfp4_woq; }"
+ARM_ENV_FN = "env_runs_nvfp4_woq"
+ARM_ENV_TERMS = ("std::getenv(name)", "value == nullptr || std::atoi(value) != 0",
+                 'on("GGML_SYCL_MOE_PP_WOQ") && on("GGML_SYCL_MOE_PP_WOQ_NVFP4")')
+ARM_SET = 'g_nvfp4_woq = std::strcmp(arm, "woq") == 0;'
+ARM_CHECK = "if (env_runs_nvfp4_woq() != g_nvfp4_woq) {"
+ARM_BACKEND_FIRST = 'setenv("GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_TRACE", "1", 1);'
+ARM_CHILD = ('execl("/proc/self/exe", "test-moe-pp-batched-dequant", flag, arg.c_str(), "--arm", '
+             'g_nvfp4_woq ? "woq" : "f16",')
+# The hot-expert cases' GEMM groups, read from the executor trace: expert 0's group and the other 31's, so the WOQ
+# GEMM's group offsets past expert 0 run.
+HOT_GEMM_GROUPS = "c.min_gemm_groups = 2;"
+GEMM_GROUPS_READ = 'g_log.min_field_since(from, "[MOE-EXEC-TRACE] executor device", "gemm_groups=")'
+GEMM_GROUPS_CHECK = "if (c.min_gemm_groups > 0 && (gemm_groups == SIZE_MAX || gemm_groups < c.min_gemm_groups)) {"
+# A preprocessor directive in squeezed text: its keyword and the first token of its condition.
+DIRECTIVE_RE = re.compile(r"#\s?(ifdef|ifndef|if|elif|else|endif)\b ?([^\s#]*)")
 SEED_MXFP4 = "if (t == GGML_TYPE_MXFP4) { return 3990.0; }"
 TABLE_TERMS = ("moe_mmvq_admission_supports_type(", "moe_pp_batched_f16_supports_layout(")
 # The types a ring consumer runs, and the publish helper's gate that plans no ring for a model with none of them.
@@ -277,11 +382,17 @@ def squeeze(src):
 
 
 def load():
-    """Squeezed text per file; C++ sources lose their comments first, the Markdown catalog is kept whole."""
+    """Squeezed text per file; C++ sources lose their comments first, CMake its # comments, and the Markdown catalog is
+    kept whole."""
     out = {}
     for key, path in FILES.items():
         text = path.read_text()
-        out[key] = squeeze(text if path.suffix == ".md" else strip_comments(text))
+        if path.suffix == ".md":
+            out[key] = squeeze(text)
+        elif path.suffix == ".txt":
+            out[key] = squeeze(cmake_strip(text))
+        else:
+            out[key] = squeeze(strip_comments(text))
     return out
 
 
@@ -453,6 +564,67 @@ def enum_values(text, enum_head):
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+def top_level_split(expr, sep):
+    """`expr` split at every `sep` outside brackets."""
+    parts, depth, start, i = [], 0, 0, 0
+    while i < len(expr):
+        c = expr[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and expr.startswith(sep, i):
+            parts.append(expr[start:i])
+            i += len(sep)
+            start = i
+            continue
+        i += 1
+    parts.append(expr[start:])
+    return parts
+
+
+def unwrap(expr):
+    """`expr` without the parentheses that enclose all of it, if any."""
+    expr = expr.strip()
+    while expr.startswith("(") and match_close(expr, 0) == len(expr):
+        expr = expr[1:-1].strip()
+    return expr
+
+
+def woq_table_rows(body):
+    """The WOQ table's rows as {type: sorted layouts}, or None unless its body returns one OR of
+    `type == T && (layout == L || ...)` terms: a negation, a knob or a constant would let the rows say less than the
+    table answers."""
+    m = re.fullmatch(r"\{ return (.*); \}", body or "")
+    if not m:
+        return None
+    rows = {}
+    for term in top_level_split(unwrap(m.group(1)), " || "):
+        row = re.fullmatch(r"type == (GGML_TYPE_\w+) && (.*)", unwrap(term))
+        if not row or row.group(1) in rows:
+            return None
+        layouts = [re.fullmatch(r"layout == (GGML_LAYOUT_\w+)", unwrap(x)) for x in
+                   top_level_split(unwrap(row.group(2)), " || ")]
+        if not all(layouts):
+            return None
+        rows[row.group(1)] = sorted(x.group(1) for x in layouts)
+    return rows
+
+
+def directive_conditions_at(text, pos):
+    """The `#if`/`#ifdef` conditions (first token) whose taken branch encloses `pos`, outermost first."""
+    stack = []
+    for m in DIRECTIVE_RE.finditer(text, 0, pos):
+        kw, cond = m.group(1), m.group(2)
+        if kw in ("if", "ifdef", "ifndef"):
+            stack.append(cond if kw != "ifndef" else "!" + cond)
+        elif kw in ("elif", "else") and stack:
+            stack[-1] = "!" + stack[-1]
+        elif kw == "endif" and stack:
+            stack.pop()
+    return stack
+
+
 def claim_a_one_table(s):
     fails = []
     for fn in ("moe_pp_batched_f16_supports_layout", "moe_pp_batched_woq_supports_layout",
@@ -545,9 +717,10 @@ def claim_b_table_types(s):
     if getter < 0 or "!pp_q8_0_soa(expert)" not in (enclosing_if_condition(lam, getter) or ""):
         fails.append("the lambda does not ask ggml_get_to_fp16_sycl_for_layout per expert, and never for Q8_0 SOA, "
                      "which it answers with the AOS kernel")
-    woq_types = set(re.findall(r"GGML_TYPE_\w+", woq))
-    if woq_types != {"GGML_TYPE_MXFP4"} or "GGML_LAYOUT_SOA" not in woq or "GGML_LAYOUT_XMX_TILED" not in woq:
-        fails.append("the WOQ table must be MXFP4 on SOA and XMX_TILED")
+    rows = woq_table_rows(woq)
+    if rows != {k: sorted(v) for k, v in WOQ_ROWS.items()}:
+        fails.append(f"the WOQ table must be MXFP4 on SOA and XMX_TILED and NVFP4 on AOS, one `type == T && layout`"
+                     f" row each (got {rows!r})")
     return fails
 
 
@@ -724,11 +897,13 @@ def claim_g_labels(s):
         ("convert", '"mxfp4.pp.repack"'): 8,
         ("convert", '"mxfp4.pp.repack.soa"'): 4,
         ("convert", '"mxfp4.pp.repack.tiled"'): 4,
+        ("gemm", '"nvfp4.pp.gemm.execute"'): 1,
+        ("convert", '"nvfp4.pp.repack.nk"'): 1,
     }
     for (key, lit), want in counts.items():
         got = s[key].count(lit)
         if got != want:
-            fails.append(f"{lit} appears {got} times in {FILES[key].name}, want {want} (byte-identical MXFP4 labels)")
+            fails.append(f"{lit} appears {got} times in {FILES[key].name}, want {want} (byte-identical WOQ labels)")
     sycl = s["sycl"]
     for text, want in (
         ("const bool pp_mxfp4_labels = src0->type == GGML_TYPE_MXFP4;", 1),
@@ -1249,6 +1424,108 @@ def claim_t_ring_consumer(s):
     return fails
 
 
+def claim_u_woq_arm(s):
+    fails = []
+    sycl, tables = s["sycl"], s["tables"]
+    arm = one_definition(tables, WOQ_ARM_FN)
+    if arm != WOQ_ARM_BODY:
+        fails.append(f"{WOQ_ARM_FN} is not defined once in moe-mmvq-tables.hpp as `{WOQ_ARM_BODY}` (got {arm!r})")
+    if definitions(sycl, WOQ_ARM_FN):
+        fails.append(f"{WOQ_ARM_FN} has a second definition in ggml-sycl.cpp")
+    supports = one_definition(tables, "moe_pp_batched_supports_layout") or ""
+    if WOQ_CLAIM_BRANCH not in supports or supports.count("moe_pp_batched_woq_supports_layout(") != 1:
+        fails.append("moe_pp_batched_supports_layout's WOQ branch is not MXFP4's alone: NVFP4's claim would move "
+                     "with the WOQ switch instead of following its f16 row under the AOS knob")
+    lam = lambda_body(sycl) or ""
+    if lam.count(WOQ_ARM_LINE) != 1 or len(re.findall(r"\bpp_woq_arm =(?!=)", lam)) != 1:
+        fails.append(f"the executor's pp_woq_arm is not exactly `{WOQ_ARM_LINE}`")
+    if "moe_pp_batched_woq_supports_layout(" in lam:
+        fails.append("the executor asks the WOQ table itself instead of moe_pp_batched_woq_arm_runs")
+    if lam.count(WOQ_NVFP4_LINE) != 1 or len(re.findall(r"\bpp_woq_nvfp4 =(?!=)", lam)) != 1:
+        fails.append(f"the executor does not name NVFP4's WOQ arm once as `{WOQ_NVFP4_LINE}`")
+    for call, cond in ((NVFP4_REPACK, "pp_woq_nvfp4"), (NVFP4_GEMM, "pp_woq_nvfp4"), (MXFP4_WOQ_GEMM, "pp_woq_arm")):
+        at = lam.find(call)
+        got = (enclosing_if_condition(lam, at) or "").strip() if at >= 0 else None
+        if lam.count(call) != 1 or got != cond:
+            fails.append(f"`{call}` is not called once in the executor, under `if ({cond})` (got {got!r})")
+    planes = lam.find(NVFP4_PLANES)
+    if lam.count(NVFP4_PLANES) != 1 or (enclosing_if_condition(lam, planes) or "").strip() != "pp_woq_nvfp4":
+        fails.append(f"the executor does not ask {NVFP4_PLANES[:-1]} once, under `if (pp_woq_nvfp4)`")
+    for pin, what in ((NVFP4_GEMM_CALL, "NVFP4's WOQ GEMM with its operands in order"),
+                      (NVFP4_SCALES_INIT, "NVFP4's first scale plane at the dense layout's scale offset"),
+                      (NVFP4_REPACK_CALL, "NVFP4's repack writing the nibble and scale planes from their own bases"),
+                      (NVFP4_BLOCK_ASSERT, "the static_assert tying the header's NVFP4 constants to ggml-common.h"),
+                      (NVFP4_SIZES_ASSERT, "the assert that the dense planes are the admission's per-expert sizes"),
+                      (NVFP4_USED_ASSERT, "the assert that the dense planes end inside the admitted slots")):
+        if lam.count(pin) != 1:
+            fails.append(f"the executor does not hold {what} once: `{pin}`")
+    at_planes, at_sizes, at_used = (lam.find(NVFP4_PLANES), lam.find(NVFP4_SIZES_ASSERT), lam.find(NVFP4_USED_ASSERT))
+    if not 0 <= at_planes < at_sizes < at_used:
+        fails.append("the dense planes' asserts do not follow the one call that fills them")
+    for const in NVFP4_HEADER_CONSTS:
+        if tables.count(const) != 1:
+            fails.append(f"moe-mmvq-tables.hpp does not name `{const}` once")
+    helper = one_definition(tables, NVFP4_PLANES[:-1]) or ""
+    for term in NVFP4_HELPER_TERMS:
+        if term not in helper:
+            fails.append(f"{NVFP4_PLANES[:-1]} does not lay the planes out with `{term}` (the header's named "
+                         "constants, the 256-byte scale boundary)")
+    switch = one_definition(sycl, NVFP4_SWITCH)
+    if switch is None:
+        fails.append(f"{NVFP4_SWITCH} is not defined exactly once in ggml-sycl.cpp")
+    else:
+        for term in NVFP4_SWITCH_TERMS:
+            if term not in switch:
+                fails.append(f"{NVFP4_SWITCH} does not hold `{term}`")
+        head = sycl.find(NVFP4_SWITCH_HEAD)
+        if head < 0 or "GGML_SYCL_DNNL" not in directive_conditions_at(sycl, head):
+            fails.append(f"{NVFP4_SWITCH} is not defined under #if GGML_SYCL_DNNL, where the oneDNN wrapper is")
+    spelled = sycl.count(f'"{NVFP4_KNOB}"')
+    if spelled != 1:
+        fails.append(f'"{NVFP4_KNOB}" is spelled {spelled} times in ggml-sycl.cpp, want 1 (the switch\'s one read)')
+    if NVFP4_KNOB_ROW not in s["catalog"]:
+        fails.append(f"docs/backend/sycl-env-vars.md has no `{NVFP4_KNOB_ROW}` row")
+    return fails
+
+
+def claim_v_device_arm(s):
+    fails = []
+    cmake, test = s["cmake"], s["device_test"]
+    for reg, what in ((DEVICE_REG_WOQ, "the WOQ arm's"), (DEVICE_REG_F16, "the f16 arm's NVFP4")):
+        if cmake.count(reg) != 1:
+            fails.append(f"CMakeLists.txt does not hold {what} registration once as `{reg}`")
+    commands = cmake.count(DEVICE_REG_COMMAND)
+    if commands != 2:
+        fails.append(f"CMakeLists.txt registers test-moe-pp-batched-dequant {commands} times, want the two above")
+    expect = one_definition(test, "expect_woq_arm")
+    if expect != ARM_EXPECT_BODY:
+        fails.append(f"expect_woq_arm is not `{ARM_EXPECT_BODY}`, the flag's arm (got {expect!r})")
+    env = one_definition(test, ARM_ENV_FN) or ""
+    for term in ARM_ENV_TERMS:
+        if term not in env:
+            fails.append(f"{ARM_ENV_FN} does not read the backend's switches as the backend does (`{term}`)")
+    main = one_definition(test, "main") or ""
+    at_set, at_check, at_backend = main.find(ARM_SET), main.find(ARM_CHECK), main.find(ARM_BACKEND_FIRST)
+    if main.count(ARM_SET) != 1 or main.count(ARM_CHECK) != 1 or not 0 <= at_set < at_check < at_backend:
+        fails.append("main does not compare --arm with the environment once, after it reads the flag and before the "
+                     "backend is touched")
+    else:
+        open_at = at_check + len(ARM_CHECK) - 1
+        block = main[open_at : match_close(main, open_at)]
+        if not block.startswith("{ std::fprintf(stderr,") or not block.endswith(" return 1; }"):
+            fails.append("a flag the environment disagrees with does not fail the run: the check's block is "
+                         f"`{block}`")
+    if test.count(ARM_CHILD) != 1:
+        fails.append("a child case is not run with the parent's --arm, so its own check would read another arm")
+    hot = one_definition(test, "make_hot_case") or ""
+    if test.count(HOT_GEMM_GROUPS) != 1 or HOT_GEMM_GROUPS not in hot:
+        fails.append(f"the hot-expert cases do not ask for two GEMM groups (`{HOT_GEMM_GROUPS}` in make_hot_case)")
+    run = one_definition(test, "run_case") or ""
+    if GEMM_GROUPS_READ not in run or GEMM_GROUPS_CHECK not in run:
+        fails.append("run_case does not read gemm_groups= from the executor trace and fail a case under its minimum")
+    return fails
+
+
 CLAIMS = {
     "a": claim_a_one_table,
     "b": claim_b_table_types,
@@ -1270,6 +1547,8 @@ CLAIMS = {
     "r": claim_r_failure_drain,
     "s": claim_s_staged_type,
     "t": claim_t_ring_consumer,
+    "u": claim_u_woq_arm,
+    "v": claim_v_device_arm,
 }
 
 
@@ -1416,8 +1695,11 @@ MUTANTS = [
     ("m", "sycl", PHASE_BOUND, "GGML_ASSERT(pp_woq_arm || (static_cast<size_t>(phase_weights - batched_weights) + "
      "(phase.end - phase.begin) * weight_elems) * sizeof(sycl::half) <= reserved.weight_size);"),
     # The route log's weight figure: one window's buffers whatever the predicate says, the plan re-derived there.
-    ("m", "sycl", WEIGHT_USED, "const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : "
-     "phase_buffers * half_elems * sizeof(sycl::half);"),
+    ("m", "sycl", WEIGHT_USED, "const size_t weight_used_bytes = pp_woq_nvfp4 ? nvfp4_planes.used_bytes : "
+     "pp_woq_arm ? weight_bytes : phase_buffers * half_elems * sizeof(sycl::half);"),
+    # NVFP4's figure taken as the slots it asked for, not the dense planes it used.
+    ("m", "sycl", "pp_woq_nvfp4 ? nvfp4_planes.used_bytes : pp_woq_arm ? weight_bytes :",
+     "pp_woq_arm ? weight_bytes :"),
     ("m", "sycl", "f16_used_elems = moe_pp_batched_phases_reuse_buffers(f16_groups) ?",
      "f16_used_elems = f16_groups.groups != 1 ?"),
     ("m", "sycl", "phase_buffers * half_elems : active_count * weight_elems;",
@@ -1516,6 +1798,89 @@ MUTANTS = [
      "in.pp_moe_onednn_weight_slot_bytes = 0; } const uint32_t n_ubatch"),
     ("t", "sycl", PLAN_SITE_HEAD,
      PLAN_SITE_HEAD + " (void) ggml_sycl::pp_moe_onednn_slots_at(0, 0, 0, 0, 0, nullptr, nullptr);"),
+    # NVFP4's WOQ row dropped, widened to SOA, or keyed on a negation.
+    ("b", "tables", " || (type == GGML_TYPE_NVFP4 && layout == GGML_LAYOUT_AOS)", ""),
+    ("b", "tables", "(type == GGML_TYPE_NVFP4 && layout == GGML_LAYOUT_AOS)",
+     "(type == GGML_TYPE_NVFP4 && (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA))"),
+    ("b", "tables", "(type == GGML_TYPE_NVFP4 && layout == GGML_LAYOUT_AOS)",
+     "(type != GGML_TYPE_Q1_0 && layout == GGML_LAYOUT_AOS)"),
+    # NVFP4's labels renamed or spelled a second time.
+    ("g", "gemm", '"nvfp4.pp.gemm.execute"', '"nvfp4.pp.gemm.exec"'),
+    ("g", "convert", '"nvfp4.pp.repack.nk"', '"nvfp4.pp.repack"'),
+    # The arm asked of the table again, or with NVFP4's switch forced on or dropped from the header.
+    ("u", "sycl", WOQ_ARM_LINE,
+     "const bool pp_woq_arm = pp_woq_enabled && moe_pp_batched_woq_supports_layout(src0->type, route_layout);"),
+    ("u", "sycl", WOQ_ARM_LINE, WOQ_ARM_LINE.replace("ggml_sycl_moe_pp_woq_nvfp4_enabled()", "true")),
+    # NVFP4's switch asked for every type again, which logs its version WARN on an MXFP4 or Q4_0 model.
+    ("u", "sycl", WOQ_ARM_LINE, WOQ_ARM_LINE.replace("src0->type == GGML_TYPE_NVFP4 && ", "")),
+    ("u", "tables", WOQ_ARM_BODY, "{ return woq_enabled && moe_pp_batched_woq_supports_layout(type, layout); }"),
+    # The claim moves with the WOQ switch for NVFP4.
+    ("u", "tables", "if (woq_enabled && type == GGML_TYPE_MXFP4 && moe_pp_batched_woq_supports_layout(type, layout))",
+     "if (woq_enabled && moe_pp_batched_woq_supports_layout(type, layout))"),
+    # NVFP4's repack or GEMM run for MXFP4 too, or the MXFP4 GEMM for NVFP4.
+    ("u", "sycl", "if (pp_woq_nvfp4) { repack_nvfp4_to_woq_nk_batched(",
+     "if (pp_woq_arm) { repack_nvfp4_to_woq_nk_batched("),
+    ("u", "sycl", "if (pp_woq_nvfp4) { group_event = DnnlGemmWrapper::woq_gemm_batch_nvfp4(",
+     "if (pp_woq_arm) { group_event = DnnlGemmWrapper::woq_gemm_batch_nvfp4("),
+    ("u", "sycl", "} else if (pp_woq_arm) { group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4(",
+     "} else if (true) { group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4("),
+    # The scales addressed from the nibble planes' stride.
+    ("u", "sycl", "woq_nvfp4_scales + lo * nvfp4_planes.scale_halves",
+     "woq_nvfp4_scales + lo * nvfp4_planes.nibble_bytes"),
+    # NVFP4's switch without the version gate, without its warning, outside the oneDNN guard, or uncatalogued.
+    ("u", "sycl", "DnnlGemmWrapper::woq_nvfp4_library_ok()", "true"),
+    ("u", "sycl", NVFP4_SWITCH_HEAD, "#endif " + NVFP4_SWITCH_HEAD),
+    ("u", "sycl", 'std::getenv("GGML_SYCL_MOE_PP_WOQ_NVFP4")', 'std::getenv("GGML_SYCL_MOE_PP_WOQ")'),
+    ("u", "catalog", NVFP4_KNOB_ROW, "| `GGML_SYCL_MOE_PP_WOQ_NVFP4=0` | OFF |"),
+    # The GEMM's operands out of order: the activation and output strides swapped, the nibble planes stepped by the
+    # scale stride, or the group's planes taken from the first expert's.
+    ("u", "sycl", NVFP4_GEMM_CALL,
+     NVFP4_GEMM_CALL.replace("act_stride", "@").replace("out_stride", "act_stride").replace("@", "out_stride")),
+    ("u", "sycl", "batched_weight_bytes + lo * nvfp4_planes.nibble_bytes",
+     "batched_weight_bytes + lo * nvfp4_planes.scale_halves"),
+    ("u", "sycl", "woq_nvfp4_scales + lo * nvfp4_planes.scale_halves, out_base(lo)", "woq_nvfp4_scales, out_base(lo)"),
+    # The first scale plane at the slot's start, over the nibbles, or the repack writing its scales there.
+    ("u", "sycl", "reinterpret_cast<sycl::half *>(batched_weight_bytes + nvfp4_planes.scale_offset_bytes)",
+     "reinterpret_cast<sycl::half *>(batched_weight_bytes)"),
+    ("u", "sycl", "n_slots, batched_weight_bytes, woq_nvfp4_scales, static_cast<int>(ne00)",
+     "n_slots, batched_weight_bytes, reinterpret_cast<sycl::half *>(batched_weight_bytes), static_cast<int>(ne00)"),
+    # The admission's checks on the dense planes dropped, or the header's constants tied to literals instead of to
+    # ggml-common.h's, or the helper counting with literals again.
+    ("u", "sycl", NVFP4_USED_ASSERT, ""),
+    ("u", "sycl", NVFP4_SIZES_ASSERT, ""),
+    ("u", "sycl", NVFP4_BLOCK_ASSERT, "static_assert(QK_NVFP4 == 64 && QK_NVFP4_SUB == 16,"),
+    ("u", "tables", "k % moe_pp_woq_nvfp4_block != 0", "k % 64 != 0"),
+    # The first scale plane straight after the last nibble plane, off the 256-byte boundary.
+    ("u", "tables", "out->scale_offset_bytes = (nibbles + 255) / 256 * 256;", "out->scale_offset_bytes = nibbles;"),
+    ("u", "tables", NVFP4_HEADER_CONSTS[1], "constexpr size_t moe_pp_woq_nvfp4_scale_group = 32;"),
+    # A registration without its arm, with the other arm, without NVFP4's switch at 0 in the f16 run's environment,
+    # or without the model label, so the unattended sweep would load the planned model onto a card.
+    ("v", "cmake", "GGML_SYCL_MOE_PP_WOQ_NVFP4=0;", ""),
+    ("v", "cmake", "--types nvfp4 --arm f16)", "--types nvfp4)"),
+    ("v", "cmake", "--types nvfp4 --arm f16)", "--types nvfp4 --arm woq)"),
+    ("v", "cmake", "COMMAND test-moe-pp-batched-dequant --arm woq)", "COMMAND test-moe-pp-batched-dequant --arm f16)"),
+    ("v", "cmake", 'PROPERTIES LABELS "sycl;moe;device;B50;model" SKIP_RETURN_CODE',
+     'PROPERTIES LABELS "sycl;moe;device;B50" SKIP_RETURN_CODE'),
+    ("v", "cmake", 'nvfp4-f16 PROPERTIES LABELS "sycl;moe;device;B50;model"',
+     'nvfp4-f16 PROPERTIES LABELS "sycl;moe;device;B50"'),
+    # A third registration of the binary.
+    ("v", "cmake", "add_test(NAME test-moe-pp-batched-dequant-nvfp4-f16",
+     "add_test(NAME x COMMAND test-moe-pp-batched-dequant --types q8_0) "
+     "add_test(NAME test-moe-pp-batched-dequant-nvfp4-f16"),
+    # The expected arm read from the environment again, so the test follows whichever arm it gives.
+    ("v", "device_test", ARM_EXPECT_BODY, "{ return type == GGML_TYPE_NVFP4 && env_runs_nvfp4_woq(); }"),
+    # The switches read as set-means-on, or one of them not read.
+    ("v", "device_test", "value == nullptr || std::atoi(value) != 0", "value == nullptr"),
+    ("v", "device_test", ' && on("GGML_SYCL_MOE_PP_WOQ_NVFP4")', ""),
+    # The flag ignored, or the mismatch check dropped or made to adapt the flag to the environment.
+    ("v", "device_test", ARM_SET, "g_nvfp4_woq = true;"),
+    ("v", "device_test", ARM_CHECK, "if (false) {"),
+    ("v", "device_test", ARM_CHECK, ARM_CHECK + " g_nvfp4_woq = !g_nvfp4_woq; } if (false) {"),
+    # A child case run without the parent's arm.
+    ("v", "device_test", ARM_CHILD, 'execl("/proc/self/exe", "test-moe-pp-batched-dequant", flag, arg.c_str(),'),
+    # The hot-expert cases without a GEMM-group floor, or the floor read and never checked.
+    ("v", "device_test", HOT_GEMM_GROUPS, "c.min_gemm_groups = 0;"),
+    ("v", "device_test", GEMM_GROUPS_CHECK, "if (false) {"),
 ]
 
 
@@ -1540,6 +1905,12 @@ def test_claims_are_not_vacuous(sources):
     assert one_definition(sources["tables"], RING_TYPE) is not None
     assert one_definition(sources["sycl"], RING_CONSUMER) is not None
     assert RING_GATE in (one_definition(sources["sycl"], PUBLISH_FN) or "")
+    assert woq_table_rows(one_definition(sources["tables"], "moe_pp_batched_woq_supports_layout")) is not None
+    assert one_definition(sources["tables"], WOQ_ARM_FN) is not None
+    assert one_definition(sources["sycl"], NVFP4_SWITCH) is not None
+    # The directive scan sees the oneDNN guard around the WOQ switch it has always stood under.
+    woq_switch = sources["sycl"].find("static bool ggml_sycl_moe_pp_woq_enabled() {")
+    assert woq_switch >= 0 and "GGML_SYCL_DNNL" in directive_conditions_at(sources["sycl"], woq_switch)
 
 
 if __name__ == "__main__":

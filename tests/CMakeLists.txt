@@ -737,6 +737,17 @@ endif()
 # fail, and no shipped path relies on an arm yet (the NVFP4 prompt executor runs its F16 arm; the weight-only arm is
 # later work). The lead runs it by hand on the B50 and reads the PROBE lines:
 #   ONEAPI_DEVICE_SELECTOR=level_zero:1 ./build/bin/test-sycl-onednn-woq-nvfp4
+# With --bench it runs no probe arm and instead times dequant + f16 GEMM against repack + WOQ GEMM at Inkling's expert
+# shapes in device time, printing "NUMERICS <arm> ..." per arm and shape, "BENCH <arm> ..." per arm and grid point and
+# "PIPELINE ..." per shape, B and M (plan Task 26a). A BENCH line ends in "timing=BADSPAN" or "timing=FAIL" when its
+# timing produced no figure, and a "WARN ... device time exceeds wall time" line flags timestamps not to trust; PIPELINE
+# prints "ratio=BADNUM" when an input arm failed its check and "form=none ratio=nan" when no WOQ form passed. At every
+# grid point and at three XCHECK-only points it prints "XCHECK <arm> ... ref_nonfinite= zero_cols=<n> of <B*N>
+# PASS|FAIL impl=" for woq-3d-ba-diag and woq-3d-f16s against f16-gemm's output, after an "XCHECK-ERROR <arm> ..." line
+# when that arm or f16-gemm could not run, and "SCRATCHPAD woq-3d-ba-diag ... user_bytes=" for that primitive in user
+# scratchpad mode, then one "XCHECK_SUMMARY pass= fail=" line; XCHECK failures do not change the exit status. woq-repack
+# writes both scale planes, so woq_best pays for the plane its form does not read: about 10% of the repack's bytes when
+# woq_best is an e4m3 form, about 5% when it is an f16-scale form.
 # Same build shape as test-onednn-woq-mxfp4 above (oneDNN and SYCL only, no backend).
 if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     llama_build(test-sycl-onednn-woq-nvfp4.cpp)
@@ -781,6 +792,29 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     # why this is load-bearing, not decorative: an unqualified run otherwise
     # lands on whatever device SYCL enumerates first).
     set_tests_properties(test-sycl-mxfp4-woq-repack PROPERTIES
+        ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
+    )
+endif()
+
+# Stored NVFP4 -> stored-order WOQ repack kernel device test (Inkling Task
+# 26b-1, llama.cpp-7mub): the production repack_nvfp4_to_woq_nk_batched
+# (ggml-sycl/convert.cpp/.hpp) must write the nibble and f16 scale planes
+# oneDNN reads as {B,K,N} strides {K*N,1,K}, byte for byte. Links the real
+# ggml-sycl library, as test-sycl-mxfp4-woq-repack above does.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    llama_build_and_test(test-sycl-nvfp4-woq-repack.cpp)
+    set_tests_properties(test-sycl-nvfp4-woq-repack PROPERTIES LABELS "sycl;moe;nvfp4;woq;tdd")
+    target_include_directories(test-sycl-nvfp4-woq-repack PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-sycl-nvfp4-woq-repack PRIVATE ggml-sycl)
+    if (TARGET IntelSYCL::SYCL_CXX)
+        target_link_libraries(test-sycl-nvfp4-woq-repack PRIVATE IntelSYCL::SYCL_CXX)
+    else()
+        target_include_directories(test-sycl-nvfp4-woq-repack PRIVATE ${SYCL_INCLUDE_DIR})
+        target_compile_options(test-sycl-nvfp4-woq-repack PRIVATE "-fsycl")
+        target_link_options(test-sycl-nvfp4-woq-repack PRIVATE "-fsycl")
+    endif()
+    # Pin off the measurement card -- see test-sycl-mxfp4-woq-repack above.
+    set_tests_properties(test-sycl-nvfp4-woq-repack PROPERTIES
         ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1"
     )
 endif()
@@ -1517,8 +1551,10 @@ if (Python3_Interpreter_FOUND)
     # test-sycl-zone-reset-audit-source's own llama_test_cmd registration
     # further below in this file -- test-sycl-pp-moe-scratch-source.py is
     # NOT a llama_test_cmd precedent, it is registered via a bare add_test
-    # in ggml/src/ggml-sycl/CMakeLists.txt instead). Host-only -- reads two
-    # source files as text, builds nothing, touches no device.
+    # in ggml/src/ggml-sycl/CMakeLists.txt instead). Host-only -- reads four
+    # source files as text (the plan, the backend sizing, the planned-model
+    # fixture and ggml-common.h, for MXFP4's e8m0 and NVFP4's f16 scale
+    # planes), builds nothing, touches no device.
     llama_test_cmd(
         ${Python3_EXECUTABLE}
         NAME test-sycl-woq-slot-formula-source

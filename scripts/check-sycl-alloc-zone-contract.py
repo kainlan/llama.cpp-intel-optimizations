@@ -2559,7 +2559,8 @@ M_FLOOR_READER = "ggml_sycl_compute_arena_bytes"
 N_MEMBERS = (("DnnlGemmWrapper", "gemm"), ("DnnlGemmWrapper", "row_gemm"), ("DnnlGemmWrapper", "woq_gemm_q4_0"),
              ("DnnlGemmWrapper", "woq_gemm_q8_0"), ("DnnlGemmWrapper", "woq_gemm_q4_0_impl"),
              ("DnnlGemmWrapper", "gemm_batch_strided"), ("DnnlGemmWrapper", "woq_gemm_batch_mxfp4"),
-             ("DnnlSoftmaxWrapper", "softmax"), ("DnnlEltwiseWrapper", "eltwise"), ("DnnlBinaryWrapper", "binary_broadcast_row"))
+             ("DnnlGemmWrapper", "woq_gemm_batch_nvfp4"), ("DnnlSoftmaxWrapper", "softmax"), ("DnnlEltwiseWrapper", "eltwise"),
+             ("DnnlBinaryWrapper", "binary_broadcast_row"))
 N_UNIQUE = ("get_scratchpad_mem", "ggml_sycl_mul_mat_batched_sycl")
 N_LAST = frozenset([m[1] for m in N_MEMBERS] + list(N_UNIQUE))
 

@@ -8113,7 +8113,7 @@ its kernel.
      `table.size() * ne10 * sizeof(sycl::half)`. Use `grid_dims(1, 1, table.size())` and the same
      `pp_copy_work_group_size(ne10)` block. Depend on `{ row_mappings_ready, packed_rows_ready }`. The `act` base is
      `batched_acts`, the packed row 0.
-   - (d) The WOQ fallback repack (the `!woq_repack_batched` branch inside the gather loop) moves into its own
+   - (d) The WOQ fallback repack (the `!mxfp4_repack_batched` branch inside the gather loop) moves into its own
      per-slot loop, unchanged and in the same position: before the gather submit.
    - (e) Replace the scatter loop the same way, with label `moe.pp.stage.scatter` / `mxfp4.pp.stage.scatter`,
      `phase=output_scatter_out`, `bytes = table.size() * ne0 * sizeof(float)` and the `out` base `batched_out`.
@@ -8234,6 +8234,631 @@ temporary, `packed_rows_dev`, as Task 24's BF16 arm admits its row map; the scra
   scope" above).
 - *Follow-ups on `llama.cpp-cl5q`* (comment `c-pkth`): the table could carry `{i1, i2, packed_row}` directly, and the
   table's upload could share the row map's stage.
+
+### Task 26a: Measure the NVFP4 weight-only GEMM against today's dequant and f16 GEMM at Inkling's shapes (written 2026-11-27)
+
+**Track:** A. **Depends on:** Task 25 (merged in fork/master `c6805bfb75`). **Base:** `c6805bfb75`.
+
+**File scope:**
+- Modify: `tests/test-sycl-onednn-woq-nvfp4.cpp` (add a `--bench` mode; the probe arms stay as they are).
+- Modify: `tests/CMakeLists.txt:722-729`, the comment block above `llama_build(test-sycl-onednn-woq-nvfp4.cpp)`: one
+  sentence naming the `--bench` mode and its output lines. The target stays built and not registered.
+
+**Why.** On the B70 long prompt the batched executor runs a dequant for each of 96,556 experts per pass. The dequant
+writes 768.8 GB of f16, and `moe.pp.gemm.execute` (1842.8 ms) then reads that f16 back. Those f16 bytes are
+3.6 times the NVFP4 bytes they came from. Task 25 left this as the largest per-expert cost the profile does not time.
+
+The lead ran the probe once on the B70 at `e972a43867` (2026-11-27, `inkling/t26-probe-nvfp4-b70/out.txt`). oneDNN
+3.13.2 builds and runs f16 x `f4_e2m1` with NVFP4's scales grouped `{16,1}`:
+- in 2-D and in 3-D (batched);
+- with the `f8_e4m3` scale bytes, and with the scales widened to f16;
+- with `worst_rel` at or below 7e-7 on every scale class.
+
+The probe's wall-clock figures at M = 32 cannot decide the question:
+- 2-D gate_up: 121 µs per execute (90 µs with f16 scales).
+- 3-D down, B = 4: 237 µs (66 µs with f16 scales).
+- Today's f16 GEMM: about 19 µs per expert.
+
+The probe has no f16 arm on its own harness, it times on the host, and it uses one batch size. This task adds the
+measurement that decides Task 26b. It changes no backend code.
+
+**What `--bench` runs.** It runs with `argv[1] == "--bench"`; without it the binary runs exactly the probe arms it runs
+today. The bench runs these arms, each at every point in the grid below:
+
+1. `f16-gemm`: a 3-D oneDNN matmul with f16 src `{B,M,K}`, weights and f32 dst. The f16 weights are stored the way the
+   executor's dequant writes them: expert b, row n holds K contiguous halves, so `{B,K,N}` with strides
+   `{K*N, 1, K}`. The dst is `{B,M,N}`. Use the same attribute `make_pd` uses, minus `set_scales`.
+2. `f16-dequant`: a SYCL kernel that reads B experts of stored NVFP4 and writes their f16 in the layout `f16-gemm`
+   reads. Stored NVFP4 is `block_nvfp4`, 36 bytes per 64 values; `make_nvfp4_problem` at `:201` builds its bytes.
+   Decode with `ue4m3_half_sycl` and `k_kvalues_doubled`, the decode the reference uses. One work-item per output
+   pair of halves, with work-items consecutive along K so reads and writes coalesce. This is a stand-in for
+   `convert.cpp`'s NVFP4 converter at equal bytes. Record its measured device time, not a bound.
+3. `woq-repack`: a SYCL kernel that reads B experts of stored NVFP4 and writes the WOQ planes `make_descs` (`:338`)
+   declares: nibbles at `k * N + n`, with the even offset in the low nibble, and scales at `g * N + n`. Write the
+   `f8_e4m3` bytes `ue4m3_sanitize` gives, and also the f16-widened scales of `with_f16_scales` (`:296`) for the
+   f16-scale arms.
+   - It is a transpose from n-major blocks to k-major nibbles. Tile it through local memory: a work-group owns 64 n
+     by 64 k, reads its 64 rows' blocks with consecutive work-items on consecutive bytes, and writes each output
+     row's 32 bytes consecutively.
+   - Task 0vqt measured a naive gather repack for MXFP4 at 16-37 GB/s on ~450 GB/s cards, so the tiling is the point.
+4. `woq-3d-e4m3` and `woq-3d-f16s`: the 3-D WOQ matmul of `run_numerics_arm` (`:444`) with the forms `nvfp4_3d` and
+   `nvfp4_3d_f16` (`:542`, `:574`). It reads the planes `woq-repack` wrote.
+5. `woq-2d-e4m3` and `woq-2d-f16s`: the 2-D form, executed B times, once per expert, as the executor's MXFP4 arm
+   does (`woq_gemm_batch_mxfp4`'s default 2-D loop).
+6. `woq-3d-ba-diag`: diagnostic only. The 3-D f16-scale form with the weights declared `{B,K,N}` with strides
+   `{K*N, 1, K}` in nibbles, that is K-contiguous per n, the stored order once blocks are unpacked. Task 4nlr found
+   that on oneDNN 3.11.4 transposed sub-byte weights are accepted and silently compute garbage. So this arm never
+   skips the numerics check (run once per shape at B 8, M 32, as below), and prints `BADNUM` when the check fails.
+   Nothing may rely on it unless it prints `PASS` at speed.
+
+**Grid.** Shapes `gate_up` (K 2304, N 2304) and `down` (K 1152, N 2304). M in {32, 64, 128}; the executor pads a
+group's rows to a multiple of 64, so 64 is its common case. B in {8, 32, 128}. Allocate with `sycl::malloc_device`
+through `dev_buffer`, as the probe does: the binary links no backend. B 128 gate_up needs 1.36 GB of f16 weights,
+which fits both cards.
+
+**Timing (device time).**
+- Create the queue with `sycl::property::queue::in_order` and `sycl::property::queue::enable_profiling`. Make the
+  oneDNN engine and stream from it.
+- For each arm and grid point: 3 warm-up executes, then a `q.single_task` marker kernel, then R executes, then a
+  second marker. Device µs per expert = (marker2 `command_start` − marker1 `command_end`) / R / B.
+- Choose R so the timed span is at least 50 ms.
+- Also print the host wall-clock µs per expert over the same R. A gap between the two shows submission cost.
+- Do not time with `ext_oneapi_submit_barrier` events. Barrier events need not carry profiling data. This plan's
+  Task 25 profile already met one profiler row that timed the wrong event.
+
+**Numerics.** Before timing each WOQ arm at B 8, M 32, run it once, apply `check_columns` (`:392`) against the
+reference, and print `PASS` or `FAIL` with `worst_rel`. A FAIL arm still prints its timing, marked `BADNUM`.
+`f16-gemm` checks against the same reference, fed by `f16-dequant`'s output. This also checks `f16-dequant`.
+
+**Output.** One line per arm and grid point:
+
+```
+BENCH <arm> shape=<gate_up|down> B=<b> M=<m> K=<k> N=<n> dev_us_per_expert=<x.xx> wall_us_per_expert=<x.xx> GBps=<x> numerics=<PASS|FAIL|BADNUM|-> impl=<impl_info_str or kernel>
+```
+
+- `GBps` is bytes read plus bytes written per expert, divided by device time:
+  - `f16-gemm`: f16 weights plus activations plus f32 dst.
+  - WOQ arms: the nibble and scale planes plus activations plus dst.
+  - `f16-dequant` and `woq-repack`: NVFP4 in plus their planes out.
+- After the grid, print one `PIPELINE` line per shape, B and M:
+  `PIPELINE shape=.. B=.. M=.. f16=<dequant+gemm> woq_best=<repack+best passing 3-D or 2-D form> form=<arm> ratio=<woq_best/f16>`.
+
+**Decision rule (fixed now, applied by the lead to the B70 and B50 runs).**
+- Task 26b moves the executor's NVFP4 experts to a WOQ arm in the best passing form if, at B 32 and M 64:
+  - on the B70, `ratio` ≤ 0.80 for both shapes;
+  - on the B50, `ratio` ≤ 1.00 for both shapes.
+- Otherwise, Task 26b is a fused NVFP4 kernel: decode in registers, XMX/DPAS on the stored layout, with today's
+  dequant plus GEMM as the bar to beat. In that case this task's numbers are its baseline.
+- If `woq-3d-ba-diag` passes numerics and is within 10% of the best 3-D form, Task 26b repacks with a per-block
+  nibble reorder instead of a transpose.
+
+**Acceptance criteria.**
+- `./scripts/sycl-build.sh test-sycl-onednn-woq-nvfp4` builds with no new warning.
+- Without `--bench`, the binary prints the same seven `PROBE` arms as before. The lead checks this on the device.
+- `--bench` prints one `BENCH` line per arm and grid point (8 arms x 2 shapes x 3 M x 3 B = 144) and 18 `PIPELINE`
+  lines. It exits 0, or 77 with no GPU.
+- `clang-format-19 --dry-run -Werror tests/test-sycl-onednn-woq-nvfp4.cpp` is clean on the lines you touched.
+- The implementer runs no GPU binary. The lead runs `--bench` once per card.
+
+**Gotchas.**
+- Nibble order: `make_nvfp4_problem` places stored block values the way the SYCL decode reads them. Copy its indexing
+  into both kernels; do not re-derive it. `f16-gemm`'s numerics check is what proves `f16-dequant` right.
+- Sub-byte weights in oneDNN must be declared exactly as `make_descs` declares them. Any other strides are the
+  diagnostic arm's business only.
+- The two kernels need distinct kernel names (`class nvfp4_bench_dequant`, `class nvfp4_bench_repack`).
+- Keep the probe arms byte-identical in what they run. The bench is added after them, behind the flag.
+- Free device buffers between grid points (each `dev_buffer` is scoped to its grid point), so peak device memory
+  stays one grid point's worth.
+
+**Commit:** `tests: the NVFP4 oneDNN probe gains a --bench mode that times dequant+f16 GEMM against repack+WOQ GEMM at
+Inkling's shapes`, staging `tests/test-sycl-onednn-woq-nvfp4.cpp` and `tests/CMakeLists.txt` only.
+
+**Result (lead, 2026-11-27, `bd31e99f48`, driver 26.44, oneDNN 3.13.2).** Evidence is in
+`inkling/t26a-bench-b70-bd31e99f48/out.txt` and `inkling/t26a-bench-b50-bd31e99f48/out.txt`. Each card printed 144
+`BENCH` and 18 `PIPELINE` lines, and all 144 `BENCH` lines are `numerics=PASS`, `woq-3d-ba-diag` included.
+
+Device µs per expert at B 32, M 64:
+
+| arm | B70 gate_up | B70 down | B50 gate_up | B50 down |
+|-----|------------:|---------:|------------:|---------:|
+| `f16-dequant` (stand-in) | 60.34 | 30.84 | 150.04 | 76.79 |
+| `f16-gemm` | 19.13 | 10.16 | 52.87 | 27.51 |
+| `woq-repack` (transpose) | 18.92 | 10.03 | 50.77 | 26.55 |
+| `woq-3d-e4m3` | 18.19 | 9.61 | 48.88 | 25.20 |
+| `woq-3d-f16s` | 18.29 | 9.58 | 48.22 | 24.91 |
+| `woq-2d-e4m3` | 54.30 | 28.28 | 77.31 | 41.58 |
+| `woq-2d-f16s` | 48.59 | 25.50 | 67.32 | 35.56 |
+| `woq-3d-ba-diag` | **8.69** | **5.01** | **21.38** | **12.58** |
+| `PIPELINE` ratio | 0.467 | 0.479 | 0.488 | 0.493 |
+
+The decision rule is applied as follows:
+- The ratios are 0.467 and 0.479 on the B70 (limit 0.80) and 0.488 and 0.493 on the B50 (limit 1.00). So Task 26b is
+  a WOQ arm, not a fused kernel.
+- `woq-3d-ba-diag` passes numerics and is not just "within 10%" of the best 3-D form. At B 32 and M 64 it is about
+  2x faster on both cards and both shapes. So Task 26b declares the weights in stored order, K-contiguous per n
+  (`{B,K,N}` with strides `{K*N,1,K}`), with f16 scales `[G][N]`. Its repack is a per-block nibble reorder plus a
+  scale widen. It does no transpose.
+
+Three facts that Task 26b must carry:
+- **The 128-row crossover.** At M 128, gate_up, the stored-order form is slower than the transposed 3-D form at every
+  B: 23.12 against 19.12 µs on the B70 (B 128) and 69.66 against 52.03 on the B50. At M 32 and M 64 it is 2.2-4.5x
+  faster. On down it never loses by more than 6%.
+  - The executor pads groups to multiples of 64, and a 512-token ubatch averages 32 rows per expert. So M 64 is the
+    common case, and 26b uses the stored-order form for every group.
+  - The weight has one layout, so 26b cannot switch forms per group without a second repack.
+  - The crossover is a follow-up, recorded under "Tracker tasks owed".
+- **The dequant stand-in is slow.** `f16-dequant` runs at 202-232 GB/s on the B70 and 75-93 GB/s on the B50. In the
+  Task 25 profile, 768.8 GB of production dequant output fits inside the pass, so the production converter must run
+  faster than the stand-in. The `PIPELINE` ratios therefore overstate the gain of the transposed form. Against a
+  dequant at twice the stand-in's speed, the transposed form would land near 0.7-0.8 on the B70.
+  - The stored-order form wins either way. If the reorder costs what the transpose repack costs, it is still
+    27.6 µs against about 49 µs for gate_up on the B70.
+  - So 26b must time the real kernels in the executor profile, with a profiler row for the reorder and one for the
+    WOQ GEMM. It must not reuse the `moe.pp.dequant.<type>` row, which times the wrong event.
+- **The silent-garbage risk is real.** Task 4nlr found that oneDNN 3.11.4 accepts transposed sub-byte weights and
+  computes garbage. 3.13.2 passes here. The first draft of this section said 26b would run a per-device numerics
+  probe before first use. **Changed on purpose (lead, 2026-11-27).**
+  - The arm must be chosen before the slot claim (`pp_woq_arm`, `ggml-sycl.cpp:100919`), and after the repack there is
+    no way back to the f16 arm.
+  - A probe would need unified-cache memory and a host readback, and one shape would not cover the 64 to 256 rows and
+    1 to 128 experts the executor runs.
+  - The failure class is a property of the library version. So 26b gates the arm on the runtime oneDNN version
+    (`dnnl_version()` at least 3.13), and when the gate fails it runs the f16 arm and logs one WARN.
+  - Coverage comes from Task 26a's cross-check at every grid point, and from 26b's device test at 64-, 128- and
+    192-row groups and a single-expert group.
+  - A oneDNN upgrade is a system change. It reruns the bench's cross-check and that device test before use.
+
+### Task 26b: NVFP4 experts take a stored-order WOQ arm in the batched prompt executor (written 2026-11-27)
+
+**Goal.** Replace the per-expert NVFP4 dequant to f16 and the f16 GEMM with two steps:
+- one batched reorder of the active experts into two dense planes, nibbles K-contiguous per n and f16 scales
+  `[G][N]`;
+- one 3-D oneDNN WOQ matmul per GEMM group, in the descriptor Task 26a measured as `woq-3d-ba-diag`.
+
+**Precondition (lead).** Task 26a's XCHECK round must print PASS for `woq-3d-ba-diag` at every grid point and every
+extra point, on both cards, before Task 26b-4 starts. Tasks 26b-1 to 26b-3 may start before that.
+- If any point fails, the lead rewrites 26b-1 and 26b-2 for the transposed form, `woq-3d-f16s`: a tiled transpose
+  repack, the bench's `nvfp4_bench_repack`, and weights `{B,K,N}` with strides `{K*N,N,1}`. 26b-3 and 26b-4 keep
+  their shape.
+
+**Precondition result (lead, 2026-11-27, `c5cfb60ffa`).** Met on both cards: `XCHECK_SUMMARY pass=48 fail=0` on each
+(`inkling/t26a-xchk-b70-c5cfb60ffa/out.txt` and `inkling/t26a-xchk-b50-c5cfb60ffa/out.txt`).
+- Across every grid point and the extra points B 1 / M 64, B 32 / M 192 and B 32 / M 256, the largest `worst_rel` of
+  `woq-3d-ba-diag` against the f16 GEMM is 1.09e-06 on the B70 and 1.28e-06 on the B50.
+- At M 256 both WOQ forms are bit-identical to the f16 GEMM (`worst_rel=0.00e+00`). oneDNN appears to unpack the
+  weights to f16 and run the f16 kernel there. That fits the M 128 slowdown in the Task 26a result.
+- The stored-order primitive needs no scratchpad in user mode: `user_bytes=0` at all 24 points on both cards.
+- The B 32, M 64 timings repeat Task 26a's within 1-3%: ba-diag 8.70 µs gate_up and 4.97 µs down on the B70, and
+  21.40 and 12.63 µs on the B50.
+- **Confirmed with poisoned planes (lead, 2026-11-27, `c637e7d47`).** The quality re-review found that the first
+  XCHECK left the dequant and repack outputs unpoisoned. A coverage gap in both kernels would then have read as zeros
+  on both sides and passed.
+  - The fix fills w16, nib, s8 and s16 with 0xff before the kernels run, and counts the all-zero columns against the
+    3/8 of N that the scale-class table expects.
+  - The rerun gives `XCHECK_SUMMARY pass=48 fail=0` on both cards (`inkling/t26a-xchk2-b70-c637e7d47/out.txt` and
+    `inkling/t26a-xchk2-b50-c637e7d47/out.txt`), with no XCHECK-ERROR line.
+  - At every point `zero_cols` is exactly 864 × B of 2304 × B, and `nonfinite=0` and `ref_nonfinite=0`.
+  - The largest `worst_rel` is unchanged, 1.09e-06 on the B70 and 1.28e-06 on the B50. M 256 is still bit-identical,
+    `user_bytes=0` at all 24 points, and the kernel log is clean.
+  - The precondition is met: 26b-4 may merge once its own reviews pass.
+
+**Arithmetic, fixed here.** K is `ne00` and N is `ne01`, and G = K / 16 is the number of scale groups.
+- Per expert:
+  - nibble plane `nib = N * K / 2` bytes;
+  - scale plane `sc = G * N * 2` bytes;
+  - the slot is `align256(nib) + align256(sc)`, the same shape as MXFP4's.
+- For Inkling's fused gate_up (K 2304, N 2304): nib = 2,654,208 and sc = 663,552, both already multiples of 256, so
+  the slot is 3,317,760 bytes.
+- Over 128 experts the planned weight slot is 424.7 MB, against 361.0 MB from today's MXFP4 formula. That costs
+  +63.7 MB of VRAM per card. The lead checks the B50 plan lines for experts moved to the host (Task 26b-5).
+- **Dispatch layout in the slot.** It is dense, not per-slot interleaved, so oneDNN sees exactly what the bench
+  measured:
+  - the nibbles of sorted slot s at `base + s * nib`;
+  - the scale plane at `scale_base = base + align256(active * nib)`;
+  - the scales of slot s at `scale_base + s * sc`.
+
+  The bytes this needs, `align256(active * nib) + active * sc`, never exceed the `active * slot` the admission is
+  asked for.
+
+**Team topology.**
+
+| Track | Tasks | Description |
+|-------|-------|-------------|
+| A | 26b-1 | Reorder kernel and its byte-exact device test |
+| B | 26b-2 | oneDNN wrapper, version gate, scratchpad site, consumer scripts |
+| C | 26b-3 | Type-aware slot formula on both sides, the fixture, the formula contract |
+| D | 26b-4 (after A, B, C and the precondition) | Executor arm, tables, switch, contracts, device test, docs |
+| lead | 26b-5 | Acceptance, merge, push |
+
+File ownership:
+- 26b-1 owns `convert.hpp`, `convert.cpp` and `tests/test-sycl-nvfp4-woq-repack.cpp`.
+- 26b-2 owns `gemm.hpp`, `common.hpp:373-385`, `common.cpp:3194-3197` and the two `scripts/check-sycl-*.py` files.
+- 26b-3 owns `src/llama-model.cpp:526-558`, `ggml-sycl.cpp:101192-101212`, `moe-planned-model-fixture.hpp:124-126`
+  and `tests/test-sycl-woq-slot-formula-source.py`.
+- 26b-4 owns the rest of `ggml-sycl.cpp`, `moe-mmvq-tables.hpp`, and the tests and docs listed under it.
+- `tests/CMakeLists.txt` is touched by 26b-1 (one new registration after `:776`) and by 26b-4 (none expected). Each
+  task works in its own worktree. The lead merges A, B and C before D starts. At most two implementer builds may run
+  at once.
+
+#### Task 26b-1: Reorder kernel, stored NVFP4 to stored-order WOQ planes
+
+**File scope.**
+- Modify: `ggml/src/ggml-sycl/convert.hpp` (a declaration after `:351`).
+- Modify: `ggml/src/ggml-sycl/convert.cpp` (the definition after `:2700`, the end of the MXFP4 coalesced-batched
+  tiled entry).
+- Create: `tests/test-sycl-nvfp4-woq-repack.cpp`.
+- Modify: `tests/CMakeLists.txt` (a registration after `:776`, copied from `:758-776`).
+
+**Interface.**
+
+```cpp
+// Stored NVFP4 (block_nvfp4 rows, AOS) of n_slots experts -> the stored-order WOQ planes oneDNN reads as f4_e2m1
+// weights {B,K,N} with strides {K*N,1,K} and f16 scales {B,K/16,N} with strides {(K/16)*N,N,1}:
+//   nibble (k, n) of slot s at byte dst_nibbles + s*(N*K/2) + (n*K + k)/2, even k in the low nibble;
+//   scale  (g, n) of slot s at half  dst_scales  + s*(K/16)*N + g*N + n, value = 2 * ggml_sycl_ue4m3_to_fp32(d)
+//   (ggml_sycl_ue4m3_to_fp32 returns half the E4M3 value; E2M1 codes pass through unchanged).
+// srcs may hold more than GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS entries: the entry launches ceil(n/MAX) times.
+void repack_nvfp4_to_woq_nk_batched(const void * const * srcs, int n_slots, uint8_t * dst_nibbles,
+                                    sycl::half * dst_scales, int k, int n, dpct::queue_ptr stream, int device = -1);
+```
+
+**The mapping per 16-element sub-block.** Stored sub-block s of a block holds `qs[s*8 + j]`, with element j (j < 8)
+in its low nibble and element j+8 in its high nibble. This is `make_nvfp4_problem`, `bd31e99f48:tests/...:252-260`.
+Output byte t (t = 0..7) of the sub-block holds elements 2t (low) and 2t+1 (high). So, with q = the 8 input bytes:
+- for t < 4: `out[t] = (q[2t] & 0xf) | ((q[2t+1] & 0xf) << 4)`;
+- for t >= 4: `out[t] = (q[2t-8] >> 4) | (q[2t-7] & 0xf0)`.
+
+This is a register shuffle with no transpose.
+- **Kernel shape:** one work-item per 64-element block (36 bytes in, 32 nibble bytes and 4 halves out).
+  - Grid `(1, n_slots_in_launch, N * K/64)`, with the index along a row's blocks fastest, so consecutive work-items
+    read consecutive 36-byte blocks and write consecutive 32-byte runs.
+  - The 4 scale halves land at `g*N + n` for g = 4*ib + s, strided by N. That is 1/9 of the bytes. Accept it.
+- **Source pointers:** a src table struct like `mxfp4_woq_repack_src_table` (`convert.cpp:1532`), as kernel argument
+  bytes, not an upload.
+- **Decode:** use `ggml_sycl_ue4m3_to_fp32` (`common.hpp:8855`) and multiply by 2. It already sanitizes the sign and
+  0x7f/0xff.
+- **Profiler:** wrap each launch in `ggml_sycl_profile_submit` with name `"nvfp4.pp.repack.nk"`, category
+  `"nvfp4.pp.repack"` and metadata `"form=batched"`, as `convert.cpp:2072-2092` does.
+- **Asserts:** `k % 64 == 0`, `n > 0`, `n_slots > 0`, and `dst_nibbles` and `dst_scales` 8-byte aligned.
+
+**RED.** Create `tests/test-sycl-nvfp4-woq-repack.cpp` on the pattern of `tests/test-sycl-mxfp4-woq-repack.cpp`.
+1. A hand fixture of one expert with K 64 and N 2, whose expected arrays are literal constants worked out by hand:
+   - block bytes `qs[i] = (uint8_t)(i * 0x11 + 1)`, the same in both rows;
+   - the four scale bytes 0x38 (1.0), 0x40 (2.0), 0xb8 (sign set, decodes as 1.0) and 0x7f (NaN pattern, 0), the
+     same in both rows.
+   Expected nibble bytes come from the two formulas above, computed by hand in a comment. Expected halves are 1.0,
+   2.0, 1.0 and 0.0.
+2. A randomized fixture: 3 experts with K 1152 and N 72 (not a multiple of 64), random bytes, one call with
+   `n_slots = 3` and the sources permuted, so a kernel that ignores the source table fails. Check it against a CPU mirror that decodes every (k, n) the way
+   `make_nvfp4_problem` does and places it by the interface formula. The mirror reads the stored order, not the
+   kernel's t-formula.
+3. A third case passes 130 slots of K 64 and N 8, to cross `GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS` (128). That makes
+   two launches, the only multi-launch case. Slots 128 and 129 must land at their own plane offsets, so that a chunk
+   that restarts its slot index at 0 fails.
+
+Register it as `test-sycl-nvfp4-woq-repack` with labels `sycl;moe;nvfp4;woq;tdd` and
+`ONEAPI_DEVICE_SELECTOR=level_zero:1`, as `:758-776` does. Build it and confirm that it fails to link (no symbol).
+
+**GREEN.** Implement the kernel and the entry. Then:
+`ctest --test-dir build -R '^test-sycl-nvfp4-woq-repack$' --output-on-failure`. The lead runs it, because it is a
+device test. The implementer reports it built and does not run it.
+
+**Commit:** `sycl: a batched reorder writes stored NVFP4 experts as stored-order WOQ planes`, staging the four files.
+
+**Gotchas.**
+- No `sycl::malloc_*` in `convert.cpp`. The test may allocate directly, as the MXFP4 repack test does.
+- `int` overflow: `N * K / 64` blocks per slot is 82,944 for gate_up, but compute every byte offset in `size_t`.
+- `clang-format-19 --dry-run -Werror` on the changed lines only. Never `-i`.
+
+#### Task 26b-2: `DnnlGemmWrapper::woq_gemm_batch_nvfp4`, the version gate and the scratchpad site
+
+**File scope.** `ggml/src/ggml-sycl/gemm.hpp` (a new member after `woq_gemm_batch_mxfp4` ends, `:1668`),
+`ggml/src/ggml-sycl/common.hpp:373-385`, `ggml/src/ggml-sycl/common.cpp:3194-3197`,
+`scripts/check-sycl-dnnl-decline-consumers.py:119-125`, and `scripts/check-sycl-alloc-zone-contract.py:2558-2562`.
+
+**Interface.** It mirrors `woq_gemm_batch_mxfp4`'s signature (`gemm.hpp:1349-1366`) with one 3-D primitive:
+
+```cpp
+// One 3-D primitive over batch_size experts: src {B,M,K} f16 strides {stride_a,K,1}; weights f4_e2m1 {B,K,N} strides
+// {K*N,1,K} (stored order, dense, Task 26a woq-3d-ba-diag); scales f16 {B,K/16,N} strides {(K/16)*N,N,1}, mask 7,
+// groups {16,1}; dst {B,M,N} strides {stride_c,N,1}. Returns nullopt when the scratchpad is declined.
+[[nodiscard]] static std::optional<sycl::event> woq_gemm_batch_nvfp4(ggml_backend_sycl_context & ctx, int m, int n,
+    int k, const void * a, dt at, int64_t stride_a, const void * b_nibbles, const sycl::half * b_scales, void * c,
+    dt ct, int64_t stride_c, int batch_size, const queue_ptr & q, const std::vector<sycl::event> & deps = {});
+
+// Whether the loaded oneDNN computes this form right: dnnl_version() at least 3.13 (Task 26a measured 3.13.2; Task
+// 4nlr found 3.11.4 computing transposed sub-byte weights wrong). Read once.
+static bool woq_nvfp4_library_ok();
+```
+
+- **Attribute:** reproducible, `scratchpad_mode::user`, `set_scales(DNNL_ARG_WEIGHTS, 7, {16, 1}, dt::f16)`, and
+  `fpmath f16 apply_to_int` under `GGML_SYCL_F16`.
+  - The groups are two entries, not three. The MXFP4 opt-in 3-D arm passes `{1, group_size, 1}`
+    (`gemm.hpp:1432-1433`), which the C API's "must be 0 or 2" contradicts. That may be why that arm computes wrong
+    numerics. See "Tracker tasks owed".
+- **Primitive key:** `variant = 6`, with `strb0 = K*N`, `strb1 = 1`, `strb2 = K`, `woq_group_size = 16` and
+  `woq_scales_mask = 7`. Variants 0-5 are taken (`gemm.hpp:426`, `:1065`, `:907`, `:1459`, `:1551`, `:691`), and the
+  key has no scale-dtype field, so a distinct variant is the only thing that keeps this primitive apart.
+- **Scratchpad:** a new site `GGML_SYCL_SCRATCHPAD_SITE_DNNL_WOQ_NVFP4_BATCH` before `_COUNT` in `common.hpp`, named
+  `"dnnl_woq_nvfp4_batch"` in `common.cpp`. Make one request; on a decline return `std::nullopt`, as `:1484-1488`
+  does.
+- **Profiler:** name `"nvfp4.pp.gemm.execute"`, category `"nvfp4.pp.gemm"` and metadata `"arm=3d-nk"`, through
+  `ggml_sycl_profile_submit`, as `:1500-1508` does.
+- **Locking and errors:** take `exec_mutex(q)` as `:1377` does. Throw `std::runtime_error` on `k % 64 != 0`, on a
+  non-positive dim, or on an unsupported dtype. If `get_or_create` returns nullptr, throw, as `:1557-1558` does.
+- **`woq_nvfp4_library_ok`:** `const dnnl_version_t * v = dnnl_version(); return v->major > 3 || (v->major == 3 &&
+  v->minor >= 13);` cached in a function-local static.
+
+**RED.** First add the new consumer to both scripts:
+- `("woq_gemm_batch_nvfp4", "DNNL_WOQ_NVFP4_BATCH", "std::nullopt", "std::optional<sycl::event>", 1)` in
+  `GEMM_CONSUMERS`;
+- `("DnnlGemmWrapper", "woq_gemm_batch_nvfp4")` in `N_MEMBERS`.
+
+Run `~/miniconda3/bin/python3 scripts/check-sycl-dnnl-decline-consumers.py` and
+`~/miniconda3/bin/python3 scripts/check-sycl-alloc-zone-contract.py`. Both must fail because the function is missing.
+If a script takes arguments, read its `--help` first.
+
+**GREEN.** Implement the member and the site, and rerun both scripts until they pass. Build `ggml-sycl`.
+
+**Commit:** `sycl: a 3-D oneDNN WOQ GEMM reads NVFP4 experts in stored order, gated on the oneDNN version`, staging
+the five files.
+
+**Gotchas.**
+- Decline-consumers also pins that the scratchpad is asked for once (`:441-446`), and alloc-zone pins its
+  declined-result consumers. Read both scripts' failure text before changing code to fit them.
+- Do not touch `woq_gemm_batch_mxfp4`.
+
+#### Task 26b-3: The weight-slot formula learns NVFP4 on both sides
+
+**File scope.** `src/llama-model.cpp:526-558`, `ggml/src/ggml-sycl/ggml-sycl.cpp:101192-101212`,
+`ggml/src/ggml-sycl/tests/moe-planned-model-fixture.hpp:124-126`, `tests/test-sycl-woq-slot-formula-source.py`.
+
+**Plan side (`llama-model.cpp`).** Inside the `pp_woq_enabled_at_plan` branch at `:548-554`, branch on
+`tensor.type == GGML_TYPE_NVFP4`:
+- nibble bytes `align_up(n * (k / 2), 256)`, as today;
+- scale bytes `align_up((k / kNvfp4ScaleGroup) * n * sizeof(ggml_fp16_t), 256)`, with
+  `constexpr size_t kNvfp4ScaleGroup = 16;` declared next to `kMxfp4BlockSize`.
+
+Every other type keeps today's MXFP4 formula, byte-identical.
+
+**Dispatch side (`ggml-sycl.cpp`, the WOQ sizing block).**
+- Keep the existing two `checked_mul` lines for MXFP4.
+- For `src0->type == GGML_TYPE_NVFP4`, compute `scale_bytes_per_expert` as
+  `checked_mul(static_cast<size_t>(ne00 / 16), static_cast<size_t>(ne01), …)` and then `checked_mul(…,
+  sizeof(sycl::half), scale_bytes_per_expert)`.
+- `woq_nibble_slot_bytes`, `woq_scale_slot_bytes` and `weight_slot_bytes` keep their names and their `align_up_256`
+  calls, and `weight_bytes = weight_slot_bytes * active_count` stays.
+- The code is unreachable for NVFP4 until 26b-4. Say so in a one-line comment.
+
+**Fixture.** `moe-planned-model-fixture.hpp:125-126` gains the same NVFP4 branch, keyed on the type it plans. Read its
+shape struct for the type field. If it has none, add `ggml_type type = GGML_TYPE_MXFP4;` to the shape and use it.
+
+**RED.** Extend `tests/test-sycl-woq-slot-formula-source.py` with three checks, which must fail first:
+- `llama-model.cpp` has `kNvfp4ScaleGroup = 16`;
+- an NVFP4 scale plane `align_up((k / kNvfp4ScaleGroup) * n * sizeof(ggml_fp16_t), 256)`;
+- the sizing region has an NVFP4 scale `checked_mul` with `ne00 / 16` and `sizeof(sycl::half)`.
+
+Keep every existing check. The existing `count(...) == 1` of each `align_up_256(...)` must still hold, so the NVFP4
+branch computes into the same two variables. Run `ctest --test-dir build -R '^test-sycl-woq-slot-formula-source$'
+--output-on-failure`: RED, then GREEN.
+
+**Commit:** `sycl: the WOQ weight slot is sized for NVFP4's f16 scale plane at plan and dispatch`, staging the four
+files.
+
+**Gotchas.** GPT-OSS on the B50 is a guardrail. Its slot must not change by a byte: MXFP4 keeps the K/32 one-byte
+formula. The lead compares the GPT-OSS plan line before and after.
+
+#### Task 26b-4: The executor runs NVFP4 on the WOQ arm
+
+**Depends on:** 26b-1, 26b-2 and 26b-3 merged into `feat/inkling2`, and the precondition above.
+
+**Tables (`moe-mmvq-tables.hpp:362-380`).**
+
+```cpp
+inline bool moe_pp_batched_woq_supports_layout(enum ggml_type type, enum ggml_layout_mode layout) {
+    return (type == GGML_TYPE_MXFP4 && (layout == GGML_LAYOUT_SOA || layout == GGML_LAYOUT_XMX_TILED)) ||
+           (type == GGML_TYPE_NVFP4 && layout == GGML_LAYOUT_AOS);
+}
+
+// Whether a dispatch runs the WOQ arm: the type's WOQ row, the GGML_SYCL_MOE_PP_WOQ switch, and for NVFP4 its own
+// switch (GGML_SYCL_MOE_PP_WOQ_NVFP4 and the oneDNN version, Task 26b-2).
+inline bool moe_pp_batched_woq_arm_runs(enum ggml_type type, enum ggml_layout_mode layout, bool woq_enabled,
+                                        bool nvfp4_woq_enabled) {
+    return woq_enabled && moe_pp_batched_woq_supports_layout(type, layout) &&
+           (type != GGML_TYPE_NVFP4 || nvfp4_woq_enabled);
+}
+```
+
+In `moe_pp_batched_supports_layout`, the first branch becomes `woq_enabled && type == GGML_TYPE_MXFP4 &&
+moe_pp_batched_woq_supports_layout(type, layout)`. So which nodes the executor takes does not change for NVFP4: it
+still goes through `aos_enabled` and its f16 row. Only the arm changes. Rewrite the comment block at `:287-329`
+(`:313-317`) to say that NVFP4 runs the WOQ arm when both switches allow it, and the f16 arm otherwise.
+
+**Switch (`ggml-sycl.cpp`, after `:89199`).** `ggml_sycl_moe_pp_woq_nvfp4_enabled()`:
+- a static once-read of `GGML_SYCL_MOE_PP_WOQ_NVFP4` (default 1), ANDed with `DnnlGemmWrapper::woq_nvfp4_library_ok()`;
+- when the env allows it and the library does not, one `GGML_LOG_WARN` naming the oneDNN version and the f16
+  fallback.
+
+**Executor (`ggml-sycl.cpp`).**
+- `:100919`: `pp_woq_arm = moe_pp_batched_woq_arm_runs(src0->type, route_layout, pp_woq_enabled,
+  ggml_sycl_moe_pp_woq_nvfp4_enabled())`. Update the comment at `:100917-100918`.
+- Add `const bool pp_woq_nvfp4 = pp_woq_arm && src0->type == GGML_TYPE_NVFP4;`.
+- `:101161-101171`: under `pp_woq_nvfp4`, refuse EXPERT_LAYOUT for an expert whose layout is not AOS, and skip the
+  `to_fp16` lookup.
+- Repacks (`:101440-101512`): under `pp_woq_nvfp4`, build `repack_srcs` from `expert.ptr` and make one
+  `repack_nvfp4_to_woq_nk_batched(srcs, active, base, (sycl::half *) scale_base, ne00, ne01, ctx.stream(),
+  ctx.device)` call. It needs no per-slot fallback: the entry chunks internally.
+  - `scale_base` is the dense layout fixed above: `base + align_up_256(active * nib)`.
+  - The MXFP4 batched and per-slot branches gain `&& !pp_woq_nvfp4`.
+- GEMM (`:101915-101923`): under `pp_woq_nvfp4`, call `DnnlGemmWrapper::woq_gemm_batch_nvfp4(ctx, group.n_rows, ne01,
+  ne00, act_base(lo), f16, act_stride, base + lo * nib, scales + lo * (ne00/16) * ne01, out_base(lo), f32,
+  out_stride, hi - lo, ctx.stream(), { deps_in })`. Otherwise call today's MXFP4 call. Either call's nullopt sets
+  `gemm_declined`.
+- Labels: `pp_mxfp4_labels` stays `src0->type == GGML_TYPE_MXFP4`. NVFP4's act and scatter stages keep `moe.pp.*`,
+  and `pp_dequant_label_name` is unused on the NVFP4 WOQ path.
+- `[PP-MOE]` already prints `arm=woq|f16` from `pp_woq_arm`. Leave it as is.
+
+**Contracts that this task updates on purpose.** For each, change the pin to the new structure and keep its mutant
+coverage:
+- `tests/test-sycl-moe-pp-batched-types-source.py`:
+  - `claim_b_table_types` `:548-550`: the WOQ table is `{MXFP4: SOA, XMX_TILED; NVFP4: AOS}`;
+  - add a claim that `moe_pp_batched_woq_arm_runs` is the executor's `pp_woq_arm` source;
+  - `claim_g_labels` gains `nvfp4.pp.gemm.execute` ×1 in gemm.hpp and `nvfp4.pp.repack.nk` ×1 in convert.cpp.
+- `tests/test-sycl-moe-pp-pack-source.py:57`: `act_base` and `out_base` are called 4 times each (NVFP4 WOQ, MXFP4
+  WOQ, f16, compare).
+- `tests/test-sycl-staged-ring-route-source.py:253-272`:
+  - `ONEDNN_CALLS` adds `woq_gemm_batch_nvfp4` ×1;
+  - `EXEC_SRCS_USES` and `EXEC_PTR_USES` gain the NVFP4 repack's one read of `expert.ptr` or `repack_srcs`;
+  - no expert pointer reaches oneDNN.
+- `tests/test-sycl-moe-exec-window-source.py:120-124`: the `WOQ_ARM` spelling follows the new `pp_woq_arm` line.
+- `tests/test-sycl-moe-mmvq-tables.cpp`:
+  - `:542-563` gains NVFP4 AOS rows for woq on, woq off, and nvfp4 off;
+  - `:570-571` allows exactly MXFP4 and NVFP4 in the WOQ table;
+  - add `moe_pp_batched_woq_arm_runs` cases, and check that `moe_pp_batched_supports_layout` is unchanged for NVFP4
+    at every `(woq, aos)` combination.
+- `ggml/src/ggml-sycl/tests/test-moe-pp-batched-dequant.cpp`:
+  - The NVFP4 cases now expect `[PP-MOE] ... arm=woq` and `groups=1`, and keep `groups >= 3` for the other types
+    (`:155`, `:494`).
+  - Add NVFP4 cases whose routing puts 64, 128 and 192 rows on single experts, and one with a single active expert.
+    Their NMSE tolerance stays 5e-4 (`:93`).
+  - Register a second ctest, `test-moe-pp-batched-dequant-nvfp4-f16`, with `GGML_SYCL_MOE_PP_WOQ_NVFP4=0` and the
+    same properties (`ggml/src/ggml-sycl/CMakeLists.txt:6549-6572`). Under it the NVFP4 cases expect `arm=f16`. If
+    the test has no type filter, add `--types nvfp4` as an argv filter and use it in the second registration.
+- `tests/test-sycl-pp-moe-scratch-admission-contract.py`: run it and keep it green. The reserve still uses the planned
+  sizes.
+- Run the source-contract sweep `sweeps.sh` (lead) and fix every red this task causes. The five known reds listed
+  under "Known limits" stay red.
+
+**Docs.**
+- `docs/backend/sycl-env-vars.md`: a row after `:60` for `GGML_SYCL_MOE_PP_WOQ_NVFP4=0`. It means "NVFP4 experts take
+  the f16 arm. The plan still sizes the WOQ slot", and names the version gate.
+- `docs/backend/sycl-env-vars.md:487` and `:1050-1078`: one sentence each, if they name the arms by type.
+
+**RED.**
+1. The table host test cases: `ctest -R '^test-sycl-moe-mmvq-tables$'` fails.
+2. The four source contracts: they fail on the new pins.
+3. The device test's new expectations: the lead runs it, and it fails because the arm is still f16.
+
+**GREEN.** The executor changes. The implementer builds `ggml-sycl`, `test-moe-pp-batched-dequant`,
+`test-sycl-moe-mmvq-tables` and `llama-cli`, runs the host test and the Python contracts, and reports the device
+tests for the lead.
+
+**Commit:** `sycl: NVFP4 prompt experts run a stored-order WOQ GEMM instead of a per-expert f16 dequant`.
+
+**Gotchas.**
+- `pp_stream_windowed` (`:100927-100929`) stays false for the WOQ arm. NVFP4 is never staged
+  (`moe_type_has_immutable_host_recipe`).
+- The phase loop (`:101619-101630`) gives the WOQ arm one phase. Do not split it.
+- The scale pointer is `sycl::half *`. Offsets are in halves in the GEMM call and in bytes in the dense layout's
+  `scale_base`: compute it once and name the unit.
+- The primitive cache now holds one 3-D primitive per `(m, batch)` pair. Report the count after the lead's long
+  prompt: the long arm's first run includes JIT time.
+- `DnnlGemmWrapper::woq_nvfp4_library_ok()` exists only under `#if GGML_SYCL_DNNL`, as does the whole wrapper. The
+  switch must use the same guard and return false without it, the way the executor's other oneDNN calls are guarded.
+- The line numbers above are from `e42c9af2fa`. 26b-1 and 26b-3 have since merged into `ggml-sycl.cpp` and
+  `convert.cpp`, so find each site by its code, not by its number.
+- NVFP4 asks `ggml_prec_set_acc(GGML_PREC_BF16)` (`src/llama-graph.cpp:1917-1919`), which this executor has never
+  read. The WOQ arm accumulates as fpmath f16 with `apply_to_int` gives it. Leave it as is; the device test's NMSE is
+  the check.
+
+#### Task 26b-5: Lead acceptance
+
+Run in this order, once each, on the merged `feat/inkling2` build:
+1. The device tests: `test-sycl-nvfp4-woq-repack`, `test-moe-pp-batched-dequant` and `-nvfp4-f16`.
+2. The Mistral and GPT-OSS gates.
+3. The Inkling gate on both cards.
+4. The long prompt on both cards. It counts as run only if:
+   - `[PP-MOE] ... type=nvfp4 ... arm=woq` appears;
+   - its log has zero `moe_pp_batched_refusal` lines;
+   - the kernel profile shows `nvfp4.pp.repack.nk` and `nvfp4.pp.gemm.execute` rows and no `moe.pp.dequant.nvfp4`
+     row.
+
+   Compare the `nvfp4.pp.repack.nk` row with its byte bound: about 6.3 MB per active expert at K = N = 2304 (36 B
+   read and 40 B written per 64 values), at about 224 GB/s on the B50 and about 608 GB/s on the B70. If the row is
+   more than 2x that bound, file the reorder tiling as a follow-up. The tiling has two parts:
+   - make each work-group a tile of 16 n by 4 ib, stage the tile's scales in local memory, and write them as 32-byte
+     runs along n, as the coalesced MXFP4 scales kernel at convert.cpp:1958 does;
+   - use int32 index math and word loads of `block_nvfp4`.
+   The 26b-1 quality review estimated that the scale plane's 2-byte scatter costs about 1.3-1.5x the bound, and the
+   tiling is not worth doing below 2x.
+
+   The output is compared with the Task 25 long-prompt baselines. A difference is expected, because the
+   accumulation order changes. Report where it first diverges and whether the text stays coherent.
+5. Perplexity on `inkling/lead/ppl-text.txt`, base and new on the same text. The base is a fresh build at
+   `fork/master` `c6805bfb7` in `inkling/wt-base-c6805`, because the ppl text was rebuilt and is not verified.
+   `c6805bfb7` has the same code as `f89fca439d`: everything between them is docs. The same tree is the base arm of
+   the ABBA in step 8. Accept a delta within 0.5%.
+6. Plan lines on the B50 for Inkling and GPT-OSS, base against new: GPT-OSS byte-identical, and Inkling with the
+   weight slot up by 63.7 MB and no expert moved to the host that was resident before.
+7. `sweeps.sh`, with no new red.
+8. `abba.sh`, base against new. Inkling B70 pp must be REAL in the right direction. Every other cell must be NOISE or
+   better.
+9. Merge, then push to `fork/master` fast-forward only, under the standing authorization.
+
+**Lead acceptance (2026-11-28), on `feat/inkling2`'s full build at `b0d0937d98`, base `c6805bfb7`.** Each device
+run ran once, B70 = `level_zero:0`, B50 = `level_zero:1`, and pp / tg are in t/s. Evidence is in `inkling/t26b5-*`.
+- *Device tests (B50).* `test-sycl-nvfp4-woq-repack` passes. `test-moe-pp-batched-dequant` passes 48 cases with
+  NVFP4 on the WOQ arm, and `-nvfp4-f16` passes 9 cases on the f16 arm.
+- *Gates.*
+  - Mistral passes on the B70.
+  - GPT-OSS passes on the B50 and the B70; the B50 count line is 1.
+  - Inkling passes on the B70, the B50 and both cards.
+- *Long prompt, 4737 tokens at `-c 8192`.*
+  - B70: 381.96 / 28.31, against Task 25's 322.12 / 27.95, which is +18.6% on the prompt.
+    - The profiled run prints `[PP-MOE] device=0 type=nvfp4 layout=aos arm=woq experts=125 groups=1` and no
+      refusal.
+    - Its profile has `nvfp4.pp.repack.nk` (880 launches, 1379.6 ms) and `nvfp4.pp.gemm.execute` (6376, 1082.3 ms).
+      It has no `moe.pp.dequant.nvfp4` row.
+    - The reorder moved 96,580 experts (608.8 GB) at 1.38x its byte bound at 608 GB/s. That is under 2x, so no
+      tiling follow-up is filed.
+    - oneDNN created 37 primitives (305 ms), once per shape.
+    - The scratchpad of the 3-D NVFP4 primitive is 0 B at B = 1, 8, 32 and 128 on both cards (Task 26a's SCRATCHPAD
+      lines, `jit:gemm:any`), so GEMM groups that share the pooled scratchpad cannot overwrite each other.
+  - B50: 20.64 / 7.36, against Task 25's 18.86 / 7.47. The text is byte-identical to Task 25's.
+  - *Step 4 assumed the B50 runs the batched executor. It does not.*
+    - The plan leaves about 9.7 GB of experts on the host and drops the PP MoE ring.
+    - The resident experts run the prompt through `mulmat.mmvq.id_aos_nvfp4`: 19,080 launches, 49.4 s of the run's
+      60.3 s of device time.
+    - So the B50 shows neither arm, no refusal and no dequant row. The task neither helps nor hurts the B50 prompt;
+      `llama.cpp-lj12` owns that path.
+  - The B70 text first differs from Task 25's about 20 tokens into the answer (byte 15802), as expected when the
+    accumulation order changes.
+    - It stays coherent.
+    - Its five bullets are shorter than Task 25's and one repeats, and then the list repeats.
+    - Perplexity, below, shows no loss.
+- *Perplexity (B70, 6 chunks at 2048):* base 7.5957, new 7.5791 (-0.22%).
+- *Plan lines.*
+  - GPT-OSS on the B50 places the same. Only `MemAvailable`, `measure_ms`, `rss_file` and the tuning-cache hit or
+    miss differ, and both runs choose `n_ubatch=512`.
+  - Inkling on the B50 sizes a ring of 619.3 MB, up from 558.6 MB. That is the WOQ slot's +63.7e6 B.
+    - The plan made with the ring is the one that is not kept. It leaves 938 experts on the host, against 910.
+    - The ring is dropped in both runs, and the kept plan is identical: WEIGHT 12626.5 MB, with 9668.3 MB (early
+      pass) and 10219.3 MB (late pass) served from the mapping.
+    - So no expert that was resident moved to the host.
+  - Inkling on the B70 has no host experts in either run.
+- *Sweeps.* The audit returns rc 0. Sweep 1 runs 287 tests with three reds and sweep 2 runs 22 with one, the same four
+  as at Task 25.
+- *Interleaved ABBA against `c6805bfb7`.* 8 repetitions per arm, and no builder or ctest in any of 249 samples.
+  Medians a / b / b2 / a2:
+
+  | model, card | pp | tg | reading |
+  |---|---|---|---|
+  | Inkling, B70 | 624.48 / 747.63 / 746.07 / 618.08 | 30.34 / 30.21 / 30.48 / 30.54 | pp **+20.2%**, tg equal |
+  | Mistral, B70 | 3341.97 / 3339.66 / 3333.05 / 3342.06 | 111.53 / 111.59 / 111.53 / 111.80 | equal |
+  | GPT-OSS, B50 | 886.36 / 876.75 / 873.06 / 876.06 | 40.30 / 39.94 / 39.99 / 40.13 | equal |
+  | Inkling, B50 tg | | 11.25 / 11.34 / 11.23 / 11.32 | equal |
+
+  - The scorer flags Mistral pp and GPT-OSS tg as "REAL": both new medians are below both base medians, by 0.07-0.27%
+    and 0.4-0.9%.
+  - A reversed-order BAAB of those two cells (`t26b5-baab-*`, medians b / a / a2 / b2) moved them:
+    - Mistral pp: 3348.05 / 3346.05 / 3337.13 / 3342.19, +0.11%.
+    - GPT-OSS tg: 40.30 / 40.17 / 39.76 / 40.07, +0.55%.
+    - Mistral tg read -0.14% on medians whose base arms sit 0.01 t/s apart, against a spread of about 0.4 t/s.
+  - Pooled over both orders, every non-Inkling cell is within ±0.15%, so these are position and noise.
+  - Neither path reaches the change: Mistral is dense, and a GPT-OSS decode token never enters the batched prompt
+    executor. Task 25's ABBA flagged the same GPT-OSS row the same way.
+- *What the task bought.* The per-expert dequant is gone. Inkling's B70 prompt runs about 20% faster at pp512 and
+  about 19% faster on the long prompt, with perplexity no worse.
 
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
@@ -8600,6 +9225,25 @@ interpreter fix for `master`; taking the 6d fix to `master`; pushing `feat/inkli
   must not be read alone.
 - `llama-bench`'s random tokens gave Inkling 112 t/s where real text gives 92: the bench stays a regression
   instrument, the long arm is the speed that is reported.
+
+*Left by Task 26a (2026-11-27):*
+- **At 128 rows, oneDNN's stored-order NVFP4 form is slower than its transposed form.** On gate_up at M 128 it takes
+  19.9-23.1 µs against 19.1-30.5 µs for the transposed form on the B70, and 47.7-69.7 against 51.5-54.0 on the B50.
+  The B 128 row is the loss on both cards (23.12 against 19.12, 69.66 against 52.03). At M 32 and M 64 the
+  stored-order form is 2.2-4.5x faster. Task 26b uses the stored-order form for every group. Whether a group of 128
+  rows or more is common on a real prompt is unmeasured: read it from 26b's executor profile, which shows the group
+  sizes. If such groups are common, the fix is a oneDNN issue or a kernel of our own, not a second layout.
+- **The NVFP4 experts' WOQ planes are rebuilt for every call.** Task 26b repacks into scratch for each node, as the
+  MXFP4 arm does. If the loaded layout were the WOQ layout, no repack would run. But every consumer, the decode
+  kernels included, would then have to read that layout (one layout per weight). This is `llama.cpp-v8d8`.
+- **MXFP4's opt-in 3-D WOQ arm may be wrong only because of its group dims.**
+  - It passes `set_scales(WEIGHTS, 7, {1, group_size, 1}, e8m0)` (`gemm.hpp:1432-1433`). oneDNN's C API says the
+    group count "must be 0 or 2", for the last two dims.
+  - Task 26a's NVFP4 3-D forms pass `{16, 1}` with mask 7 and compute right on both cards.
+  - In the bench the 2-D per-expert loop GPT-OSS runs today is 1.7-3x slower than the 3-D form (`woq-2d-*` against
+    `woq-3d-*`).
+  - Test MXFP4 3-D with `{32, 1}` groups. If it computes right, GPT-OSS prompt processing gains a batched GEMM. This
+    is a GPT-OSS task, not this plan's.
 
 ---
 

@@ -3,10 +3,11 @@
 The executor lambda try_pp_onednn_f16_batched (ggml/src/ggml-sycl/ggml-sycl.cpp) lays its activation and output
 scratch out per GEMM group, from moe_pp_pack_gemm_groups (moe-pp-pack.hpp). Every reader of that scratch that addresses
 one expert takes its offsets from act_base and out_base, so they cannot disagree about where an expert's rows are, and
-none of the old rectangle's names remains. Those readers are counted exactly: the two GEMM arms (WOQ and f16) and the
-debug compare, three calls of each helper. The batched gather and scatter (Inkling Task 25) address the scratch from row
-0 through the packed-row table, whose rows come from the same layout (slot_base_row, moe_pp_pack_row_table): each takes
-its pointer once, in one pinned spelling, inside the submit that launches its kernel.
+none of the old rectangle's names remains. Those readers are counted exactly: the three GEMM calls (NVFP4's WOQ,
+MXFP4's WOQ and the f16 arm's) and the debug compare, four calls of each helper. The batched gather and scatter
+(Inkling Task 25) address the scratch from row 0 through the packed-row table, whose rows come from the same layout
+(slot_base_row, moe_pp_pack_row_table): each takes its pointer once, in one pinned spelling, inside the submit that
+launches its kernel.
 
 Host-only text assertions. llama_test_pytest hands this file to pytest, so every check lives inside a test_*()
 function: a file with none is "no tests collected" (exit 5), which ctest scores as a failure. Checks run on
@@ -54,7 +55,7 @@ def test_the_groups_come_from_the_header():
     assert "moe_pp_pack_gemm_groups(" in body, "the executor does not take its groups from moe_pp_pack_gemm_groups"
 
 
-@pytest.mark.parametrize("pointer,helper,uses", [("batched_acts", "act_base", 3), ("batched_out", "out_base", 3)])
+@pytest.mark.parametrize("pointer,helper,uses", [("batched_acts", "act_base", 4), ("batched_out", "out_base", 4)])
 def test_every_offset_comes_from_one_helper(pointer, helper, uses):
     body = _executor_body()
     failures = []
@@ -63,8 +64,8 @@ def test_every_offset_comes_from_one_helper(pointer, helper, uses):
         failures.append(f"{pointer}: {offsets} pointer offsets, want exactly one (inside {helper})")
     calls = len(re.findall(rf"\b{helper}\(", body))
     if calls != uses:
-        failures.append(f"{helper}: {calls} calls, want exactly {uses} (the WOQ GEMM arm, the f16 GEMM arm and the debug "
-                        f"compare); a new reader of one expert's rows is a deliberate edit here")
+        failures.append(f"{helper}: {calls} calls, want exactly {uses} (the NVFP4 and MXFP4 WOQ GEMMs, the f16 GEMM "
+                        f"and the debug compare); a new reader of one expert's rows is a deliberate edit here")
     assert not failures, "\n".join(failures)
 
 
