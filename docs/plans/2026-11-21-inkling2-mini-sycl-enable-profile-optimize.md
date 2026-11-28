@@ -8753,6 +8753,10 @@ tests for the lead.
   `scale_base`: compute it once and name the unit.
 - The primitive cache now holds one 3-D primitive per `(m, batch)` pair. Report the count after the lead's long
   prompt: the long arm's first run includes JIT time.
+- `DnnlGemmWrapper::woq_nvfp4_library_ok()` exists only under `#if GGML_SYCL_DNNL`, as does the whole wrapper. The
+  switch must use the same guard and return false without it, the way the executor's other oneDNN calls are guarded.
+- The line numbers above are from `e42c9af2fa`. 26b-1 and 26b-3 have since merged into `ggml-sycl.cpp` and
+  `convert.cpp`, so find each site by its code, not by its number.
 - NVFP4 asks `ggml_prec_set_acc(GGML_PREC_BF16)` (`src/llama-graph.cpp:1917-1919`), which this executor has never
   read. The WOQ arm accumulates as fpmath f16 with `apply_to_int` gives it. Leave it as is; the device test's NMSE is
   the check.
