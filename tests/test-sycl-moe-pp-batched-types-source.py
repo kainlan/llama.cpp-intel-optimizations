@@ -191,10 +191,12 @@ PHASE_OFFSET = ("const size_t phase_offset = "
                 "sycl::half * phase_weights = batched_weights + phase_offset;")
 PHASE_BOUND = ("GGML_ASSERT(pp_woq_arm || (phase_offset + (phase.end - phase.begin) * weight_elems) * "
                "sizeof(sycl::half) <= reserved.weight_size);")
-# The route log's weight figure: the f16 arm's buffers when its phases reuse them, else every active expert's region.
+# The route log's weight figure: NVFP4's dense planes, MXFP4's slots, the f16 arm's buffers when its phases reuse
+# them, else every active expert's region.
 WEIGHT_USED = ("const size_t f16_used_elems = moe_pp_batched_phases_reuse_buffers(f16_groups) ? "
                "phase_buffers * half_elems : active_count * weight_elems; "
-               "const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : f16_used_elems * sizeof(sycl::half);")
+               "const size_t weight_used_bytes = pp_woq_nvfp4 ? nvfp4_planes.used_bytes : pp_woq_arm ? weight_bytes : "
+               "f16_used_elems * sizeof(sycl::half);")
 PHASE_WAIT = ("if (moe_pp_batched_phases_reuse_buffers(f16_groups) && !half_readers[phase.buffer].empty()) { "
               "stream->ext_oneapi_submit_barrier(half_readers[phase.buffer]); half_readers[phase.buffer].clear(); }")
 # The debugging compare arm (GGML_SYCL_MOE_PP_ONEDNN_F16_BATCHED_COMPARE), the one block in the lambda that may wait on
@@ -239,12 +241,13 @@ STAGED_CLAIM_HEAD = "planned = plan != nullptr && ggml_sycl_moe_pp_batched_claim
 SEED_GATE = "if (!moe_pp_batched_takes_staged_type(t)) { return MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED; }"
 # The WOQ table's rows: MXFP4's repack reads its SOA or XMX_TILED planes, NVFP4's reads its AOS blocks.
 WOQ_ROWS = {"GGML_TYPE_MXFP4": ["GGML_LAYOUT_SOA", "GGML_LAYOUT_XMX_TILED"], "GGML_TYPE_NVFP4": ["GGML_LAYOUT_AOS"]}
-# Which arm a dispatch runs, asked of the header, and the claim's WOQ branch, which stays MXFP4's alone.
+# Which arm a dispatch runs, asked of the header, and the claim's WOQ branch, which stays MXFP4's alone. NVFP4's
+# switch is asked only for an NVFP4 op, so its oneDNN-version WARN never prints for another type's model.
 WOQ_ARM_FN = "moe_pp_batched_woq_arm_runs"
 WOQ_ARM_BODY = ("{ return woq_enabled && moe_pp_batched_woq_supports_layout(type, layout) && "
                 "(type != GGML_TYPE_NVFP4 || nvfp4_woq_enabled); }")
 WOQ_ARM_LINE = ("const bool pp_woq_arm = moe_pp_batched_woq_arm_runs(src0->type, route_layout, pp_woq_enabled, "
-                "ggml_sycl_moe_pp_woq_nvfp4_enabled());")
+                "src0->type == GGML_TYPE_NVFP4 && ggml_sycl_moe_pp_woq_nvfp4_enabled());")
 WOQ_NVFP4_LINE = "const bool pp_woq_nvfp4 = pp_woq_arm && src0->type == GGML_TYPE_NVFP4;"
 WOQ_CLAIM_BRANCH = ("if (woq_enabled && type == GGML_TYPE_MXFP4 && moe_pp_batched_woq_supports_layout(type, layout)) "
                     "{ return true; }")
@@ -1564,8 +1567,11 @@ MUTANTS = [
     ("m", "sycl", PHASE_BOUND, "GGML_ASSERT(pp_woq_arm || (static_cast<size_t>(phase_weights - batched_weights) + "
      "(phase.end - phase.begin) * weight_elems) * sizeof(sycl::half) <= reserved.weight_size);"),
     # The route log's weight figure: one window's buffers whatever the predicate says, the plan re-derived there.
-    ("m", "sycl", WEIGHT_USED, "const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : "
-     "phase_buffers * half_elems * sizeof(sycl::half);"),
+    ("m", "sycl", WEIGHT_USED, "const size_t weight_used_bytes = pp_woq_nvfp4 ? nvfp4_planes.used_bytes : "
+     "pp_woq_arm ? weight_bytes : phase_buffers * half_elems * sizeof(sycl::half);"),
+    # NVFP4's figure taken as the slots it asked for, not the dense planes it used.
+    ("m", "sycl", "pp_woq_nvfp4 ? nvfp4_planes.used_bytes : pp_woq_arm ? weight_bytes :",
+     "pp_woq_arm ? weight_bytes :"),
     ("m", "sycl", "f16_used_elems = moe_pp_batched_phases_reuse_buffers(f16_groups) ?",
      "f16_used_elems = f16_groups.groups != 1 ?"),
     ("m", "sycl", "phase_buffers * half_elems : active_count * weight_elems;",
@@ -1677,6 +1683,8 @@ MUTANTS = [
     ("u", "sycl", WOQ_ARM_LINE,
      "const bool pp_woq_arm = pp_woq_enabled && moe_pp_batched_woq_supports_layout(src0->type, route_layout);"),
     ("u", "sycl", WOQ_ARM_LINE, WOQ_ARM_LINE.replace("ggml_sycl_moe_pp_woq_nvfp4_enabled()", "true")),
+    # NVFP4's switch asked for every type again, which logs its version WARN on an MXFP4 or Q4_0 model.
+    ("u", "sycl", WOQ_ARM_LINE, WOQ_ARM_LINE.replace("src0->type == GGML_TYPE_NVFP4 && ", "")),
     ("u", "tables", WOQ_ARM_BODY, "{ return woq_enabled && moe_pp_batched_woq_supports_layout(type, layout); }"),
     # The claim moves with the WOQ switch for NVFP4.
     ("u", "tables", "if (woq_enabled && type == GGML_TYPE_MXFP4 && moe_pp_batched_woq_supports_layout(type, layout))",

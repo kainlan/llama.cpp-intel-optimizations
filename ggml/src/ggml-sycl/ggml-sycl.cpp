@@ -89200,8 +89200,9 @@ static bool ggml_sycl_moe_pp_woq_enabled() {
 
 // NVFP4's own WOQ switch (moe_pp_batched_woq_arm_runs): GGML_SYCL_MOE_PP_WOQ_NVFP4, read once, default on, and the
 // oneDNN version, since an oneDNN older than 3.13 computes woq_gemm_batch_nvfp4's transposed sub-byte weights wrong.
-// Off, NVFP4's prompt experts run the f16 arm in the same planned slot. It is under the oneDNN guard, as the wrapper
-// it asks is: a build without oneDNN runs neither arm.
+// Off, NVFP4's prompt experts run the f16 arm in the same planned slot. The executor asks it only for an NVFP4 op, so
+// the WARN below prints at most once, on an NVFP4 model's first batched prompt dispatch. It is under the oneDNN guard,
+// as the wrapper it asks is: a build without oneDNN runs neither arm.
 static bool ggml_sycl_moe_pp_woq_nvfp4_enabled() {
     static const bool enabled = []() {
         const char * env = std::getenv("GGML_SYCL_MOE_PP_WOQ_NVFP4");
@@ -100939,12 +100940,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             const bool pp_woq_enabled = ggml_sycl_moe_pp_woq_enabled();
             // The WOQ arm is MXFP4's and NVFP4's (moe_pp_batched_woq_arm_runs): MXFP4's under GGML_SYCL_MOE_PP_WOQ,
             // NVFP4's under that and its own switch as well. Every other type the tables take, and either of those two
-            // with its switch off, runs the f16 arm.
-            const bool pp_woq_arm     = moe_pp_batched_woq_arm_runs(src0->type, route_layout, pp_woq_enabled,
-                                                                    ggml_sycl_moe_pp_woq_nvfp4_enabled());
+            // with its switch off, runs the f16 arm. NVFP4's switch is asked only for an NVFP4 op, the one type that
+            // reads it, so its oneDNN-version WARN never prints for another type's model.
+            const bool pp_woq_arm =
+                moe_pp_batched_woq_arm_runs(src0->type, route_layout, pp_woq_enabled,
+                                            src0->type == GGML_TYPE_NVFP4 && ggml_sycl_moe_pp_woq_nvfp4_enabled());
             // NVFP4's WOQ arm: a GEMM over the experts' stored-order nibbles and f16 scales, in dense planes
             // (moe_pp_woq_nvfp4_dense_planes), where MXFP4's has one planned slot per expert.
-            const bool pp_woq_nvfp4   = pp_woq_arm && src0->type == GGML_TYPE_NVFP4;
+            const bool pp_woq_nvfp4 = pp_woq_arm && src0->type == GGML_TYPE_NVFP4;
 
             // llama.cpp-8epx: whether this op reads ring windows, decided once for the op. Windows hold only a claimed
             // layer's GATE, UP and DOWN host matrices, which the f16 arm dequantizes. Such a layer's other ops have no
@@ -101218,7 +101221,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             size_t       woq_nibble_slot_bytes = 0;  // WOQ-arm only
             size_t       woq_scale_slot_bytes  = 0;  // WOQ-arm only
             size_t       weight_slot_bytes     = 0;  // WOQ-arm only: woq_nibble_slot_bytes + woq_scale_slot_bytes
-            moe_pp_woq_nvfp4_planes nvfp4_planes = {};          // NVFP4's WOQ arm only: where its planes sit
+
+            // NVFP4's WOQ arm only: where its dense planes sit in the slot (moe_pp_woq_nvfp4_dense_planes, below).
+            moe_pp_woq_nvfp4_planes nvfp4_planes = {};
             if (!checked_mul(pack.packed_rows, static_cast<size_t>(ne10), total_act_elems) ||
                 !checked_mul(pack.packed_rows, static_cast<size_t>(ne0), total_out_elems) ||
                 !checked_mul(total_act_elems, sizeof(sycl::half), act_bytes) ||
@@ -102338,13 +102343,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
 
             if (ggml_sycl::ggml_sycl_moe_route_log_enabled()) {
-                // The weight figure is what this dispatch used of the slot: the WOQ planes of every active expert;
-                // the f16 arm's buffers when its phases reuse them; otherwise every active expert's own region, which
-                // the last phase's region ends at.
+                // The weight figure is what this dispatch used of the slot: NVFP4's dense planes; MXFP4's WOQ slot of
+                // every active expert; the f16 arm's buffers when its phases reuse them; otherwise every active
+                // expert's own region, which the last phase's region ends at.
                 const size_t f16_used_elems    = moe_pp_batched_phases_reuse_buffers(f16_groups) ?
                                                      phase_buffers * half_elems :
                                                      active_count * weight_elems;
-                const size_t weight_used_bytes = pp_woq_arm ? weight_bytes : f16_used_elems * sizeof(sycl::half);
+                const size_t weight_used_bytes = pp_woq_nvfp4 ? nvfp4_planes.used_bytes :
+                                                 pp_woq_arm   ? weight_bytes :
+                                                                f16_used_elems * sizeof(sycl::half);
+
                 static std::atomic<int> batched_log{ 0 };
                 if (batched_log.fetch_add(1, std::memory_order_relaxed) < 96) {
                     GGML_LOG_INFO(
