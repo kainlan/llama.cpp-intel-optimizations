@@ -8781,7 +8781,9 @@ Run in this order, once each, on the merged `feat/inkling2` build:
    The output is compared with the Task 25 long-prompt baselines. A difference is expected, because the
    accumulation order changes. Report where it first diverges and whether the text stays coherent.
 5. Perplexity on `inkling/lead/ppl-text.txt`, base and new on the same text. The base is a fresh build at
-   `f89fca439d` in W, because the ppl text was rebuilt and is not verified. Accept a delta within 0.5%.
+   `fork/master` `c6805bfb7` in `inkling/wt-base-c6805`, because the ppl text was rebuilt and is not verified.
+   `c6805bfb7` has the same code as `f89fca439d`: everything between them is docs. The same tree is the base arm of
+   the ABBA in step 8. Accept a delta within 0.5%.
 6. Plan lines on the B50 for Inkling and GPT-OSS, base against new: GPT-OSS byte-identical, and Inkling with the
    weight slot up by 63.7 MB and no expert moved to the host that was resident before.
 7. `sweeps.sh`, with no new red.
