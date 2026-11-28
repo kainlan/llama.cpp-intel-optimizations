@@ -59,6 +59,13 @@ so the baseline stayed red until they were recorded (G-CATCH, written with `--wr
 Nothing in unified-cache.cpp, moe-stream-ring.cpp or zone-tag-census.hpp throws `ggml_sycl_fallback_error`, and dpct does not know
 the type.
 
+Re-keyed, same handlers (written with `--write-debt --allow-growth`, two out and two in): the deferred-free walks in
+`unified_cache::process_deferred_frees_locked` now run as `ggml_sycl::vector_compact_visit` visitors, so the barrier-submission
+`catch (...)` and the host-event `wait_and_throw` `catch (...)` sit in lambdas, keyed
+`lambda in unified_cache::process_deferred_frees_locked::catch_clause:all#0` and `#1`. They were the function's `#0` and `#1`; the
+inflight-unpin walk's handler, still in the function body, was `#2` and is now `#0`, so the entries `#1` and `#2` went. The handlers'
+bodies did not change.
+
 Clause (q), libc allocation primitives (S3-0): `mmap`, `mmap64`, `mremap`, `posix_memalign`, `memalign`, `aligned_alloc`, `valloc`,
 `pvalloc`, `malloc`, `calloc`, `realloc`, `reallocarray`, `strdup`, `strndup` and `VirtualAlloc`, called bare or through `std::` / `::` (or taken as a value, or spelled in a `#define` body), are E-LIBC findings. A member
 (`pool.realloc`), a name qualified by another scope (`sycl::malloc` stays clause (e)'s) and a declaration are not. Seven allowlist entries

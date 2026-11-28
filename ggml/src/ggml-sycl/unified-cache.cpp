@@ -36,6 +36,7 @@
 #include "sycl-timeline.hpp"
 #include "tlsf-allocator.hpp"
 #include "unified-types.hpp"
+#include "vector-compact.hpp"
 #include "vram-headroom.hpp"
 #include "weight-row-padding.hpp"
 #include "zone-sizing.hpp"
@@ -12629,17 +12630,16 @@ void unified_cache::finish_optional_layout_release(optional_layout_release &    
         (void) finalize_retired_entries_locked();
         if (readers_finished) {
             std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);
-            for (auto it = deferred_frees_.begin(); it != deferred_frees_.end();) {
-                if (!it->managed || !it->handle.owner.valid() ||
-                    std::find(owner_ids.begin(), owner_ids.end(), it->handle.owner.owner_control_id()) ==
+            ggml_sycl::vector_compact_visit(deferred_frees_, [&owner_ids, &released](deferred_free_entry & entry) {
+                if (!entry.managed || !entry.handle.owner.valid() ||
+                    std::find(owner_ids.begin(), owner_ids.end(), entry.handle.owner.owner_control_id()) ==
                         owner_ids.end() ||
-                    (it->has_event && !event_complete(it->event))) {
-                    ++it;
-                    continue;
+                    (entry.has_event && !event_complete(entry.event))) {
+                    return false;
                 }
-                released.push_back(std::move(*it));
-                it = deferred_frees_.erase(it);
-            }
+                released.push_back(std::move(entry));
+                return true;
+            });
         }
     }
     released.clear();
@@ -17258,111 +17258,111 @@ void unified_cache::process_deferred_frees_locked() {
     // Enqueue paths do not necessarily hold rw_mutex_, so serialize all vector
     // iteration/erasure separately. No queue wait is performed while pending.
     std::lock_guard<std::mutex> deferred_lock(deferred_frees_mutex_);
-    auto it = deferred_frees_.begin();
-    while (it != deferred_frees_.end()) {
-        const bool ready = !it->has_event || event_complete(it->event);
+    // Both walks compact in place rather than erase each ready entry from the
+    // middle: one evict boundary can make thousands ready at once, and an erase
+    // per entry moves every later entry, O(n^2) moves on this thread. Each
+    // dropped entry is still destroyed as soon as its visit returns true,
+    // before the next entry is visited, under these locks.
+    ggml_sycl::vector_compact_visit(deferred_frees_, [this](deferred_free_entry & entry) {
+        const bool ready = !entry.has_event || event_complete(entry.event);
         if (!ready) {
-            GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free pending: ptr=%p size=%zu\n", it->ptr, it->size);
-            ++it;
-            continue;
+            GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free pending: ptr=%p size=%zu\n", entry.ptr, entry.size);
+            return false;
         }
 
-        if (it->ptr) {
-            const bool is_arena = vram_owns(it->ptr);
-            const bool is_pool  = !is_arena && layout_pool_ && layout_pool_->owns(it->ptr);
-            if (it->zone_managed) {
-                if (it->zone != vram_zone_id::COUNT) {
-                    zone_free(it->zone, it->ptr);
+        if (entry.ptr) {
+            const bool is_arena = vram_owns(entry.ptr);
+            const bool is_pool  = !is_arena && layout_pool_ && layout_pool_->owns(entry.ptr);
+            if (entry.zone_managed) {
+                if (entry.zone != vram_zone_id::COUNT) {
+                    zone_free(entry.zone, entry.ptr);
                 }
             } else if (is_arena) {
                 // Arena entries: just remove from deferred list, no sycl::free needed.
-                GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free skip arena ptr=%p size=%zu\n", it->ptr, it->size);
-            } else if (it->managed) {
-                if (it->handle.owner.valid()) {
-                    it->handle.owner = {};
+                GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free skip arena ptr=%p size=%zu\n", entry.ptr, entry.size);
+            } else if (entry.managed) {
+                if (entry.handle.owner.valid()) {
+                    entry.handle.owner = {};
                 } else {
-                    if (release_registered_pointer(it->handle.ptr, it->handle.device) !=
+                    if (release_registered_pointer(entry.handle.ptr, entry.handle.device) !=
                         registered_release_status::RELEASED) {
-                        GGML_LOG_ERROR("[UNIFIED-CACHE] deferred managed free failed ptr=%p size=%zu\n", it->ptr,
-                                       it->size);
+                        GGML_LOG_ERROR("[UNIFIED-CACHE] deferred managed free failed ptr=%p size=%zu\n", entry.ptr,
+                                       entry.size);
                         GGML_ASSERT(false && "deferred managed release failed");
                     }
                 }
             } else if (!is_pool) {
-                if (!it->has_event) {
+                if (!entry.has_event) {
                     // Instead of queue_.wait() under rw_mutex_ (deadlock risk),
                     // submit a barrier event and defer to the next cycle.
                     try {
-                        it->event     = submit_barrier_all();
-                        it->has_event = true;
+                        entry.event     = submit_barrier_all();
+                        entry.has_event = true;
                     } catch (...) {
                         // If barrier submission fails, fall back to skipping
                     }
-                    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free: added barrier for ptr=%p\n", it->ptr);
-                    ++it;
-                    continue;
+                    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free: added barrier for ptr=%p\n", entry.ptr);
+                    return false;
                 }
                 alloc_metadata tracked{};
-                if (unified_lookup(it->ptr, &tracked)) {
+                if (unified_lookup(entry.ptr, &tracked)) {
                     if (release_registered_allocation(tracked) != registered_release_status::RELEASED) {
-                        GGML_LOG_ERROR("[UNIFIED-CACHE] deferred tracked free failed ptr=%p size=%zu\n", it->ptr,
-                                       it->size);
+                        GGML_LOG_ERROR("[UNIFIED-CACHE] deferred tracked free failed ptr=%p size=%zu\n", entry.ptr,
+                                       entry.size);
                         GGML_ASSERT(false && "deferred tracked free failed");
                     }
                 } else {
-                    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free skip non-owned ptr=%p size=%zu\n", it->ptr,
-                                    it->size);
+                    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free skip non-owned ptr=%p size=%zu\n", entry.ptr,
+                                    entry.size);
                 }
             }
             // Pool entries: used_ stays at chunk level, memory stays in pool
-            GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free done: ptr=%p size=%zu pool=%d\n", it->ptr, it->size,
+            GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred free done: ptr=%p size=%zu pool=%d\n", entry.ptr, entry.size,
                             is_pool ? 1 : 0);
         }
 
-        it = deferred_frees_.erase(it);
-    }
+        return true;
+    });
 
-    auto host_it = deferred_host_frees_.begin();
-    while (host_it != deferred_host_frees_.end()) {
-        const bool ready = !host_it->has_event || event_complete(host_it->event);
+    ggml_sycl::vector_compact_visit(deferred_host_frees_, [](deferred_host_free_entry & entry) {
+        const bool ready = !entry.has_event || event_complete(entry.event);
         if (!ready) {
-            ++host_it;
-            continue;
+            return false;
         }
-        if (host_it->ptr) {
+        if (entry.ptr) {
             try {
-                if (host_it->has_event) {
-                    host_it->event.wait_and_throw();
+                if (entry.has_event) {
+                    entry.event.wait_and_throw();
                 }
             } catch (...) {
             }
-            if (host_it->managed) {
-                if (host_it->handle.owner.valid()) {
-                    host_it->handle.owner = {};
+            if (entry.managed) {
+                if (entry.handle.owner.valid()) {
+                    entry.handle.owner = {};
                 } else {
-                    if (release_registered_pointer(host_it->handle.ptr, host_it->handle.device) !=
+                    if (release_registered_pointer(entry.handle.ptr, entry.handle.device) !=
                         registered_release_status::RELEASED) {
-                        GGML_LOG_ERROR("[UNIFIED-CACHE] deferred host tracked free failed ptr=%p size=%zu\n",
-                                       host_it->ptr, host_it->size);
+                        GGML_LOG_ERROR("[UNIFIED-CACHE] deferred host tracked free failed ptr=%p size=%zu\n", entry.ptr,
+                                       entry.size);
                         GGML_ASSERT(false && "deferred host tracked free failed");
                     }
                 }
             } else {
                 alloc_metadata tracked{};
-                if (unified_lookup(host_it->ptr, &tracked)) {
+                if (unified_lookup(entry.ptr, &tracked)) {
                     if (release_registered_allocation(tracked) != registered_release_status::RELEASED) {
-                        GGML_LOG_ERROR("[UNIFIED-CACHE] deferred host lookup free failed ptr=%p size=%zu\n",
-                                       host_it->ptr, host_it->size);
+                        GGML_LOG_ERROR("[UNIFIED-CACHE] deferred host lookup free failed ptr=%p size=%zu\n", entry.ptr,
+                                       entry.size);
                         GGML_ASSERT(false && "deferred host lookup free failed");
                     }
                 } else {
-                    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred host free skip non-owned ptr=%p size=%zu\n", host_it->ptr,
-                                    host_it->size);
+                    GGML_SYCL_DEBUG("[UNIFIED-CACHE] deferred host free skip non-owned ptr=%p size=%zu\n", entry.ptr,
+                                    entry.size);
                 }
             }
         }
-        host_it = deferred_host_frees_.erase(host_it);
-    }
+        return true;
+    });
 
     auto pin_it = inflight_unpins_.begin();
     while (pin_it != inflight_unpins_.end()) {

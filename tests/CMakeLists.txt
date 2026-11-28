@@ -563,6 +563,16 @@ if (GGML_SYCL AND NOT GGML_BACKEND_DL)
     set_tests_properties(test-sycl-cow-chunked-vector PROPERTIES LABELS "sycl;hostonly" TIMEOUT 30)
 endif()
 
+# The in-place compaction the unified cache's deferred-free walks drop their ready entries with: one pass, survivors in
+# order, each drop destroyed as soon as its visit returns true. ggml-sycl/vector-compact.hpp includes only the standard
+# library, so the test links nothing: no SYCL runtime is loaded and no device is opened.
+if (GGML_SYCL AND NOT GGML_BACKEND_DL)
+    add_executable(test-sycl-vector-compact test-sycl-vector-compact.cpp)
+    target_include_directories(test-sycl-vector-compact PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-sycl-vector-compact COMMAND test-sycl-vector-compact)
+    set_tests_properties(test-sycl-vector-compact PROPERTIES LABELS "sycl;hostonly" TIMEOUT 30)
+endif()
+
 # The keyed handle bag the MoE pointer table's per-expert leases live in: every lease on one cache entry comes out by
 # an index lookup, not a walk of the bag. ggml-sycl/keyed-handle-bag.hpp includes only the standard library, so the
 # test links nothing: no SYCL runtime is loaded and no device is opened.
