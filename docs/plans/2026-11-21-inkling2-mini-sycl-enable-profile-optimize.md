@@ -8795,6 +8795,71 @@ Run in this order, once each, on the merged `feat/inkling2` build:
    better.
 9. Merge, then push to `fork/master` fast-forward only, under the standing authorization.
 
+**Lead acceptance (2026-11-28), on `feat/inkling2`'s full build at `b0d0937d98`, base `c6805bfb7`.** Each device
+run ran once, B70 = `level_zero:0`, B50 = `level_zero:1`, and pp / tg are in t/s. Evidence is in `inkling/t26b5-*`.
+- *Device tests (B50).* `test-sycl-nvfp4-woq-repack` passes. `test-moe-pp-batched-dequant` passes 48 cases with
+  NVFP4 on the WOQ arm, and `-nvfp4-f16` passes 9 cases on the f16 arm.
+- *Gates.*
+  - Mistral passes on the B70.
+  - GPT-OSS passes on the B50 and the B70; the B50 count line is 1.
+  - Inkling passes on the B70, the B50 and both cards.
+- *Long prompt, 4737 tokens at `-c 8192`.*
+  - B70: 381.96 / 28.31, against Task 25's 322.12 / 27.95, which is +18.6% on the prompt.
+    - The profiled run prints `[PP-MOE] device=0 type=nvfp4 layout=aos arm=woq experts=125 groups=1` and no
+      refusal.
+    - Its profile has `nvfp4.pp.repack.nk` (880 launches, 1379.6 ms) and `nvfp4.pp.gemm.execute` (6376, 1082.3 ms).
+      It has no `moe.pp.dequant.nvfp4` row.
+    - The reorder moved 96,580 experts (608.8 GB) at 1.38x its byte bound at 608 GB/s. That is under 2x, so no
+      tiling follow-up is filed.
+    - oneDNN created 37 primitives (305 ms), once per shape.
+    - The scratchpad of the 3-D NVFP4 primitive is 0 B at B = 1, 8, 32 and 128 on both cards (Task 26a's SCRATCHPAD
+      lines, `jit:gemm:any`), so GEMM groups that share the pooled scratchpad cannot overwrite each other.
+  - B50: 20.64 / 7.36, against Task 25's 18.86 / 7.47. The text is byte-identical to Task 25's.
+  - *Step 4 assumed the B50 runs the batched executor. It does not.*
+    - The plan leaves about 9.7 GB of experts on the host and drops the PP MoE ring.
+    - The resident experts run the prompt through `mulmat.mmvq.id_aos_nvfp4`: 19,080 launches, 49.4 s of the run's
+      60.3 s of device time.
+    - So the B50 shows neither arm, no refusal and no dequant row. The task neither helps nor hurts the B50 prompt;
+      `llama.cpp-lj12` owns that path.
+  - The B70 text first differs from Task 25's about 20 tokens into the answer (byte 15802), as expected when the
+    accumulation order changes.
+    - It stays coherent.
+    - Its five bullets are shorter than Task 25's and one repeats, and then the list repeats.
+    - Perplexity, below, shows no loss.
+- *Perplexity (B70, 6 chunks at 2048):* base 7.5957, new 7.5791 (-0.22%).
+- *Plan lines.*
+  - GPT-OSS on the B50 places the same. Only `MemAvailable`, `measure_ms`, `rss_file` and the tuning-cache hit or
+    miss differ, and both runs choose `n_ubatch=512`.
+  - Inkling on the B50 sizes a ring of 619.3 MB, up from 558.6 MB. That is the WOQ slot's +63.7e6 B.
+    - The plan made with the ring is the one that is not kept. It leaves 938 experts on the host, against 910.
+    - The ring is dropped in both runs, and the kept plan is identical: WEIGHT 12626.5 MB, with 9668.3 MB (early
+      pass) and 10219.3 MB (late pass) served from the mapping.
+    - So no expert that was resident moved to the host.
+  - Inkling on the B70 has no host experts in either run.
+- *Sweeps.* The audit returns rc 0. Sweep 1 runs 287 tests with three reds and sweep 2 runs 22 with one, the same four
+  as at Task 25.
+- *Interleaved ABBA against `c6805bfb7`.* 8 repetitions per arm, and no builder or ctest in any of 249 samples.
+  Medians a / b / b2 / a2:
+
+  | model, card | pp | tg | reading |
+  |---|---|---|---|
+  | Inkling, B70 | 624.48 / 747.63 / 746.07 / 618.08 | 30.34 / 30.21 / 30.48 / 30.54 | pp **+20.2%**, tg equal |
+  | Mistral, B70 | 3341.97 / 3339.66 / 3333.05 / 3342.06 | 111.53 / 111.59 / 111.53 / 111.80 | equal |
+  | GPT-OSS, B50 | 886.36 / 876.75 / 873.06 / 876.06 | 40.30 / 39.94 / 39.99 / 40.13 | equal |
+  | Inkling, B50 tg | | 11.25 / 11.34 / 11.23 / 11.32 | equal |
+
+  - The scorer flags Mistral pp and GPT-OSS tg as "REAL": both new medians are below both base medians, by 0.07-0.27%
+    and 0.4-0.9%.
+  - A reversed-order BAAB of those two cells (`t26b5-baab-*`, medians b / a / a2 / b2) moved them:
+    - Mistral pp: 3348.05 / 3346.05 / 3337.13 / 3342.19, +0.11%.
+    - GPT-OSS tg: 40.30 / 40.17 / 39.76 / 40.07, +0.55%.
+    - Mistral tg read -0.14% on medians whose base arms sit 0.01 t/s apart, against a spread of about 0.4 t/s.
+  - Pooled over both orders, every non-Inkling cell is within ±0.15%, so these are position and noise.
+  - Neither path reaches the change: Mistral is dense, and a GPT-OSS decode token never enters the batched prompt
+    executor. Task 25's ABBA flagged the same GPT-OSS row the same way.
+- *What the task bought.* The per-expert dequant is gone. Inkling's B70 prompt runs about 20% faster at pp512 and
+  about 19% faster on the long prompt, with perplexity no worse.
+
 ## Tracker tasks owed (kept here because the tracker is unreachable from the lead session)
 
 *Left by Task 21, step 1d (2026-11-24):*
