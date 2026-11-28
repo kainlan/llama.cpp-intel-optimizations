@@ -246,8 +246,9 @@ STAGED_CAP_STEPS = (
 STAGED_RECIPE_CALL = ("const moe_route_capability cap = ggml_sycl_moe_build_device_recipe(src0, submit_device, rows, "
                       "invocation_backend, invocation_queue, queue_capability, staged);")
 # The batched prompt executor (llama.cpp-348c), and every place an active expert's weight pointer goes in it: the
-# MXFP4 repacks into the WOQ slot, the f16 dequants into the f16 slot, and the route log, which records the address.
-# The pointer's writers are counted apart. oneDNN takes only the executor's own slots.
+# MXFP4 and NVFP4 repacks into the WOQ slot (the batched ones through repack_srcs, which both build from one loop), the
+# f16 dequants into the f16 slot, and the route log, which records the address. The pointer's writers are counted
+# apart. oneDNN takes only the executor's own slots, in all three of its GEMM calls.
 EXEC_SIG = "auto try_pp_onednn_f16_batched = [&]() -> bool"
 EXEC_PTR_WRITE_RE = r"\bexpert\.ptr\s*=(?!=)"
 EXEC_PTR_USES = (
@@ -268,8 +269,10 @@ EXEC_SRCS_USES = (
     "repack_srcs.push_back(expert.ptr);",
     "repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(repack_srcs.data(),",
     "repack_mxfp4_soa_to_woq_coalesced_batched(repack_srcs.data(),",
+    "repack_nvfp4_to_woq_nk_batched(repack_srcs.data(),",
 )
-ONEDNN_CALLS = ("DnnlGemmWrapper::gemm_batch_strided(", "DnnlGemmWrapper::woq_gemm_batch_mxfp4(")
+ONEDNN_CALLS = ("DnnlGemmWrapper::gemm_batch_strided(", "DnnlGemmWrapper::woq_gemm_batch_mxfp4(",
+                "DnnlGemmWrapper::woq_gemm_batch_nvfp4(")
 EXPERT_NAMES = ("expert.ptr", "expert_src", "repack_srcs", "active_experts", "route.ptr", "moe_stream")
 # The executor's read of a staged slot (llama.cpp-3460): the stage-table key, built as the staged route builds it.
 # Since the window ring (llama.cpp-8epx) the expert loop only defers the HOST expert of an op that reads windows
@@ -637,6 +640,14 @@ def test_served_only_as_plain_kernel_mutants():
     # The WOQ GEMM handed the repack sources instead of the WOQ slot.
     assert not c(mutate(SYCL, "act_stride, batched_weight_bytes + lo * weight_slot_bytes,",
                         "act_stride, (const uint8_t *) repack_srcs[lo],"))
+    # NVFP4's WOQ GEMM handed an expert's own blocks instead of the repacked nibble planes, or its scales.
+    assert not c(mutate(SYCL, "act_stride, batched_weight_bytes + lo * nvfp4_planes.nibble_bytes,",
+                        "act_stride, static_cast<const uint8_t *>(active_experts[lo].ptr),"))
+    assert not c(mutate(SYCL, "woq_nvfp4_scales + lo * nvfp4_planes.scale_halves,",
+                        "static_cast<const sycl::half *>(repack_srcs[lo]),"))
+    # NVFP4's repack reads the experts through a list the pin does not follow.
+    assert not c(mutate(SYCL, "repack_nvfp4_to_woq_nk_batched(repack_srcs.data(),",
+                        "repack_nvfp4_to_woq_nk_batched(nvfp4_srcs.data(),"))
     # A new reader of the expert's pointer beside the pinned kernels.
     assert not c(mutate(SYCL, "const void * expert_src = expert.ptr;",
                         "const void * expert_src = expert.ptr; ggml_sycl_onednn_read(expert.ptr);"))

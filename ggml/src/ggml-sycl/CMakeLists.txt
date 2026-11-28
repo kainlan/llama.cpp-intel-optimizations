@@ -6539,12 +6539,15 @@ set_tests_properties(test-moe-mul-mat-id-q4q8 PROPERTIES
 endif() # static SYCL backend fixture
 
 # llama.cpp-348c: the batched oneDNN MoE prompt executor takes every expert type its f16 table admits that the
-# fixture can quantize without an importance matrix (17 types, the k_types list in the test) on a planned model,
+# fixture can quantize without an importance matrix (18 types, the k_types list in the test) on a planned model,
 # matches the CPU backend at NMSE <= 5e-4, logs [PP-MOE] once per type, and refuses nothing. Each case runs in the
 # planned weight slot in f16 groups across its two halves: at least three at the slot's own grouping, and exactly
 # what the cap gives in two more Q4_0 cases that the test runs as child processes of itself with
-# GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX at 1 and 3. Pinned to the B50; a run with no SYCL GPU exits 77. The timeout
-# covers 38 cases, two of them skewed at 1024 and 2048 rows, and the single-threaded IQ quantizers.
+# GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX at 1 and 3. NVFP4's cases run its WOQ arm instead, one group, among them
+# one expert at 64, 128 and 192 rows and a single active expert. Pinned to the B50; a run with no SYCL GPU exits 77.
+# The timeout covers 48 cases, two of them skewed at 1024 and 2048 rows, and the single-threaded IQ quantizers.
+# test-moe-pp-batched-dequant-nvfp4-f16 runs NVFP4's 9 cases again with GGML_SYCL_MOE_PP_WOQ_NVFP4=0, on the f16 arm
+# that switch keeps for it.
 if (NOT GGML_BACKEND_DL)
 add_executable(test-moe-pp-batched-dequant
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-moe-pp-batched-dequant.cpp
@@ -6568,6 +6571,14 @@ set_tests_properties(test-moe-pp-batched-dequant PROPERTIES
     SKIP_RETURN_CODE 77
     RUN_SERIAL TRUE
     ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 600
+)
+add_test(NAME test-moe-pp-batched-dequant-nvfp4-f16 COMMAND test-moe-pp-batched-dequant --types nvfp4)
+set_tests_properties(test-moe-pp-batched-dequant-nvfp4-f16 PROPERTIES
+    LABELS "sycl;moe;device;B50"
+    SKIP_RETURN_CODE 77
+    RUN_SERIAL TRUE
+    ENVIRONMENT "ONEAPI_DEVICE_SELECTOR=level_zero:1;GGML_SYCL_MOE_PP_WOQ_NVFP4=0;LD_LIBRARY_PATH=/opt/intel/oneapi/redist/lib:$ENV{LD_LIBRARY_PATH}"
     TIMEOUT 600
 )
 endif() # static SYCL backend fixture

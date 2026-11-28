@@ -15,7 +15,8 @@ dequant. These claims pin that shape:
       without a pin is red), and every type it lists has a case in convert.cpp's
       ggml_get_to_fp16_sycl_for_layout; that case decodes SOA with a reorder kernel for Q4_0, Q4_K and Q6_K, and
       since it answers Q8_0 with the AOS kernel for every layout, the lambda takes Q8_0 SOA to
-      dequantize_row_q8_0_soa_to_fp16_rowmajor and never asks it; the WOQ table is MXFP4 on SOA and XMX_TILED;
+      dequantize_row_q8_0_soa_to_fp16_rowmajor and never asks it; the WOQ table is MXFP4 on SOA and XMX_TILED and
+      NVFP4 on AOS, one row per type;
   (c) the Q4_K device-weight CPU fallback (a D2H copy per dispatch) does not fire for a prompt the executor claims,
       and the mechanism is precedence, not a term on the fallback: a claimed prompt drops the planner's prompt route
       (planner_needs_prompt_route), so an all-local claimed prompt never enters the hybrid world where the fallback
@@ -31,7 +32,8 @@ dequant. These claims pin that shape:
   (f) one [PP-MOE] INFO line per (device, type, layout), naming the type, layout, experts per dispatch and the
       planned slot;
   (g) the MXFP4 profiler label strings are byte-identical and keep their counts, the non-MXFP4 labels are moe.pp.*,
-      and the MXFP4 dispatch-record profile stays MXFP4-only;
+      and the MXFP4 dispatch-record profile stays MXFP4-only; NVFP4's WOQ GEMM and repack keep their one label each
+      (nvfp4.pp.gemm.execute in gemm.hpp, nvfp4.pp.repack.nk in convert.cpp);
   (h) the capability query admits a prompt-phase op the executor takes only after the MMVQ check (so no type that
       has an MMVQ-ID kernel changes kernel), and MUL_MAT_ID admission takes a type with no MMVQ-ID kernel only for
       a prompt the executor claims, which is only a layer whose every expert is planned on this device: the claim's
@@ -103,6 +105,14 @@ dequant. These claims pin that shape:
       names the loader sizes the ring from) of a type that predicate serves. The consumer asks no knob predicate, so the
       ring a load plans never follows a runtime knob. A model whose experts are only Q1_0 (the MMID direct route) or
       BF16 (the BF16 direct route) plans none, so its RUNTIME zone carries no ring nobody would use.
+  (u) the WOQ arm a dispatch runs is one header question: moe_pp_batched_woq_arm_runs (moe-mmvq-tables.hpp) is the
+      type's WOQ row under GGML_SYCL_MOE_PP_WOQ and, for NVFP4, its own switch, and the executor's pp_woq_arm is that
+      call alone. The claim does not move with it: moe_pp_batched_supports_layout takes the WOQ row for MXFP4 only, so
+      NVFP4 is claimed through its f16 row under the AOS knob whichever arm then runs it. NVFP4's switch
+      (ggml_sycl_moe_pp_woq_nvfp4_enabled) reads GGML_SYCL_MOE_PP_WOQ_NVFP4 once, asks the oneDNN version
+      (DnnlGemmWrapper::woq_nvfp4_library_ok) and WARNs when the version alone turns the arm off; it is defined under
+      #if GGML_SYCL_DNNL, as the wrapper is, and catalogued. Its repack and its GEMM each run under pp_woq_nvfp4 and
+      take the dense planes from moe_pp_woq_nvfp4_dense_planes, asked once; the MXFP4 WOQ GEMM stays under pp_woq_arm.
 
 Comments are stripped and whitespace is squeezed before matching, so a comment cannot satisfy a probe and the
 probes are written with single spaces. Every claim has at least one mutant below that must turn it red.
@@ -227,6 +237,29 @@ CLAIMS_STAGED_TYPE_BODY = ("{ return moe_pp_batched_takes_staged_type(type) && "
                            "ggml_sycl_moe_pp_batched_takes_layout(type, GGML_LAYOUT_AOS); }")
 STAGED_CLAIM_HEAD = "planned = plan != nullptr && ggml_sycl_moe_pp_batched_claims_staged_type(weight->type) && "
 SEED_GATE = "if (!moe_pp_batched_takes_staged_type(t)) { return MOE_EXEC_DEV_GFLOPS_PER_ROW_SEED; }"
+# The WOQ table's rows: MXFP4's repack reads its SOA or XMX_TILED planes, NVFP4's reads its AOS blocks.
+WOQ_ROWS = {"GGML_TYPE_MXFP4": ["GGML_LAYOUT_SOA", "GGML_LAYOUT_XMX_TILED"], "GGML_TYPE_NVFP4": ["GGML_LAYOUT_AOS"]}
+# Which arm a dispatch runs, asked of the header, and the claim's WOQ branch, which stays MXFP4's alone.
+WOQ_ARM_FN = "moe_pp_batched_woq_arm_runs"
+WOQ_ARM_BODY = ("{ return woq_enabled && moe_pp_batched_woq_supports_layout(type, layout) && "
+                "(type != GGML_TYPE_NVFP4 || nvfp4_woq_enabled); }")
+WOQ_ARM_LINE = ("const bool pp_woq_arm = moe_pp_batched_woq_arm_runs(src0->type, route_layout, pp_woq_enabled, "
+                "ggml_sycl_moe_pp_woq_nvfp4_enabled());")
+WOQ_NVFP4_LINE = "const bool pp_woq_nvfp4 = pp_woq_arm && src0->type == GGML_TYPE_NVFP4;"
+WOQ_CLAIM_BRANCH = ("if (woq_enabled && type == GGML_TYPE_MXFP4 && moe_pp_batched_woq_supports_layout(type, layout)) "
+                    "{ return true; }")
+NVFP4_SWITCH = "ggml_sycl_moe_pp_woq_nvfp4_enabled"
+NVFP4_SWITCH_HEAD = "static bool ggml_sycl_moe_pp_woq_nvfp4_enabled() {"
+NVFP4_KNOB = "GGML_SYCL_MOE_PP_WOQ_NVFP4"
+NVFP4_KNOB_ROW = "| `GGML_SYCL_MOE_PP_WOQ_NVFP4=0` | ON |"
+NVFP4_SWITCH_TERMS = ('static const bool enabled', 'std::getenv("GGML_SYCL_MOE_PP_WOQ_NVFP4")',
+                      "DnnlGemmWrapper::woq_nvfp4_library_ok()", "GGML_LOG_WARN(", "dnnl_version()")
+NVFP4_REPACK = "repack_nvfp4_to_woq_nk_batched("
+NVFP4_GEMM = "DnnlGemmWrapper::woq_gemm_batch_nvfp4("
+MXFP4_WOQ_GEMM = "DnnlGemmWrapper::woq_gemm_batch_mxfp4("
+NVFP4_PLANES = "moe_pp_woq_nvfp4_dense_planes("
+# A preprocessor directive in squeezed text: its keyword and the first token of its condition.
+DIRECTIVE_RE = re.compile(r"#\s?(ifdef|ifndef|if|elif|else|endif)\b ?([^\s#]*)")
 SEED_MXFP4 = "if (t == GGML_TYPE_MXFP4) { return 3990.0; }"
 TABLE_TERMS = ("moe_mmvq_admission_supports_type(", "moe_pp_batched_f16_supports_layout(")
 # The types a ring consumer runs, and the publish helper's gate that plans no ring for a model with none of them.
@@ -453,6 +486,67 @@ def enum_values(text, enum_head):
 # ---------------------------------------------------------------------------------------------------------------------
 
 
+def top_level_split(expr, sep):
+    """`expr` split at every `sep` outside brackets."""
+    parts, depth, start, i = [], 0, 0, 0
+    while i < len(expr):
+        c = expr[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and expr.startswith(sep, i):
+            parts.append(expr[start:i])
+            i += len(sep)
+            start = i
+            continue
+        i += 1
+    parts.append(expr[start:])
+    return parts
+
+
+def unwrap(expr):
+    """`expr` without the parentheses that enclose all of it, if any."""
+    expr = expr.strip()
+    while expr.startswith("(") and match_close(expr, 0) == len(expr):
+        expr = expr[1:-1].strip()
+    return expr
+
+
+def woq_table_rows(body):
+    """The WOQ table's rows as {type: sorted layouts}, or None unless its body returns one OR of
+    `type == T && (layout == L || ...)` terms: a negation, a knob or a constant would let the rows say less than the
+    table answers."""
+    m = re.fullmatch(r"\{ return (.*); \}", body or "")
+    if not m:
+        return None
+    rows = {}
+    for term in top_level_split(unwrap(m.group(1)), " || "):
+        row = re.fullmatch(r"type == (GGML_TYPE_\w+) && (.*)", unwrap(term))
+        if not row or row.group(1) in rows:
+            return None
+        layouts = [re.fullmatch(r"layout == (GGML_LAYOUT_\w+)", unwrap(x)) for x in
+                   top_level_split(unwrap(row.group(2)), " || ")]
+        if not all(layouts):
+            return None
+        rows[row.group(1)] = sorted(x.group(1) for x in layouts)
+    return rows
+
+
+def directive_conditions_at(text, pos):
+    """The `#if`/`#ifdef` conditions (first token) whose taken branch encloses `pos`, outermost first."""
+    stack = []
+    for m in DIRECTIVE_RE.finditer(text, 0, pos):
+        kw, cond = m.group(1), m.group(2)
+        if kw in ("if", "ifdef", "ifndef"):
+            stack.append(cond if kw != "ifndef" else "!" + cond)
+        elif kw in ("elif", "else") and stack:
+            stack[-1] = "!" + stack[-1]
+        elif kw == "endif" and stack:
+            stack.pop()
+    return stack
+
+
 def claim_a_one_table(s):
     fails = []
     for fn in ("moe_pp_batched_f16_supports_layout", "moe_pp_batched_woq_supports_layout",
@@ -545,9 +639,10 @@ def claim_b_table_types(s):
     if getter < 0 or "!pp_q8_0_soa(expert)" not in (enclosing_if_condition(lam, getter) or ""):
         fails.append("the lambda does not ask ggml_get_to_fp16_sycl_for_layout per expert, and never for Q8_0 SOA, "
                      "which it answers with the AOS kernel")
-    woq_types = set(re.findall(r"GGML_TYPE_\w+", woq))
-    if woq_types != {"GGML_TYPE_MXFP4"} or "GGML_LAYOUT_SOA" not in woq or "GGML_LAYOUT_XMX_TILED" not in woq:
-        fails.append("the WOQ table must be MXFP4 on SOA and XMX_TILED")
+    rows = woq_table_rows(woq)
+    if rows != {k: sorted(v) for k, v in WOQ_ROWS.items()}:
+        fails.append(f"the WOQ table must be MXFP4 on SOA and XMX_TILED and NVFP4 on AOS, one `type == T && layout`"
+                     f" row each (got {rows!r})")
     return fails
 
 
@@ -724,11 +819,13 @@ def claim_g_labels(s):
         ("convert", '"mxfp4.pp.repack"'): 8,
         ("convert", '"mxfp4.pp.repack.soa"'): 4,
         ("convert", '"mxfp4.pp.repack.tiled"'): 4,
+        ("gemm", '"nvfp4.pp.gemm.execute"'): 1,
+        ("convert", '"nvfp4.pp.repack.nk"'): 1,
     }
     for (key, lit), want in counts.items():
         got = s[key].count(lit)
         if got != want:
-            fails.append(f"{lit} appears {got} times in {FILES[key].name}, want {want} (byte-identical MXFP4 labels)")
+            fails.append(f"{lit} appears {got} times in {FILES[key].name}, want {want} (byte-identical WOQ labels)")
     sycl = s["sycl"]
     for text, want in (
         ("const bool pp_mxfp4_labels = src0->type == GGML_TYPE_MXFP4;", 1),
@@ -1249,6 +1346,56 @@ def claim_t_ring_consumer(s):
     return fails
 
 
+def claim_u_woq_arm(s):
+    fails = []
+    sycl, tables = s["sycl"], s["tables"]
+    arm = one_definition(tables, WOQ_ARM_FN)
+    if arm != WOQ_ARM_BODY:
+        fails.append(f"{WOQ_ARM_FN} is not defined once in moe-mmvq-tables.hpp as `{WOQ_ARM_BODY}` (got {arm!r})")
+    if definitions(sycl, WOQ_ARM_FN):
+        fails.append(f"{WOQ_ARM_FN} has a second definition in ggml-sycl.cpp")
+    supports = one_definition(tables, "moe_pp_batched_supports_layout") or ""
+    if WOQ_CLAIM_BRANCH not in supports or supports.count("moe_pp_batched_woq_supports_layout(") != 1:
+        fails.append("moe_pp_batched_supports_layout's WOQ branch is not MXFP4's alone: NVFP4's claim would move "
+                     "with the WOQ switch instead of following its f16 row under the AOS knob")
+    lam = lambda_body(sycl) or ""
+    if lam.count(WOQ_ARM_LINE) != 1 or len(re.findall(r"\bpp_woq_arm =(?!=)", lam)) != 1:
+        fails.append(f"the executor's pp_woq_arm is not exactly `{WOQ_ARM_LINE}`")
+    if "moe_pp_batched_woq_supports_layout(" in lam:
+        fails.append("the executor asks the WOQ table itself instead of moe_pp_batched_woq_arm_runs")
+    if lam.count(WOQ_NVFP4_LINE) != 1 or len(re.findall(r"\bpp_woq_nvfp4 =(?!=)", lam)) != 1:
+        fails.append(f"the executor does not name NVFP4's WOQ arm once as `{WOQ_NVFP4_LINE}`")
+    for call, cond in ((NVFP4_REPACK, "pp_woq_nvfp4"), (NVFP4_GEMM, "pp_woq_nvfp4"), (MXFP4_WOQ_GEMM, "pp_woq_arm")):
+        at = lam.find(call)
+        got = (enclosing_if_condition(lam, at) or "").strip() if at >= 0 else None
+        if lam.count(call) != 1 or got != cond:
+            fails.append(f"`{call}` is not called once in the executor, under `if ({cond})` (got {got!r})")
+    planes = lam.find(NVFP4_PLANES)
+    if lam.count(NVFP4_PLANES) != 1 or (enclosing_if_condition(lam, planes) or "").strip() != "pp_woq_nvfp4":
+        fails.append(f"the executor does not ask {NVFP4_PLANES[:-1]} once, under `if (pp_woq_nvfp4)`")
+    gemm = lam.find(NVFP4_GEMM)
+    gemm_call = statement(lam, None, start=gemm) if gemm >= 0 else ""
+    for term in ("nvfp4_planes.nibble_bytes", "nvfp4_planes.scale_halves", "woq_nvfp4_scales"):
+        if term not in (gemm_call or ""):
+            fails.append(f"NVFP4's WOQ GEMM does not address its expert's planes with {term}")
+    switch = one_definition(sycl, NVFP4_SWITCH)
+    if switch is None:
+        fails.append(f"{NVFP4_SWITCH} is not defined exactly once in ggml-sycl.cpp")
+    else:
+        for term in NVFP4_SWITCH_TERMS:
+            if term not in switch:
+                fails.append(f"{NVFP4_SWITCH} does not hold `{term}`")
+        head = sycl.find(NVFP4_SWITCH_HEAD)
+        if head < 0 or "GGML_SYCL_DNNL" not in directive_conditions_at(sycl, head):
+            fails.append(f"{NVFP4_SWITCH} is not defined under #if GGML_SYCL_DNNL, where the oneDNN wrapper is")
+    spelled = sycl.count(f'"{NVFP4_KNOB}"')
+    if spelled != 1:
+        fails.append(f'"{NVFP4_KNOB}" is spelled {spelled} times in ggml-sycl.cpp, want 1 (the switch\'s one read)')
+    if NVFP4_KNOB_ROW not in s["catalog"]:
+        fails.append(f"docs/backend/sycl-env-vars.md has no `{NVFP4_KNOB_ROW}` row")
+    return fails
+
+
 CLAIMS = {
     "a": claim_a_one_table,
     "b": claim_b_table_types,
@@ -1270,6 +1417,7 @@ CLAIMS = {
     "r": claim_r_failure_drain,
     "s": claim_s_staged_type,
     "t": claim_t_ring_consumer,
+    "u": claim_u_woq_arm,
 }
 
 
@@ -1516,6 +1664,38 @@ MUTANTS = [
      "in.pp_moe_onednn_weight_slot_bytes = 0; } const uint32_t n_ubatch"),
     ("t", "sycl", PLAN_SITE_HEAD,
      PLAN_SITE_HEAD + " (void) ggml_sycl::pp_moe_onednn_slots_at(0, 0, 0, 0, 0, nullptr, nullptr);"),
+    # NVFP4's WOQ row dropped, widened to SOA, or keyed on a negation.
+    ("b", "tables", " || (type == GGML_TYPE_NVFP4 && layout == GGML_LAYOUT_AOS)", ""),
+    ("b", "tables", "(type == GGML_TYPE_NVFP4 && layout == GGML_LAYOUT_AOS)",
+     "(type == GGML_TYPE_NVFP4 && (layout == GGML_LAYOUT_AOS || layout == GGML_LAYOUT_SOA))"),
+    ("b", "tables", "(type == GGML_TYPE_NVFP4 && layout == GGML_LAYOUT_AOS)",
+     "(type != GGML_TYPE_Q1_0 && layout == GGML_LAYOUT_AOS)"),
+    # NVFP4's labels renamed or spelled a second time.
+    ("g", "gemm", '"nvfp4.pp.gemm.execute"', '"nvfp4.pp.gemm.exec"'),
+    ("g", "convert", '"nvfp4.pp.repack.nk"', '"nvfp4.pp.repack"'),
+    # The arm asked of the table again, or with NVFP4's switch forced on or dropped from the header.
+    ("u", "sycl", WOQ_ARM_LINE,
+     "const bool pp_woq_arm = pp_woq_enabled && moe_pp_batched_woq_supports_layout(src0->type, route_layout);"),
+    ("u", "sycl", WOQ_ARM_LINE, WOQ_ARM_LINE.replace("ggml_sycl_moe_pp_woq_nvfp4_enabled()", "true")),
+    ("u", "tables", WOQ_ARM_BODY, "{ return woq_enabled && moe_pp_batched_woq_supports_layout(type, layout); }"),
+    # The claim moves with the WOQ switch for NVFP4.
+    ("u", "tables", "if (woq_enabled && type == GGML_TYPE_MXFP4 && moe_pp_batched_woq_supports_layout(type, layout))",
+     "if (woq_enabled && moe_pp_batched_woq_supports_layout(type, layout))"),
+    # NVFP4's repack or GEMM run for MXFP4 too, or the MXFP4 GEMM for NVFP4.
+    ("u", "sycl", "if (pp_woq_nvfp4) { repack_nvfp4_to_woq_nk_batched(",
+     "if (pp_woq_arm) { repack_nvfp4_to_woq_nk_batched("),
+    ("u", "sycl", "if (pp_woq_nvfp4) { group_event = DnnlGemmWrapper::woq_gemm_batch_nvfp4(",
+     "if (pp_woq_arm) { group_event = DnnlGemmWrapper::woq_gemm_batch_nvfp4("),
+    ("u", "sycl", "} else if (pp_woq_arm) { group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4(",
+     "} else if (true) { group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4("),
+    # The scales addressed from the nibble planes' stride.
+    ("u", "sycl", "woq_nvfp4_scales + lo * nvfp4_planes.scale_halves",
+     "woq_nvfp4_scales + lo * nvfp4_planes.nibble_bytes"),
+    # NVFP4's switch without the version gate, without its warning, outside the oneDNN guard, or uncatalogued.
+    ("u", "sycl", "DnnlGemmWrapper::woq_nvfp4_library_ok()", "true"),
+    ("u", "sycl", NVFP4_SWITCH_HEAD, "#endif " + NVFP4_SWITCH_HEAD),
+    ("u", "sycl", 'std::getenv("GGML_SYCL_MOE_PP_WOQ_NVFP4")', 'std::getenv("GGML_SYCL_MOE_PP_WOQ")'),
+    ("u", "catalog", NVFP4_KNOB_ROW, "| `GGML_SYCL_MOE_PP_WOQ_NVFP4=0` | OFF |"),
 ]
 
 
@@ -1540,6 +1720,12 @@ def test_claims_are_not_vacuous(sources):
     assert one_definition(sources["tables"], RING_TYPE) is not None
     assert one_definition(sources["sycl"], RING_CONSUMER) is not None
     assert RING_GATE in (one_definition(sources["sycl"], PUBLISH_FN) or "")
+    assert woq_table_rows(one_definition(sources["tables"], "moe_pp_batched_woq_supports_layout")) is not None
+    assert one_definition(sources["tables"], WOQ_ARM_FN) is not None
+    assert one_definition(sources["sycl"], NVFP4_SWITCH) is not None
+    # The directive scan sees the oneDNN guard around the WOQ switch it has always stood under.
+    woq_switch = sources["sycl"].find("static bool ggml_sycl_moe_pp_woq_enabled() {")
+    assert woq_switch >= 0 and "GGML_SYCL_DNNL" in directive_conditions_at(sources["sycl"], woq_switch)
 
 
 if __name__ == "__main__":

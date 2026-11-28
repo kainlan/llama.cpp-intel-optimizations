@@ -117,7 +117,9 @@ def test_stream_call_at_function_scope_mutants():
 
 ROLE_DECL = ("const ggml_sycl::expert_tensor_role pp_stream_role = ctx.moe_stream ? "
              "ggml_sycl::expert_tensor_role_from_tensor_name(src0->name) : ggml_sycl::expert_tensor_role::UNKNOWN;")
-WOQ_ARM = "const bool pp_woq_arm = pp_woq_enabled && moe_pp_batched_woq_supports_layout(src0->type, route_layout);"
+# The WOQ arm is MXFP4's and NVFP4's: the table's row, GGML_SYCL_MOE_PP_WOQ, and NVFP4's own switch.
+WOQ_ARM = ("const bool pp_woq_arm = moe_pp_batched_woq_arm_runs(src0->type, route_layout, pp_woq_enabled, "
+           "ggml_sycl_moe_pp_woq_nvfp4_enabled());")
 WINDOWED = ("const bool pp_stream_windowed = pp_onednn_batched_claims_staged_layer && "
             "ggml_sycl::detail::moe_expert_role_is_triplet(pp_stream_role) && !pp_woq_arm;")
 LAYER_FLAG = "pp_onednn_batched_claims_staged_layer"

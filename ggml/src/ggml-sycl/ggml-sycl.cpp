@@ -89198,6 +89198,29 @@ static bool ggml_sycl_moe_pp_woq_enabled() {
     return enabled;
 }
 
+// NVFP4's own WOQ switch (moe_pp_batched_woq_arm_runs): GGML_SYCL_MOE_PP_WOQ_NVFP4, read once, default on, and the
+// oneDNN version, since an oneDNN older than 3.13 computes woq_gemm_batch_nvfp4's transposed sub-byte weights wrong.
+// Off, NVFP4's prompt experts run the f16 arm in the same planned slot. It is under the oneDNN guard, as the wrapper
+// it asks is: a build without oneDNN runs neither arm.
+static bool ggml_sycl_moe_pp_woq_nvfp4_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_SYCL_MOE_PP_WOQ_NVFP4");
+        if (env != nullptr && std::atoi(env) == 0) {
+            return false;
+        }
+        if (!DnnlGemmWrapper::woq_nvfp4_library_ok()) {
+            const dnnl_version_t * v = dnnl_version();
+            GGML_LOG_WARN(
+                "[PP-MOE] oneDNN %d.%d.%d is older than 3.13, which NVFP4's WOQ GEMM needs: NVFP4 prompt "
+                "experts run the f16 arm\n",
+                v->major, v->minor, v->patch);
+            return false;
+        }
+        return true;
+    }();
+    return enabled;
+}
+
 // llama.cpp-6405 (perf-recovery epic, PP gap analysis sub-task): device-event
 // breakdown of the batched PP MoE oneDNN executor
 // (try_pp_onednn_f16_batched below), gated on GGML_SYCL_MXFP4_PP_PROFILE
@@ -100914,16 +100937,21 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // was taught the same restriction, which is exactly the
             // divergence that produced the original bug.
             const bool pp_woq_enabled = ggml_sycl_moe_pp_woq_enabled();
-            // llama.cpp-348c: the WOQ arm is MXFP4's alone (moe_pp_batched_woq_supports_layout); every other type the
-            // tables take, and MXFP4 under GGML_SYCL_MOE_PP_WOQ=0, runs the f16 arm.
-            const bool pp_woq_arm     = pp_woq_enabled && moe_pp_batched_woq_supports_layout(src0->type, route_layout);
+            // The WOQ arm is MXFP4's and NVFP4's (moe_pp_batched_woq_arm_runs): MXFP4's under GGML_SYCL_MOE_PP_WOQ,
+            // NVFP4's under that and its own switch as well. Every other type the tables take, and either of those two
+            // with its switch off, runs the f16 arm.
+            const bool pp_woq_arm     = moe_pp_batched_woq_arm_runs(src0->type, route_layout, pp_woq_enabled,
+                                                                    ggml_sycl_moe_pp_woq_nvfp4_enabled());
+            // NVFP4's WOQ arm: a GEMM over the experts' stored-order nibbles and f16 scales, in dense planes
+            // (moe_pp_woq_nvfp4_dense_planes), where MXFP4's has one planned slot per expert.
+            const bool pp_woq_nvfp4   = pp_woq_arm && src0->type == GGML_TYPE_NVFP4;
 
             // llama.cpp-8epx: whether this op reads ring windows, decided once for the op. Windows hold only a claimed
             // layer's GATE, UP and DOWN host matrices, which the f16 arm dequantizes. Such a layer's other ops have no
-            // host expert, or the layer would not be claimed: a fused GATE_UP or CHUNK_* weight, or an MXFP4 role (the
-            // WOQ arm's type, which the ring refuses), is all resident. Any other op runs uncapped and windowless, and
-            // a HOST route there (the cache can evict a planned-device expert at runtime) declines EXPERT_NOT_LOCAL in
-            // the expert loop, as on a layer the executor does not claim.
+            // host expert, or the layer would not be claimed: a fused GATE_UP or CHUNK_* weight, or a role of a WOQ
+            // arm's type (MXFP4, which the ring refuses, or NVFP4, which it never stages), is all resident. Any other
+            // op runs uncapped and windowless, and a HOST route there (the cache can evict a planned-device expert at
+            // runtime) declines EXPERT_NOT_LOCAL in the expert loop, as on a layer the executor does not claim.
             const bool pp_stream_windowed = pp_onednn_batched_claims_staged_layer &&
                                             ggml_sycl::detail::moe_expert_role_is_triplet(pp_stream_role) &&
                                             !pp_woq_arm;
@@ -101149,9 +101177,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             // llama.cpp-348c, llama.cpp-3460: each expert's reader follows the layout that expert is in: a device
             // expert's is the route's (the loop above refused any other), a staged one's is its slot's, AOS. MXFP4's
-            // readers, the WOQ repacks and its f16 arm's SOA row-major dequant, read the route's layout alone. Q8_0's
-            // SOA experts take dequantize_row_q8_0_soa_to_fp16_rowmajor in the phase loop below, as the PP dequant
-            // pipeline's do: ggml_get_to_fp16_sycl_for_layout answers Q8_0 with the AOS kernel for every layout.
+            // readers, the WOQ repacks and its f16 arm's SOA row-major dequant, read the route's layout alone, and
+            // NVFP4's WOQ repack reads AOS alone. Q8_0's SOA experts take dequantize_row_q8_0_soa_to_fp16_rowmajor in
+            // the phase loop below, as the PP dequant pipeline's do: ggml_get_to_fp16_sycl_for_layout answers Q8_0
+            // with the AOS kernel for every layout.
             // Every other expert takes that table's converter for its layout. An expert with no reader for its layout
             // refuses the dispatch.
             const auto pp_q8_0_soa = [&](const pp_onednn_batched_expert & expert) {
@@ -101160,6 +101189,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             for (pp_onednn_batched_expert & expert : active_experts) {
                 if (src0->type == GGML_TYPE_MXFP4) {
                     if (expert.layout != route_layout) {
+                        return reject_batched(moe_pp_batched_refusal::EXPERT_LAYOUT,
+                                              ggml_sycl_layout_mode_name(expert.layout), expert.expert_id);
+                    }
+                } else if (pp_woq_nvfp4) {
+                    // NVFP4's WOQ repack reads the AOS blocks as loaded, and no f16 converter.
+                    if (expert.layout != GGML_LAYOUT_AOS) {
                         return reject_batched(moe_pp_batched_refusal::EXPERT_LAYOUT,
                                               ggml_sycl_layout_mode_name(expert.layout), expert.expert_id);
                     }
@@ -101183,6 +101218,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             size_t       woq_nibble_slot_bytes = 0;  // WOQ-arm only
             size_t       woq_scale_slot_bytes  = 0;  // WOQ-arm only
             size_t       weight_slot_bytes     = 0;  // WOQ-arm only: woq_nibble_slot_bytes + woq_scale_slot_bytes
+            moe_pp_woq_nvfp4_planes nvfp4_planes = {};          // NVFP4's WOQ arm only: where its planes sit
             if (!checked_mul(pack.packed_rows, static_cast<size_t>(ne10), total_act_elems) ||
                 !checked_mul(pack.packed_rows, static_cast<size_t>(ne0), total_out_elems) ||
                 !checked_mul(total_act_elems, sizeof(sycl::half), act_bytes) ||
@@ -101195,7 +101231,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // aligned: e8m0 scales ((K/QK_MXFP4)*N bytes) for MXFP4, f16
                 // scales ((K/16)*N halves) for NVFP4. ~4x smaller than the
                 // f16-arm's dequant slot. llama-model.cpp's plan computes the
-                // same slot (tests/test-sycl-woq-slot-formula-source.py).
+                // same slot (tests/test-sycl-woq-slot-formula-source.py), and
+                // the admission asks for it per active expert. NVFP4 then lays
+                // its planes out dense inside that (below).
                 const auto align_up_256 = [](size_t v) -> size_t {
                     return (v + 255) & ~static_cast<size_t>(255);
                 };
@@ -101205,7 +101243,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                     return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
                 }
                 if (src0->type == GGML_TYPE_NVFP4) {
-                    // Unreachable until Task 26b-4 admits NVFP4 to the WOQ arm.
                     size_t scale_elems_per_expert = 0;
                     if (!checked_mul(static_cast<size_t>(ne00 / QK_NVFP4_SUB), static_cast<size_t>(ne01),
                                      scale_elems_per_expert) ||
@@ -101221,6 +101258,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 weight_slot_bytes     = woq_nibble_slot_bytes + woq_scale_slot_bytes;
                 if (!checked_mul(weight_slot_bytes, active_count, weight_bytes)) {
                     return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
+                }
+                if (pp_woq_nvfp4) {
+                    // oneDNN's 3-D GEMM steps from one expert to the next by one nibble and one scale stride, so
+                    // NVFP4's planes are dense, every nibble plane and then every scale plane, and they end inside
+                    // the per-expert slots asked for above.
+                    static_assert(QK_NVFP4 == 64 && QK_NVFP4_SUB == 16,
+                                  "moe_pp_woq_nvfp4_dense_planes counts 64-value blocks and 16-value scale groups");
+                    if (!moe_pp_woq_nvfp4_dense_planes(static_cast<size_t>(ne00), static_cast<size_t>(ne01),
+                                                       active_count, &nvfp4_planes)) {
+                        return reject_batched(moe_pp_batched_refusal::SCRATCH_SIZE, nullptr);
+                    }
+                    GGML_ASSERT(nvfp4_planes.used_bytes <= weight_bytes);
                 }
             } else {
                 // llama.cpp-348c: the f16 arm asks the admission for one expert's f16 matrix. It runs in the weight
@@ -101344,7 +101393,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             }
             // The f16 arm's groups: what the slot it claimed holds, capped by GGML_SYCL_MOE_PP_F16_GROUP_EXPERTS_MAX.
             // The check above leaves room for one expert, so there is at least one group. The WOQ arm repacks every
-            // active expert into its own planned slot and runs as one group.
+            // active expert into the slot, MXFP4's each into its own planned slot and NVFP4's into dense planes, and
+            // runs as one group.
             moe_pp_batched_f16_groups f16_groups;
             if (!pp_woq_arm) {
                 f16_groups = moe_pp_batched_f16_plan_groups(reserved.weight_size, f16_expert_bytes, active_count,
@@ -101357,6 +101407,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             } else {
                 batched_weights = static_cast<sycl::half *>(reserved.weight);
             }
+            // NVFP4's first scale plane. Its offset is in bytes; the GEMM steps from it in halves.
+            sycl::half * woq_nvfp4_scales =
+                pp_woq_nvfp4 ? reinterpret_cast<sycl::half *>(batched_weight_bytes + nvfp4_planes.scale_offset_bytes) :
+                               nullptr;
             batched_acts = static_cast<sycl::half *>(reserved.activation);
             batched_out  = static_cast<float *>(reserved.output);
             // Where the expert at sorted position `slot` has its rows. The GEMM arms and the debug compare ask here, so
@@ -101449,9 +101503,13 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // to the pre-1lon per-slot loop below on the chance a dispatch
             // has more active slots than that (not reached by any shipped
             // MXFP4 model; GPT-OSS 20B's max is 32).
+            //
+            // NVFP4's WOQ repack takes every active expert in one call, whatever their number: its entry launches once
+            // per GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS experts itself, so it has no per-slot fallback.
             const bool woq_repack_batched =
-                pp_woq_arm && active_experts.size() <= static_cast<size_t>(GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
-            if (woq_repack_batched) {
+                pp_woq_arm && !pp_woq_nvfp4 &&
+                active_experts.size() <= static_cast<size_t>(GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS);
+            if (pp_woq_nvfp4 || woq_repack_batched) {
                 std::vector<const void *> repack_srcs;
                 repack_srcs.reserve(active_experts.size());
                 for (const pp_onednn_batched_expert & expert : active_experts) {
@@ -101478,7 +101536,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                 // measured 4.8-5.7x over the pre-0vqt batched kernels'
                 // effective bandwidth on both cards (task comments c-swol,
                 // and the iter3 acceptance run).
-                if (experts_are_tiled) {
+                if (pp_woq_nvfp4) {
+                    // Each expert's AOS blocks into its dense planes: nibbles in stored order, UE4M3 scales as f16.
+                    repack_nvfp4_to_woq_nk_batched(repack_srcs.data(), n_slots, batched_weight_bytes, woq_nvfp4_scales,
+                                                   static_cast<int>(ne00), static_cast<int>(ne01), ctx.stream(),
+                                                   ctx.device);
+                } else if (experts_are_tiled) {
                     repack_mxfp4_xmx_tiled_to_woq_coalesced_batched(
                         repack_srcs.data(), n_slots, batched_weight_bytes, weight_slot_bytes, woq_nibble_slot_bytes,
                         blocks_per_row, static_cast<int>(ne01), static_cast<int>(tile_n_total), ctx.stream(),
@@ -101497,7 +101560,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
             // Fallback: this dispatch exceeded the batched repack's slot capacity (see
             // GGML_SYCL_MXFP4_WOQ_REPACK_MAX_SLOTS above) -- repack each slot individually, exactly as before
             // llama.cpp-1lon.
-            if (pp_woq_arm && !woq_repack_batched) {
+            if (pp_woq_arm && !pp_woq_nvfp4 && !woq_repack_batched) {
                 for (size_t slot = 0; slot < active_experts.size(); ++slot) {
                     const pp_onednn_batched_expert & expert     = active_experts[slot];
                     uint8_t *                        nibble_dst = batched_weight_bytes + slot * weight_slot_bytes;
@@ -101924,7 +101987,16 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
                         // A declined scratchpad submitted nothing for this group; the groups before it wrote only the
                         // batched scratch buffers, never dst, so the whole stage takes the failure path below.
                         std::optional<sycl::event> group_event;
-                        if (pp_woq_arm) {
+                        if (pp_woq_nvfp4) {
+                            // The experts' dense planes, one nibble plane (bytes) and one scale plane (halves) apart.
+                            group_event = DnnlGemmWrapper::woq_gemm_batch_nvfp4(
+                                ctx, /* m = */ static_cast<int>(group.n_rows), /* n = */ static_cast<int>(ne01),
+                                /* k = */ static_cast<int>(ne00), act_base(lo), DnnlGemmWrapper::to_dt<sycl::half>(),
+                                act_stride, batched_weight_bytes + lo * nvfp4_planes.nibble_bytes,
+                                woq_nvfp4_scales + lo * nvfp4_planes.scale_halves, out_base(lo),
+                                DnnlGemmWrapper::to_dt<float>(), out_stride, static_cast<int>(hi - lo), ctx.stream(),
+                                { deps_in });
+                        } else if (pp_woq_arm) {
                             group_event = DnnlGemmWrapper::woq_gemm_batch_mxfp4(
                                 ctx, /* m = */ static_cast<int>(group.n_rows), /* n = */ static_cast<int>(ne01),
                                 /* k = */ static_cast<int>(ne00), act_base(lo), DnnlGemmWrapper::to_dt<sycl::half>(),
